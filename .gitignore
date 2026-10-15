@@ -1,0 +1,47 @@
+# Plan file, deliberately kept out of history. It is a working document.
+/PLAN.md
+
+# ASDF build output
+*.fasl
+*.fasl.new
+*.dx64fsl
+*.dx32fsl
+*.dxo
+*.dfsl
+*.lib
+*.tlib
+*.pdf
+.asdf/
+.direnv/
+/result
+/result-*
+/.nix-defexpr
+
+# Operator configuration. config.example.cl is tracked and is the template.
+# config.cl holds local paths, allowed user ids, and model choices.
+/config.cl
+
+# Agent runtime state. The agent owns this, git does not.
+agents/*/state.json
+agents/*/state.json.new
+agents/*/memory.db
+agents/*/memory.db-*
+agents/*/memory.db-shm
+agents/*/memory.db-wal
+agents/*/private/
+run/
+
+# Sandbox scratch. Agent-authored code is verified here before it loads.
+/tmp/enchiridion/
+
+# Secrets. .env sits beside the code, is mode 600, and is never committed.
+# The run script copies it into a container tmpfs that the agent cannot read.
+/.env
+/.env.*
+
+# Editor and operating system
+.DS_Store
+*.swp
+*.swo
+*~
+.#*

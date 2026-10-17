@@ -73,7 +73,18 @@
       (testing "a search does not create the store it is looking for"
         (ok (string= "no matches"
                      (enchiridion.tools.builtin:search-run (list :query "anything"))))
-        (ok (null (probe-file (merge-pathnames "memory.db" scratch))))))))
+        (ok (null (probe-file (merge-pathnames "memory.db" scratch)))))
+      (testing "and a stray empty file is not adopted as the agent's memory"
+        (let ((path (merge-pathnames "memory.db" scratch)))
+          (ensure-directories-exist path)
+          (let ((stream (open path :direction :output
+                                   :if-exists :supersede
+                                   :if-does-not-exist :create)))
+            (close stream))
+          (ok (string= "no matches"
+                       (enchiridion.tools.builtin:search-run (list :query "anything"))))
+          (ok (zerop (with-open-file (stream path :element-type '(unsigned-byte 8))
+                       (file-length stream)))))))))
 
 (deftest search-refuses-an-empty-query-and-an-unknown-scope ()
   (with-scratch-directory (scratch)

@@ -279,6 +279,36 @@ itself is what proves the trigger ran."
                                (enchiridion.memory.store:session-block store))))))
       (enchiridion.llm.secrets:clear-secrets))))
 
+(deftest a-store-file-is-recognized-by-its-header ()
+  (let* ((directory (scratch-directory))
+         (path (merge-pathnames "memory.db" directory))
+         (empty (merge-pathnames "empty.db" directory))
+         (text (merge-pathnames "notes.txt" directory)))
+    (unwind-protect
+         (progn
+           (testing "a path that is not there is not a store"
+             (ok (null (enchiridion.memory.store:store-file-p path))))
+           (let ((store (enchiridion.memory.store:open-store :path path)))
+             (enchiridion.memory.store:close-store store))
+           (ok (enchiridion.memory.store:store-file-p path))
+           (testing "a file of zero bytes is not a store"
+             (ensure-directories-exist empty)
+             (let ((stream (open empty :direction :output
+                                       :if-exists :supersede
+                                       :if-does-not-exist :create)))
+               (close stream))
+             (ok (null (enchiridion.memory.store:store-file-p empty))))
+           (testing "and neither is text that starts like one"
+             (ensure-directories-exist text)
+             (with-open-file (stream text :direction :output
+                                          :if-exists :supersede
+                                          :if-does-not-exist :create)
+               (write-string "SQLite format 3 but not really" stream))
+             (ok (null (enchiridion.memory.store:store-file-p text)))))
+      (uiop:delete-directory-tree directory
+                                  :validate t
+                                  :if-does-not-exist :ignore))))
+
 (deftest dropping-the-store-removes-every-table ()
   (with-scratch-store (store)
     (enchiridion.memory.store:record-turn store :session "s" :body "xylophone")

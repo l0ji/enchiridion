@@ -52,6 +52,36 @@ the supervisor wrote."
           (uiop:ensure-directory-pathname
            (if (and home (plusp (length home))) home (uiop:getcwd))))))))
 
+(defparameter +sqlite-header+ "SQLite format 3"
+  "The magic string at the start of every SQLite database file. The header on
+disk is these fifteen characters and one zero byte, so the check below reads
+one byte more than the string and wants that byte to be zero.")
+
+(declaim (ftype (function (t) boolean) store-file-p))
+
+(defun store-file-p (path)
+  "Return T when PATH holds an SQLite database.
+
+A search opens the store, and opening a store creates it. A file that is
+empty, or is not a database at all, is not a store: it is a leftover, and a
+search is not a reason to turn it into one. The magic string says more than a
+size test, and it costs one read of sixteen bytes."
+  (handler-case
+      (with-open-file (stream path :direction :input
+                                   :element-type '(unsigned-byte 8)
+                                   :if-does-not-exist nil)
+        (when stream
+          (let* ((length (length +sqlite-header+))
+                 (header (make-array (1+ length)
+                                     :element-type '(unsigned-byte 8)
+                                     :initial-element 0)))
+            (and (= (read-sequence header stream) (1+ length))
+                 (loop for index from 0 below length
+                       always (= (aref header index)
+                                 (char-code (char +sqlite-header+ index))))
+                 (zerop (aref header length))))))
+    (error () nil)))
+
 ;;;; The schema.
 ;;;;
 ;;;; One statement per element, in dependency order: a content table exists

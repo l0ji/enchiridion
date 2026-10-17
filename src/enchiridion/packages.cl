@@ -152,7 +152,7 @@ the three loading tiers, and the bootstrap state machine."))
   (:export
    ;; The one path a caller needs before a store exists. A store is a file, so
    ;; the default is a rule about directories and not a piece of state.
-   #:*store-path* #:default-store-path
+   #:*store-path* #:default-store-path #:store-file-p
    #:open-store #:close-store #:store-path
    #:record-turn #:turn-row #:session-count #:recent-sessions #:delete-session
    ;; A turn row is a struct, and the four fields a searcher reads are exported

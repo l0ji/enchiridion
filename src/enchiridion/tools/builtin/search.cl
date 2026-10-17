@@ -134,14 +134,15 @@ hit is one line of output and a result cannot forge a second line."
 (defun search-memory-run (args)
   "Search stored sessions and memories for QUERY and return one line per hit.
 
-The store is only opened when the file is already there. Opening it would
-create it, and a search is not a reason to write to disk."
+The store is opened only when the file is already a database. Opening one
+creates it, and a search is not a reason to write to disk or to adopt a stray
+file as the agent's memory."
   (let* ((query (check-query (argument args "query")))
          (limit (check-limit (or (argument args "limit") 20)))
          (path (or enchiridion.memory.store:*store-path*
                    (enchiridion.memory.store:default-store-path)))
          (results '()))
-    (when (probe-file path)
+    (when (enchiridion.memory.store:store-file-p path)
       (let ((store (enchiridion.memory.store:open-store :path path)))
         (unwind-protect
              (progn

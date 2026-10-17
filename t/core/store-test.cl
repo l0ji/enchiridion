@@ -136,7 +136,14 @@ itself is what proves the trigger ran."
     (testing "quotes, arithmetic, and a comment end nothing"
       (ok (listp (enchiridion.memory.store:search-sessions store "\" OR 1=1 --"))))
     (testing "FTS keywords are ordinary words"
-      (ok (listp (enchiridion.memory.store:search-sessions store "NEAR OR AND NOT"))))))
+      (ok (listp (enchiridion.memory.store:search-sessions store "NEAR OR AND NOT"))))
+    (testing "a control character is refused rather than handed to the parser"
+      (ok (signals (enchiridion.memory.store:search-sessions
+                    store (format nil "xylophone~Cmore" (code-char 0)))
+                   'enchiridion.errors:schema-error))
+      (ok (signals (enchiridion.memory.store:search-sessions
+                    store (format nil "xylophone~Cmore" (code-char 7)))
+                   'enchiridion.errors:schema-error)))))
 
 (deftest a-deleted-session-stops-matching ()
   (with-scratch-store (store)

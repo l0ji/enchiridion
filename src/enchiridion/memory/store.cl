@@ -191,6 +191,21 @@ write it the way it appears in this file. One door, one shape."
 
 ;;;; The search string.
 
+(defparameter +query-whitespace+ '(#\Space #\Tab #\Newline #\Return)
+  "The whitespace FTS-QUERY splits on. A control character outside this list
+carries no term, so it can only confuse the parser the query is handed to.")
+
+(defun bad-query-character-p (character)
+  "Return T for a character that must never reach the SQLite parser.
+
+Control characters are how a string stops being a string to a C parser. NUL is
+the one that matters: it turns the query into an unterminated string, which
+arrives as a sqlite error rather than as the schema error the caller can read
+and correct."
+  (and (not (member character +query-whitespace+))
+       (let ((code (char-code character)))
+         (or (< code 32) (= code 127)))))
+
 (defun quote-term (term)
   "Return TERM as an FTS5 quoted prefix query."
   (with-output-to-string (stream)
@@ -212,11 +227,14 @@ character in the operator's text is a literal and never a syntax error: the
 model asks for C++ and gets a search rather than a backtrace. A term with no
 alphanumeric character carries nothing to match and is dropped, and a query
 that is left with no terms at all is a schema error rather than a query that
-silently matches everything."
+silently matches everything. A control character is refused before any of
+that, because it is not text to a parser and NOT a term to match."
+  (when (find-if #'bad-query-character-p text)
+    (error 'enchiridion.errors:schema-error
+           :detail "The query has a control character."))
   (let ((terms (remove-if (lambda (term)
                             (notany #'alphanumericp term))
-                          (uiop:split-string text
-                                             :separator '(#\Space #\Tab #\Newline #\Return)))))
+                          (uiop:split-string text :separator +query-whitespace+))))
     (when (null terms)
       (error 'enchiridion.errors:schema-error
              :detail "The query has no searchable terms."))

@@ -99,9 +99,13 @@ writable copy later."
   (spend '() :type list)
   (turn 0 :type (integer 0 *))
   (budget nil :type list)
-  (directory nil :type (or null pathname)))
+  (directory nil :type (or null pathname))
+  (broker nil :type t)
+  (tools-p t :type boolean)
+  (tool-rounds 8 :type (integer 0 *)))
 
-(defun make-agent (&key (name "default") backend blocks directory budget)
+(defun make-agent (&key (name "default") backend blocks directory budget
+                          broker (tools-p t) (tool-rounds 8))
   "Return an AGENT with a prompt compiled from BLOCKS, or from DIRECTORY.
 
 The prompt is compiled here, once. Callers that pass BLOCKS usually pass the
@@ -115,7 +119,10 @@ and the two harness blocks, with seed templates for absent files."
                  :snapshot snapshot
                  :budget budget
                  :directory (and directory
-                                 (uiop:ensure-directory-pathname directory)))))
+                                 (uiop:ensure-directory-pathname directory))
+                 :broker broker
+                 :tools-p tools-p
+                 :tool-rounds tool-rounds)))
 
 ;;;; The ledger.
 
@@ -201,15 +208,56 @@ session formed by accident."
 
 ;;;; One turn.
 
+(defun complete-with-tools (backend messages model tools)
+  "Call BACKEND with TOOLS only when there are any. A backend that has no tool
+support must not receive an empty :TOOLS keyword it never promised to accept."
+  (apply #'enchiridion.llm:complete backend messages
+         :model model
+         (when tools (list :tools tools))))
+
+(defun tool-result-text (result)
+  "Return RESULT as scrubbed text for a tool message."
+  (let ((text (typecase result
+                (string result)
+                (null "")
+                (t (handler-case (enchiridion.llm:stringify result)
+                     (error () (princ-to-string result)))))))
+    (enchiridion.llm.secrets:scrub text)))
+
+(defun execute-tool (agent call)
+  "Run CALL for AGENT and return its result as text.
+
+A tool error becomes text in the transcript, not a broken turn. The model has
+to see the failure to correct the call; the operator does not need a crash for
+a misspelled argument."
+  (handler-case
+      (let* ((arguments (enchiridion.llm:parse-json
+                         (enchiridion.llm:tool-call-arguments call)))
+             (result (if (agent-broker agent)
+                         (enchiridion.tools.broker:broker-call
+                          (agent-broker agent)
+                          (enchiridion.llm:tool-call-name call)
+                          arguments)
+                         (enchiridion.tools:dispatch
+                          (enchiridion.llm:tool-call-name call)
+                          arguments))))
+        (tool-result-text result))
+    (error (condition)
+      (tool-result-text (format nil "error: ~A" condition)))))
+
 (defun run-turn (agent text &key model session)
-  "Send TEXT to AGENT's backend with the frozen prompt and return the
-COMPLETION.
+  "Send TEXT to AGENT and run any tool calls the model asks for.
 
 The system message is the snapshot compiled by MAKE-AGENT. A block written
 after that point is visible in the block object and on disk, but not here.
 Both the prompt and the user text go through the scrubber before they leave
-this process. When SESSION is supplied, the completion is appended to its
-turns, and a closed or foreign session is refused."
+this process. When SESSION is supplied, every completion is appended to its
+turns, and a closed or foreign session is refused.
+
+Each round is one backend call and one spend row. A tool call appends the
+assistant message that asked for it and one tool message per result, in the
+provider's order. The loop stops after AGENT-TOOL-ROUNDS to bound a model that
+keeps asking for tools without answering."
   (check-type text string)
   (let ((backend (agent-backend agent)))
     (unless backend
@@ -225,14 +273,34 @@ turns, and a closed or foreign session is refused."
              :key :session
              :detail "The session belongs to a different agent."))
     (let* ((snapshot (agent-snapshot agent))
+           (tools (when (agent-tools-p agent)
+                    (enchiridion.tools:registry-tool-definitions)))
            (messages (list (enchiridion.llm:system-message
                             (enchiridion.llm.secrets:scrub
                              (prompt-text snapshot)))
                            (enchiridion.llm:user-message
                             (enchiridion.llm.secrets:scrub text))))
-           (completion (enchiridion.llm:complete backend messages :model model)))
+           (rounds 0)
+           (completion nil))
+      (loop
+        (setf completion (complete-with-tools backend messages model tools))
+        (record-spend agent completion)
+        (when session
+          (push completion (session-turns session)))
+        (let ((calls (enchiridion.llm:completion-tool-calls completion)))
+          (unless (and calls (< rounds (agent-tool-rounds agent)))
+            (return completion))
+          (incf rounds)
+          (setf messages
+                (append messages
+                        (list (enchiridion.llm:assistant-message
+                               (enchiridion.llm:completion-text completion)
+                               calls))))
+          (dolist (call calls)
+            (setf messages
+                  (append messages
+                          (list (enchiridion.llm:tool-message
+                                 (execute-tool agent call)
+                                 (enchiridion.llm:tool-call-id call))))))))
       (incf (agent-turn agent))
-      (record-spend agent completion)
-      (when session
-        (push completion (session-turns session)))
       completion)))

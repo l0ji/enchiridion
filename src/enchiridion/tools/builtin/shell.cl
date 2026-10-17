@@ -40,8 +40,3 @@ A timeout ends the child and the result says so."
   (dolist (tool +shell-tools+)
     (enchiridion.tools:register-tool tool))
   (length +shell-tools+))
-
-(defun register-builtin-tools ()
-  "Register every built-in tool that exists in this milestone."
-  (+ (register-file-tools)
-     (register-shell-tools)))

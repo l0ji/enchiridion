@@ -103,6 +103,30 @@ counted without a parse, and it means a test can inspect the declaration."
           :budget *schema-budget*
           :remaining (- *schema-budget* used))))
 
+(defun tool-definition (tool)
+  "Return TOOL as the function object an OpenAI tool definition wraps."
+  (let ((entry (make-hash-table :test #'equal)))
+    (setf (gethash "name" entry) (tool-name tool))
+    (setf (gethash "description" entry) (tool-description tool))
+    (setf (gethash "parameters" entry) (schema-to-json (tool-schema tool)))
+    entry))
+
+(declaim (ftype (function () list) registry-tool-definitions))
+
+(defun registry-tool-definitions ()
+  "Return every tool as a name, description, and parameter object.
+
+The budget is checked here because this is the object the kernel sends. A
+registry that grew past the cap reports it rather than silently spending the
+context on schemas."
+  (let ((used (registry-schema-tokens)))
+    (when (> used *schema-budget*)
+      (error 'enchiridion.errors:budget-exceeded
+             :spent used
+             :cap *schema-budget*
+             :window :schema))
+    (loop for tool in (list-tools) collect (tool-definition tool))))
+
 (declaim (ftype (function () string) registry-schema))
 
 (defun registry-schema ()
@@ -111,20 +135,7 @@ counted without a parse, and it means a test can inspect the declaration."
 The schema budget is checked here, at the moment the model-facing object is
 built. A tool registry that grows past the cap reports it rather than silently
 spending the context on schemas."
-  (let ((used (registry-schema-tokens)))
-    (when (> used *schema-budget*)
-      (error 'enchiridion.errors:budget-exceeded
-             :spent used
-             :cap *schema-budget*
-             :window :schema))
-    (com.inuoe.jzon:stringify
-     (loop for tool in (list-tools)
-           collect (let ((entry (make-hash-table :test #'equal)))
-                     (setf (gethash "name" entry) (tool-name tool))
-                     (setf (gethash "description" entry) (tool-description tool))
-                     (setf (gethash "parameters" entry)
-                           (schema-to-json (tool-schema tool)))
-                     entry)))))
+  (com.inuoe.jzon:stringify (registry-tool-definitions)))
 
 (defun dispatch (name arguments &key generation)
   "Find the tool NAME, validate ARGUMENTS, and call its handler.

@@ -10,6 +10,8 @@
 
 set -eu
 
+PHASE=${ISOLATION_PHASE:-all}
+
 fail() {
   echo "FAIL: $*" >&2
   exit 1
@@ -17,13 +19,18 @@ fail() {
 
 [ "$(id -u)" -eq 1000 ] || fail "run this as uid 1000, not $(id -u)"
 
-# 1 and 2: the file is unreadable, and a shell cannot cat it.
-if cat /run/secrets/.env >/dev/null 2>&1; then
-  fail "the agent can read /run/secrets/.env"
-fi
-if sh -c 'cat /run/secrets/.env' >/dev/null 2>&1; then
-  fail "a shell can read /run/secrets/.env"
-fi
+# 1 and 2: the file is unreadable, and a shell cannot cat it. These need the
+# file to exist, so a harness that removes it for test 6 runs the ABSENT phase.
+case "$PHASE" in
+  present|all)
+    if cat /run/secrets/.env >/dev/null 2>&1; then
+      fail "the agent can read /run/secrets/.env"
+    fi
+    if sh -c 'cat /run/secrets/.env' >/dev/null 2>&1; then
+      fail "a shell can read /run/secrets/.env"
+    fi
+    ;;
+esac
 
 # 3: hidepid is mounted, so /proc/<supervisor>/environ is not readable.
 if [ -r /proc/1/environ ]; then
@@ -37,16 +44,19 @@ for name in OPENCODE_API_KEY OPENAI_API_KEY FLUXER_BOT_TOKEN; do
   fi
 done
 
-# 6: the supervisor unlinks the tmpfs file after reading it.
-if [ -e /run/secrets/.env ]; then
-  fail "/run/secrets/.env still exists at steady state"
-fi
-
-# 7: no .env anywhere else on the container filesystem, except the secrets
-# directory that test 6 already requires to be empty.
-found=$(find / -xdev -path /run/secrets -prune -o -name .env -print 2>/dev/null || true)
-if [ -n "$found" ]; then
-  fail "a .env exists outside /run/secrets: $found"
-fi
+# 6 and 7: after the supervisor reads it, the file is gone and no copy is
+# anywhere else. A PRESENT phase skips these two because the file must exist
+# for test 1.
+case "$PHASE" in
+  absent|all)
+    if [ -e /run/secrets/.env ]; then
+      fail "/run/secrets/.env still exists at steady state"
+    fi
+    found=$(find / -xdev -path /run/secrets -prune -o -name .env -print 2>/dev/null || true)
+    if [ -n "$found" ]; then
+      fail "a .env exists outside /run/secrets: $found"
+    fi
+    ;;
+esac
 
 echo "isolation: all checks passed as uid $(id -u)"

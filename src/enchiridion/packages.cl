@@ -37,7 +37,7 @@ because a file in the repository is a file that ends up in a store path."))
    #:run-program #:run-program-blocking #:process-uid #:set-process-uid
    #:process-user #:set-process-user #:implementation-dependency-p
    #:script-arguments #:exit-with #:backtrace-string
-   #:encode-utf8 #:decode-utf8 #:run-program-capture)
+   #:encode-utf8 #:decode-utf8 #:run-program-capture #:temp-directory)
   (:documentation
    "The only file in the tree that contains implementation extensions.
 Everything above it is standard Common Lisp, which is what makes the agent
@@ -68,6 +68,7 @@ recover from a string."))
    ;; The result and message shapes.
    #:message #:user-message #:assistant-message #:system-message
    #:tool-message #:message-role #:message-content #:message-tool-call-id
+   #:message-tool-calls
    #:tool-call #:tool-call-id #:tool-call-name #:tool-call-arguments
    #:completion #:completion-text #:completion-tool-calls
    #:completion-model #:completion-stop-reason
@@ -80,7 +81,7 @@ recover from a string."))
    ;; without a network. They are pure functions over text and data, which is
    ;; the only reason the format is testable at all. PARSE-JSON goes with them
    ;; because it is the JSON door: one place decides what a parsed object is.
-   #:completion-request #:parse-completion #:parse-json
+   #:completion-request #:parse-completion #:parse-json #:stringify
    ;; Tiers. The models are primary-model, cheap-model and sleep-model rather
    ;; than the bare words, because a function named SLEEP in a package that
    ;; uses CL is a package lock error.
@@ -132,6 +133,7 @@ did not think of."))
    ;; Blocks. Written in milestone 2.
    #:block #:make-block #:block-label #:block-text #:block-limit
    #:block-file #:block-writable-p #:block-bytes #:block-full-p #:block-slack
+   #:default-block-limit #:scan-block-text
    #:set-block-text #:compile-blocks #:block-summary #:block-descriptions
    #:*default-block-limits*
    ;; The bootstrap state machine. Milestone 7.
@@ -163,7 +165,8 @@ no model call, so a search costs nothing."))
    #:tool #:make-tool #:tool-name #:tool-description #:tool-schema
    #:tool-handler #:tool-self-test #:tool-generation #:tool-broker-side-p
    #:registry #:register-tool #:define-tool #:find-tool #:tool-names #:list-tools
-   #:unregister-tool #:clear-registry #:registry-schema #:dispatch
+   #:unregister-tool #:clear-registry #:registry-schema
+   #:registry-tool-definitions #:dispatch
    ;; Schema.
    #:*schema-budget* #:schema-tokens #:schema-budget-report #:validate-arguments
    #:schema-to-json #:schema-json-string #:schema-error-message)

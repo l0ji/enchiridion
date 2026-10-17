@@ -33,7 +33,7 @@ fail() {
 
 # The tmpfs is the point. Without it, /run/secrets is an ordinary directory
 # and mode 700 is the only thing between the agent and the key.
-mountpoint -q "$SECRETS_DIR" || [ -n "$(grep " $SECRETS_DIR " /proc/mounts 2>/dev/null)" ] || {
+grep -q " $SECRETS_DIR " /proc/mounts 2>/dev/null || {
   log "$SECRETS_DIR is not a mount. Run with --tmpfs $SECRETS_DIR:mode=0700"
   log "A plain directory here is not isolation, it is a folder with a lock on it."
   exit 1
@@ -49,7 +49,14 @@ if [ -f "$SECRETS_FILE" ]; then
     log "$SECRETS_FILE has unexpected ownership; continuing"
 fi
 
-id agent >/dev/null 2>&1 || fail "uid 1000 is missing from the image"
+if ! id agent >/dev/null 2>&1; then
+  mkdir -p /etc /home/agent
+  [ -f /etc/passwd ] || : > /etc/passwd
+  [ -f /etc/group ] || : > /etc/group
+  echo 'agent:x:1000:1000:agent:/home/agent:/bin/sh' >> /etc/passwd
+  echo 'agent:x:1000:' >> /etc/group
+  chown 1000:1000 /home/agent
+fi
 
 AGENT_UID=$(id -u agent)
 AGENT_GID=$(id -g agent)

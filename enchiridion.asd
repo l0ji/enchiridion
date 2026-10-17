@@ -49,7 +49,6 @@
         :components
         ((:file "blocks")
          (:file "seed")))
-       (:file "kernel")
        (:module "tools"
         :serial t
         :default-component-class "cl-source-file.cl"
@@ -63,7 +62,13 @@
           :default-component-class "cl-source-file.cl"
           :components
           ((:file "file")
-           (:file "shell"))))))))))
+           (:file "shell")
+           (:file "search")
+           (:file "blockops")
+           (:file "meta")
+           (:file "web")
+           (:file "register")))))
+       (:file "kernel"))))))
 
   ;; A warning is a failure. Style warnings nobody reads are warnings nobody
   ;; fixes, and #check is the gate every commit passes through, so the gate

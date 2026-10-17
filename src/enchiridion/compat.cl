@@ -178,6 +178,20 @@ tree, so the broker framing and anything else that writes bytes agree."
   #-sbcl (progn (declare (ignore octets))
                 (error "No UTF-8 decoder is available in ~A." +implementation+)))
 
+(declaim (ftype (function () pathname) temp-directory))
+
+(defun temp-directory ()
+  "Return a directory the agent can write.
+
+Inside the container /tmp is root owned and mode 755, so a tool that writes
+there fails for uid 1000. ENCHIRIDION_HOME is the agent's writable state, and
+the host keeps using /tmp."
+  (if (uiop:getenv "ENCHIRIDION_HOME")
+      (merge-pathnames "tmp/"
+                       (uiop:ensure-directory-pathname
+                        (uiop:getenv "ENCHIRIDION_HOME")))
+      #p"/tmp/"))
+
 (defun run-program-capture (program arguments &key (timeout nil))
   "Run PROGRAM with ARGUMENTS and return its combined output and exit status.
 
@@ -187,15 +201,17 @@ Standard error goes to the same string stream as standard output: a shell
 command that fails usually explains why on stderr, and a caller that sees only
 stdout sees an empty string and no reason."
   #+sbcl
-  (let* ((path (merge-pathnames
+  (let* ((directory (temp-directory))
+         (path (merge-pathnames
                 (format nil "enchiridion-capture-~D.txt" (random most-positive-fixnum))
-                #p"/tmp/"))
+                directory))
          (process nil)
          (deadline (and timeout
                         (+ (get-internal-real-time)
                            (* timeout internal-time-units-per-second)))))
     (unwind-protect
          (progn
+           (ensure-directories-exist path)
            (ignore-errors (delete-file path))
            ;; A file, not a pipe. With :WAIT NIL SBCL's string stream is not
            ;; flushed by the child's exit, and :PIPE is not an accepted

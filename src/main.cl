@@ -108,6 +108,16 @@ launch into a backtrace."
                   (namestring (getcwd)))))
     (format nil "~A/agents/default/" (string-right-trim "/" root))))
 
+(defun broker-socket-path ()
+  "Return the socket path for the one-shot broker.
+Inside the container the state volume is the writable tree, so the socket
+lives under it. A checkout uses the agent directory, which the operator owns."
+  (let ((home (environment-value "ENCHIRIDION_HOME")))
+    (if home
+        (merge-pathnames "run/broker.sock"
+                         (uiop:ensure-directory-pathname home))
+        (merge-pathnames "broker.sock" (agent-directory)))))
+
 ;;;; Configuration.
 ;;;;
 ;;;; An absent config.cl is not an error. It means defaults, which is how a
@@ -234,35 +244,46 @@ the count, which is worse than printing nothing."
                    :key :api-key
                    :detail (format nil "No API key. Put ~A in .env or the environment."
                                    (enchiridion.llm:default-api-key-env config))))
+          (enchiridion.tools.builtin:register-builtin-tools)
           (let* ((backend (enchiridion.llm:resolve-backend
                            :config config
                            :api-key key))
+                 (broker (enchiridion.tools.broker:make-broker
+                          :socket (broker-socket-path)
+                          :uid 1000
+                          :timeout 30))
                  (agent (enchiridion.kernel:make-agent
                          :name "default"
                          :backend backend
-                         :directory (agent-directory)))
-                 (completion (enchiridion.kernel:run-turn agent question))
-                 (model (enchiridion.llm:completion-model completion))
-                 (fallback (or (enchiridion:config-value config :model-primary)
-                               (enchiridion.llm:primary-model)))
-                 (cache-read (enchiridion.llm:completion-cache-read-tokens completion))
-                 (cache-write (enchiridion.llm:completion-cache-write-tokens completion)))
-            (format t "~A~%"
-                    (enchiridion.llm.secrets:scrub
-                     (enchiridion.llm:completion-text completion)))
-            (format *error-output* "~A  in ~D  out ~D~A~A~%"
-                    (if (plusp (length model)) model fallback)
-                    (enchiridion.llm:completion-input-tokens completion)
-                    (enchiridion.llm:completion-output-tokens completion)
-                    (if (plusp cache-read)
-                        (format nil "  cached ~D" cache-read)
-                        "")
-                    (if (plusp cache-write)
-                        (format nil "  wrote ~D" cache-write)
-                        ""))
-            (finish-output)
-            (finish-output *error-output*)
-            0)))
+                         :directory (agent-directory)
+                         :broker broker))
+                 (completion nil))
+            (unwind-protect
+                 (progn
+                   (enchiridion.tools.broker:broker-start broker)
+                   (setf completion (enchiridion.kernel:run-turn agent question))
+                   (let ((model (enchiridion.llm:completion-model completion))
+                         (fallback (or (enchiridion:config-value config :model-primary)
+                                       (enchiridion.llm:primary-model)))
+                         (cache-read (enchiridion.llm:completion-cache-read-tokens completion))
+                         (cache-write (enchiridion.llm:completion-cache-write-tokens completion)))
+                     (format t "~A~%"
+                             (enchiridion.llm.secrets:scrub
+                              (enchiridion.llm:completion-text completion)))
+                     (format *error-output* "~A  in ~D  out ~D~A~A~%"
+                             (if (plusp (length model)) model fallback)
+                             (enchiridion.llm:completion-input-tokens completion)
+                             (enchiridion.llm:completion-output-tokens completion)
+                             (if (plusp cache-read)
+                                 (format nil "  cached ~D" cache-read)
+                                 "")
+                             (if (plusp cache-write)
+                                 (format nil "  wrote ~D" cache-write)
+                                 ""))
+                     (finish-output)
+                     (finish-output *error-output*)
+                     0))
+              (enchiridion.tools.broker:broker-stop broker)))))
     (enchiridion.errors:enchiridion-error (condition)
       (format *error-output* "~&~A~%" condition)
       ;; The report line is one line so that it can go in a log. The detail is

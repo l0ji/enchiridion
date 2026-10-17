@@ -287,27 +287,37 @@
         pkgs.dockerTools.buildImage {
           name = "enchiridion";
           tag = "0.1.0";
-          copyToRoot = true;
+          copyToRoot = pkgs.buildEnv {
+            name = "enchiridion-root";
+            paths = [
+              (mkEnchiridion { inherit pkgs; })
+              (pkgs.runCommand "enchiridion-docker-files" { } ''
+                mkdir -p $out/usr/local/bin $out/bin
+                cp ${./docker/entrypoint.sh} $out/usr/local/bin/entrypoint.sh
+                cp ${./docker/isolation-test.sh} $out/usr/local/bin/isolation-test.sh
+                chmod +x $out/usr/local/bin/entrypoint.sh $out/usr/local/bin/isolation-test.sh
+                ln -s /bin/enchiridion $out/usr/local/bin/enchiridion
+                ln -s ${pkgs.bash}/bin/bash $out/bin/sh
+              '')
+              pkgs.bash
+              pkgs.coreutils
+              pkgs.gnugrep
+              pkgs.findutils
+              pkgs.util-linux
+            ];
+            pathsToLink = [ "/bin" "/lib" "/cache" "/config" "/usr/local/bin" ];
+          };
           config = {
             User = "0:0";
+            Entrypoint = [ "/usr/local/bin/entrypoint.sh" ];
             Env = [
               "PATH=/usr/local/bin:/usr/bin:/bin"
               "ENCHIRIDION_HOME=/var/lib/enchiridion"
             ];
-            ExposedPorts = [ "8787" ];
-            Volumes = [ "/var/lib/enchiridion" ];
+            ExposedPorts = { "8787/tcp" = { }; };
+            Volumes = { "/var/lib/enchiridion" = { }; };
             WorkingDir = "/var/lib/enchiridion";
           };
-          runAsRoot = ''
-            mkdir -p /run/secrets /var/lib/enchiridion
-            chmod 700 /run/secrets
-            groupadd --gid 1000 agent
-            useradd --uid 1000 --gid 1000 --home-dir /home/agent --shell /bin/sh agent
-          '';
-          extraInputs = [
-            (mkEnchiridion { inherit pkgs; })
-            ./docker/entrypoint.sh
-          ];
         };
 
       # The flake evaluates for every supported system. Cheap, and it catches a

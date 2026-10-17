@@ -40,6 +40,8 @@
      (:file "pipe-test")
      (:file "file-test")
      (:file "broker-test")
+     (:file "builtin-test")
+     (:file "tool-loop-test")
      (:file "seed-test")
      (:file "secrets-test"))))
 

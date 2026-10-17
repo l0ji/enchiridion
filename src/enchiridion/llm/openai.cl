@@ -211,30 +211,50 @@ than in every object the tree builds."
 
 (declaim (ftype (function (message) hash-table) message->request-message))
 
+(defun tool-call->request (call)
+  "Return CALL as the assistant tool_calls object a provider accepts."
+  (json-object :id (tool-call-id call)
+               :type "function"
+               :function (json-object :name (tool-call-name call)
+                                      :arguments (tool-call-arguments call))))
+
 (defun message->request-message (message)
   "Return MESSAGE as the request object. A tool message carries its call id;
-every other message does not carry the key at all, because some servers reject
-an unexpected field rather than ignoring it."
+an assistant message carries its tool calls when it asked for any. Every other
+message does not carry either key, because some servers reject an unexpected
+field rather than ignoring it."
   (let ((pairs (list :role (message-role message)
                      :content (message-content message))))
-    (if (plusp (length (message-tool-call-id message)))
-        (apply #'json-object (append pairs (list :tool_call_id
-                                                  (message-tool-call-id message))))
-        (apply #'json-object pairs))))
+    (cond
+      ((plusp (length (message-tool-call-id message)))
+       (apply #'json-object
+              (append pairs (list :tool_call_id (message-tool-call-id message)))))
+      ((message-tool-calls message)
+       (apply #'json-object
+              (append pairs (list :tool_calls
+                                  (map 'list #'tool-call->request
+                                       (message-tool-calls message))))))
+      (t (apply #'json-object pairs)))))
 
-(declaim (ftype (function (string list) string) completion-request))
+(defun tool-definition->request (definition)
+  "Wrap one registry function object as an OpenAI tool definition."
+  (json-object :type "function" :function definition))
 
-(defun completion-request (model messages)
+(defun completion-request (model messages &key tools)
   "Return the request body for MODEL continuing MESSAGES, as JSON text.
 
 #'MESSAGE->REQUEST-MESSAGE and not the bare name: MAP evaluates its function
 argument as a value, so a bare symbol there is a variable reference and the
 failure arrives at run time as UNBOUND-VARIABLE from a function that is
 plainly defined."
-  (stringify
-   (json-object :model model
-                :stream nil
-                :messages (map 'list #'message->request-message messages))))
+  (let ((body (json-object :model model
+                           :stream nil
+                           :messages (map 'list #'message->request-message messages))))
+    (when tools
+      (setf (gethash "tools" body)
+            (map 'list #'tool-definition->request tools))
+      (setf (gethash "tool_choice" body) "auto"))
+    (stringify body)))
 
 ;;;; The reply.
 
@@ -361,9 +381,7 @@ read and the one place it is formatted are not two different places."
   "The base delay in seconds for a retry. Attempt N waits N times this. Bound
 to 0 in tests so a retry test does not spend six seconds asleep.")
 
-(declaim (ftype (function (openai-connection list string)) send-completion))
-
-(defun send-completion (connection messages model)
+(defun send-completion (connection messages model &key tools)
   "Return the COMPLETION for MESSAGES from CONNECTION using MODEL.
 
 429 and 5xx are repeated with a growing gap, because they are the two the same
@@ -375,7 +393,7 @@ There is no loop inside the handler. The handler returns after it sleeps, the
 body of the outer loop ends, and the outer loop runs again. An inner (loop)
 would be a new infinite loop and a 429 would hang the process instead of
 retrying the request."
-  (let ((body (completion-request model messages))
+  (let ((body (completion-request model messages :tools tools))
         (attempt 0))
     (loop
       (handler-case
@@ -434,8 +452,9 @@ TOOLS is ignored: this milestone has no tool registry and the OpenAI request
 shape is built without it. That is recorded by ignoring the argument out loud
 rather than by omitting it from the signature, because omitting it would mean a
 signature change the moment tools arrive."
-  (declare (ignore tools budget))
-  (send-completion connection messages (or model (openai-connection-model connection))))
+  (declare (ignore budget))
+  (send-completion connection messages (or model (openai-connection-model connection))
+                   :tools tools))
 
 ;;;; Providers.
 ;;;;

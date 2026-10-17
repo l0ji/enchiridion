@@ -26,7 +26,8 @@
 (defstruct (message (:constructor %make-message))
   (:role "" :type string)
   (:content "" :type string)
-  (:tool-call-id "" :type string))
+  (:tool-call-id "" :type string)
+  (:tool-calls '() :type list))
 
 (defun system-message (text)
   "Return a message carrying instructions, which the model never replies to."
@@ -36,9 +37,9 @@
   "Return a message carrying what the operator or an agent asked."
   (%make-message :role "user" :content text))
 
-(defun assistant-message (text)
-  "Return a message carrying what the model said."
-  (%make-message :role "assistant" :content text))
+(defun assistant-message (text &optional tool-calls)
+  "Return a message carrying what the model said and the calls it asked for."
+  (%make-message :role "assistant" :content text :tool-calls tool-calls))
 
 (defun tool-message (text id)
   "Return a message carrying the result of tool call ID."

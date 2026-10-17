@@ -12,7 +12,7 @@
 the model gets the head plus the path, which is cheaper than the whole result
 and still recoverable.")
 
-(defun spill-path (text &key (directory #p"/tmp/enchiridion/"))
+(defun spill-path (text &key (directory (enchiridion.compat:temp-directory)))
   "Write TEXT to a fresh file under DIRECTORY and return the namestring."
   (let* ((directory (uiop:ensure-directory-pathname directory))
          (path (merge-pathnames
@@ -26,7 +26,7 @@ and still recoverable.")
       (write-string text stream))
     (namestring path)))
 
-(defun cap-result (text &key (cap +result-cap+) (spill-directory #p"/tmp/enchiridion/"))
+(defun cap-result (text &key (cap +result-cap+) (spill-directory (enchiridion.compat:temp-directory)))
   "Return TEXT when it fits, or its head and a spill path when it does not."
   (if (<= (length text) cap)
       text
@@ -109,9 +109,18 @@ reader's package for the next form."
                 (getf form :form))))))
 
 (defun argument (args key &optional default)
-  "Return KEY from the tool argument hash, or DEFAULT."
-  (multiple-value-bind (value present) (gethash key args)
-    (if present value default)))
+  "Return KEY from the tool arguments, or DEFAULT.
+
+DISPATCH normalises arguments to a hash table, but a Lisp caller and a unit
+test often hold the plist directly. Both shapes answer here, so a handler does
+not fail on the shape of the thing it was called with."
+  (etypecase args
+    (hash-table
+     (multiple-value-bind (value present) (gethash key args)
+       (if present value default)))
+    (list
+     (getf args (if (keywordp key) key (intern (string-upcase key) :keyword))
+           default))))
 
 (defun tool-index (args)
   (cap-result (file-index (argument args "path"))))

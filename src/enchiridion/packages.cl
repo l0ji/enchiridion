@@ -37,7 +37,8 @@ because a file in the repository is a file that ends up in a store path."))
    #:run-program #:run-program-blocking #:process-uid #:set-process-uid
    #:process-user #:set-process-user #:implementation-dependency-p
    #:script-arguments #:exit-with #:backtrace-string
-   #:encode-utf8 #:decode-utf8 #:run-program-capture #:temp-directory)
+   #:encode-utf8 #:decode-utf8 #:run-program-capture #:temp-directory
+   #:set-file-mode)
   (:documentation
    "The only file in the tree that contains implementation extensions.
 Everything above it is standard Common Lisp, which is what makes the agent
@@ -149,8 +150,15 @@ the three loading tiers, and the bootstrap state machine."))
 (defpackage #:enchiridion.memory.store
   (:use #:cl)
   (:export
+   ;; The one path a caller needs before a store exists. A store is a file, so
+   ;; the default is a rule about directories and not a piece of state.
+   #:*store-path* #:default-store-path
    #:open-store #:close-store #:store-path
    #:record-turn #:turn-row #:session-count #:recent-sessions #:delete-session
+   ;; A turn row is a struct, and the four fields a searcher reads are exported
+   ;; so that the text, the role, and the session survive the round trip.
+   #:turn-row-id #:turn-row-session #:turn-row-role #:turn-row-body
+   #:turn-row-model #:turn-row-channel #:turn-row-ts
    #:search-sessions #:search-memories #:save-memory #:list-memories
    #:session-block #:set-session-block #:ledger-block #:set-ledger-block
    #:record-usage #:usage-rows #:usage-since #:drop-store)

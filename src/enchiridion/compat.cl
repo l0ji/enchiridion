@@ -289,6 +289,31 @@ name to a uid first, because SB-POSIX setuid takes a number."
       (error "No such user: ~A." name))
     (set-process-uid (parse-integer resolved))))
 
+;;;; File modes.
+;;;;
+;;;; The supervisor creates the memory store as root and the broker searches it
+;;;; as uid 1000. SQLite cannot lock a file its user cannot write, so whoever
+;;;; creates the file has to set the mode. chmod is an extension and lives
+;;;; here for the same reason geteuid does.
+
+(declaim (ftype (function (t (or null integer)) (or null integer)) set-file-mode))
+
+#+sbcl
+(defun set-file-mode (path mode)
+  "Set the permission bits of PATH to MODE, an integer such as #o666, and
+return MODE. NIL means leave the mode alone, which is the host case, and the
+return is MODE rather than the call's own value so that a caller can chain."
+  (when mode
+    (sb-posix:chmod (pathname path) mode)
+    mode))
+
+#-sbcl
+(defun set-file-mode (path mode)
+  "Set the permission bits of PATH. There is no portable spelling, so this
+implementation leaves the file with whatever the umask gave it."
+  (declare (ignore path mode))
+  nil)
+
 ;;;; Backtraces.
 ;;;;
 ;;;; A long running server without a trace on crash is a server the operator

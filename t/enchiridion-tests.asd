@@ -34,6 +34,7 @@
      (:file "config-test")
      (:file "llm-test")
      (:file "blocks-test")
+     (:file "store-test")
      (:file "kernel-test")
      (:file "schema-test")
      (:file "registry-test")

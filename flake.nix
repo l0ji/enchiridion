@@ -106,6 +106,7 @@
       # packages in the set and the directories ASDF searches.
       lispPackageNames = [
         "cl-dbi"
+        "dbd-sqlite3"
         "dexador"
         "cl-jschema"
         "com_dot_inuoe_dot_jzon"

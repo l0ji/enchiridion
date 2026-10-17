@@ -20,9 +20,14 @@
 
   ;; Deterministic load order. Packages before the files that use them,
   ;; conditions before the code that signals them.
+  ;;
+  ;; dbi and dbd-sqlite3 are the SQLite binding the memory store opens. The
+  ;; driver is named rather than left to DBI's own loader, so opening a store
+  ;; never depends on a system load inside a query.
   :serial t
   :depends-on ("alexandria" "cl-ppcre" "dexador" "com.inuoe.jzon"
-               "cl-jschema" "usocket" "bordeaux-threads")
+               "cl-jschema" "usocket" "bordeaux-threads"
+               "dbi" "dbd-sqlite3")
   :components
   ((:module "src"
     :serial t
@@ -48,6 +53,7 @@
         :default-component-class "cl-source-file.cl"
         :components
         ((:file "blocks")
+         (:file "store")
          (:file "seed")))
        (:module "tools"
         :serial t

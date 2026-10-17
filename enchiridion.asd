@@ -21,7 +21,8 @@
   ;; Deterministic load order. Packages before the files that use them,
   ;; conditions before the code that signals them.
   :serial t
-  :depends-on ("alexandria" "cl-ppcre" "dexador" "com.inuoe.jzon")
+  :depends-on ("alexandria" "cl-ppcre" "dexador" "com.inuoe.jzon"
+               "cl-jschema" "usocket" "bordeaux-threads")
   :components
   ((:module "src"
     :serial t
@@ -48,7 +49,21 @@
         :components
         ((:file "blocks")
          (:file "seed")))
-       (:file "kernel"))))))
+       (:file "kernel")
+       (:module "tools"
+        :serial t
+        :default-component-class "cl-source-file.cl"
+        :components
+        ((:file "schema")
+         (:file "registry")
+         (:file "pipe")
+         (:file "broker")
+         (:module "builtin"
+          :serial t
+          :default-component-class "cl-source-file.cl"
+          :components
+          ((:file "file")
+           (:file "shell"))))))))))
 
   ;; A warning is a failure. Style warnings nobody reads are warnings nobody
   ;; fixes, and #check is the gate every commit passes through, so the gate

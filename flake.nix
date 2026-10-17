@@ -114,6 +114,8 @@
         "cl-ppcre"
         "cl-base64"
         "alexandria"
+        "usocket"
+        "bordeaux-threads"
         "trivial-backtrace"
         "rove"
         "cl-quickcheck"
@@ -227,12 +229,14 @@
                         ;; has to be compiled here as well. Without this a
                         ;; broken main.cl ships inside a derivation that built
                         ;; cleanly and only fails when it is run.
-                        (compile-file (merge-pathnames
-                                        "src/main.cl"
-                                        (uiop:pathname-directory-pathname
-                                           *default-pathname-defaults*))
-                                      :output-file
-                                      (merge-pathnames "main.fasl" #p".")))
+                        (let ((root (uiop:pathname-directory-pathname
+                                      *default-pathname-defaults*)))
+                          (compile-file (merge-pathnames "src/main.cl" root)
+                                        :output-file
+                                        (merge-pathnames "main.fasl" #p"."))
+                          (compile-file (merge-pathnames "src/broker-exec.cl" root)
+                                        :output-file
+                                        (merge-pathnames "broker-exec.fasl" #p"."))))
                       (error (condition)
                         (format *error-output* "~&~A~%" condition)
                         (sb-ext:exit :code 1)))'
@@ -255,6 +259,7 @@
               --set XDG_CACHE_HOME "$out/cache" \
               --set XDG_CONFIG_HOME "$out/config" \
               --set ENCHIRIDION_SOURCE "$out/lib" \
+              --set ENCHIRIDION_SBCL "${sbcl}/bin/sbcl" \
               --add-flags '--script' \
               --add-flags "\"$out/lib/src/main.cl\""
 
@@ -359,14 +364,14 @@
                 --eval "(handler-case (progn $1) (error (condition) (format *error-output* \"~&~A~%\" condition) (sb-ext:exit :code 1)))"
             }
 
-            echo "compiling src/main.cl, which is not a system component"
+            echo "compiling the entry scripts, which are not system components"
             run_sbcl "(asdf:load-system \"enchiridion\")
                        (let* ((root (pathname (format nil \"~A/\" (uiop:getenv \"SOURCE_DIR\"))))
-                              (source (merge-pathnames \"src/main.cl\" root)))
-                         (compile-file source
-                                       :output-file
-                                       (merge-pathnames \"main.fasl\"
-                                                         (pathname (uiop:getenv \"GATE_DIR\")))))"
+                              (out (pathname (uiop:getenv \"GATE_DIR\"))))
+                         (compile-file (merge-pathnames \"src/main.cl\" root)
+                                       :output-file (merge-pathnames \"main.fasl\" out))
+                         (compile-file (merge-pathnames \"src/broker-exec.cl\" root)
+                                       :output-file (merge-pathnames \"broker-exec.fasl\" out)))"
 
             ${if run-tests then ''
               echo "running the suite"

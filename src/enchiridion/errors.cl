@@ -90,13 +90,15 @@ can try something else, because the report is a sentence rather than a
 backtrace."))
 
 (define-condition schema-error (enchiridion-error)
-  ((tool :initarg :tool :reader schema-tool)
-   (path :initarg :path :reader schema-path
+  ((tool :initarg :tool :initform nil :reader schema-tool)
+   (path :initarg :path :initform nil :reader schema-path
          :documentation "Where in the arguments the failure is."))
   (:report (lambda (condition stream)
-             (format stream "Tool ~A got the wrong arguments at ~A."
+             (format stream "~@[Tool ~A: ~]~A"
                      (schema-tool condition)
-                     (schema-path condition))))
+                     (or (schema-path condition)
+                         (error-detail condition)
+                         "the arguments do not match the schema"))))
   (:documentation
    "A tool call did not match its schema. It fails at the boundary with a
 readable message, before the handler ever runs."))

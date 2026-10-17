@@ -36,7 +36,8 @@ because a file in the repository is a file that ends up in a store path."))
    #:environment #:environment-value #:environment-bound-p
    #:run-program #:run-program-blocking #:process-uid #:set-process-uid
    #:process-user #:set-process-user #:implementation-dependency-p
-   #:script-arguments #:exit-with #:backtrace-string)
+   #:script-arguments #:exit-with #:backtrace-string
+   #:encode-utf8 #:decode-utf8 #:run-program-capture)
   (:documentation
    "The only file in the tree that contains implementation extensions.
 Everything above it is standard Common Lisp, which is what makes the agent
@@ -161,7 +162,7 @@ no model call, so a search costs nothing."))
    ;; Registry.
    #:tool #:make-tool #:tool-name #:tool-description #:tool-schema
    #:tool-handler #:tool-self-test #:tool-generation #:tool-broker-side-p
-   #:registry #:define-tool #:find-tool #:tool-names #:list-tools
+   #:registry #:register-tool #:define-tool #:find-tool #:tool-names #:list-tools
    #:unregister-tool #:clear-registry #:registry-schema #:dispatch
    ;; Schema.
    #:*schema-budget* #:schema-tokens #:schema-budget-report #:validate-arguments
@@ -181,7 +182,7 @@ this costs no interpreter of its own."))
   (:use #:cl)
   (:export
    #:broker #:broker-start #:broker-stop #:broker-call #:broker-running-p
-   #:make-broker #:broker-health)
+   #:make-broker #:broker-health #:serve-broker)
   (:documentation
    "Supervisor side of the privilege boundary. Agent authored code runs in the
 child; the supervisor never loads it."))

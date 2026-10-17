@@ -35,6 +35,11 @@
      (:file "llm-test")
      (:file "blocks-test")
      (:file "kernel-test")
+     (:file "schema-test")
+     (:file "registry-test")
+     (:file "pipe-test")
+     (:file "file-test")
+     (:file "broker-test")
      (:file "seed-test")
      (:file "secrets-test"))))
 

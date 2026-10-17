@@ -105,27 +105,29 @@ inside a container."
 ;;;; Processes.
 
 (defun run-program (program arguments &key input (output :stream)
-                                (error-output :stream) directory search wait)
+                                (error-output :stream) directory search wait
+                                environment)
   "Start PROGRAM with ARGUMENTS and wait for it when WAIT. OUTPUT defaults to
 :stream, which means the child inherits this process's streams and a shell
 command writes where the operator is looking. Return the exit status.
 SBCL spells the stderr keyword :error, not :error-output; this function keeps
 the longer name and translates."
   #+sbcl
-  (sb-ext:run-program program arguments
-                      :input input
-                      :output output
-                      :error error-output
-                      :directory directory
-                      :search search
-                      :wait wait)
+  (apply #'sb-ext:run-program program arguments
+         :input input
+         :output output
+         :error error-output
+         :directory directory
+         :search search
+         :wait wait
+         (when environment (list :environment environment)))
   ;; One form, not a declare followed by an error. A reader conditional covers
   ;; exactly the next form, so #-sbcl on the DECLARE would leave the ERROR
   ;; unconditional and every SBCL call would run it after doing the work.
   #-sbcl
   (progn
     (declare (ignore program arguments input output error-output directory
-                     search wait))
+                     search wait environment))
     (error "No process launcher is available in ~A." +implementation+)))
 
 (defun run-program-blocking (program arguments &key input)
@@ -157,6 +159,74 @@ expects a number, and every exit code check after that is quietly wrong."
   #-sbcl
   (progn
     (declare (ignore program arguments input))
+    (error "No process launcher is available in ~A." +implementation+)))
+
+(declaim (ftype (function (string) vector) encode-utf8))
+
+(defun encode-utf8 (text)
+  "Return TEXT as UTF-8 octets. One implementation-specific encoder in the
+tree, so the broker framing and anything else that writes bytes agree."
+  #+sbcl (sb-ext:string-to-octets text :external-format :utf-8)
+  #-sbcl (progn (declare (ignore text))
+                (error "No UTF-8 encoder is available in ~A." +implementation+)))
+
+(declaim (ftype (function (vector) string) decode-utf8))
+
+(defun decode-utf8 (octets)
+  "Return OCTETS decoded as UTF-8 text."
+  #+sbcl (sb-ext:octets-to-string octets :external-format :utf-8)
+  #-sbcl (progn (declare (ignore octets))
+                (error "No UTF-8 decoder is available in ~A." +implementation+)))
+
+(defun run-program-capture (program arguments &key (timeout nil))
+  "Run PROGRAM with ARGUMENTS and return its combined output and exit status.
+
+TIMEOUT is seconds, or NIL for no limit. On expiry the child gets SIGTERM,
+then SIGKILL after a short grace period, and the second value is :TIMEOUT.
+Standard error goes to the same string stream as standard output: a shell
+command that fails usually explains why on stderr, and a caller that sees only
+stdout sees an empty string and no reason."
+  #+sbcl
+  (let* ((path (merge-pathnames
+                (format nil "enchiridion-capture-~D.txt" (random most-positive-fixnum))
+                #p"/tmp/"))
+         (process nil)
+         (deadline (and timeout
+                        (+ (get-internal-real-time)
+                           (* timeout internal-time-units-per-second)))))
+    (unwind-protect
+         (progn
+           (ignore-errors (delete-file path))
+           ;; A file, not a pipe. With :WAIT NIL SBCL's string stream is not
+           ;; flushed by the child's exit, and :PIPE is not an accepted
+           ;; :OUTPUT value. A pathname is the one output sink that works for
+           ;; a short lived child and keeps stderr on the same text.
+           (setf process (sb-ext:run-program program arguments
+                                             :search t
+                                             :output path
+                                             :error :output
+                                             :if-output-exists :supersede
+                                             :wait nil))
+           (loop
+             (let ((code (sb-ext:process-exit-code process)))
+               (when code
+                 (return (values (if (probe-file path)
+                                     (uiop:read-file-string path)
+                                     "")
+                                 code))))
+             (when (and deadline (> (get-internal-real-time) deadline))
+               (ignore-errors (sb-ext:process-kill process :sigterm))
+               (sleep 0.1)
+               (ignore-errors (sb-ext:process-kill process :sigkill))
+               (return (values (if (probe-file path)
+                                   (uiop:read-file-string path)
+                                   "")
+                               :timeout)))
+             (sleep 0.01)))
+      (ignore-errors (delete-file path))))
+  #-sbcl
+  (progn
+    (declare (ignore program arguments timeout))
     (error "No process launcher is available in ~A." +implementation+)))
 
 ;;;; Process identity.

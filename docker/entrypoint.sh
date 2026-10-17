@@ -51,8 +51,16 @@ fi
 
 id agent >/dev/null 2>&1 || fail "uid 1000 is missing from the image"
 
-mkdir -p "$STATE_DIR" "$STATE_DIR/agents/default"
-chown -R 0:0 "$STATE_DIR"
+AGENT_UID=$(id -u agent)
+AGENT_GID=$(id -g agent)
+
+mkdir -p "$STATE_DIR" "$STATE_DIR/agents/default" /run/enchiridion
+# The broker runs as the agent and must read and write the files it acts on.
+# The supervisor is root and reaches them anyway; the secrets tmpfs is the one
+# directory that stays 700 root.
+chown -R "$AGENT_UID:$AGENT_GID" "$STATE_DIR"
+chown "$AGENT_UID:$AGENT_GID" /run/enchiridion
+chmod 700 /run/enchiridion
 
 # The agent gets a home it can write and nothing else. PATH is built here, not
 # inherited: nothing reaches this process's environment and is passed on by

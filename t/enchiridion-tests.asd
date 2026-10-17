@@ -59,10 +59,15 @@
       (format t "~&enchiridion-tests: ~D tests passed.~%" count)
       (finish-output)))
 
+  ;; The same gate as the core system, for the same three reasons. A test file
+  ;; that compiles with a warning is a test file nobody trusts. See
+  ;; enchiridion.asd for what each part of the hook is for.
   :around-compile
   (lambda (compile-function)
     (handler-bind ((warning #'error))
-      (funcall compile-function))))
+      (let ((asdf:*compile-file-warnings-behaviour* :error))
+        (with-compilation-unit (:override t)
+          (funcall compile-function))))))
 
 (defsystem "enchiridion-tests/property"
   :description "Property tests for enchiridion"
@@ -84,7 +89,12 @@
       (format t "~&enchiridion-tests/property: ~D tests passed.~%" count)
       (finish-output)))
 
+  ;; The same gate as the core system, for the same three reasons. A test file
+  ;; that compiles with a warning is a test file nobody trusts. See
+  ;; enchiridion.asd for what each part of the hook is for.
   :around-compile
   (lambda (compile-function)
     (handler-bind ((warning #'error))
-      (funcall compile-function))))
+      (let ((asdf:*compile-file-warnings-behaviour* :error))
+        (with-compilation-unit (:override t)
+          (funcall compile-function))))))

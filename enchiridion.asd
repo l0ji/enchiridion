@@ -81,10 +81,23 @@
   ;; fixes, and #check is the gate every commit passes through, so the gate
   ;; has to actually fail. The agent runs the same code path, which is why a
   ;; problem the operator can see is a problem the agent cannot hide.
+  ;; A warning is a failure. Three things have to hold for that to be true.
+  ;;
+  ;; The handler catches a warning raised while this file compiles. The binding
+  ;; makes UIOP:COMPILE-FILE*, which decides whether a file's warnings are
+  ;; fatal, treat them as fatal. :OVERRIDE catches the warning SBCL defers to
+  ;; the end of the outermost compilation unit: ASDF keeps a unit open for the
+  ;; whole plan, so without it an undefined function in this file is reported
+  ;; after this hook returned and no handler is left to see it.
+  ;;
+  ;; The binding is scoped to this one file, so a dependency that compiles with
+  ;; a warning of its own does not stop this system's build.
   :around-compile
   (lambda (compile-function)
     (handler-bind ((warning #'error))
-      (funcall compile-function)))
+      (let ((asdf:*compile-file-warnings-behaviour* :error))
+        (with-compilation-unit (:override t)
+          (funcall compile-function)))))
 
   :in-order-to ((test-op (test-op "enchiridion-tests"))))
 

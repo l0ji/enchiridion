@@ -36,6 +36,43 @@
   (enchiridion.memory:make-block :label label :text text
                                  :limit limit :writable-p writable-p))
 
+(deftest a-turn-with-a-store-is-recorded ()
+  (let* ((directory (uiop:ensure-directory-pathname
+                     (merge-pathnames
+                      (format nil "enchiridion-kernel-test-~D/"
+                              (random most-positive-fixnum))
+                      (uiop:ensure-directory-pathname *default-pathname-defaults*))))
+         (store (enchiridion.memory.store:open-store
+                 :path (merge-pathnames "memory.db" directory))))
+    (unwind-protect
+         (let* ((blocks (list (make-test-block "voice")))
+                (agent (enchiridion.kernel:make-agent
+                        :backend (make-fake-backend) :blocks blocks :tools-p nil))
+                (session (enchiridion.kernel:make-session :agent agent)))
+           (enchiridion.kernel:run-turn agent "what is the index"
+                                        :session session :store store)
+           (testing "the question is in the transcript, under its session"
+             (let ((hits (enchiridion.memory.store:search-sessions store "index")))
+               (ok (= 1 (length hits)))
+               (ok (string= "user" (enchiridion.memory.store:turn-row-role (first hits))))
+               (ok (string= (enchiridion.kernel:session-id session)
+                            (enchiridion.memory.store:turn-row-session (first hits))))))
+           (testing "the answer is there too, exactly once"
+             (ok (= 1 (length (enchiridion.memory.store:search-sessions
+                               store "fake reply")))))
+           (testing "and the spend row is in the usage ledger"
+             (let ((rows (enchiridion.memory.store:usage-rows store)))
+               (ok (= 1 (length rows)))
+               (ok (string= "fake-model" (getf (first rows) :model)))
+               (ok (= 7 (getf (first rows) :input)))
+               (ok (= 3 (getf (first rows) :output)))
+               (ok (string= (enchiridion.kernel:session-id session)
+                            (getf (first rows) :session))))))
+      (enchiridion.memory.store:close-store store)
+      (uiop:delete-directory-tree directory
+                                  :validate t
+                                  :if-does-not-exist :ignore))))
+
 (deftest a-prompt-is-compiled-once-and-flagged-frozen ()
   (let* ((blocks (list (make-test-block "voice")))
          (prompt (enchiridion.kernel:compile-prompt blocks))

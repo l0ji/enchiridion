@@ -214,6 +214,34 @@ upper bound, so the phrase says so instead of reading NIL as a number."
 ;;;; is read, the request is built, it goes out, the reply comes back parsed,
 ;;;; and the tokens are on a record. Everything above it is an assembly of this.
 
+(defun memory-store-path (config)
+  "Return the store file CONFIG names, or the default beside the agent files.
+
+The configured path wins because the container puts the store on the state
+volume. The default is the file the agent directory owns, which is what a
+checkout uses and what the search tool in the broker resolves on its own."
+  (or (enchiridion:config-memory-db config)
+      (enchiridion.memory.store:default-store-path (agent-directory))))
+
+(defun open-agent-store (config)
+  "Open the store CONFIG names, or return NIL and say why.
+
+A store that cannot be opened must not cost the operator the turn: the reply
+still prints, and the one line on stderr says the transcript was not kept. The
+mode is set only when this process is root, which is the container case: the
+broker runs as uid 1000 and SQLite cannot lock a file its user cannot write."
+  (handler-case
+      (let ((store (enchiridion.memory.store:open-store
+                    :path (memory-store-path config)
+                    :mode (when (zerop (enchiridion.compat:process-uid)) #o666))))
+        (setf enchiridion.memory.store:*store-path*
+              (enchiridion.memory.store:store-path store))
+        store)
+    (error (condition)
+      (format *error-output* "~&enchiridion: not keeping a transcript: ~A~%" condition)
+      (finish-output *error-output*)
+      nil)))
+
 (defun command-ask (arguments)
   "Send one turn to the configured backend and print the reply. Returns an
 exit status.
@@ -225,7 +253,11 @@ already had it and showing it is what turns that into a screenshot.
 
 The optional cache fields are built as strings and appended. A ~@[ clause
 keeps the tested value for the body, so it would print the boolean instead of
-the count, which is worse than printing nothing."
+the count, which is worse than printing nothing.
+
+The turn is also written to the memory store, so that a later search can find
+what was asked and what was answered. A store that cannot be opened costs the
+transcript and not the turn: the reply prints either way."
   ;; A provider that refuses the request is an expected outcome and is reported
   ;; as the operator's problem to fix. MAIN prints a backtrace for everything
   ;; else, and MAIN's backtrace stops at MAIN itself because the compiler
@@ -257,11 +289,15 @@ the count, which is worse than printing nothing."
                          :backend backend
                          :directory (agent-directory)
                          :broker broker))
+                 (store (open-agent-store config))
+                 (session (enchiridion.kernel:make-session :agent agent))
                  (completion nil))
             (unwind-protect
                  (progn
                    (enchiridion.tools.broker:broker-start broker)
-                   (setf completion (enchiridion.kernel:run-turn agent question))
+                   (setf completion (enchiridion.kernel:run-turn agent question
+                                                                 :session session
+                                                                 :store store))
                    (let ((model (enchiridion.llm:completion-model completion))
                          (fallback (or (enchiridion:config-value config :model-primary)
                                        (enchiridion.llm:primary-model)))
@@ -283,7 +319,10 @@ the count, which is worse than printing nothing."
                      (finish-output)
                      (finish-output *error-output*)
                      0))
-              (enchiridion.tools.broker:broker-stop broker)))))
+              (enchiridion.tools.broker:broker-stop broker)
+              (enchiridion.kernel:end-session session)
+              (when store
+                (enchiridion.memory.store:close-store store))))))
     (enchiridion.errors:enchiridion-error (condition)
       (format *error-output* "~&~A~%" condition)
       ;; The report line is one line so that it can go in a log. The detail is

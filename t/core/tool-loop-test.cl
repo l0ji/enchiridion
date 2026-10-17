@@ -74,6 +74,48 @@
            (ok (= 1 (enchiridion.kernel:agent-turn agent)))))
     (enchiridion.tools:clear-registry)))
 
+(deftest a-tool-turn-is-recorded-beside-the-question ()
+  (enchiridion.tools:clear-registry)
+  (let* ((directory (uiop:ensure-directory-pathname
+                     (merge-pathnames
+                      (format nil "enchiridion-tool-loop-test-~D/"
+                              (random most-positive-fixnum))
+                      (uiop:ensure-directory-pathname *default-pathname-defaults*))))
+         (store (enchiridion.memory.store:open-store
+                 :path (merge-pathnames "memory.db" directory))))
+    (unwind-protect
+         (progn
+           (enchiridion.tools:register-tool
+            (enchiridion.tools:make-tool
+             :name "echo"
+             :description "Echo text."
+             :schema '(:object :required (:text) :properties ((:text :string)))
+             :handler (lambda (arguments) (gethash "text" arguments))))
+           (let* ((backend (make-scripted-backend
+                            :replies (list (completion "" :tool-calls
+                                                       (list (call "c1" "echo"
+                                                                   "{\"text\":\"hi\"}")))
+                                           (completion "done"))))
+                  (agent (test-agent backend)))
+             (enchiridion.kernel:run-turn agent "go" :store store)
+             (testing "the tool result is a turn of its own"
+               (let ((hits (enchiridion.memory.store:search-sessions store "hi")))
+                 (ok (= 1 (length hits)))
+                 (ok (string= "tool"
+                              (enchiridion.memory.store:turn-row-role (first hits))))))
+             (testing "and the empty assistant round was not written down"
+               (ok (= 1 (length (enchiridion.memory.store:search-sessions
+                                 store "done")))))
+             (testing "so the transcript is the question, the tool, and the answer"
+               (ok (= 3 (getf (first (enchiridion.memory.store:recent-sessions store))
+                              :turns)))
+               (ok (= 1 (length (enchiridion.memory.store:search-sessions store "go")))))))
+      (enchiridion.tools:clear-registry)
+      (enchiridion.memory.store:close-store store)
+      (uiop:delete-directory-tree directory
+                                  :validate t
+                                  :if-does-not-exist :ignore))))
+
 (deftest a-tool-error-is-text-not-a-crash ()
   (enchiridion.tools:clear-registry)
   (unwind-protect

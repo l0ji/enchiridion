@@ -245,14 +245,61 @@ a misspelled argument."
     (error (condition)
       (tool-result-text (format nil "error: ~A" condition)))))
 
-(defun run-turn (agent text &key model session)
+(declaim (ftype (function (t t t) t) persist-usage))
+
+(defun persist-usage (store session row)
+  "Write one ledger ROW to STORE when there is a store.
+
+The row is what a usage report sums, so every column a provider reported is
+written. A store that refuses the write prints one line and lets the turn
+finish: the tokens are spent either way, and a broken report must not be a
+broken reply."
+  (when store
+    (handler-case
+        (enchiridion.memory.store:record-usage
+         store
+         :session (and session (session-id session))
+         :model (spend-row-model row)
+         :input (spend-row-input row)
+         :output (spend-row-output row)
+         :cache-read (spend-row-cache-read row)
+         :cache-write (spend-row-cache-write row)
+         :channel (spend-row-channel row)
+         :ts (spend-row-time row))
+      (error (condition)
+        (format *error-output* "~&enchiridion: could not write the usage row: ~A~%"
+                condition)))))
+
+(declaim (ftype (function (t t string string) t) persist-turn))
+
+(defun persist-turn (store session role body)
+  "Record one turn in STORE when there is a store and text to record.
+
+An empty body is skipped: a tool-calling assistant message often has no words
+in it, and a row that matches nothing is noise in every later search. A store
+that refuses the write prints one line and lets the turn finish, because
+losing the transcript is bad and losing the reply is worse."
+  (when (and store (stringp body) (plusp (length body)))
+    (handler-case
+        (enchiridion.memory.store:record-turn
+         store
+         :session (and session (session-id session))
+         :role role
+         :body body)
+      (error (condition)
+        (format *error-output* "~&enchiridion: could not record a turn: ~A~%"
+                condition)))))
+
+(defun run-turn (agent text &key model session store)
   "Send TEXT to AGENT and run any tool calls the model asks for.
 
 The system message is the snapshot compiled by MAKE-AGENT. A block written
 after that point is visible in the block object and on disk, but not here.
 Both the prompt and the user text go through the scrubber before they leave
 this process. When SESSION is supplied, every completion is appended to its
-turns, and a closed or foreign session is refused.
+turns, and a closed or foreign session is refused. When STORE is supplied, the
+turn and what the model answered are written to the transcript, which is what
+makes a later search able to find them.
 
 Each round is one backend call and one spend row. A tool call appends the
 assistant message that asked for it and one tool message per result, in the
@@ -282,11 +329,17 @@ keeps asking for tools without answering."
                             (enchiridion.llm.secrets:scrub text))))
            (rounds 0)
            (completion nil))
+      (persist-turn store session "user" text)
       (loop
         (setf completion (complete-with-tools backend messages model tools))
-        (record-spend agent completion)
+        (persist-usage store session (record-spend agent completion))
         (when session
           (push completion (session-turns session)))
+        ;; Every round is written down, and the last one is the reply the
+        ;; operator reads. Persisting only the rounds that asked for a tool
+        ;; would store the questions and forget every answer.
+        (persist-turn store session "assistant"
+                      (enchiridion.llm:completion-text completion))
         (let ((calls (enchiridion.llm:completion-tool-calls completion)))
           (unless (and calls (< rounds (agent-tool-rounds agent)))
             (return completion))
@@ -297,10 +350,12 @@ keeps asking for tools without answering."
                                (enchiridion.llm:completion-text completion)
                                calls))))
           (dolist (call calls)
-            (setf messages
-                  (append messages
-                          (list (enchiridion.llm:tool-message
-                                 (execute-tool agent call)
-                                 (enchiridion.llm:tool-call-id call))))))))
+            (let ((result (execute-tool agent call)))
+              (persist-turn store session "tool" result)
+              (setf messages
+                    (append messages
+                            (list (enchiridion.llm:tool-message
+                                   result
+                                   (enchiridion.llm:tool-call-id call)))))))))
       (incf (agent-turn agent))
       completion)))

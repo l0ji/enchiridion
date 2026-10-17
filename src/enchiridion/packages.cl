@@ -24,7 +24,7 @@
    #:*config* #:*config-source* #:default-config #:read-config #:config
    #:config-set #:channel-config #:channel-enabled-p #:model-for
    #:agent-directory #:run-directory #:load-config #:config-digest
-   #:sectioned-config-p #:config-section #:config-value)
+   #:sectioned-config-p #:config-section #:config-value #:config-memory-db)
   (:documentation
    "Configuration. Paths and behaviour only; a secret never comes from here,
 because a file in the repository is a file that ends up in a store path."))

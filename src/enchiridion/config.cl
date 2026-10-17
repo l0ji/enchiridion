@@ -38,6 +38,18 @@ Return NIL when the section is absent or CONFIG is flat."
               while (consp entry)
               collect entry)))))
 
+(declaim (ftype (function (t) t) config-memory-db))
+
+(defun config-memory-db (config)
+  "Return the memory store path from the :MEMORY section of CONFIG, or NIL.
+
+CONFIG-VALUE reads the :LLM section, because that is where every option it
+was written for lives. The store path is the first option outside that
+section, and a reader that looked in the wrong one would fall back to the
+default file in silence, which is the failure this function exists to avoid.
+A NIL return is not an error: it means the default beside the agent files."
+  (second (assoc :db (config-section config :memory) :test #'eq)))
+
 (declaim (ftype (function (t keyword &optional t) t) config-value))
 
 (defun config-value (config key &optional default)

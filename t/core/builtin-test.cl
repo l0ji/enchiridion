@@ -34,6 +34,56 @@
       (ok (search "b.cl" output))
       (ok (search "beta line" output)))))
 
+(deftest search-reads-the-store-when-there-is-one ()
+  (with-scratch-directory (scratch)
+    (let* ((path (merge-pathnames "memory.db" scratch))
+           (store (enchiridion.memory.store:open-store :path path)))
+      (unwind-protect
+           (progn
+             (enchiridion.memory.store:record-turn
+              store :session "session-9" :role "user" :body "the xylophone index")
+             (enchiridion.memory.store:save-memory
+              store "note" (format nil "a remembered glockenspiel~%on two lines"))
+             (let ((enchiridion.memory.store:*store-path* path))
+               (testing "a turn is found with its session and role"
+                 (let ((output (enchiridion.tools.builtin:search-run
+                                (list :query "xylophone"))))
+                   (ok (search "session session-9 user" output))
+                   (ok (search "the xylophone index" output))))
+               (testing "a memory is found with its name, on one line"
+                 (let ((output (enchiridion.tools.builtin:search-run
+                                (list :query "glockenspiel"))))
+                   (ok (search "memory note" output))
+                   (ok (search "on two lines" output))
+                   (ok (not (search (format nil "~%on two lines") output)))))
+               (testing "a query that matches nothing says so"
+                 (ok (string= "no matches"
+                              (enchiridion.tools.builtin:search-run
+                               (list :query "kettledrum")))))
+               (testing "the files scope is still reachable by name"
+                 (ok (string= "no matches"
+                              (enchiridion.tools.builtin:search-run
+                               (list :query "kettledrum" :scope "files"
+                                     :path (namestring scratch))))))))
+        (enchiridion.memory.store:close-store store)))))
+
+(deftest search-with-no-store-says-no-matches ()
+  (with-scratch-directory (scratch)
+    (let ((enchiridion.memory.store:*store-path* (merge-pathnames "memory.db" scratch)))
+      (testing "a search does not create the store it is looking for"
+        (ok (string= "no matches"
+                     (enchiridion.tools.builtin:search-run (list :query "anything"))))
+        (ok (null (probe-file (merge-pathnames "memory.db" scratch))))))))
+
+(deftest search-refuses-an-empty-query-and-an-unknown-scope ()
+  (with-scratch-directory (scratch)
+    (let ((enchiridion.memory.store:*store-path* (merge-pathnames "memory.db" scratch)))
+      (ok (signals (enchiridion.tools.builtin:search-run (list :query ""))
+                   'enchiridion.errors:schema-error))
+      (ok (signals (enchiridion.tools.builtin:search-run
+                    (list :query "x" :scope "sessions"))
+                   'enchiridion.errors:schema-error)))))
+
 (deftest blockops-adds-patches-and-scans ()
   (with-scratch-directory (scratch)
     (let ((directory (namestring scratch)))

@@ -54,6 +54,7 @@
         :components
         ((:file "blocks")
          (:file "store")
+         (:file "tiers")
          (:file "seed")))
        (:module "tools"
         :serial t

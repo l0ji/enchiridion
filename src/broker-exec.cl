@@ -19,7 +19,23 @@
       (when symbol
         (setf (symbol-value symbol) nil)))))
 
-(asdf:load-system "enchiridion" :verbose nil)
+;; The same warning muffling as the supervisor, for the same reason: DBI's
+;; macros redefine each DEFTYPE <NAME> as a class, and the child should not
+;; print nineteen warnings before it serves its first request. The predicate
+;; matches one message and lets every other warning through.
+(defun broker-exec-muffled-warning-p (condition)
+  "Return T for the one library warning the child does not print.
+
+The test is on the report, for the reason given in src/main.cl: SBCL keeps the
+format control of a SIMPLE-WARNING in its own representation."
+  (let ((report (princ-to-string condition)))
+    (and (>= (length report) 40)
+         (eql 0 (search "redefining DEFTYPE type to be a class" report)))))
+
+(handler-bind ((warning (lambda (condition)
+                          (when (broker-exec-muffled-warning-p condition)
+                            (muffle-warning condition)))))
+  (asdf:load-system "enchiridion" :verbose nil))
 
 (defun broker-exec-argument (arguments name)
   "Return the value after NAME in ARGUMENTS, or NIL."

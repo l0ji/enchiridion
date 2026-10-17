@@ -43,10 +43,29 @@
       (when symbol
         (setf (symbol-value symbol) nil)))))
 
+;; DBI's DEFCLASS/A and DEFINE-CONDITION/A macros define a DEFTYPE for each
+;; <NAME> and then redefine that same name as a class, so SBCL warns nineteen
+;; times on every load of the library. The pattern is the library's own and it
+;; changes nothing here, but it is not something the operator should read on
+;; every run. Only that exact message is muffled: any other warning still
+;; reaches the terminal, which is what makes this a silence and not a blindfold.
+(defun muffled-library-warning-p (condition)
+  "Return T for the one library warning this program does not print.
+
+The test is on the report and not on SIMPLE-CONDITION-FORMAT-CONTROL, because
+SBCL keeps that control as an SB-FORMAT::FMT-CONTROL object rather than as the
+string the operator sees."
+  (let ((report (princ-to-string condition)))
+    (and (>= (length report) 40)
+         (eql 0 (search "redefining DEFTYPE type to be a class" report)))))
+
 ;; ASDF binds *VERBOSE-OUT* to the standard output while it loads a system,
 ;; so setting the variable globally is not enough. VERBOSE NIL is the switch
 ;; that reaches the source-registry scan. REQUIRE has no such argument.
-(asdf:load-system "enchiridion" :verbose nil)
+(handler-bind ((warning (lambda (condition)
+                          (when (muffled-library-warning-p condition)
+                            (muffle-warning condition)))))
+  (asdf:load-system "enchiridion" :verbose nil))
 
 ;; The table is defined after the handlers it names, and two of the
 ;; handlers read the table, so the forward reference is real. Proclaiming

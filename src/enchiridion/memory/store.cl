@@ -138,6 +138,18 @@ drops its triggers with it, so this list is also the whole trigger list.")
 
 ;;;; Talking to the database.
 
+(declaim (ftype (function (string) string) scrubbed))
+
+(defun scrubbed (text)
+  "Return TEXT with every loaded secret and every known secret shape removed.
+
+Every string that reaches a column passes through here, including the ones
+that are not prose. A session id, a memory name, a model name, and a block body
+are all text, and text is where a secret hides. The store is readable by the
+agent through the search tool, so this is the last gate before the disk, and a
+column that skips it is a column that leaks."
+  (enchiridion.llm.secrets:scrub text))
+
 (declaim (ftype (function (store string &optional list) integer) exec))
 
 (defun exec (store statement &optional parameters)
@@ -302,17 +314,17 @@ not an exposure."
   "Store one raw message and return it as a TURN-ROW.
 
 SESSION groups the turns of one conversation and defaults to the single name
-DEFAULT. BODY and MODEL are scrubbed before they are stored: the store is
-readable by the agent through the search tool, so a secret that reached a turn
-must not reach the disk."
+DEFAULT. Every string in the row is scrubbed, the session id and the role
+included: the store is readable by the agent through the search tool, so a
+secret that reached a turn must not reach the disk, whatever field it sits in."
   (check-type body string)
   (check-type session (or null string))
   (check-type ts integer)
-  (let ((session (or session "default"))
-        (role (normalise-role role))
-        (body (enchiridion.llm.secrets:scrub body))
-        (model (enchiridion.llm.secrets:scrub (or model "")))
-        (channel (normalise-channel channel)))
+  (let ((session (scrubbed (or session "default")))
+        (role (scrubbed (normalise-role role)))
+        (body (scrubbed body))
+        (model (scrubbed (or model "")))
+        (channel (normalise-channel (scrubbed (string channel)))))
     (check-type model string)
     (exec store
           "INSERT INTO turns (session, role, body, model, channel, ts)
@@ -383,11 +395,13 @@ tokens and can be wrong."
 An exact duplicate is refused, the way a block write is: a write that changes
 nothing is a turn spent for no memory. An empty body after the scrub is
 refused too, because a memory that holds nothing is a match the operator
-cannot read."
+cannot read. The name is scrubbed as well as the body: a name is text, and a
+name is searchable."
   (check-type name string)
   (check-type body string)
   (check-type ts integer)
-  (let ((body (enchiridion.llm.secrets:scrub body)))
+  (let ((name (scrubbed name))
+        (body (scrubbed body)))
     (cond
       ((zerop (length body))
        (error 'enchiridion.errors:configuration-error
@@ -436,12 +450,13 @@ Each entry is a plist with :ID, :NAME, :BODY, :SESSION, and :TS."
     (if row (field row "body") "")))
 
 (defun store-block (store name text)
-  "Write the block called NAME as TEXT and return TEXT."
+  "Write the block called NAME as TEXT and return the text that was stored."
   (check-type text string)
-  (exec store
-        "INSERT OR REPLACE INTO blocks (name, body, ts) VALUES (?, ?, ?)"
-        (list name text (get-universal-time)))
-  text)
+  (let ((text (scrubbed text)))
+    (exec store
+          "INSERT OR REPLACE INTO blocks (name, body, ts) VALUES (?, ?, ?)"
+          (list name text (get-universal-time)))
+    text))
 
 (declaim (ftype (function (store) string) session-block))
 
@@ -478,14 +493,15 @@ knows the label and the limit; this layer stores what it is given."
 
 The four numbers are what a provider reported, and nothing here is derived.
 The usage report sums these rows, so a row that lost a column is a report that
-lies."
-  (let ((session (or session ""))
-        (model (or model ""))
+lies. SESSION, MODEL, and CHANNEL are scrubbed like every other string this
+file writes, because a model name is text and text can hold a key."
+  (let ((session (scrubbed (or session "")))
+        (model (scrubbed (or model "")))
         (input (or input 0))
         (output (or output 0))
         (cache-read (or cache-read 0))
         (cache-write (or cache-write 0))
-        (channel (normalise-channel channel)))
+        (channel (normalise-channel (scrubbed (string channel)))))
     (check-type session string)
     (check-type model string)
     (check-type input integer)

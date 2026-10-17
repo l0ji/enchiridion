@@ -39,6 +39,19 @@ another."
                                    :validate t
                                    :if-does-not-exist :ignore))))
 
+(defun index-hits (store table query)
+  "Return how many rows of the FTS TABLE match QUERY, with no join.
+
+A search joins the index to its row table, so a stale index entry for a
+deleted row is invisible there: the join drops it. Counting on the index
+itself is what proves the trigger ran."
+  (getf (first (enchiridion.memory.store::query-rows
+                store
+                (format nil "SELECT COUNT(*) AS n FROM ~A WHERE ~A MATCH ?"
+                        table table)
+                (list (enchiridion.memory.store::fts-query query))))
+        :n))
+
 (deftest a-store-creates-its-file-and-reopens ()
   (let* ((directory (scratch-directory))
          (path (merge-pathnames "memory.db" directory)))
@@ -132,11 +145,15 @@ another."
     (enchiridion.memory.store:record-turn
      store :session "b" :body "the unique phrase glockenspiel")
     (ok (= 2 (length (enchiridion.memory.store:search-sessions store "unique"))))
+    (ok (= 2 (index-hits store "turns_fts" "unique")))
     (ok (= 1 (enchiridion.memory.store:delete-session store "a")))
     (ok (= 1 (enchiridion.memory.store:session-count store)))
     (testing "the index forgot the row and not only the table"
       (ok (= 1 (length (enchiridion.memory.store:search-sessions store "unique"))))
-      (ok (null (enchiridion.memory.store:search-sessions store "xylophone"))))))
+      (ok (null (enchiridion.memory.store:search-sessions store "xylophone"))))
+    (testing "and the index itself is clean, which the join alone cannot show"
+      (ok (zerop (index-hits store "turns_fts" "xylophone")))
+      (ok (= 1 (index-hits store "turns_fts" "unique"))))))
 
 (deftest an-updated-body-replaces-its-index-entry ()
   (with-scratch-store (store)
@@ -222,6 +239,36 @@ another."
            (let ((memory (first (enchiridion.memory.store:list-memories store))))
              (ok memory)
              (ok (null (search +fake-key+ (getf memory :body))))))
+      (enchiridion.llm.secrets:clear-secrets))))
+
+(deftest a-secret-in-any-column-is-scrubbed ()
+  (with-scratch-store (store)
+    (enchiridion.llm.secrets:clear-secrets)
+    (unwind-protect
+         (progn
+           (enchiridion.llm.secrets:register-secret "OPENCODE_API_KEY" +fake-key+)
+           (enchiridion.memory.store:record-turn
+            store :session +fake-key+ :body "harmless" :model +fake-key+)
+           (enchiridion.memory.store:save-memory store +fake-key+ "harmless body")
+           (enchiridion.memory.store:record-usage store :session +fake-key+
+                                                  :model +fake-key+ :input 1)
+           (enchiridion.memory.store:set-session-block
+            store (format nil "state is ~A" +fake-key+))
+           (testing "the session id is scrubbed"
+             (ok (null (search +fake-key+
+                               (getf (first (enchiridion.memory.store:recent-sessions store))
+                                     :id)))))
+           (testing "the memory name is scrubbed"
+             (ok (null (search +fake-key+
+                               (getf (first (enchiridion.memory.store:list-memories store))
+                                     :name)))))
+           (testing "the usage model is scrubbed"
+             (ok (null (search +fake-key+
+                               (getf (first (enchiridion.memory.store:usage-rows store))
+                                     :model)))))
+           (testing "and the harness block is scrubbed"
+             (ok (null (search +fake-key+
+                               (enchiridion.memory.store:session-block store))))))
       (enchiridion.llm.secrets:clear-secrets))))
 
 (deftest dropping-the-store-removes-every-table ()

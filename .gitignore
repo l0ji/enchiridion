@@ -34,6 +34,11 @@ run/
 # Sandbox scratch. Agent-authored code is verified here before it loads.
 /tmp/enchiridion/
 
+# Property-test scratch. The tests write here because the Nix build sandbox
+# gives them a writable build directory and nothing else.
+/enchiridion-property/
+/enchiridion-property-agents/
+
 # Secrets. .env sits beside the code, is mode 600, and is never committed.
 # The run script copies it into a container tmpfs that the agent cannot read.
 /.env

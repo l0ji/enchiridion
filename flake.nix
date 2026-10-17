@@ -1,14 +1,18 @@
 {
   description = "enchiridion, an autonomous agent harness written in Common Lisp";
 
-  # Pinned to one immutable commit, not a branch tip. A branch tip is a moving
-  # target and costs several minutes of evaluation per build.
+  # Pinned to one immutable commit, not a branch tip. flake.lock records the
+  # rev and narHash, so the build is reproducible and only an explicit flake
+  # update moves it.
   #
-  # This is the revision the 25.05 release channel points at, taken from
-  # github rather than from the channel tarball so that flake.lock records a
-  # rev and a narHash that a reader can check against github themselves.
+  # This is nixpkgs-unstable at 2026-10-16, chosen because it carries the two
+  # versions section 8 of the plan names: SBCL 2.6.8 and SQLite 3.53.3. The
+  # previous 25.05 pin carried SBCL 2.5.4, which cannot start on macOS 27: it
+  # aborts with "failed to allocate 1048576 bytes at 0x300100000" before it
+  # compiles anything. The fix is in SBCL 2.6.5 and later. NixOS 26.11 is not
+  # released yet, so no release channel can supply it.
   inputs.nixpkgs.url =
-    "github:NixOS/nixpkgs/ac62194c3917d5f474c1a844b6fd6da2db95077d";
+    "github:NixOS/nixpkgs/f20cd90e28fe0403873f473b29e42662cd86e8c4";
 
   outputs = { self, nixpkgs }:
     let
@@ -27,27 +31,67 @@
       # would turn the key into a permanent, public, content addressed string.
       # This filter is the only thing between .env and the binary cache, so it
       # is deny by default and no path reaches Nix unfiltered.
+      #
+      # The rules are about the path inside this checkout, so the relative path
+      # is what they get. An earlier version took the head of the absolute path
+      # instead: for /Users/penny/.../enchiridion/.env that is "", not ".env",
+      # so every segment rule was dead and the file would have been copied into
+      # the store like any other source file. Absolute paths do not intersect
+      # the names below, which is why the bug was invisible until it was tested.
+      source-root = toString ./.;
+
+      relative-path = path:
+        let
+          text = toString path;
+        in
+        if text == source-root then ""
+        else lib.removePrefix (source-root + "/") text;
+
       denied = path:
         let
-          as-string = toString path;
-          base = baseNameOf as-string;
-          first-segment = lib.head (lib.splitString "/" as-string);
+          relative = relative-path path;
+          segments = if relative == "" then [ ] else lib.splitString "/" relative;
+          base = baseNameOf (toString path);
+          first = if segments == [ ] then "" else lib.head segments;
+          under-agents = first == "agents";
+          agent-state =
+            under-agents
+            && (base == "state.json"
+                || lib.hasPrefix "state.json." base
+                || base == "memory.db"
+                || lib.hasPrefix "memory.db-" base
+                || lib.elem "private" segments);
         in
         lib.elem base [
           "config.cl"
           "PLAN.md"
           ".DS_Store"
-          "result"
         ]
-        || lib.hasPrefix ".env" first-segment
-        || lib.elem first-segment [
-          ".git"
-          ".direnv"
-          ".asdf"
+        # .env and .env.* anywhere in the tree. The secret is beside the code,
+        # and a nested copy is just as readable from the store.
+        || base == ".env"
+        || lib.hasPrefix ".env." base
+        # A build output symlink is not source. result-* is the .gitignore form.
+        || base == "result"
+        || lib.hasPrefix "result-" base
+        # Version-control and cache directories. Matched at any depth, not only
+        # at the root, because a vendored checkout can carry its own .git.
+        || builtins.any
+             (segment: lib.elem segment [ ".git" ".direnv" ".asdf" ])
+             segments
+        # Runtime and test scratch at the root. Root only: these names are
+        # directories here, not source directories that happen to share them.
+        # The property tests write enchiridion-property* into their current
+        # directory because the build sandbox has nowhere else to write.
+        || lib.elem first [
           "run"
+          "enchiridion-property"
+          "enchiridion-property-agents"
         ]
-        || lib.hasPrefix "state.json" first-segment
-        || lib.hasPrefix "memory.db" first-segment;
+        # Per-agent runtime state. The Markdown seed files and the example
+        # skills and tools stay in the source; state.json, memory.db, and
+        # private/ are the three that hold what the agent has learned.
+        || agent-state;
 
       source = builtins.path {
         path = ./.;
@@ -123,7 +167,14 @@
       mkEnchiridion = { pkgs }:
         let
           sbcl = rawSbcl pkgs;
-          library-path = lib.makeLibraryPath [ pkgs.sqlite ];
+          # openssl because dexador pulls in cl+ssl, and cl+ssl dlopens
+          # libcrypto at load time rather than linking against it. An RPATH on
+          # the SBCL binary is therefore not enough: without this on
+          # LD_LIBRARY_PATH the system loads right up to the point where the
+          # first HTTPS call is made and then dies inside CFFI.
+          # sqlite because the memory store opens it, and it is the same
+          # situation: loaded by name, not linked.
+          library-path = lib.makeLibraryPath [ pkgs.sqlite pkgs.openssl ];
 
           # The fasls live under XDG_CACHE_HOME and not under
           # ASDF_OUTPUT_TRANSLATIONS. ASDF merges the environment, the user
@@ -163,6 +214,7 @@
             export XDG_CONFIG_HOME="$TMPDIR/build-config"
             export CL_SOURCE_REGISTRY="${registry}"
             export SBCL_HOME="${sbcl}/lib/sbcl"
+            export LD_LIBRARY_PATH="${library-path}"
 
             ${sbcl}/bin/sbcl \
               --non-interactive \
@@ -288,7 +340,7 @@
               pkgs.bash
               pkgs.coreutils
             ];
-            LD_LIBRARY_PATH = lib.makeLibraryPath [ pkgs.sqlite ];
+            LD_LIBRARY_PATH = lib.makeLibraryPath [ pkgs.sqlite pkgs.openssl ];
             SBCL_HOME = "${sbcl}/lib/sbcl";
             REGISTRY = registry;
             SOURCE_DIR = "${enchiridion}/lib";

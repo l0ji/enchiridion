@@ -147,14 +147,29 @@ else."
 ;;;; One place reads a secret. Everything else calls scrub, so there is one
 ;;;; thing to audit.
 
-(defun secrets-file ()
-  "Return the path the secret file is read from. The container tmpfs wins
-when it exists, because the host .env is never copied in at its own path: the
-run script puts it at /run/secrets/.env and the supervisor deletes it once
-loaded."
-  (if (probe-file #p"/run/secrets/.env")
-      #p"/run/secrets/.env"
-      #p".env"))
+(defun host-secrets-file (directory)
+  "Return the .env path inside DIRECTORY. DIRECTORY is a directory pathname
+or a namestring; a file pathname is not accepted because .env is always a
+sibling of the code, never the code itself."
+  (merge-pathnames ".env" (uiop:ensure-directory-pathname directory)))
+
+(defun secrets-file (&key (directories (list #p"./"))
+                            (container #p"/run/secrets/.env"))
+  "Return the secret file to read. The container tmpfs wins when it exists,
+because the host .env is never copied in at its own path: the run script puts
+it at /run/secrets/.env and the supervisor deletes it once loaded.
+
+DIRECTORIES is tried in order for a host .env, which is how `enchiridion ask`
+finds the operator's file when the binary lives in a store path. The first
+directory is the fallback when no file exists, so the caller can still tell
+the operator which path it would have read. CONTAINER is nil in tests, so the
+host lookup is not at the mercy of a /run/secrets that happens to exist."
+  (or (and container (probe-file container))
+      (loop for directory in directories
+            for path = (host-secrets-file directory)
+            when (probe-file path)
+              return path)
+      (host-secrets-file (or (first directories) #p"./"))))
 
 (defun register-secret (name value &optional (source :argument))
   "Hold VALUE under NAME, noting SOURCE. An empty or non string value is

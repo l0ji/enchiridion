@@ -23,7 +23,8 @@
    ;; Configuration.
    #:*config* #:*config-source* #:default-config #:read-config #:config
    #:config-set #:channel-config #:channel-enabled-p #:model-for
-   #:agent-directory #:run-directory #:load-config #:config-digest)
+   #:agent-directory #:run-directory #:load-config #:config-digest
+   #:sectioned-config-p #:config-section #:config-value)
   (:documentation
    "Configuration. Paths and behaviour only; a secret never comes from here,
 because a file in the repository is a file that ends up in a store path."))
@@ -35,7 +36,7 @@ because a file in the repository is a file that ends up in a store path."))
    #:environment #:environment-value #:environment-bound-p
    #:run-program #:run-program-blocking #:process-uid #:set-process-uid
    #:process-user #:set-process-user #:implementation-dependency-p
-   #:script-arguments #:exit-with)
+   #:script-arguments #:exit-with #:backtrace-string)
   (:documentation
    "The only file in the tree that contains implementation extensions.
 Everything above it is standard Common Lisp, which is what makes the agent
@@ -47,7 +48,10 @@ able to rewrite itself without rewriting the porting layer."))
    #:enchiridion-error #:configuration-error #:usage-error #:missing-command
    #:backend-error #:transport-error #:tool-error #:schema-error
    #:block-overflow #:block-frozen #:bootstrap-pending #:budget-exceeded
-   #:duplicate-message #:not-found #:unauthorized #:condition-report-line)
+   #:duplicate-message #:not-found #:unauthorized #:condition-report-line
+   ;; The note every condition carries. The report line stays one line so it can
+   ;; go in a log; this is the part that says what to do about it.
+   #:error-detail)
   (:documentation
    "The condition hierarchy. Conditions, not formatted strings: a caller can
 recover from a block overflow by asking it for the shortfall, and it cannot
@@ -56,21 +60,31 @@ recover from a string."))
 (defpackage #:enchiridion.llm
   (:use #:cl)
   (:export
-   ;; The protocol every backend implements.
-   #:backend #:complete #:model-capabilities #:backend-name
+   ;; The protocol every backend implements. Three generic functions and the
+   ;; check that stands in for satisfies, because SBCL 2.5.4 has no
+   ;; defprotocol.
+   #:complete #:model-capabilities #:backend-name #:backendp
    ;; The result and message shapes.
    #:message #:user-message #:assistant-message #:system-message
    #:tool-message #:message-role #:message-content #:message-tool-call-id
    #:tool-call #:tool-call-id #:tool-call-name #:tool-call-arguments
-   #:completion #:completion-text #:completion-tool-calls #:completion-usage
-   #:completion-model #:completion-stop-reason #:input-tokens #:output-tokens
-   #:cache-read-tokens #:cache-write-tokens
+   #:completion #:completion-text #:completion-tool-calls
+   #:completion-model #:completion-stop-reason
+   #:completion-input-tokens #:completion-output-tokens
+   #:completion-cache-read-tokens #:completion-cache-write-tokens
+   #:completion-total-tokens
    ;; Backends.
-   #:make-backend #:openai-backend #:anthropic-backend #:litellm-backend
-   #:resolve-backend
-   ;; Tiers and the cache breakpoint.
-   #:*model-primary* #:*model-cheap* #:*model-sleep* #:tier #:primary #:cheap #:sleep
-   #:base-extra-options #:cache-breakpoint #:prompt-cache-marker)
+   #:openai-backend #:resolve-backend
+   ;; The two halves of the OpenAI wire format, exported so they can be tested
+   ;; without a network. They are pure functions over text and data, which is
+   ;; the only reason the format is testable at all. PARSE-JSON goes with them
+   ;; because it is the JSON door: one place decides what a parsed object is.
+   #:completion-request #:parse-completion #:parse-json
+   ;; Tiers. The models are primary-model, cheap-model and sleep-model rather
+   ;; than the bare words, because a function named SLEEP in a package that
+   ;; uses CL is a package lock error.
+   #:*model-primary* #:*model-cheap* #:*model-sleep*
+   #:tier #:model-for-tier #:primary-model #:cheap-model #:sleep-model)
   (:documentation
    "LLM backends, the request and result shapes they share, and the three
 model tiers. The kernel never branches on which backend is in use."))

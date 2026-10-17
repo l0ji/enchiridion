@@ -21,7 +21,7 @@
   ;; Deterministic load order. Packages before the files that use them,
   ;; conditions before the code that signals them.
   :serial t
-  :depends-on ("alexandria" "cl-ppcre")
+  :depends-on ("alexandria" "cl-ppcre" "dexador" "com.inuoe.jzon")
   :components
   ((:module "src"
     :serial t
@@ -33,12 +33,15 @@
       :components
       ((:file "packages")
        (:file "compat")
+       (:file "config")
        (:file "errors")
        (:module "llm"
         :serial t
         :default-component-class "cl-source-file.cl"
         :components
-        ((:file "secrets")))
+        ((:file "secrets")
+         (:file "protocol")
+         (:file "openai")))
        (:module "memory"
         :serial t
         :default-component-class "cl-source-file.cl"

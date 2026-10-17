@@ -203,6 +203,27 @@ name to a uid first, because SB-POSIX setuid takes a number."
       (error "No such user: ~A." name))
     (set-process-uid (parse-integer resolved))))
 
+;;;; Backtraces.
+;;;;
+;;;; A long running server without a trace on crash is a server the operator
+;;;; cannot report a bug about. The trace is implementation specific, so it is
+;;;; read here and returned as a string; the caller prints it and knows nothing
+;;;; about SB-DEBUG.
+
+(declaim (ftype (function (&optional integer) string) backtrace-string))
+
+#+sbcl
+(defun backtrace-string (&optional (count 12))
+  "Return up to COUNT frames of the current call stack as text."
+  (with-output-to-string (stream)
+    (sb-debug:backtrace count stream)))
+
+#-sbcl
+(defun backtrace-string (&optional (count 12))
+  "Return a note that this implementation has no backtrace reader."
+  (declare (ignore count))
+  (format nil "No backtrace is available in ~A." +implementation+))
+
 ;;;; The command line.
 ;;;;
 ;;;; sb-ext:*posix-argv* is the one piece of the script interface that no

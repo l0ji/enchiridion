@@ -31,6 +31,8 @@
     :components
     ((:file "errors-test")
      (:file "compat-test")
+     (:file "config-test")
+     (:file "llm-test")
      (:file "seed-test")
      (:file "secrets-test"))))
 

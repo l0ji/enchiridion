@@ -60,6 +60,11 @@
   (ok (integerp (enchiridion.compat:process-uid)))
   (ok (stringp (enchiridion.compat:process-user))))
 
+(deftest a-backtrace-is-a-string ()
+  ;; The caller prints this and knows nothing about SB-DEBUG. A non-string
+  ;; return would turn a crash report into a second crash.
+  (ok (stringp (enchiridion.compat:backtrace-string 3))))
+
 (deftest the-implementation-is-named ()
   ;; A keyword, not whatever LISP-IMPLEMENTATION-TYPE returned. It is the
   ;; string "SBCL" on SBCL 2.5.4, and a test that compares the raw value passes

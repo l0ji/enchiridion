@@ -62,11 +62,12 @@
                 || lib.hasPrefix "memory.db-" base
                 || lib.elem "private" segments);
         in
-        lib.elem base [
-          "config.cl"
-          "PLAN.md"
-          ".DS_Store"
-        ]
+        lib.elem base [ ".DS_Store" ]
+        # The operator config and the working plan sit at the root only.
+        # Matching the basename anywhere also excluded src/enchiridion/config.cl,
+        # which is a source module and not the operator's file.
+        || relative == "config.cl"
+        || relative == "PLAN.md"
         # .env and .env.* anywhere in the tree. The secret is beside the code,
         # and a nested copy is just as readable from the store.
         || base == ".env"

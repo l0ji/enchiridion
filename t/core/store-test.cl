@@ -133,7 +133,8 @@ itself is what proves the trigger ran."
      store :session "s" :body "the cache-write column and the cache read column")
     (testing "a hyphen is a literal and not an operator"
       (ok (= 1 (length (enchiridion.memory.store:search-sessions store "cache-write")))))
-    (testing "quotes, arithmetic, and a comment end nothing"
+    (testing "a quote is a literal, and the word inside it still matches"
+      (ok (= 1 (length (enchiridion.memory.store:search-sessions store "\"cache\""))))
       (ok (listp (enchiridion.memory.store:search-sessions store "\" OR 1=1 --"))))
     (testing "FTS keywords are ordinary words"
       (ok (listp (enchiridion.memory.store:search-sessions store "NEAR OR AND NOT"))))

@@ -41,3 +41,15 @@
     (ok (eq :backend (first (first llm))))
     (testing "and the next section is not part of it"
       (ok (null (assoc :channels llm))))))
+
+(deftest the-memory-store-path-is-read-from-its-own-section ()
+  (let ((config '(:llm (:backend :openai)
+                  :memory (:db "/var/lib/enchiridion/memory.db"))))
+    (ok (string= "/var/lib/enchiridion/memory.db"
+                 (enchiridion:config-memory-db config))))
+  (testing "a config with no memory section is not an error"
+    (ok (null (enchiridion:config-memory-db '(:backend :openai)))))
+  (testing "and a memory section that names no db keeps the default file"
+    (ok (null (enchiridion:config-memory-db
+               '(:llm (:backend :openai)
+                 :memory (:block-limits (:persona 10))))))))

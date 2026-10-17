@@ -175,6 +175,23 @@ demands :VALIDATE T, and signals unless the directory is really there, so
         (write-string "x" stream))
       (ok (enchiridion.memory:agent-seeded-p directory)))))
 
+(deftest a-directory-that-cannot-be-made-is-a-result ()
+  ;; The operator gets the path and the OS error in the problems list, not a
+  ;; backtrace from ensure-directories-exist. A regular file standing where a
+  ;; parent directory must go is the portable way to make that call fail.
+  (with-scratch-directory (scratch)
+    (ensure-directories-exist (merge-pathnames "x" scratch))
+    (let* ((blocker (merge-pathnames "blocker" scratch))
+           (directory (merge-pathnames
+                       "child/" (uiop:ensure-directory-pathname blocker))))
+      (with-open-file (stream blocker :direction :output
+                                      :if-exists :supersede
+                                      :if-does-not-exist :create)
+        (write-string "not a directory" stream))
+      (let ((result (enchiridion.memory:init-agent directory)))
+        (ok (null (enchiridion.memory:init-created result)))
+        (ok (assoc :directory (enchiridion.memory:init-problems result)))))))
+
 (deftest the-example-skill-and-tool-are-plausible-lisp ()
   ;; Both files ship with the harness and the agent will read them before it
   ;; writes its own, and the tool loader compiles them. A template that does

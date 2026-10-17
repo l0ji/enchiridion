@@ -31,7 +31,22 @@
 
 (in-package #:enchiridion.main)
 
-(require :enchiridion)
+;; ASDF adds the SBCL implementation directory to its wrapping source
+;; registry. SBCL ships duplicate .asd files in contrib, and ASDF warns about
+;; each duplicate only while *VERBOSE-OUT* is true. The duplicates are
+;; harmless and the warnings are noise, so a command-line run silences the
+;; scan. The package and the symbol are looked up by name: both are ASDF
+;; internals, and a version that renames one must not stop the program.
+(let ((package (find-package "ASDF/SOURCE-REGISTRY")))
+  (when package
+    (let ((symbol (find-symbol "*VERBOSE-OUT*" package)))
+      (when symbol
+        (setf (symbol-value symbol) nil)))))
+
+;; ASDF binds *VERBOSE-OUT* to the standard output while it loads a system,
+;; so setting the variable globally is not enough. VERBOSE NIL is the switch
+;; that reaches the source-registry scan. REQUIRE has no such argument.
+(asdf:load-system "enchiridion" :verbose nil)
 
 ;; The table is defined after the handlers it names, and two of the
 ;; handlers read the table, so the forward reference is real. Proclaiming
@@ -82,9 +97,16 @@ is unset or empty."
 (defun agent-directory ()
   "Return the agent directory as a namestring, with a trailing slash.
 ENCHIRIDION_HOME wins when it is set: inside the container the installed
-source is read only and the agent directory has to be on the volume."
-  (format nil "~A/agents/default/" (or (environment-value "ENCHIRIDION_HOME")
-                                       (resolve-project-root))))
+source is read only and the agent directory has to be on the volume.
+
+Without ENCHIRIDION_HOME the current directory is the root. A checkout has no
+writable source tree under /nix/store, and `nix run` starts in the checkout,
+so the current directory is the one place the operator can own. The old
+fallback used the installed source, which is read only and turned the first
+launch into a backtrace."
+  (let ((root (or (environment-value "ENCHIRIDION_HOME")
+                  (namestring (getcwd)))))
+    (format nil "~A/agents/default/" (string-right-trim "/" root))))
 
 ;;;; Configuration.
 ;;;;
@@ -131,7 +153,7 @@ surprise."
       (dolist (problem (enchiridion.memory:init-problems result))
         (format t "  ~A: ~A~%" (car problem) (cdr problem))))
     (finish-output)
-    0))
+    (if (enchiridion.memory:init-problems result) 1 0)))
 
 (defun command-version (arguments)
   "Print the version and where the binary was installed."
@@ -357,14 +379,19 @@ bound.")
     (format t "~A~%" (enchiridion.memory:init-status-line result))
     (dolist (name (enchiridion.memory:init-created result))
       (format t "  ~A~%" name))
-    (when (enchiridion.memory:init-problems result)
-      (format t "~&Could not write:~%")
-      (dolist (problem (enchiridion.memory:init-problems result))
-        (format t "  ~A: ~A~%" (car problem) (cdr problem))))
-    (format t "~&Bootstrap has not started. Edit SOUL.md, OPERATOR.md, and WORLD.md first,~%")
-    (format t "then run `enchiridion chat`. See agents/default/GUIDE.md for the walkthrough.~%")
-    (finish-output)
-    0))
+    (if (enchiridion.memory:init-problems result)
+        (progn
+          (format t "~&Could not write:~%")
+          (dolist (problem (enchiridion.memory:init-problems result))
+            (format t "  ~A: ~A~%" (car problem) (cdr problem)))
+          (format t "~&Fix the problem above, then run again.~%")
+          (finish-output)
+          1)
+        (progn
+          (format t "~&Bootstrap has not started. Edit SOUL.md, OPERATOR.md, and WORLD.md first,~%")
+          (format t "then run `enchiridion chat`. See agents/default/GUIDE.md for the walkthrough.~%")
+          (finish-output)
+          0))))
 
 ;;;; Entry.
 

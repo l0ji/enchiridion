@@ -461,11 +461,14 @@ shape for the same reason.
 
 The T clause exists so that a typo in a config key is named rather than
 reported as a missing function."
+  ;; The default is OpenCode Go, not api.openai.com. OPENCODE_API_KEY is the
+  ;; default secret name, and a key from that provider must not be sent to a
+  ;; different company because no config.cl was written.
   (let* ((config (or config '()))
          (backend (enchiridion:config-value config :backend :openai))
          (url (or base-url
                   (enchiridion:config-value config :base-url)
-                  "https://api.openai.com/v1/"))
+                  "https://opencode.ai/zen/go/v1"))
          (model (enchiridion:config-value config :model-primary))
          (key (or api-key (backend-api-key config backend))))
     (case backend

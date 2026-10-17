@@ -279,6 +279,13 @@
     (ok (string= "section-model"
                  (enchiridion.llm::openai-connection-model backend)))))
 
+(deftest the-default-backend-is-opencode-go ()
+  ;; OPENCODE_API_KEY is the default secret name. A missing config.cl must not
+  ;; send that key to api.openai.com.
+  (let ((backend (enchiridion.llm:resolve-backend :api-key "k")))
+    (ok (search "opencode.ai/zen/go/v1"
+                (enchiridion.llm:backend-name backend)))))
+
 (deftest the-configured-model-reaches-the-backend ()
   ;; The config names a model string, not a tier. Passing it through
   ;; MODEL-FOR-TIER replaced it with the global default, so the operator's

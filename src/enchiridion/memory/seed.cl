@@ -433,27 +433,39 @@ type error, so the answer is coerced."
 (defun init-agent (directory)
   "Create DIRECTORY and write every seed file that is not already there. Never
 overwrite anything. Return an init-result holding what was written and what
-was left alone."
-  (ensure-directories-exist (merge-pathnames "x" directory))
-  (dolist (sub (copy-list *seed-subdirectories*))
-    (ensure-directories-exist (merge-pathnames (format nil "~A/x" sub) directory)))
-  (let ((populated (agent-seeded-p directory)))
-    (let ((created '()) (existing '()) (problems '()))
-      (dolist (entry *seed-templates*)
-        ;; The row is a name followed by a plist, so :contents has to be
-        ;; looked up rather than destructured: there are more than four
-        ;; elements in the row.
-        ;; let*, not let: PATH uses NAME, and let binds in parallel.
-        (let* ((name (car entry))
-               (contents (contents-of entry :contents))
-               (path (merge-pathnames name directory)))
-          (multiple-value-bind (outcome condition) (write-if-absent path contents)
-            (case outcome
-              (:created (push name created))
-              (:kept (push name existing))
-              (otherwise (push (cons name condition) problems))))))
+was left alone.
+
+A directory that cannot be made is a result with a problem, not a signal. The
+caller prints the problems and exits; the operator gets the path and the OS
+error instead of a backtrace from inside ASDF's source registry."
+  (handler-case
+      (progn
+        (ensure-directories-exist (merge-pathnames "x" directory))
+        (dolist (sub (copy-list *seed-subdirectories*))
+          (ensure-directories-exist (merge-pathnames (format nil "~A/x" sub) directory)))
+        (let ((populated (agent-seeded-p directory)))
+          (let ((created '()) (existing '()) (problems '()))
+            (dolist (entry *seed-templates*)
+              ;; The row is a name followed by a plist, so :contents has to be
+              ;; looked up rather than destructured: there are more than four
+              ;; elements in the row.
+              ;; let*, not let: PATH uses NAME, and let binds in parallel.
+              (let* ((name (car entry))
+                     (contents (contents-of entry :contents))
+                     (path (merge-pathnames name directory)))
+                (multiple-value-bind (outcome condition) (write-if-absent path contents)
+                  (case outcome
+                    (:created (push name created))
+                    (:kept (push name existing))
+                    (otherwise (push (cons name condition) problems))))))
+            (%make-init-result :directory (namestring directory)
+                                :created (nreverse created)
+                                :existing (nreverse existing)
+                                :problems (nreverse problems)
+                                :existed-p populated))))
+    (file-error (condition)
       (%make-init-result :directory (namestring directory)
-                          :created (nreverse created)
-                          :existing (nreverse existing)
-                          :problems (nreverse problems)
-                          :existed-p populated))))
+                          :created '()
+                          :existing '()
+                          :problems (list (cons :directory condition))
+                          :existed-p nil))))

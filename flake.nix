@@ -255,7 +255,6 @@
               --set XDG_CACHE_HOME "$out/cache" \
               --set XDG_CONFIG_HOME "$out/config" \
               --set ENCHIRIDION_SOURCE "$out/lib" \
-              --set-default ENCHIRIDION_HOME "/var/lib/enchiridion" \
               --add-flags '--script' \
               --add-flags "\"$out/lib/src/main.cl\""
 

@@ -33,6 +33,8 @@
      (:file "compat-test")
      (:file "config-test")
      (:file "llm-test")
+     (:file "blocks-test")
+     (:file "kernel-test")
      (:file "seed-test")
      (:file "secrets-test"))))
 
@@ -62,7 +64,8 @@
     :serial t
     :default-component-class "cl-source-file.cl"
     :components
-    ((:file "seed-property"))))
+    ((:file "seed-property")
+     (:file "prompt-property"))))
 
   :perform
   (test-op (operation component)

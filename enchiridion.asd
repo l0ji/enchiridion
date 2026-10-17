@@ -46,7 +46,9 @@
         :serial t
         :default-component-class "cl-source-file.cl"
         :components
-        ((:file "seed"))))))))
+        ((:file "blocks")
+         (:file "seed")))
+       (:file "kernel"))))))
 
   ;; A warning is a failure. Style warnings nobody reads are warnings nobody
   ;; fixes, and #check is the gate every commit passes through, so the gate

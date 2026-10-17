@@ -117,6 +117,7 @@ did not think of."))
 
 (defpackage #:enchiridion.memory
   (:use #:cl)
+  (:shadow #:block)
   (:import-from #:alexandria #:ensure-list)
   (:export
    ;; Seed files and the first launch.
@@ -243,7 +244,7 @@ reactions are all out, so the allowlist is the whole authorisation story."))
   (:use #:cl)
   (:export
    #:agent #:make-agent #:agent-name #:agent-turn #:run-turn #:agent-snapshot
-   #:compile-prompt #:prompt #:prompt-tokens #:snapshot-p
+   #:compile-prompt #:prompt #:prompt-text #:prompt-tokens #:snapshot-p
    #:record-spend #:spend #:reset-spend #:budget-exhausted-p #:spend-row
    #:session #:make-session #:session-id #:session-turns #:end-session
    #:heartbeat #:task-queue #:enqueue-task #:dequeue-task #:task-queue-length

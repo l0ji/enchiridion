@@ -237,10 +237,11 @@ the count, which is worse than printing nothing."
           (let* ((backend (enchiridion.llm:resolve-backend
                            :config config
                            :api-key key))
-                 (completion
-                   (enchiridion.llm:complete
-                    backend
-                    (list (enchiridion.llm:user-message question))))
+                 (agent (enchiridion.kernel:make-agent
+                         :name "default"
+                         :backend backend
+                         :directory (agent-directory)))
+                 (completion (enchiridion.kernel:run-turn agent question))
                  (model (enchiridion.llm:completion-model completion))
                  (fallback (or (enchiridion:config-value config :model-primary)
                                (enchiridion.llm:primary-model)))

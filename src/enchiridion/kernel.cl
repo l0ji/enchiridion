@@ -270,22 +270,26 @@ broken reply."
         (format *error-output* "~&enchiridion: could not write the usage row: ~A~%"
                 condition)))))
 
-(declaim (ftype (function (t t string string) t) persist-turn))
+;; No F-TYPE on PERSIST-TURN, for the reason RESOLVE-BACKEND has none: SBCL
+;; wants every keyword of an F-TYPE lambda list declared in an earlier one, and
+;; a dummy declaration per keyword costs more than the annotation catches.
 
-(defun persist-turn (store session role body)
+(defun persist-turn (store session role body &key model)
   "Record one turn in STORE when there is a store and text to record.
 
 An empty body is skipped: a tool-calling assistant message often has no words
 in it, and a row that matches nothing is noise in every later search. A store
 that refuses the write prints one line and lets the turn finish, because
-losing the transcript is bad and losing the reply is worse."
+losing the transcript is bad and losing the reply is worse. MODEL names what
+answered, which is empty for the operator's own turn."
   (when (and store (stringp body) (plusp (length body)))
     (handler-case
         (enchiridion.memory.store:record-turn
          store
          :session (and session (session-id session))
          :role role
-         :body body)
+         :body body
+         :model (or model ""))
       (error (condition)
         (format *error-output* "~&enchiridion: could not record a turn: ~A~%"
                 condition)))))
@@ -339,7 +343,8 @@ keeps asking for tools without answering."
         ;; operator reads. Persisting only the rounds that asked for a tool
         ;; would store the questions and forget every answer.
         (persist-turn store session "assistant"
-                      (enchiridion.llm:completion-text completion))
+                      (enchiridion.llm:completion-text completion)
+                      :model (enchiridion.llm:completion-model completion))
         (let ((calls (enchiridion.llm:completion-tool-calls completion)))
           (unless (and calls (< rounds (agent-tool-rounds agent)))
             (return completion))

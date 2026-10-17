@@ -57,9 +57,11 @@
                (ok (string= "user" (enchiridion.memory.store:turn-row-role (first hits))))
                (ok (string= (enchiridion.kernel:session-id session)
                             (enchiridion.memory.store:turn-row-session (first hits))))))
-           (testing "the answer is there too, exactly once"
-             (ok (= 1 (length (enchiridion.memory.store:search-sessions
-                               store "fake reply")))))
+           (testing "the answer is there too, exactly once, and names its model"
+             (let ((hits (enchiridion.memory.store:search-sessions store "fake reply")))
+               (ok (= 1 (length hits)))
+               (ok (string= "fake-model"
+                            (enchiridion.memory.store:turn-row-model (first hits))))))
            (testing "and the spend row is in the usage ledger"
              (let ((rows (enchiridion.memory.store:usage-rows store)))
                (ok (= 1 (length rows)))

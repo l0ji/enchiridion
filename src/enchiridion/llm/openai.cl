@@ -437,6 +437,83 @@ signature change the moment tools arrive."
   (declare (ignore tools budget))
   (send-completion connection messages (or model (openai-connection-model connection))))
 
+;;;; Providers.
+;;;;
+;;;; The wire protocol is :OPENAI for both providers. The provider chooses the
+;;;; endpoint, the default reasoning model, and the name of the key variable.
+;;;; OpenAI is the default. A key that the environment or .env supplies selects
+;;;; the other provider. An explicit :PROVIDER or a recognized :BASE-URL in
+;;;; config.cl wins over both.
+
+(defparameter +provider-defaults+
+  '(:openai
+    (:base-url "https://api.openai.com/v1/"
+     :model "gpt-5.6-luna"
+     :api-key-env "OPENAI_API_KEY")
+    :opencode
+    (:base-url "https://opencode.ai/zen/go/v1"
+     :model "kimi-k3"
+     :api-key-env "OPENCODE_API_KEY"))
+  "Provider name to the endpoint, default model, and key variable it uses.
+Both speak the OpenAI chat completions shape; only these three facts differ.")
+
+(declaim (ftype (function (t) list) provider-properties))
+
+(defun provider-properties (provider)
+  "Return the plist for PROVIDER, falling back to the OpenAI entry."
+  (or (getf +provider-defaults+ provider)
+      (getf +provider-defaults+ :openai)))
+
+(declaim (ftype (function (t) (or null keyword)) normalize-provider))
+
+(defun normalize-provider (name)
+  "Return NAME as :OPENAI or :OPENCODE, or NIL when it is neither."
+  (when name
+    (let ((keyword (intern (string-upcase (string name)) :keyword)))
+      (when (member keyword '(:openai :opencode))
+        keyword))))
+
+(declaim (ftype (function (t) (or null keyword)) provider-from-base-url))
+
+(defun provider-from-base-url (url)
+  "Return the provider URL names, or NIL for a server that is neither.
+A local OpenAI-compatible server is neither, and its config still works: the
+base URL is used as written and the key variable comes from detection."
+  (when (stringp url)
+    (cond
+      ((search "opencode.ai" url) :opencode)
+      ((search "api.openai.com" url) :openai)
+      (t nil))))
+
+(declaim (ftype (function (string) boolean) provider-key-present-p))
+
+(defun provider-key-present-p (name)
+  "Return T when NAME is in the environment or the secret loader holds it.
+The loader runs before this in the CLI, so a key in .env selects a provider
+the same way an exported variable does."
+  (or (enchiridion.compat:environment-bound-p name)
+      (enchiridion.llm.secrets:secret-present-p name)))
+
+(declaim (ftype (function (&optional t) keyword) detect-provider))
+
+(defun detect-provider (&optional config)
+  "Return the provider CONFIG asks for, or the one the keys select.
+The order is explicit config, a recognized base URL, an OpenAI key, an
+OpenCode key, then OpenAI. OpenAI wins a tie because it is the default."
+  (or (normalize-provider (enchiridion:config-value config :provider))
+      (provider-from-base-url (enchiridion:config-value config :base-url))
+      (and (provider-key-present-p "OPENAI_API_KEY") :openai)
+      (and (provider-key-present-p "OPENCODE_API_KEY") :opencode)
+      :openai))
+
+(declaim (ftype (function (&optional t) string) default-api-key-env))
+
+(defun default-api-key-env (&optional config)
+  "Return the name of the variable that holds the key for the active provider.
+An explicit :API-KEY-ENV in config wins; otherwise the provider decides."
+  (or (enchiridion:config-value config :api-key-env)
+      (getf (provider-properties (detect-provider config)) :api-key-env)))
+
 ;;;; Resolution.
 
 ;; No F-TYPE on RESOLVE-BACKEND, which is a choice rather than an oversight.
@@ -448,9 +525,10 @@ signature change the moment tools arrive."
 (defun resolve-backend (&key (config nil) (api-key nil) (base-url nil))
   "Return the BACKEND that CONFIG asks for.
 
-CONFIG is a plist as config.cl holds it. Nothing is read from the environment
-here: the secret loader owns that, and a backend that quietly reached into the
-environment would put a second, unaudited path to the key on the map.
+CONFIG is a plist as config.cl holds it. An explicit :BASE-URL, :MODEL-PRIMARY,
+or :API-KEY-ENV wins. When one is absent, DETECT-PROVIDER chooses between
+OpenAI and OpenCode Go from the config, a recognized base URL, or the keys the
+environment and .env supplied.
 
 CASE and not ECASE. ECASE is the better construct here in principle, because it
 refuses to run if a backend is added without a clause here, but SBCL 2.5.4
@@ -461,20 +539,20 @@ shape for the same reason.
 
 The T clause exists so that a typo in a config key is named rather than
 reported as a missing function."
-  ;; The default is OpenCode Go, not api.openai.com. OPENCODE_API_KEY is the
-  ;; default secret name, and a key from that provider must not be sent to a
-  ;; different company because no config.cl was written.
   (let* ((config (or config '()))
+         (provider (detect-provider config))
+         (properties (provider-properties provider))
          (backend (enchiridion:config-value config :backend :openai))
          (url (or base-url
                   (enchiridion:config-value config :base-url)
-                  "https://opencode.ai/zen/go/v1"))
-         (model (enchiridion:config-value config :model-primary))
+                  (getf properties :base-url)))
+         (model (or (enchiridion:config-value config :model-primary)
+                    (getf properties :model)))
          (key (or api-key (backend-api-key config backend))))
     (case backend
       (:openai (openai-backend :base-url url
                                :api-key key
-                               :model (or model (primary-model))))
+                               :model model))
       (t
        (error 'enchiridion.errors:configuration-error
               :key :backend
@@ -482,11 +560,12 @@ reported as a missing function."
                               backend))))))
 
 (defun backend-api-key (config backend)
-  "Return the API key for BACKEND, from CONFIG or from the environment.
+  "Return the API key for BACKEND, from CONFIG, .env, or the environment.
 
-The name of the variable comes from the configuration and the value comes from
-the environment, which is the rule the whole project follows: a file in the
-repository names a secret, it never holds one."
+The name of the variable comes from the active provider. The value is looked up
+in the secret loader first, because .env is not the process environment and
+the provider detection already saw the registered keys there."
   (declare (ignore backend))
-  (let ((variable (enchiridion:config-value config :api-key-env "OPENCODE_API_KEY")))
-    (enchiridion.compat:environment-value variable)))
+  (let ((variable (default-api-key-env config)))
+    (or (enchiridion.llm.secrets:secret-value variable)
+        (enchiridion.compat:environment-value variable))))

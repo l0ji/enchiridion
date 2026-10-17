@@ -279,12 +279,65 @@
     (ok (string= "section-model"
                  (enchiridion.llm::openai-connection-model backend)))))
 
-(deftest the-default-backend-is-opencode-go ()
-  ;; OPENCODE_API_KEY is the default secret name. A missing config.cl must not
-  ;; send that key to api.openai.com.
+(deftest the-default-provider-is-openai ()
+  ;; No config and no provider key means OpenAI. The key name follows the
+  ;; provider, so a missing key is reported as OPENAI_API_KEY.
+  (enchiridion.llm.secrets:clear-secrets)
   (let ((backend (enchiridion.llm:resolve-backend :api-key "k")))
-    (ok (search "opencode.ai/zen/go/v1"
-                (enchiridion.llm:backend-name backend)))))
+    (ok (search "api.openai.com" (enchiridion.llm:backend-name backend)))
+    (ok (string= "gpt-5.6-luna"
+                 (enchiridion.llm::openai-connection-model backend)))))
+
+(deftest an-openai-key-selects-openai ()
+  (enchiridion.llm.secrets:clear-secrets)
+  (enchiridion.llm.secrets:register-secret "OPENAI_API_KEY" "fake-openai-key-123456")
+  (unwind-protect
+       (let ((backend (enchiridion.llm:resolve-backend :api-key "k")))
+         (ok (search "api.openai.com"
+                     (enchiridion.llm:backend-name backend)))
+         (ok (string= "OPENAI_API_KEY"
+                      (enchiridion.llm:default-api-key-env))))
+    (enchiridion.llm.secrets:clear-secrets)))
+
+(deftest an-opencode-key-selects-opencode-go ()
+  (enchiridion.llm.secrets:clear-secrets)
+  (enchiridion.llm.secrets:register-secret "OPENCODE_API_KEY"
+                                           "fake-opencode-key-123456")
+  (unwind-protect
+       (let ((backend (enchiridion.llm:resolve-backend :api-key "k")))
+         (ok (search "opencode.ai/zen/go/v1"
+                     (enchiridion.llm:backend-name backend)))
+         (ok (string= "kimi-k3"
+                      (enchiridion.llm::openai-connection-model backend)))
+         (ok (string= "OPENCODE_API_KEY"
+                      (enchiridion.llm:default-api-key-env))))
+    (enchiridion.llm.secrets:clear-secrets)))
+
+(deftest openai-wins-when-both-provider-keys-are-present ()
+  (enchiridion.llm.secrets:clear-secrets)
+  (enchiridion.llm.secrets:register-secret "OPENAI_API_KEY" "fake-openai-key-123456")
+  (enchiridion.llm.secrets:register-secret "OPENCODE_API_KEY"
+                                           "fake-opencode-key-123456")
+  (unwind-protect
+       (ok (search "api.openai.com"
+                   (enchiridion.llm:backend-name
+                    (enchiridion.llm:resolve-backend :api-key "k"))))
+    (enchiridion.llm.secrets:clear-secrets)))
+
+(deftest an-explicit-provider-overrides-the-keys ()
+  (enchiridion.llm.secrets:clear-secrets)
+  (enchiridion.llm.secrets:register-secret "OPENAI_API_KEY" "fake-openai-key-123456")
+  (unwind-protect
+       (let ((backend (enchiridion.llm:resolve-backend
+                       :config '(:llm
+                                 (:provider :opencode)
+                                 (:model-primary "chosen-model"))
+                       :api-key "k")))
+         (ok (search "opencode.ai/zen/go/v1"
+                     (enchiridion.llm:backend-name backend)))
+         (ok (string= "chosen-model"
+                      (enchiridion.llm::openai-connection-model backend))))
+    (enchiridion.llm.secrets:clear-secrets)))
 
 (deftest the-configured-model-reaches-the-backend ()
   ;; The config names a model string, not a tier. Passing it through

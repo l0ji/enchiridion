@@ -232,7 +232,8 @@ the count, which is worse than printing nothing."
           (when (zerop (length key))
             (error 'enchiridion.errors:configuration-error
                    :key :api-key
-                   :detail "No API key. Put OPENCODE_API_KEY in .env or the environment."))
+                   :detail (format nil "No API key. Put ~A in .env or the environment."
+                                   (enchiridion.llm:default-api-key-env config))))
           (let* ((backend (enchiridion.llm:resolve-backend
                            :config config
                            :api-key key))
@@ -305,18 +306,19 @@ when the provider quotes it back. A value that came from the environment is
 registered here for the same reason; otherwise the one path that did not pass
 through .env would be the one that leaks."
   (let* ((config (load-config))
-         (variable (enchiridion:config-value config :api-key-env "OPENCODE_API_KEY"))
-         (path (secrets-path))
-         (file-value (when (probe-file path)
-                       (enchiridion.llm.secrets:load-secrets :path path)
-                       (enchiridion.llm.secrets:secret-value variable)))
-         (value (or file-value
-                    (enchiridion.compat:environment-value variable))))
-    (when (and value
-               (plusp (length value))
-               (not (enchiridion.llm.secrets:secret-present-p variable)))
-      (enchiridion.llm.secrets:register-secret variable value :env))
-    (or value "")))
+         (path (secrets-path)))
+    ;; Load .env before choosing the provider. A key in the file is a key the
+    ;; provider detection can see, and the file is not the process environment.
+    (when (probe-file path)
+      (enchiridion.llm.secrets:load-secrets :path path))
+    (let* ((variable (enchiridion.llm:default-api-key-env config))
+           (value (or (enchiridion.llm.secrets:secret-value variable)
+                      (enchiridion.compat:environment-value variable))))
+      (when (and value
+                 (plusp (length value))
+                 (not (enchiridion.llm.secrets:secret-present-p variable)))
+        (enchiridion.llm.secrets:register-secret variable value :env))
+      (or value ""))))
 
 (defparameter *commands*
   ;; Built with LIST rather than quoted. Under a quote the reader turns #'X

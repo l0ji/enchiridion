@@ -13,12 +13,18 @@
 
 (defparameter *enchiridion-config*
   '(:llm
+    ;;; This template uses OpenCode Go. Without config.cl, a key in
+    ;;; OPENAI_API_KEY selects OpenAI, a key in OPENCODE_API_KEY selects
+    ;;; OpenCode Go, and OpenAI is the fallback. :provider makes the choice
+    ;;; explicit and wins over both the environment and the base URL.
+    (:provider :opencode)
+
     ;;; Which backend protocol to speak. :openai covers OpenCode Go, OpenAI,
     ;;; and any local OpenAI-compatible server. :anthropic covers the Messages
     ;;; API with cache_control. :litellm starts a supervised LiteLLM process.
     (:backend :openai)
 
-    ;;; Base URL. Omit for the backend default.
+    ;;; Base URL. Omit for the provider default.
     (:base-url "https://opencode.ai/zen/go/v1")
 
     ;;; Model tiers. Primary handles reasoning turns. Cheap handles memory
@@ -51,7 +57,7 @@
      ;;; Direct messages only for now. No guilds, no mentions, no reactions.
      ;;; Deny by default: an empty allowlist means nobody may talk to the agent.
      (:allowed-users '("REPLACE-WITH-YOUR-FLUXER-USER-ID"))
-     (:token-env "FLUXER_BOT_TOKEN")))
+     (:token-env "FLUXER_BOT_TOKEN"))
 
    :budget
     ;;; Caps for unattended work. The heartbeat stops acting rather than

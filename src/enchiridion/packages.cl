@@ -84,7 +84,10 @@ recover from a string."))
    ;; than the bare words, because a function named SLEEP in a package that
    ;; uses CL is a package lock error.
    #:*model-primary* #:*model-cheap* #:*model-sleep*
-   #:tier #:model-for-tier #:primary-model #:cheap-model #:sleep-model)
+   #:tier #:model-for-tier #:primary-model #:cheap-model #:sleep-model
+   ;; Provider selection and the variable that holds the key for the active
+   ;; provider. Main uses the second one before it builds the backend.
+   #:detect-provider #:default-api-key-env)
   (:documentation
    "LLM backends, the request and result shapes they share, and the three
 model tiers. The kernel never branches on which backend is in use."))

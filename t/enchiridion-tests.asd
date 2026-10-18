@@ -50,7 +50,8 @@
      (:file "supervisor-test")
      (:file "tool-loop-test")
      (:file "seed-test")
-     (:file "secrets-test"))))
+     (:file "secrets-test")
+     (:file "http-test"))))
 
   ;; Every suite rove collected is run, and the count is checked first. The
   ;; obvious implementation, (rove:run "enchiridion-tests"), finds nothing

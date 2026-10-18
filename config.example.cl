@@ -56,7 +56,11 @@
      (:bind "127.0.0.1")
      (:port 8787)
      (:token-env "ENCHIRIDION_HTTP_TOKEN")
-     (:token nil))
+     (:token nil)
+     ;;; How many bytes of request body the webhook will read. The declared
+     ;;; length is checked first and the bytes are counted as they arrive, so
+     ;;; a chunked body with no length is bounded too.
+     (:max-body-bytes 65536))
 
     (:fluxer
      (:enabled nil)

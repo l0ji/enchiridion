@@ -272,7 +272,8 @@ into. The agent loop never learns which channel a turn arrived on."))
 
 (defpackage #:enchiridion.channel.cli
   (:use #:cl)
-  (:export #:start-cli #:run-repl #:run-command #:command-table #:command-names
+  (:export #:start-cli #:make-cli-channel
+           #:run-repl #:run-command #:command-table #:command-names
            #:command-help #:repl-only-commands
            ;; The context a command reads. Handlers keep the one-argument
            ;; shape the shared table promises, so the live objects a command
@@ -290,15 +291,26 @@ interface, so the two surfaces cannot drift."))
 
 (defpackage #:enchiridion.channel.http
   (:use #:cl)
-  (:export #:start-http #:stop-http #:http-running-p)
+  (:export #:start-http #:stop-http #:http-running-p #:make-http-channel
+           #:http-channel #:http-channel-acceptor
+           #:make-http-service #:make-http-request
+           #:http-channel-service #:http-service-token #:http-service-bind
+           #:http-service-port #:http-service-body-limit
+           #:http-request-method #:http-request-path #:http-request-body
+           #:http-request-authorization #:http-request-content-type
+           #:handle-http-request #:dispatch-http-request #:usage-limit
+           #:loopback-bind-p #:constant-time-string= #:authorized-p
+           #:bearer-token #:json-content-type-p #:declared-length
+           #:check-http-policy
+           #:http-error #:http-error-status #:http-error-message
+           #:+http-body-limit+ #:+http-usage-limit+ #:+http-max-usage-limit+)
   (:documentation
    "The webhook. Loopback by default; a non loopback bind without a token is
 refused at startup rather than at first request."))
 
 (defpackage #:enchiridion.channel.fluxer
   (:use #:cl)
-  (:export #:start-fluxer #:stop-fluxer #:fluxer-running-p #:allowed-p
-           #:make-fluxer-channel)
+  (:export #:start-fluxer #:stop-fluxer #:fluxer-running-p #:allowed-p)
   (:documentation
    "Direct messages only. Group channels, guild events, mentions, and
 reactions are all out, so the allowlist is the whole authorisation story."))
@@ -312,7 +324,7 @@ reactions are all out, so the allowlist is the whole authorisation story."))
    #:supervisor-run-directory
    #:supervisor-generation #:supervisor-channels #:supervisor-running-p
    #:supervisor-heartbeat-p #:supervisor-poll-control #:supervisor-poll-loop
-   #:supervisor-write-status
+   #:supervisor-write-status #:supervisor-started #:channel-row
    #:supervisor-reload #:find-channel
    ;; The two files that let a one-shot shell command talk to a process that is
    ;; already up. A file, not a socket, so tail and grep work on it.
@@ -330,7 +342,8 @@ the shell. It is the only writer of run/enchiridion.status, which is what lets
   (:export
    #:agent #:make-agent #:agent-name #:agent-turn #:run-turn #:agent-snapshot
    #:compile-prompt #:prompt #:prompt-text #:prompt-tokens #:snapshot-p
-   #:record-spend #:spend #:reset-spend #:budget-exhausted-p #:spend-row
+   #:record-spend #:spend #:spend-since #:spend-summary #:reset-spend
+   #:budget-exhausted-p #:spend-row
    #:session #:make-session #:session-id #:session-turns #:end-session
    #:heartbeat #:task-queue #:enqueue-task #:dequeue-task #:task-queue-length
    #:sleep-agent #:run-sleep-pass)

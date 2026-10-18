@@ -467,6 +467,209 @@ over the webhook is not filed as a turn typed at the terminal."
         (finish-output *error-output*)
         1))))
 
+;;;; Channels.
+;;;;
+;;;; A channel never sees an agent, a store or a supervisor: it sees functions.
+;;;; Everything a route needs is built here, in the process that owns the live
+;;;; objects, which is what keeps the channel files above the kernel.
+
+(declaim (ftype (function (keyword string) list) channel-failure))
+
+(defun channel-failure (reason message)
+  "Return the plist a channel reports when a turn did not run."
+  (list :ok-p nil :reply "" :error message :reason reason :usage nil))
+
+(declaim (ftype (function (t) string) condition-line))
+
+(defun condition-line (condition)
+  "Return CONDITION as one line: its report, then its detail when it has one."
+  (let ((detail (and (typep condition 'enchiridion.errors:enchiridion-error)
+                     (enchiridion.errors:error-detail condition))))
+    (if (stringp detail)
+        (format nil "~A ~A" condition detail)
+        (princ-to-string condition))))
+
+(declaim (ftype (function (t) function) make-channel-turn))
+
+(defun make-channel-turn (context)
+  "Return the function a channel calls to run one turn.
+
+The result is a plist, because every channel formats its own answer and none
+of them should have to know what a completion is: :ok-p says whether the turn
+ran, :reply is the text to send, :error is one line when it did not, :reason
+separates a busy agent from a failure, and :usage sums what the turn cost.
+
+The turn takes the agent lock without waiting. A webhook client is better
+served by a 503 and a retry than by a connection held open behind somebody
+else's turn, and the reply is scrubbed here as well as in the kernel: the
+model can echo a secret back, and the outbound path is the last gate."
+  (lambda (message)
+    (handler-case
+        (let ((text (enchiridion.channel:msg-text message))
+              (channel (enchiridion.channel:msg-channel message)))
+          (unless (context-backend context)
+            (error 'enchiridion.errors:configuration-error
+                   :key :api-key
+                   :detail (format nil "No API key. Put ~A in .env or the environment."
+                                   (enchiridion.llm:default-api-key-env
+                                    (context-config context)))))
+          (ensure-started context)
+          (let* ((agent (context-agent context))
+                 (before (length (enchiridion.kernel:spend agent)))
+                 (completion (enchiridion.kernel:run-turn
+                              agent text
+                              :session (context-session context)
+                              :store (context-store context)
+                              :channel channel
+                              :block-p nil)))
+            (list :ok-p t
+                  :reply (enchiridion.llm.secrets:scrub
+                          (enchiridion.llm:completion-text completion))
+                  :error ""
+                  :reason nil
+                  :usage (enchiridion.kernel:spend-summary
+                          (enchiridion.kernel:spend-since agent before)))))
+      (enchiridion.errors:turn-busy (condition)
+        (channel-failure :busy (condition-line condition)))
+      (enchiridion.errors:turn-cancelled (condition)
+        (channel-failure :cancelled (condition-line condition)))
+      (enchiridion.errors:enchiridion-error (condition)
+        (channel-failure :failed (condition-line condition)))
+      (error (condition)
+        (channel-failure :failed (condition-line condition))))))
+
+(declaim (ftype (function (t) t) make-http-health))
+
+(defun make-http-health (supervisor)
+  "Return the function GET /health reads.
+The answer comes from the live supervisor rather than from the status file: a
+file left by a process that stopped reports an uptime that grows forever."
+  (lambda ()
+    (when (enchiridion.supervisor:supervisor-running-p supervisor)
+      (list :ok-p t
+            :uptime (max 0 (- (get-universal-time)
+                              (enchiridion.supervisor:supervisor-started supervisor)))
+            :channels (mapcar #'enchiridion.supervisor:channel-row
+                              (enchiridion.supervisor:supervisor-channels supervisor))))))
+
+(declaim (ftype (function (t) t) make-ledger-reader))
+
+(defun make-ledger-reader (store)
+  "Return the function GET /usage reads.
+A store that refuses the read is reported rather than signalled: the route
+answers 503 with the reason and the process keeps running."
+  (lambda (limit)
+    (if store
+        (handler-case
+            (list :ok-p t :rows (enchiridion.memory.store:usage-rows store :limit limit))
+          (error (condition) (list :ok-p nil :error (princ-to-string condition))))
+        (list :ok-p nil :error "no memory store is open"))))
+
+(declaim (ftype (function (t list) list) http-entry))
+
+(defun http-entry (config options)
+  "Return the :http channel entry with the command line flags applied.
+The entry is a copy: the flags belong to this process, not to the loaded
+configuration, and writing them back would make the next command see them."
+  (let ((entry (copy-list (enchiridion:channel-config :http config))))
+    (when (getf options :bind)
+      (setf (getf entry :bind) (getf options :bind)))
+    (when (getf options :port)
+      (setf (getf entry :port) (getf options :port)))
+    (when (getf options :token-env)
+      (setf (getf entry :token-env) (getf options :token-env)))
+    entry))
+
+(declaim (ftype (function (list) (or null string)) http-token))
+
+(defun http-token (entry)
+  "Return the webhook token named by ENTRY, or NIL.
+
+The value is named by :token-env and read through the loader, so the scrubber
+knows it. A literal :token is accepted for a loopback bind and for tests and
+is registered here for the same reason. Anything read from the environment is
+registered before it is returned: an unregistered token is the one kind the
+shape filter cannot catch."
+  (let ((name (let ((value (getf entry :token-env)))
+                (if (and (stringp value) (plusp (length value)))
+                    value
+                    "ENCHIRIDION_HTTP_TOKEN")))
+        (literal (getf entry :token)))
+    (cond
+      ((and (stringp literal) (plusp (length literal)))
+       (unless (enchiridion.llm.secrets:secret-present-p name)
+         (enchiridion.llm.secrets:register-secret name literal :argument))
+       literal)
+      (t
+       (or (enchiridion.llm.secrets:secret-value name)
+           (let ((value (enchiridion.compat:environment-value name)))
+             (when (and value (plusp (length value)))
+               (enchiridion.llm.secrets:register-secret name value :env)
+               value)))))))
+
+(declaim (ftype (function (t t t list string) list) build-channels))
+
+(defun build-channels (context supervisor command-context options command)
+  "Return the channels this process supervises.
+
+Every channel the process can run is built, not only the enabled ones: the
+control file's `channels enable http` has to be able to start a channel that
+was disabled at startup, and an object that does not exist cannot be started.
+Building one binds no port and opens no socket.
+
+CHAT and SERVE differ by one channel. The REPL is the command's own foreground
+surface, so the cli channel is a supervised channel only under `serve`; giving
+it to chat as well would run a second REPL on a thread."
+  (let* ((config (context-config context))
+         (requested (getf options :channel))
+         (http-p (or (and (stringp requested) (string-equal requested "http"))
+                     (enchiridion:channel-enabled-p :http)))
+         (channels '()))
+    (when (string= command "serve")
+      (push (enchiridion.channel.cli:make-cli-channel :context command-context)
+            channels))
+    (when http-p
+      (let* ((entry (http-entry config options))
+             (bind (or (getf entry :bind) "127.0.0.1"))
+             (port (or (getf entry :port) 8787)))
+        (push (enchiridion.channel.http:make-http-channel
+               :service (enchiridion.channel.http:make-http-service
+                         :turn (make-channel-turn context)
+                         :health (make-http-health supervisor)
+                         :usage (make-ledger-reader (context-store context))
+                         :token (http-token entry)
+                         :bind bind
+                         :port port
+                         :body-limit (or (getf entry :max-body-bytes)
+                                         enchiridion.channel.http:+http-body-limit+)))
+              channels)))
+    (nreverse channels)))
+
+(declaim (ftype (function (list) null) check-channel-policy))
+
+(defun check-channel-policy (channels)
+  "Refuse a webhook that would answer the network without a token, before the
+supervisor starts. CHANNEL-START checks again; this one exists so that a bad
+flag is one line and an exit status instead of a channel that dies and
+restarts every second."
+  (dolist (channel channels)
+    (when (typep channel 'enchiridion.channel.http:http-channel)
+      (enchiridion.channel.http:check-http-policy
+       (enchiridion.channel.http:http-channel-service channel))))
+  nil)
+
+(declaim (ftype (function (t) null) print-condition))
+
+(defun print-condition (condition)
+  "Write CONDITION and its detail, when it has one, to the error stream."
+  (format *error-output* "~&~A~%" condition)
+  (let ((detail (and (typep condition 'enchiridion.errors:enchiridion-error)
+                     (enchiridion.errors:error-detail condition))))
+    (when (stringp detail)
+      (format *error-output* "~A~%" detail)))
+  (finish-output *error-output*)
+  nil)
+
 (defun make-application-supervisor (context)
   "Return the supervisor this process owns, with the broker round trip as its
 reload hook.
@@ -528,29 +731,38 @@ Return an exit status."
   "Return T for the two commands that own a supervisor process."
   (not (null (member name '("chat" "serve") :test #'string=))))
 
-(declaim (ftype (function (string list) integer) run-supervised-command))
+(declaim (ftype (function (string list &optional list) integer) run-supervised-command))
 
-(defun run-supervised-command (name arguments)
+(defun run-supervised-command (name arguments &optional options)
   "Run chat or serve with a supervisor this process owns.
 
 CHAT runs the REPL in the foreground with the control poll on a thread beside
 it, so a reload typed at the REPL reaches a supervisor that answers. SERVE
 hands the supervisor to the command, which starts it and polls in the
-foreground itself."
+foreground itself.
+
+The channels are built and handed over before the supervisor starts. It starts
+whatever is in its list, and an empty list is why `serve` used to come up with
+no channels at all."
   (let ((context (make-context)))
     (unwind-protect
          (progn
            (ensure-started context)
            (let* ((supervisor (make-application-supervisor context))
                   (cancelled (list nil))
-                  (poll nil))
+                  (poll nil)
+                  (command-context
+                    (command-context-for
+                     context
+                     :supervisor supervisor
+                     :respond (make-respond context cancelled)
+                     :cancel (lambda () (setf (car cancelled) t)))))
+             (setf (enchiridion.supervisor:supervisor-channels supervisor)
+                   (build-channels context supervisor command-context options name))
+             (check-channel-policy
+              (enchiridion.supervisor:supervisor-channels supervisor))
              (unwind-protect
-                  (let ((enchiridion.channel.cli:*command-context*
-                          (command-context-for
-                           context
-                           :supervisor supervisor
-                           :respond (make-respond context cancelled)
-                           :cancel (lambda () (setf (car cancelled) t)))))
+                  (let ((enchiridion.channel.cli:*command-context* command-context))
                     (when (string= name "chat")
                       (enchiridion.supervisor:supervisor-start supervisor)
                       (setf poll
@@ -573,37 +785,74 @@ foreground itself."
 (defun split-options (argv)
   "Return two values: the options at the front of ARGV and what follows them.
 
-The channel flags are accepted here so that the command line the plan
-documents works. Only the CLI channel exists yet, so a flag that names another
-one is answered with one line rather than an error."
+A flag and its value are pushed as a pair, and a flag whose value is missing
+is pushed with :MISSING so that MAIN can say which flag it was. A value that
+starts with a dash is the next flag, not a value: --bind --port is a mistake,
+and reading --port as the bind address would hide it."
   (let ((options '()))
     (loop while (and argv
                      (stringp (first argv))
                      (> (length (first argv)) 2)
                      (string= "--" (subseq (first argv) 0 2)))
-          do (let ((flag (subseq (first argv) 2)))
-               (if (member flag '("channel" "bind" "port") :test #'string=)
+          do (let* ((flag (subseq (first argv) 2))
+                    (value (second argv))
+                    (usable (and (stringp value)
+                                 (not (and (> (length value) 1)
+                                           (string= "--" (subseq value 0 2)))))))
+               (if (member flag '("channel" "bind" "port" "token-env") :test #'string=)
                    (progn
-                     (push (second argv) options)
                      (push (intern (string-upcase flag) :keyword) options)
-                     (setf argv (cddr argv)))
+                     (push (if usable value :missing) options)
+                     (setf argv (if usable (cddr argv) (rest argv))))
                    (return (values (nreverse options) argv)))))
     (values (nreverse options) argv)))
+
+(declaim (ftype (function (list) (or null string)) validate-options))
+
+(defun validate-options (options)
+  "Return one line about the first unusable option, or NIL.
+
+The command line is read by a person, so every failure here is a sentence
+rather than a condition: a flag with no value, a channel that does not exist,
+a port that is not a port."
+  (let ((channel (getf options :channel))
+        (port (getf options :port)))
+    (let ((missing (loop for (key value) on options by #'cddr
+                         when (eq value :missing)
+                           return key)))
+      (cond
+        (missing
+         (format nil "The --~(~A~) flag needs a value." missing))
+        ((and channel (not (member channel '("cli" "http" "fluxer") :test #'string=)))
+         (format nil "There is no channel called ~A. The channels are cli, http and fluxer."
+                 channel))
+        ((and (or (getf options :bind) (getf options :port) (getf options :token-env))
+              (not (and channel (string= channel "http"))))
+         "The --bind, --port and --token-env flags belong to --channel http.")
+        ((and port
+              (let ((number (parse-integer port :junk-allowed t)))
+                (or (null number) (< number 1) (> number 65535))))
+         (format nil "The port must be a number between 1 and 65535, not ~A." port))
+        (t nil)))))
 
 (declaim (ftype (function (&rest t) integer) main))
 
 (defun main (&rest argv)
   "Read ARGV, everything after the script name, and run the named command.
-Return an exit status."
+Return an exit status.
+
+A bad flag, an unknown channel and a refused configuration are exit 2, the
+status the command table already uses for a call it could not use. A first
+launch is checked before the channel flags, because nothing may start before
+the operator has had a chance to edit the seed files."
   (handler-case
       (multiple-value-bind (options arguments) (split-options argv)
-        (let ((command (or (first arguments) "")))
-          (when (getf options :channel)
-            (unless (string= (getf options :channel) "cli")
-              (format *error-output*
-                      "~&enchiridion: only the cli channel is implemented; ~A arrives later.~%"
-                      (getf options :channel))
-              (finish-output *error-output*)))
+        (let ((command (or (first arguments) ""))
+              (problem (validate-options options)))
+          (when problem
+            (format *error-output* "~&enchiridion: ~A~%" problem)
+            (finish-output *error-output*)
+            (return-from main 2))
           (cond
             ((string= command "--verify-plugin")
              (let ((directory (second arguments)))
@@ -614,15 +863,25 @@ Return an exit status."
                (verify-plugin-directory directory)))
             ((plusp (length command))
              (if (supervisor-command-p command)
-                 (run-supervised-command command (rest arguments))
+                 (run-supervised-command command (rest arguments) options)
                  (run-command command (rest arguments))))
             ((first-launch-p) (print-first-launch))
+            ;; The plan prints `enchiridion --channel http --bind 127.0.0.1
+            ;; --port 8787` with no subcommand, so a channel flag with no
+            ;; command is a request to serve.
+            (options (run-supervised-command "serve" '() options))
             (t
              (format t "~&Agent directory is ready. Run `enchiridion chat`, or `enchiridion help`.~%")
              (finish-output)
              0))))
+    (enchiridion.errors:usage-error (condition)
+      (print-condition condition)
+      2)
+    (enchiridion.errors:configuration-error (condition)
+      (print-condition condition)
+      2)
     (error (condition)
-      (format *error-output* "~&~A~%" condition)
+      (print-condition condition)
       ;; A command line tool that dies with no trace is a tool the operator
       ;; cannot report a bug about.
       (format *error-output* "~A~%" (enchiridion.compat:backtrace-string 12))

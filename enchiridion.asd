@@ -100,7 +100,11 @@
         :serial t
         :default-component-class "cl-source-file.cl"
         :components
-        ((:file "protocol")))
+        ((:file "protocol")
+         ;; The webhook is a channel like the terminal one, and it needs only
+         ;; the protocol, the JSON writer and the server: it never mentions a
+         ;; supervisor, a store or a kernel, which is why it can load here.
+         (:file "http")))
        (:file "supervisor")
        (:file "kernel")
        (:module "cli"

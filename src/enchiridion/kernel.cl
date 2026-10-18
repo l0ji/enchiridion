@@ -165,6 +165,45 @@ than pretending to serialise."
   "Return AGENT's spend rows oldest first."
   (reverse (agent-spend agent)))
 
+(declaim (ftype (function (agent integer) list) spend-since))
+
+(defun spend-since (agent index)
+  "Return AGENT's spend rows from INDEX onwards, oldest first.
+
+A caller records (length (spend agent)) before a turn and asks for the tail
+after it. That is the only way to report what one turn cost: a turn with tool
+calls makes several model calls, and the completion it returns is only the
+last of them."
+  (check-type index (integer 0 *))
+  (nthcdr index (spend agent)))
+
+(declaim (ftype (function (list) list) spend-summary))
+
+(defun spend-summary (rows)
+  "Return ROWS, spend rows, summed as the plist a caller reports.
+
+The model is the last row's, because that is the call that answered. ROUNDS is
+how many model calls the rows cover, which is what tells a caller whether the
+turn used tools at all."
+  (let ((input 0)
+        (output 0)
+        (cache-read 0)
+        (cache-write 0)
+        (model ""))
+    (dolist (row rows)
+      (incf input (spend-row-input row))
+      (incf output (spend-row-output row))
+      (incf cache-read (spend-row-cache-read row))
+      (incf cache-write (spend-row-cache-write row))
+      (setf model (spend-row-model row)))
+    (list :model model
+          :input input
+          :output output
+          :cache-read cache-read
+          :cache-write cache-write
+          :rounds (length rows)
+          :total (+ input output))))
+
 (declaim (ftype (function (agent) null) reset-spend))
 
 (defun reset-spend (agent)

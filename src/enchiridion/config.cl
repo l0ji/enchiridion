@@ -102,7 +102,7 @@ store path. The model defaults match the shipped adapter defaults."
     :channels
     (:cli (:enabled t))
     (:http (:enabled nil) (:bind "127.0.0.1") (:port 8787) (:token nil)
-           (:token-env "ENCHIRIDION_HTTP_TOKEN"))
+           (:token-env "ENCHIRIDION_HTTP_TOKEN") (:max-body-bytes 65536))
     (:fluxer (:enabled nil) (:allowed-users nil) (:token-env "FLUXER_BOT_TOKEN"))
 
     :budget

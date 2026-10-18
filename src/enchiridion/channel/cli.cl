@@ -957,8 +957,21 @@ other channel."))
   "Run the REPL to completion and return CHANNEL.
 
 The channel is live for as long as the REPL reads, which is what a supervisor
-owning this channel on a thread needs to see."
+owning this channel on a thread needs to see.
+
+A terminal is what makes this channel real. Under `serve` in a container there
+is no terminal: the REPL would read end of file at once, the channel would
+return, and the supervisor's restart loop would start a new one every second
+for the life of the process. A channel with no terminal says so once and stops
+instead, and the operator reads that line rather than a restart every second."
   (declare (ignore config))
+  (unless (interactive-stream-p *standard-input*)
+    (format *error-output*
+            "~&enchiridion: stdin is not a terminal, so the cli channel stays down.~%")
+    (finish-output *error-output*)
+    (setf (enchiridion.channel:channel-live-p channel) nil
+          (enchiridion.channel:channel-state channel) :stopped)
+    (return-from enchiridion.channel:channel-start channel))
   (setf (enchiridion.channel:channel-live-p channel) t
         (enchiridion.channel:channel-state channel) :live)
   (unwind-protect

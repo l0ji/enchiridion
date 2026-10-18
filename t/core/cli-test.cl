@@ -77,7 +77,7 @@ is not."
 (deftest the-plan-argument-ranges-are-in-the-table ()
   (dolist (expected '(("ask" 1 nil) ("memory" 1 nil) ("skills" 0 2)
                       ("undo" 1 1) ("reload" 0 0) ("help" 0 1)
-                      ("journey" 0 2) ("tasks" 0 2) ("channels" 0 2)
+                      ("journey" 0 2) ("tasks" 0 nil) ("channels" 0 2)
                       ("heartbeat" 0 1) ("init" 0 1) ("check" 0 0)))
     (destructuring-bind (name minimum maximum) expected
       (let ((row (command-row name)))

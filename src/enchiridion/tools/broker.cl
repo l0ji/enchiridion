@@ -293,7 +293,7 @@ report, a hash table with the keys ok, generation and report."
           (setf (broker-running-p broker) t)
           broker)
       (error (condition)
-        (ignore-errors (sb-ext:process-kill child :sigterm))
+        (ignore-errors (enchiridion.compat:process-kill child :sigterm))
         (error condition)))))
 
 (defun broker-start (broker &key (in-process nil))
@@ -317,7 +317,7 @@ Return BROKER."
     (ignore-errors (bordeaux-threads:destroy-thread (broker-server-thread broker)))
     (setf (broker-server-thread broker) nil))
   (when (broker-child broker)
-    (ignore-errors (sb-ext:process-kill (broker-child broker) :sigterm))
+    (ignore-errors (enchiridion.compat:process-kill (broker-child broker) :sigterm))
     (setf (broker-child broker) nil))
   (ignore-errors (delete-file (broker-socket broker)))
   (setf (broker-running-p broker) nil)

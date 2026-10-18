@@ -192,6 +192,31 @@ the host keeps using /tmp."
                         (uiop:getenv "ENCHIRIDION_HOME")))
       #p"/tmp/"))
 
+(defparameter +signal-numbers+
+  '((:sigterm . 15) (:sigkill . 9) (:sigint . 2) (:sighup . 1) (:sigtstp . 20))
+  "The signals this tree sends, as numbers.
+
+SBCL's PROCESS-KILL wants a signal number and a keyword is a type error, which
+an IGNORE-ERRORS then hides: the process is never killed and nothing says so.
+The mapping lives here because it is an implementation detail.")
+
+(declaim (ftype (function (t t) t) process-kill))
+
+(defun process-kill (process signal)
+  "Send SIGNAL to PROCESS. SIGNAL is a keyword or a number.
+
+On the pinned SBCL, (SB-EXT:PROCESS-KILL p :SIGTERM) signals a type error and
+(SB-EXT:PROCESS-KILL p 15) works. Every caller writes the keyword, so the
+translation has to be here rather than at five call sites."
+  #+sbcl (sb-ext:process-kill
+          process
+          (if (integerp signal)
+              signal
+              (or (cdr (assoc signal +signal-numbers+)) 15)))
+  #-sbcl (progn
+           (declare (ignore process signal))
+           (error "No process signal sender is available in ~A." +implementation+)))
+
 (defun run-program-capture (program arguments &key (timeout nil) (environment nil))
   "Run PROGRAM with ARGUMENTS and return its combined output and exit status.
 
@@ -237,9 +262,9 @@ and to switch signing off without writing any configuration file."
                                      "")
                                  code))))
              (when (and deadline (> (get-internal-real-time) deadline))
-               (ignore-errors (sb-ext:process-kill process :sigterm))
+               (ignore-errors (process-kill process :sigterm))
                (sleep 0.1)
-               (ignore-errors (sb-ext:process-kill process :sigkill))
+               (ignore-errors (process-kill process :sigkill))
                (return (values (if (probe-file path)
                                    (uiop:read-file-string path)
                                    "")

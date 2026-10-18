@@ -439,14 +439,47 @@ ends. Return :QUIT or :EOF."
     (say "~A" output)
     (if (eql 0 status) 0 1)))
 
+(declaim (ftype (function (t) t) skill-trigger))
+
+(defun skill-trigger (path)
+  "Return the trigger line a skill file declares, or NIL.
+
+The trigger is the string in a top-level (defparameter +trigger+ ...) form. The
+file is read with *READ-EVAL* NIL and nothing is evaluated: a listing must not
+run the code it lists. A file that will not read has no trigger, and that is
+not an error for a listing."
+  (handler-case
+      (with-open-file (stream path :direction :input :external-format :utf-8)
+        (let ((*read-eval* nil)
+              (*package* (find-package :enchiridion.channel.cli)))
+          (loop for form = (read stream nil :eof)
+                until (eq form :eof)
+                when (and (consp form)
+                          (eq (first form) 'defparameter)
+                          (symbolp (second form))
+                          (string-equal "+TRIGGER+" (symbol-name (second form)))
+                          (stringp (third form)))
+                  do (return (third form)))))
+    (error () nil)))
+
 (declaim (ftype (function (list) integer) cmd-skills))
 
 (defun cmd-skills (arguments)
-  "List the agent's skills, or show one."
+  "List the agent's skills with their trigger line, or show one.
+
+The trigger line is charged on every turn, which is why it is short and why it
+belongs in the listing the operator reads."
   (let ((files (agent-files-in "skills/"))
         (action (string-downcase (or (first arguments) "list"))))
     (cond
-      ((string= action "list") (list-numbered files) 0)
+      ((string= action "list")
+       (if files
+           (loop for path in files
+                 for index from 1
+                 do (say "~D. ~A~@[ -- ~A~]"
+                         index (file-namestring path) (skill-trigger path)))
+           (say "no skills yet."))
+       0)
       ((string= action "show") (show-numbered files (second arguments)))
       (t (say "skills takes list or show NUMBER.") 2))))
 
@@ -719,8 +752,10 @@ file a block is backed by."
         (let ((branch (ignore-errors (enchiridion.git:git-current-branch root)))
               (head (ignore-errors (enchiridion.git:git-head root))))
           (say "source ~A" root)
-          (when branch (say "branch ~A" branch))
-          (when head (say "head   ~A" head)))
+          (when (and branch (plusp (length branch)))
+            (say "branch ~A" branch))
+          (when (and head (plusp (length head)))
+            (say "head   ~A" head)))
         (say "no checkout was found above this directory.")))
   0)
 
@@ -865,7 +900,7 @@ operator's view of a state machine the agent works through."
    (list "undo" 1 1 #'cmd-undo "Roll back the nth change in the agent directory")
    (list "usage" 0 0 #'cmd-usage "Token ledger by model, day and channel")
    (list "budget" 0 0 #'cmd-budget "Spend against the caps")
-   (list "tasks" 0 2 #'cmd-tasks "The task queue")
+   (list "tasks" 0 nil #'cmd-tasks "The task queue")
    (list "secrets" 0 0 #'cmd-secrets "Names and sources, never values")
    (list "version" 0 0 #'cmd-version "Version and build provenance")
    (list "help" 0 1 #'cmd-help "Command list, or detail for one")

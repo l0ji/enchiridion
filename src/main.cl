@@ -335,18 +335,10 @@ turn: the builtins still work, and the agent is told what happened."
   nil)
 
 ;;;; The agent repository.
-
-(defun ensure-agent-repository (directory)
-  "Make DIRECTORY a git repository when it is not one, and commit what is
-there. Return the commit hash, or NIL when there was nothing to commit.
-
-The repository is nested: the agent's history is its own, so `enchiridion
-undo` rolls back an agent change and never a change to the harness."
-  (if (enchiridion.git:repository-p directory)
-      (enchiridion.git:git-commit-all directory "Record the agent directory")
-      (progn
-        (enchiridion.git:git-init directory)
-        (enchiridion.git:git-commit-all directory "Create the agent directory"))))
+;;;;
+;;;; The repository itself is created by ENCHIRIDION.MEMORY:INIT-AGENT, so that
+;;;; `init` and the first launch cannot disagree about whether one exists. What
+;;;; lives here is the commit that follows a turn.
 
 (defun commit-agent-turn (context label)
   "Commit whatever the turn changed in the agent directory.
@@ -665,7 +657,6 @@ Return an exit status."
           (finish-output)
           1)
         (progn
-          (ensure-agent-repository (agent-directory))
           (format t "~&Bootstrap has not started. Edit SOUL.md, OPERATOR.md, and WORLD.md first,~%")
           (format t "then run `enchiridion chat`. See agents/default/GUIDE.md for the walkthrough.~%")
           (finish-output)

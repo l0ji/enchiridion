@@ -383,13 +383,15 @@ a keyword, because both spellings reach here."
         (name (second arguments)))
     (cond
       ((string= action "list")
-       (format nil "~{~A~^, ~}"
-               (mapcar (lambda (channel)
-                         (format nil "~A ~A"
-                                 (enchiridion.channel:channel-name channel)
-                                 (string-downcase
-                                  (string (enchiridion.channel:channel-state channel)))))
-                       (supervisor-channels supervisor))))
+       (if (supervisor-channels supervisor)
+           (format nil "~{~A~^, ~}"
+                   (mapcar (lambda (channel)
+                             (format nil "~A ~A"
+                                     (enchiridion.channel:channel-name channel)
+                                     (string-downcase
+                                      (string (enchiridion.channel:channel-state channel)))))
+                           (supervisor-channels supervisor)))
+           "no channels are up."))
       ((member action '("enable" "disable") :test #'string=)
        (let ((channel (and name (find-channel supervisor name))))
          (cond

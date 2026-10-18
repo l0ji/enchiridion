@@ -37,7 +37,7 @@ because a file in the repository is a file that ends up in a store path."))
    #:environment #:environment-value #:environment-bound-p
    #:run-program #:run-program-blocking #:process-uid #:set-process-uid
    #:process-user #:set-process-user #:implementation-dependency-p
-   #:process-id
+   #:process-id #:process-kill
    #:script-arguments #:exit-with #:backtrace-string
    #:encode-utf8 #:decode-utf8 #:run-program-capture #:temp-directory
    #:set-file-mode)
@@ -141,6 +141,7 @@ did not think of."))
    ;; Seed files and the first launch.
    #:init-agent #:init-result #:init-created #:init-existing
    #:init-status-line #:agent-seeded-p #:seed-file-names #:write-if-absent
+   #:ensure-agent-repository
    #:init-result-directory #:init-result-existed-p #:init-problems
    #:seed-subdirectories
    ;; Templates, exported so that a test can assert on them without a disk.

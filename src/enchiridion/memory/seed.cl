@@ -474,6 +474,30 @@ type error, so the answer is coerced."
   (not (null (some (lambda (name) (probe-file (merge-pathnames name directory)))
                    (seed-file-names)))))
 
+(declaim (ftype (function (t) t) ensure-agent-repository))
+
+(defun ensure-agent-repository (directory)
+  "Make DIRECTORY a git repository when it is not one, and commit what is
+there. Return the commit hash, or NIL.
+
+The repository is nested: the agent's history is its own, so `enchiridion
+undo` rolls a change back inside the agent directory and never inside the
+harness. A host with no git, and a build sandbox with no identity, both leave
+the files alone: they are written either way, and the commit is what turns
+them into a journey the operator can read.
+
+This lives with INIT-AGENT and not with the first launch, because
+`enchiridion init` and the first launch are the same thing on demand, and a
+directory created by one of them must not be a repository while the other one
+is not."
+  (handler-case
+      (if (enchiridion.git:repository-p directory)
+          (enchiridion.git:git-commit-all directory "Record the agent directory")
+          (progn
+            (enchiridion.git:git-init directory)
+            (enchiridion.git:git-commit-all directory "Create the agent directory")))
+    (error () nil)))
+
 (defun init-agent (directory)
   "Create DIRECTORY and write every seed file that is not already there. Never
 overwrite anything. Return an init-result holding what was written and what
@@ -481,7 +505,10 @@ was left alone.
 
 A directory that cannot be made is a result with a problem, not a signal. The
 caller prints the problems and exits; the operator gets the path and the OS
-error instead of a backtrace from inside ASDF's source registry."
+error instead of a backtrace from inside ASDF's source registry.
+
+The repository is created here, once, after the files are on disk: a commit of
+an empty directory would be a history with nothing in it."
   (handler-case
       (progn
         (ensure-directories-exist (merge-pathnames "x" directory))
@@ -502,6 +529,8 @@ error instead of a backtrace from inside ASDF's source registry."
                     (:created (push name created))
                     (:kept (push name existing))
                     (otherwise (push (cons name condition) problems))))))
+            (unless problems
+              (ensure-agent-repository directory))
             (%make-init-result :directory (namestring directory)
                                 :created (nreverse created)
                                 :existing (nreverse existing)

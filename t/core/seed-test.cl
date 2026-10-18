@@ -85,7 +85,9 @@ demands :VALIDATE T, and signals unless the directory is really there, so
       (ok (null (enchiridion.memory:init-problems result)))
       (testing "every file is on disk after init"
         (dolist (name (enchiridion.memory:seed-file-names))
-          (ok (probe-file (merge-pathnames name directory))))))))
+          (ok (probe-file (merge-pathnames name directory)))))
+      (testing "and the directory is a repository of its own, from init"
+        (ok (enchiridion.git:repository-p directory))))))
 
 (deftest init-never-overwrites ()
   ;; The one that matters. Seed a directory with an operator's edit, rerun

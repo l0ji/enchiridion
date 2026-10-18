@@ -221,3 +221,18 @@ is not."
           (multiple-value-bind (text status) (captured-run name arguments)
             (ok (eql 1 status))
             (ok (search "memory store" text))))))))
+
+;;;; The budget.
+
+(deftest budget-reads-the-budget-section ()
+  (let ((enchiridion.channel.cli:*command-context*
+          (enchiridion.channel.cli:make-command-context
+           :config '(:llm (:backend :openai)
+                     :budget (:max-tokens-per-tick 1234) (:max-tokens-per-day 5678)))))
+    (multiple-value-bind (text status) (captured-run "budget" '())
+      (ok (eql 0 status))
+      (testing "a configured cap is printed"
+        (ok (search "1234" text))
+        (ok (search "5678" text)))
+      (testing "and it is not reported as none"
+        (ng (search "none" text))))))

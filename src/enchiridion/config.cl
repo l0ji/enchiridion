@@ -63,6 +63,21 @@ fallback, so a one-line config still reads the way it looks."
       ((sectioned-config-p config) default)
       (t (getf config key default)))))
 
+(declaim (ftype (function (t keyword keyword &optional t) t) config-section-value))
+
+(defun config-section-value (config section key &optional default)
+  "Return KEY from SECTION of CONFIG, or DEFAULT.
+
+CONFIG-VALUE reads the :LLM section only, because that is where every option
+it was written for lives. The budget caps, the agent uid, the sleep interval
+and the memory limits live in sections of their own, and an option read
+through CONFIG-VALUE falls back to the default in silence: `budget` prints no
+cap for a cap that is configured, and the heartbeat never finds its interval.
+A flat CONFIG has no sections, so there DEFAULT is the whole answer rather
+than a value invented from a shape that does not carry one."
+  (let ((entry (assoc key (config-section config section) :test #'eq)))
+    (if entry (second entry) default)))
+
 ;;;; The active configuration.
 ;;;;
 ;;;; One plist is active for the life of the process, bound by READ-CONFIG.
@@ -137,25 +152,63 @@ what lets an explicit NIL in config.cl mean NIL rather than missing."
         (config-value (default-config) key default)
         value)))
 
+(declaim (ftype (function (t) keyword) channel-key))
+
+(defun channel-key (name)
+  "Return NAME as the keyword the :CHANNELS section is keyed by.
+A keyword and a string are one value everywhere else in the tree and they are
+one value here."
+  (if (keywordp name) name (intern (string-upcase (string name)) :keyword)))
+
+(declaim (ftype (function (t) list) channel-options))
+
+(defun channel-options (entry)
+  "Return one :CHANNELS entry as a property list.
+
+A channel entry is a list of (key value ...) entries, not a property list.
+GETF on that shape reads the first option and nothing else, so every option
+after :ENABLED was unreachable: the webhook could never find its bind address
+and Fluxer could never find its allowlist. This is the one place that knows
+the difference."
+  (loop for option in (rest entry)
+        append (list (first option) (second option))))
+
 (declaim (ftype (function (t &optional t) t) channel-config))
 
 (defun channel-config (name &optional (config (config)))
-  "Return the plist under :CHANNELS for NAME, or the default entry for NAME.
+  "Return the plist under :CHANNELS for NAME, or the shipped entry for NAME.
+
 NAME is a keyword or a string; the two are one value everywhere else in the
-tree and they are one value here."
-  (let* ((config (or config (config)))
-         (name (if (keywordp name)
-                   name
-                   (intern (string-upcase (string name)) :keyword))))
-    (or (second (assoc name (config-section config :channels) :test #'eq))
-        (second (assoc name (config-section (default-config) :channels) :test #'eq)))))
+tree and they are one value here. The operator's options win key by key and
+the shipped entry fills the gaps, so a config.cl that writes
+(:http (:enabled t)) keeps the default bind address and port instead of
+losing them. An explicit NIL in the operator's entry is a value and wins: it
+means off, not missing."
+  (let ((key (channel-key name)))
+    (let ((options '()))
+      (dolist (entry (list (assoc key (config-section (default-config) :channels)
+                                  :test #'eq)
+                           (assoc key (config-section (or config (config)) :channels)
+                                  :test #'eq)))
+        (when entry
+          (loop for (option value) on (channel-options entry) by #'cddr
+                do (setf (getf options option) value))))
+      options)))
+
+(declaim (ftype (function (t keyword &optional t) t) channel-value))
+
+(defun channel-value (name key &optional default)
+  "Return KEY of the channel called NAME, or DEFAULT.
+CHANNEL-CONFIG already merges the operator's entry over the shipped one, so
+this is only the reader that gives a missing key a caller's default."
+  (getf (channel-config name) key default))
 
 (declaim (ftype (function (t) boolean) channel-enabled-p))
 
 (defun channel-enabled-p (name)
   "Return T when the channel called NAME is enabled. A channel with no entry
 is disabled, because an unconfigured channel that starts is a surprise."
-  (not (null (getf (channel-config name) :enabled))))
+  (not (null (channel-value name :enabled))))
 
 (declaim (ftype (function (keyword) t) model-for))
 

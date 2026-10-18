@@ -29,8 +29,10 @@
 
     ;;; Model tiers. Primary handles reasoning turns. Cheap handles memory
     ;;; digests and compaction. Sleep handles the sleep-time agent, which can
-    ;;; afford a stronger model because nothing is waiting on it.
-    (:model-primary "kimi-k3")
+    ;;; afford a stronger model because nothing is waiting on it. Every tier
+    ;;; defaults to the cheap model, and :model-primary is the one to raise
+    ;;; when a turn is worth the stronger one.
+    (:model-primary "space-bunny")
     (:model-cheap   "space-bunny")
     (:model-sleep   "space-bunny")
 

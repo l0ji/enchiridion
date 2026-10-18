@@ -95,8 +95,10 @@ added twice: it is already part of the prompt the provider counted."
 ;;;; warning here is an error.
 
 (defparameter *model-primary*
-  "kimi-k3"
-  "The model that handles reasoning turns.")
+  "space-bunny"
+  "The model that handles reasoning turns. It defaults to the cheap model: a
+default that spends more per turn is a default the operator did not choose,
+and a stronger primary is one :MODEL-PRIMARY line in config.cl away.")
 
 (defparameter *model-cheap*
   "space-bunny"

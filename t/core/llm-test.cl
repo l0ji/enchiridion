@@ -307,7 +307,7 @@
        (let ((backend (enchiridion.llm:resolve-backend :api-key "k")))
          (ok (search "opencode.ai/zen/go/v1"
                      (enchiridion.llm:backend-name backend)))
-         (ok (string= "kimi-k3"
+         (ok (string= "space-bunny"
                       (enchiridion.llm::openai-connection-model backend)))
          (ok (string= "OPENCODE_API_KEY"
                       (enchiridion.llm:default-api-key-env))))

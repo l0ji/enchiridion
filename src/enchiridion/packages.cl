@@ -265,7 +265,8 @@ than the process."))
    #:define-channel #:channel-name #:channel-live-p #:channel-state
    #:channel-thread
    #:msg #:make-msg #:msg-id #:msg-channel #:msg-target #:msg-thread #:msg-author
-   #:msg-text #:msg-ts #:msg-reply-to #:normalize #:deliver #:message-digest)
+   #:msg-text #:msg-ts #:msg-reply-to #:normalize #:deliver #:message-digest
+   #:digest-text)
   (:documentation
    "The channel protocol and the one message shape every channel normalizes
 into. The agent loop never learns which channel a turn arrived on."))
@@ -310,7 +311,8 @@ refused at startup rather than at first request."))
 
 (defpackage #:enchiridion.channel.fluxer
   (:use #:cl)
-  (:export #:start-fluxer #:stop-fluxer #:fluxer-running-p #:allowed-p)
+  (:export #:start-fluxer #:stop-fluxer #:fluxer-running-p #:allowed-p
+           #:make-fluxer-channel)
   (:documentation
    "Direct messages only. Group channels, guild events, mentions, and
 reactions are all out, so the allowlist is the whole authorisation story."))

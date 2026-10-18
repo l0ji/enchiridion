@@ -624,6 +624,8 @@ it to chat as well would run a second REPL on a thread."
          (requested (getf options :channel))
          (http-p (or (and (stringp requested) (string-equal requested "http"))
                      (enchiridion:channel-enabled-p :http)))
+         (fluxer-p (or (and (stringp requested) (string-equal requested "fluxer"))
+                       (enchiridion:channel-enabled-p :fluxer)))
          (channels '()))
     (when (string= command "serve")
       (push (enchiridion.channel.cli:make-cli-channel :context command-context)
@@ -643,6 +645,14 @@ it to chat as well would run a second REPL on a thread."
                          :body-limit (or (getf entry :max-body-bytes)
                                          enchiridion.channel.http:+http-body-limit+)))
               channels)))
+    (when fluxer-p
+      ;; The channel resolves its own allowlist and token from the
+      ;; configuration it is handed, so a test and the supervisor use the same
+      ;; reader and a short :fluxer entry cannot lose the operator's allowlist.
+      (push (enchiridion.channel.fluxer:make-fluxer-channel
+             :turn (make-channel-turn context)
+             :config config)
+            channels))
     (nreverse channels)))
 
 (declaim (ftype (function (list) null) check-channel-policy))

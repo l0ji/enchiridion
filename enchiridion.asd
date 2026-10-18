@@ -104,7 +104,12 @@
          ;; The webhook is a channel like the terminal one, and it needs only
          ;; the protocol, the JSON writer and the server: it never mentions a
          ;; supervisor, a store or a kernel, which is why it can load here.
-         (:file "http")))
+         (:file "http")
+         ;; The Fluxer channel is a second channel and not a branch in the
+         ;; supervisor: it was written only after a live gateway stayed up.
+         ;; It needs the protocol, the scrubber, the configuration reader,
+         ;; and the websocket client, all of which load before this module.
+         (:file "fluxer")))
        (:file "supervisor")
        (:file "kernel")
        (:module "cli"

@@ -48,10 +48,14 @@
 
     (:http
      (:enabled nil)
-     ;;; Loopback only by default. A non-loopback bind requires :token, and
-     ;;; the harness refuses to start without one.
+     ;;; Loopback only by default. A non-loopback bind requires a token, and
+     ;;; the harness refuses to start without one. The token comes from the
+     ;;; variable named here, or from .env, and never from this file: a
+     ;;; literal here would not pass through the scrubber. :token stays
+     ;;; accepted for a loopback bind and for tests.
      (:bind "127.0.0.1")
      (:port 8787)
+     (:token-env "ENCHIRIDION_HTTP_TOKEN")
      (:token nil))
 
     (:fluxer

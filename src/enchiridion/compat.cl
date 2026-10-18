@@ -79,6 +79,44 @@ rather than on a reader conditional.")
   (declare (ignore name))
   (error "No environment reader is available in ~A." +implementation+))
 
+(declaim (ftype (function (string string) string) set-environment-variable))
+
+#+sbcl
+(defun set-environment-variable (name value)
+  "Set environment variable NAME to VALUE and return VALUE.
+
+The pair with UNSET-ENVIRONMENT-VARIABLE exists so that the unset can be
+proved. An absent name is the ordinary case here, and a test that only checks
+an absent name proves nothing about the writer."
+  (sb-posix:setenv name value 1)
+  value)
+
+#-sbcl
+(defun set-environment-variable (name value)
+  "Set environment variable NAME to VALUE and return VALUE."
+  (declare (ignore name value))
+  (error "No environment writer is available in ~A." +implementation+))
+
+(declaim (ftype (function (string) boolean) unset-environment-variable))
+
+#+sbcl
+(defun unset-environment-variable (name)
+  "Remove environment variable NAME from this process and return T.
+
+PLAN.md section 5.2: the supervisor reads its secrets once, holds the values
+in memory, and then removes them from its own environment, so a child cannot
+inherit a key and a later /proc read finds nothing. SB-POSIX:UNSETENV reports
+no status and a name that was never set is not an error, so T is the honest
+answer to the only question that is left: the name is gone from this process."
+  (sb-posix:unsetenv name)
+  t)
+
+#-sbcl
+(defun unset-environment-variable (name)
+  "Remove environment variable NAME from this process and return T."
+  (declare (ignore name))
+  (error "No environment writer is available in ~A." +implementation+))
+
 (declaim (ftype (function () list) environment))
 
 #+sbcl

@@ -27,6 +27,23 @@
     (ng (enchiridion.compat:environment-bound-p name))
     (ng (enchiridion.compat:environment-value name))))
 
+(deftest a-variable-can-be-set-and-then-unset ()
+  ;; The unset is the step that keeps a loaded secret out of a child's
+  ;; environment, so it is proved on a name that was really there rather than
+  ;; on one that was never set.
+  (let ((name "ENCHIRIDION_COMPAT_TEST_VALUE"))
+    (unwind-protect
+         (progn
+           (enchiridion.compat:set-environment-variable name "present")
+           (testing "the setter makes the value readable"
+             (ok (enchiridion.compat:environment-bound-p name))
+             (ok (string= "present" (enchiridion.compat:environment-value name))))
+           (testing "and the unset removes it"
+             (ok (enchiridion.compat:unset-environment-variable name))
+             (ng (enchiridion.compat:environment-bound-p name))
+             (ng (enchiridion.compat:environment-value name))))
+      (enchiridion.compat:unset-environment-variable name))))
+
 (deftest the-environment-is-an-alist-of-strings ()
   ;; An alist, not a list of NAME=VALUE strings. The supervisor builds the
   ;; broker's whole environment from this, and SBCL has changed the shape of

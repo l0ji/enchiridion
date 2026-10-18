@@ -79,6 +79,31 @@
               (enchiridion:config-section-value config :budget :max-tokens-per-tick
                                                 :fallback))))))
 
+(deftest every-credential-name-the-config-mentions-is-collected ()
+  (testing "the shipped names, so an unconfigured harness still loads them"
+    (ok (equal '("OPENAI_API_KEY" "FLUXER_BOT_TOKEN" "ENCHIRIDION_HTTP_TOKEN")
+               (enchiridion:configured-secret-names (enchiridion:default-config)))))
+  (testing "a configured name wins and the channels are still read"
+    (let ((config '(:llm (:api-key-env "MY_LLM_KEY")
+                    :channels (:http (:enabled t) (:token-env "MY_WEBHOOK_TOKEN"))
+                               (:fluxer (:enabled t) (:token-env "MY_FLUXER_TOKEN")))))
+      (ok (equal '("MY_LLM_KEY" "MY_FLUXER_TOKEN" "MY_WEBHOOK_TOKEN")
+                 (enchiridion:configured-secret-names config)))))
+  (testing "an empty name is skipped rather than turned back into a default"
+    ;; The operator wrote the empty string, so it wins over the shipped name
+    ;; the way every other explicit value does; there is simply nothing to
+    ;; read. FLUXER_BOT_TOKEN is still collected because :fluxer was not
+    ;; configured at all.
+    (ok (equal '("FLUXER_BOT_TOKEN")
+               (enchiridion:configured-secret-names
+                '(:llm (:api-key-env "")
+                  :channels (:http (:enabled t) (:token-env "")))))))
+  (testing "a name repeated in two places is collected once"
+    (let ((config '(:llm (:api-key-env "SAME_NAME")
+                    :channels (:http (:enabled t) (:token-env "SAME_NAME")))))
+      (ok (equal '("SAME_NAME" "FLUXER_BOT_TOKEN")
+                 (enchiridion:configured-secret-names config))))))
+
 (deftest a-channel-entry-inherits-what-it-does-not-name ()
   (let ((config '(:llm (:backend :openai)
                   :channels (:http (:enabled t) (:port 9999)))))

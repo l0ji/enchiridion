@@ -101,7 +101,8 @@ store path. The model defaults match the shipped adapter defaults."
 
     :channels
     (:cli (:enabled t))
-    (:http (:enabled nil) (:bind "127.0.0.1") (:port 8787) (:token nil))
+    (:http (:enabled nil) (:bind "127.0.0.1") (:port 8787) (:token nil)
+           (:token-env "ENCHIRIDION_HTTP_TOKEN"))
     (:fluxer (:enabled nil) (:allowed-users nil) (:token-env "FLUXER_BOT_TOKEN"))
 
     :budget
@@ -209,6 +210,25 @@ this is only the reader that gives a missing key a caller's default."
   "Return T when the channel called NAME is enabled. A channel with no entry
 is disabled, because an unconfigured channel that starts is a surprise."
   (not (null (channel-value name :enabled))))
+
+(declaim (ftype (function (t) list) configured-secret-names))
+
+(defun configured-secret-names (config)
+  "Return every environment variable name the configuration says holds a secret.
+
+The API key, the Fluxer bot token and the webhook token are each named by a
+configuration key rather than written into the file, so the loader has to ask
+the configuration which names to read. One list, one call to the loader, and
+one place to audit: a channel whose token variable is missing from this list
+is a token that never reaches the scrubber, and an unregistered token is the
+one kind the shape filter cannot catch."
+  (let ((names '()))
+    (dolist (name (list (config-value config :api-key-env)
+                        (getf (channel-config :fluxer config) :token-env)
+                        (getf (channel-config :http config) :token-env)))
+      (when (and (stringp name) (plusp (length name)))
+        (pushnew name names :test #'string=)))
+    (nreverse names)))
 
 (declaim (ftype (function (keyword) t) model-for))
 

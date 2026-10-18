@@ -24,7 +24,7 @@
   (:export
    #:main #:project-root #:resolve-project-root #:agent-directory
    #:environment-value #:load-config #:first-launch-p #:run-command
-   #:join-arguments #:secrets-api-key)
+   #:join-arguments #:load-configured-secrets)
   (:documentation
    "Process entry: roots, configuration, argument handling, and first launch."))
 
@@ -194,33 +194,38 @@ checkout, so the current directory is the one that can see the host file."
   (enchiridion.llm.secrets:secrets-file
    :directories (list (getcwd) (enchiridion:project-root))))
 
-(declaim (ftype (function () string) secrets-api-key))
+(declaim (ftype (function (&optional t) string) load-configured-secrets))
 
-(defun secrets-api-key ()
-  "Return the API key, loading .env first if there is one.
+(defun load-configured-secrets (&optional config)
+  "Load every secret the configuration names, then unset those names, and
+return the API key.
 
 The key comes from the loader rather than from getenv so that there is one
 path to a secret. .env is read here, held in memory by the loader, and not
 written anywhere; the process is short lived and nothing is logged.
 
-The loader registers every value it reads, so the scrubber knows the key even
-when the provider quotes it back. A value that came from the environment is
-registered here for the same reason; otherwise the one path that did not pass
-through .env would be the one that leaks."
-  (let* ((config (load-config))
-         (path (secrets-path)))
+Every name the configuration mentions is read, not only the LLM key: a Fluxer
+bot token and a webhook token are secrets too, and a token that never reaches
+the loader is a token the scrubber does not know and the shape filter cannot
+recognise. Loading them here is also what lets `enchiridion secrets` list them
+by name and source without ever printing a value.
+
+The names are then removed from this process's environment, which is the step
+PLAN.md section 5.2 promises: a child inherits nothing and a later read of
+/proc finds nothing. The value stays in memory for the life of the process."
+  (let* ((config (or config (load-config)))
+         (path (secrets-path))
+         (names (enchiridion:configured-secret-names config)))
     ;; Load .env before choosing the provider. A key in the file is a key the
     ;; provider detection can see, and the file is not the process environment.
-    (when (probe-file path)
-      (enchiridion.llm.secrets:load-secrets :path path))
-    (let* ((variable (enchiridion.llm:default-api-key-env config))
-           (value (or (enchiridion.llm.secrets:secret-value variable)
-                      (enchiridion.compat:environment-value variable))))
-      (when (and value
-                 (plusp (length value))
-                 (not (enchiridion.llm.secrets:secret-present-p variable)))
-        (enchiridion.llm.secrets:register-secret variable value :env))
-      (or value ""))))
+    (enchiridion.llm.secrets:load-secrets
+     :path (and (probe-file path) path)
+     :names names)
+    (dolist (name names)
+      (enchiridion.compat:unset-environment-variable name))
+    (let ((value (enchiridion.llm.secrets:secret-value
+                  (enchiridion.llm:default-api-key-env config))))
+      (if (and value (plusp (length value))) value ""))))
 
 ;; directory is the agent directory, generation is the last generation that
 ;; loaded, and started-p says whether the broker is up.
@@ -239,7 +244,7 @@ through .env would be the one that leaks."
   "Build the context for one command. Start nothing and open no socket."
   (let* ((config (load-config))
          (directory (agent-directory))
-         (key (secrets-api-key))
+         (key (load-configured-secrets config))
          (backend (when (plusp (length key))
                     (enchiridion.llm:resolve-backend :config config :api-key key)))
          (broker (enchiridion.tools.broker:make-broker

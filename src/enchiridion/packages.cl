@@ -26,7 +26,7 @@
    #:agent-directory #:run-directory #:load-config #:config-digest
    #:control-path #:status-path #:project-root
    #:sectioned-config-p #:config-section #:config-value #:config-section-value
-   #:config-memory-db)
+   #:configured-secret-names #:config-memory-db)
   (:documentation
    "Configuration. Paths and behaviour only; a secret never comes from here,
 because a file in the repository is a file that ends up in a store path."))
@@ -36,6 +36,7 @@ because a file in the repository is a file that ends up in a store path."))
   (:export
    #:+implementation+
    #:environment #:environment-value #:environment-bound-p
+   #:set-environment-variable #:unset-environment-variable
    #:run-program #:run-program-blocking #:process-uid #:set-process-uid
    #:process-user #:set-process-user #:implementation-dependency-p
    #:process-id #:process-kill

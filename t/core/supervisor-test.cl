@@ -249,6 +249,32 @@ and remove the directory. A failing test must not leave a thread behind."
       (ignore-errors (enchiridion.supervisor:supervisor-stop supervisor))
       (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
+(deftest a-fresh-supervisor-waits-an-interval-for-its-first-tick ()
+  ;; A pass at t=0 competes with the first operator turn and spends tokens
+  ;; before anyone asked for anything, so the schedule starts one interval out
+  ;; and only an explicit `heartbeat run` ticks sooner.
+  (let* ((directory (scratch-directory))
+         (run (merge-pathnames "run/" directory))
+         (supervisor (enchiridion.supervisor:make-supervisor
+                      :directory (namestring directory)
+                      :run-directory (namestring run)
+                      :heartbeat-p t
+                      :heartbeat-interval 900
+                      :tick-function (lambda (supervisor)
+                                       (declare (ignore supervisor))
+                                       (list :ok-p t :report "ticked")))))
+    (unwind-protect
+         (progn
+           (enchiridion.supervisor:supervisor-start supervisor)
+           (ok (not (enchiridion.supervisor:supervisor-heartbeat-due-p supervisor)))
+           (testing "and a request still ticks at once"
+             (setf (enchiridion.supervisor:supervisor-tick-requested-p supervisor) t)
+             (ok (enchiridion.supervisor:supervisor-heartbeat-due-p supervisor))
+             (enchiridion.supervisor:supervisor-tick supervisor)
+             (ok (= 1 (enchiridion.supervisor:supervisor-ticks supervisor)))))
+      (ignore-errors (enchiridion.supervisor:supervisor-stop supervisor))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
 (deftest heartbeat-on-without-a-hook-is-not-a-success ()
   ;; The operator script that turns the heartbeat on deserves to know that
   ;; nothing will happen: a channel with no sleep agent attached is a schedule

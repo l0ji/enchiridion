@@ -598,12 +598,15 @@ answers 503 with the reason and the process keeps running."
 (defun http-entry (config options)
   "Return the :http channel entry with the command line flags applied.
 The entry is a copy: the flags belong to this process, not to the loaded
-configuration, and writing them back would make the next command see them."
+configuration, and writing them back would make the next command see them.
+The port is parsed here because a command line flag is text and the service
+takes an integer; VALIDATE-OPTIONS has already refused anything that is not a
+number in range."
   (let ((entry (copy-list (enchiridion:channel-config :http config))))
     (when (getf options :bind)
       (setf (getf entry :bind) (getf options :bind)))
     (when (getf options :port)
-      (setf (getf entry :port) (getf options :port)))
+      (setf (getf entry :port) (parse-integer (getf options :port) :junk-allowed t)))
     (when (getf options :token-env)
       (setf (getf entry :token-env) (getf options :token-env)))
     entry))

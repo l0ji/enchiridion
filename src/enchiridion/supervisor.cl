@@ -287,13 +287,20 @@ is a tick loop and a string is a mis-typed configuration key."
 (declaim (ftype (function (t) hash-table) channel-row))
 
 (defun channel-row (channel)
-  "Return CHANNEL as the JSON row the status file carries."
+  "Return CHANNEL as the JSON row the status file carries.
+
+ENABLED is true when the configuration enables the channel or when this process
+is running it. A channel started by a --channel flag is enabled in the process
+that is serving, and a row that called it disabled while its state said live
+would be the status file contradicting itself."
   (let ((row (make-hash-table :test #'equal))
         (name (enchiridion.channel:channel-name channel)))
     (setf (gethash "name" row) name)
     (setf (gethash "state" row)
           (string-downcase (string (enchiridion.channel:channel-state channel))))
-    (setf (gethash "enabled" row) (not (null (enchiridion:channel-enabled-p name))))
+    (setf (gethash "enabled" row)
+          (or (not (null (enchiridion:channel-enabled-p name)))
+              (not (null (enchiridion.channel:channel-live-p channel)))))
     row))
 
 (declaim (ftype (function (supervisor) pathname) supervisor-write-status))
@@ -387,6 +394,11 @@ a channel that fails at once from becoming a busy loop."
   ;; worked.
   (when (and (supervisor-tick-function supervisor)
              (supervisor-heartbeat-p supervisor))
+    ;; LAST-TICK starts at the start time, so the first tick waits one interval
+    ;; rather than firing at t=0. A pass immediately after startup competes
+    ;; with the first operator turn and spends tokens before anyone asked for
+    ;; anything; `heartbeat run` still forces one at once.
+    (setf (supervisor-last-tick supervisor) (get-universal-time))
     (setf (supervisor-heartbeat-thread supervisor)
           (bordeaux-threads:make-thread
            (lambda () (supervisor-heartbeat-loop supervisor))

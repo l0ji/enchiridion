@@ -321,8 +321,20 @@
               # need git inside the image. It is not on the host side of the
               # boundary and it never holds a secret.
               pkgs.git
+              # The trust anchor for every TLS connection this process makes:
+              # the LLM call, the Fluxer gateway, and a webhook reply forwarded
+              # over HTTPS. The image is FROM scratch and does not inherit the
+              # host's /etc, so without this the handshake has nothing to
+              # verify a certificate against. Docker's buildImage copies the
+              # closure of copyToRoot into the layer, so the bundle arrives
+              # with the symlink that points at it.
+              pkgs.cacert
             ];
-            pathsToLink = [ "/bin" "/lib" "/cache" "/config" "/usr/local/bin" ];
+            # cacert keeps the bundle at /etc/ssl/certs/ca-bundle.crt. Linking
+            # the file's own directory rather than all of /etc keeps this list
+            # auditable: a package that installs something else under /etc does
+            # not reach the image root through it.
+            pathsToLink = [ "/bin" "/lib" "/cache" "/config" "/usr/local/bin" "/etc/ssl/certs" ];
           };
           config = {
             User = "0:0";
@@ -330,6 +342,12 @@
             Env = [
               "PATH=/usr/local/bin:/usr/bin:/bin"
               "ENCHIRIDION_HOME=/var/lib/enchiridion"
+              # cl+ssl reads the bundle through OpenSSL, and OpenSSL reads
+              # SSL_CERT_FILE before its compiled-in default. The name is the
+              # file and not the directory: the directory form also needs the
+              # per-certificate hashes, and the file is the one the image
+              # ships.
+              "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
             ];
             ExposedPorts = { "8787/tcp" = { }; };
             Volumes = { "/var/lib/enchiridion" = { }; };

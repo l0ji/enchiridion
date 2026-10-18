@@ -70,8 +70,8 @@
      (:token-env "FLUXER_BOT_TOKEN"))
 
    :budget
-    ;;; Caps for unattended work. The heartbeat stops acting rather than
-    ;;; exceeding these.
+    ;;; Caps for unattended work. The heartbeat starts no new phase once the
+    ;;; spend reaches them, so a phase already under way finishes.
     (:max-tokens-per-tick 4000)
     (:max-tokens-per-day 400000)
 

@@ -238,6 +238,75 @@ here the way the operator would see it."
       (ok (eq :quit (enchiridion.channel.cli:run-repl :input input :output output)))
       (ok (search "no channel is attached" (get-output-stream-string output))))))
 
+(deftest the-repl-survives-an-interrupt-during-a-turn ()
+  ;; Ctrl-C used to be unhandled. --script runs with the debugger disabled, so
+  ;; the condition printed a backtrace and exited 1 instead of reaching the
+  ;; prompt. The interrupt has to leave the turn, say so, and ask again; the
+  ;; /quit that follows proves the loop kept reading.
+  #+sbcl
+  (let* ((turns 0)
+         (context (enchiridion.channel.cli:make-command-context
+                   :respond (lambda (text)
+                              (declare (ignore text))
+                              (incf turns)
+                              (enchiridion.compat:signal-interactive-interrupt)
+                              1))))
+    (multiple-value-bind (text result)
+        (captured-repl (format nil "hello~%/quit~%") context)
+      (ok (eq :quit result))
+      (ok (= 1 turns) "the turn ran once and was abandoned")
+      (ok (search "interrupted." text))))
+  #-sbcl
+  (ok t "this implementation has no interrupt condition"))
+
+(deftest an-interrupt-does-not-cancel-the-next-turn ()
+  ;; The cancel function sets a flag that stays set, so an interrupt must not
+  ;; reach for it: a turn after the interrupt still has to run.
+  #+sbcl
+  (let* ((turns 0)
+         (cancelled nil)
+         (context (enchiridion.channel.cli:make-command-context
+                   :cancel (lambda () (setf cancelled t))
+                   :respond (lambda (text)
+                              (declare (ignore text))
+                              (incf turns)
+                              (when (= turns 1)
+                                (enchiridion.compat:signal-interactive-interrupt))
+                              0))))
+    (multiple-value-bind (text result)
+        (captured-repl (format nil "first~%second~%/quit~%") context)
+      (ok (eq :quit result))
+      (ok (= 2 turns) "both turns reached the respond function")
+      (ok (null cancelled) "the interrupt did not set the cancel flag")
+      (ok (search "interrupted." text))))
+  #-sbcl
+  (ok t "this implementation has no interrupt condition"))
+
+(deftest a-shutdown-interrupt-leaves-the-repl ()
+  ;; SIGTERM must stop the process, not just the line. The REPL handler
+  ;; declines the shutdown condition, so it reaches the outer handler; here the
+  ;; test stands in for the entry point and checks that the loop never got to
+  ;; answer the turn itself.
+  #+sbcl
+  (let ((context (enchiridion.channel.cli:make-command-context
+                  :respond (lambda (text)
+                             (declare (ignore text))
+                             (enchiridion.compat:signal-shutdown-interrupt)
+                             0))))
+    (ok (eq :stopped
+            (catch 'outer-interrupt
+              (enchiridion.compat:with-interrupt-handler
+                  ((lambda (condition)
+                     (declare (ignore condition))
+                     (throw 'outer-interrupt :stopped)))
+                (enchiridion.channel.cli:run-repl
+                 :context context
+                 :input (make-string-input-stream (format nil "hello~%/quit~%"))
+                 :output (make-string-output-stream)))))
+        "the outer handler answered it, so the REPL did not swallow the stop"))
+  #-sbcl
+  (ok t "this implementation has no shutdown interrupt"))
+
 (deftest repl-help-lists-the-slash-form-and-the-repl-only-commands ()
   ;; The bug this guards: `help` printed bare names, so the operator typed the
   ;; one form the REPL does not read and spent a turn on it.

@@ -42,7 +42,8 @@ because a file in the repository is a file that ends up in a store path."))
    #:process-id #:process-kill
    #:script-arguments #:exit-with #:backtrace-string
    #:encode-utf8 #:decode-utf8 #:run-program-capture #:temp-directory
-   #:set-file-mode)
+   #:set-file-mode #:with-interrupt-handler #:signal-interactive-interrupt
+   #:install-shutdown-signals #:shutdown-interrupt-p #:signal-shutdown-interrupt)
   (:documentation
    "The only file in the tree that contains implementation extensions.
 Everything above it is standard Common Lisp, which is what makes the agent

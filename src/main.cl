@@ -980,8 +980,26 @@ the operator has had a chance to edit the seed files."
 
 ;;;; Entry.
 
-(load-config)
-;; apply, not a plain call: MAIN is &rest over the arguments, so passing the
-;; list as one argument would nest it and every command would look absent.
+;; An interrupt is the one exit that does not come from a command. Ctrl-C is
+;; handled here rather than inside MAIN so that LOAD-CONFIG is covered too, and
+;; because the throw unwinds through every UNWIND-PROTECT on the way out: serve
+;; stops its channels, chat stops its supervisor, and ask closes its context.
+;; SIGTERM and SIGHUP join Ctrl-C on the same path, so `docker stop` and a
+;; closed terminal stop the process the same way. The status is 130, the shell
+;; convention for a process ended by SIGINT.
 (enchiridion.compat:exit-with
- (apply #'main (enchiridion.compat:script-arguments)))
+ (catch 'enchiridion-interrupt
+   (enchiridion.compat:with-interrupt-handler
+       ((lambda (condition)
+          (declare (ignore condition))
+          (format *error-output* "~&enchiridion: interrupted.~%")
+          (finish-output *error-output*)
+          (throw 'enchiridion-interrupt 130)))
+     ;; Installed inside the handler, so there is no window where SIGTERM
+     ;; reaches a process that has not armed it yet.
+     (enchiridion.compat:install-shutdown-signals)
+     (load-config)
+     ;; apply, not a plain call: MAIN is &rest over the arguments, so passing
+     ;; the list as one argument would nest it and every command would look
+     ;; absent.
+     (apply #'main (enchiridion.compat:script-arguments)))))

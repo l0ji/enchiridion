@@ -412,6 +412,114 @@ implementation leaves the file with whatever the umask gave it."
   (declare (ignore count))
   (format nil "No backtrace is available in ~A." +implementation+))
 
+;;;; Interrupts.
+;;;;
+;;;; Ctrl-C is SIGINT, and SBCL turns it into SB-SYS:INTERACTIVE-INTERRUPT in
+;;;; the main thread even when other threads are running. A --script process
+;;;; runs with the debugger disabled, so an interrupt nobody handles prints a
+;;;; forty frame backtrace and exits 1: the REPL dies at the prompt and serve
+;;;; dies in the middle of its poll. The condition's name is the one
+;;;; implementation extension in that story, so it stays here and every file
+;;;; above answers an interrupt through this macro.
+
+(defmacro with-interrupt-handler ((handler) &body body)
+  "Run BODY; when an interactive interrupt arrives, call HANDLER with it.
+
+HANDLER has to leave the interrupted code by a non-local exit, usually a THROW
+to a CATCH outside this form. A handler that returns lets the interrupt keep
+unwinding, and nothing above this frame answers it, so the process still dies
+with a backtrace."
+  #+sbcl `(handler-bind ((sb-sys:interactive-interrupt
+                           (lambda (condition)
+                             (funcall ,handler condition))))
+            ,@body)
+  ;; The handler is evaluated only to keep a non SBCL call from looking like it
+  ;; silently drops the form; there is no interrupt condition to bind.
+  #-sbcl `(let ((ignored ,handler))
+            (declare (ignore ignored))
+            ,@body))
+
+(declaim (ftype (function () t) signal-interactive-interrupt))
+
+#+sbcl
+(defun signal-interactive-interrupt ()
+  "Signal the condition a Ctrl-C produces.
+
+SIGNAL and not ERROR: a caller that has installed the handler through
+WITH-INTERRUPT-HANDLER sees it, and a test that runs without one does not kill
+the suite."
+  (signal 'sb-sys:interactive-interrupt))
+
+#-sbcl
+(defun signal-interactive-interrupt ()
+  "Signal an ordinary error: this implementation has no interrupt condition."
+  (error "No interactive interrupt is available in ~A." +implementation+))
+
+#+sbcl
+(define-condition shutdown-interrupt (sb-sys:interactive-interrupt) ()
+  (:documentation
+   "A SIGTERM or SIGHUP raised as an interrupt, so one handler answers both.
+
+The process has to tell a Ctrl-C, which belongs to the line or the turn in
+front of the operator, from a request to stop. This subtype is how the REPL
+declines the second and lets the top level answer it."))
+
+(declaim (ftype (function (t) boolean) shutdown-interrupt-p))
+
+#+sbcl
+(defun shutdown-interrupt-p (condition)
+  "Return T when CONDITION is a SIGTERM or SIGHUP and not a Ctrl-C."
+  (typep condition 'shutdown-interrupt))
+
+#-sbcl
+(defun shutdown-interrupt-p (condition)
+  "Return NIL: this implementation has no shutdown interrupt."
+  (declare (ignore condition))
+  nil)
+
+(declaim (ftype (function () t) signal-shutdown-interrupt))
+
+#+sbcl
+(defun signal-shutdown-interrupt ()
+  "Signal the shutdown condition a SIGTERM raises, for a test.
+
+SIGNAL and not ERROR, for the reason SIGNAL-INTERACTIVE-INTERRUPT gives."
+  (signal 'shutdown-interrupt))
+
+#-sbcl
+(defun signal-shutdown-interrupt ()
+  "Signal an ordinary error: this implementation has no shutdown interrupt."
+  (error "No shutdown interrupt is available in ~A." +implementation+))
+
+(declaim (ftype (function () boolean) install-shutdown-signals))
+
+#+sbcl
+(defun install-shutdown-signals ()
+  "Make SIGTERM and SIGHUP raise a shutdown interrupt in the main thread.
+
+`docker stop` and a closed terminal end the process with SIGTERM and SIGHUP,
+not SIGINT, and the default action kills it where it stands. Raising the
+condition in the main thread instead is what lets the handler installed by
+WITH-INTERRUPT-HANDLER answer them the way it answers Ctrl-C: every
+UNWIND-PROTECT runs, the channels stop, and the process leaves with 130.
+
+The main thread is the one that installed the handler, so it is the one to
+interrupt. Return T when the handlers are installed."
+  (let ((main sb-thread:*current-thread*))
+    (flet ((raise-shutdown (signal info context)
+             (declare (ignore signal info context))
+             (sb-thread:interrupt-thread
+              main
+              (lambda () (error 'shutdown-interrupt)))))
+      (sb-sys:enable-interrupt sb-unix:sigterm #'raise-shutdown)
+      (sb-sys:enable-interrupt sb-unix:sighup #'raise-shutdown))
+    t))
+
+#-sbcl
+(defun install-shutdown-signals ()
+  "Return NIL: this implementation has no signal interface to install."
+  nil)
+
 ;;;; The command line.
 ;;;;
 ;;;; sb-ext:*posix-argv* is the one piece of the script interface that no

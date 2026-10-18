@@ -116,4 +116,15 @@ function, which verification counts as a warning and therefore as a failure."
         (format *error-output* "~&broker-exec: ~A~%" condition)
         1))))
 
-(enchiridion.compat:exit-with (broker-exec-main))
+;; The child is in the terminal's process group, so a Ctrl-C at the supervising
+;; terminal reaches it as well. It answers the interrupt the same way the
+;; supervisor does, with a quiet exit and no backtrace: the supervisor is about
+;; to stop the child anyway, and a trace from the sandbox side reads as the
+;; agent crashing.
+(enchiridion.compat:exit-with
+ (catch 'broker-exec-interrupt
+   (enchiridion.compat:with-interrupt-handler
+       ((lambda (condition)
+          (declare (ignore condition))
+          (throw 'broker-exec-interrupt 130)))
+     (broker-exec-main))))

@@ -347,6 +347,19 @@ unknown-command line, and the REPL reads the next one. `run-repl` ignores the
 status of every command except `/quit`. An end of input leaves the loop, and
 `run-repl` returns `:eof`.
 
+Ctrl-C does not leave the session. It aborts the line being typed, or the turn
+being answered, prints `interrupted.`, and the prompt comes back. `/stop` is the
+cooperative version of the same request: it asks the turn in flight to stop and
+lets it report the cancellation.
+
+Ctrl-C, SIGTERM, and SIGHUP share one handler at the top level: the throw
+unwinds through every open context, so a `serve` process stops its channels and
+writes its last status, a chat process stops its supervisor, and the exit status
+is 130. That is why `docker stop` and a closed terminal end the container
+cleanly rather than in the middle of a write. The REPL is the one difference: it
+answers SIGINT itself, by aborting the line, and declines SIGTERM and SIGHUP, so
+those two leave the session instead of interrupting it.
+
 There is no `exit` command. A shell call with the name `exit` prints the
 unknown-command line and returns 2. Use `/quit` or an end of input.
 

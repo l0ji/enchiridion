@@ -478,19 +478,43 @@ left off the slash, and the REPL says so instead of spending a turn on it."
                       (input *standard-input*)
                       (output *standard-output*))
   "Read lines from INPUT and evaluate each, until the operator quits or INPUT
-ends. Return :QUIT or :EOF."
+ends. Return :QUIT or :EOF.
+
+Ctrl-C does not leave the session. An interrupt aborts the line being read, or
+the turn being answered, prints one line, and the loop asks again. The throw is
+what makes that work: the handler has to leave READ-LINE or RESPOND, and the
+catch is the nearest place the loop can pick up from. Nothing calls the cancel
+function here, because the flag behind it stays set and every later turn would
+be cancelled with it.
+
+SIGTERM and SIGHUP are the other case. They ask the process to stop rather than
+the line to stop, so the handler declines them and the top level answers, which
+is what makes `docker stop` end a chat session instead of interrupting it."
   (let ((*command-context* context)
         (*standard-input* input)
         (*standard-output* output))
     (loop
       (format output "~&enchiridion> ")
       (finish-output output)
-      (let ((line (read-line input nil :eof)))
-        (when (eq line :eof)
+      (let ((result
+              (catch 'repl-interrupt
+                (enchiridion.compat:with-interrupt-handler
+                    ((lambda (condition)
+                       ;; Declining is a normal return: the search continues
+                       ;; to the handler the entry point installed, which
+                       ;; throws out of the process.
+                       (unless (enchiridion.compat:shutdown-interrupt-p condition)
+                         (format output "~&interrupted.~%")
+                         (finish-output output)
+                         (throw 'repl-interrupt :interrupted))))
+                  (let ((line (read-line input nil :eof)))
+                    (if (eq line :eof)
+                        :eof
+                        (repl-evaluate line)))))))
+        (when (eq result :eof)
           (return :eof))
-        (let ((result (repl-evaluate line)))
-          (when (eq result :quit)
-            (return :quit)))))))
+        (when (eq result :quit)
+          (return :quit))))))
 
 ;;;; The handlers.
 ;;;;

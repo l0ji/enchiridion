@@ -143,6 +143,10 @@ REPL-only `/stop`, `/quit`, and `/who`. The shell-only commands `chat` and
 `help`, prints ``Commands start with a slash: try `/help`.`` and sends no turn.
 Two or more words, and a word that names nothing, are still turns.
 
+Ctrl-C does not leave the session either. It aborts the line being typed or the
+turn being answered, prints `interrupted.`, and the prompt comes back. Use
+`/quit` or end of input to leave.
+
 The reply goes to standard output. A token line goes to standard error:
 
 ```text

@@ -93,3 +93,68 @@
   (ok (eql t (enchiridion.compat:implementation-dependency-p :sbcl))
       "or nil, on an implementation that is not SBCL")
   (ok (keywordp enchiridion.compat:+implementation+)))
+
+;;;; Interrupts.
+
+(deftest a-body-without-an-interrupt-returns-its-value ()
+  ;; Every REPL iteration and every command line runs under the handler, so
+  ;; the ordinary path has to come back untouched.
+  (ok (eq :done
+          (enchiridion.compat:with-interrupt-handler
+              ((lambda (condition) (declare (ignore condition)) nil))
+            :done))))
+
+(deftest an-interactive-interrupt-reaches-the-handler ()
+  ;; SIGNAL-INTERACTIVE-INTERRUPT stands in for a real Ctrl-C. The condition
+  ;; is not an ERROR, so a HANDLER-CASE would not see it, and this HANDLER-BIND
+  ;; is the only thing that does. The throw proves the handler can leave the
+  ;; interrupted code, which is the contract the REPL and MAIN depend on.
+  #+sbcl
+  (let ((caught nil))
+    (ok (eq :interrupted
+            (catch 'interrupt-test
+              (enchiridion.compat:with-interrupt-handler
+                  ((lambda (condition)
+                     (declare (ignore condition))
+                     (setf caught t)
+                     (throw 'interrupt-test :interrupted)))
+                (enchiridion.compat:signal-interactive-interrupt)
+                :not-reached))))
+    (ok caught))
+  #-sbcl
+  (ok t "this implementation has no interrupt condition to signal"))
+
+(deftest a-ctrl-c-is-not-a-shutdown-request ()
+  ;; The REPL aborts the line for the first and declines the second, so the
+  ;; predicate has to tell them apart.
+  #+sbcl
+  (let ((shutdown nil))
+    (catch 'interrupt-test
+      (enchiridion.compat:with-interrupt-handler
+          ((lambda (condition)
+             (setf shutdown (enchiridion.compat:shutdown-interrupt-p condition))
+             (throw 'interrupt-test :ok)))
+        (enchiridion.compat:signal-interactive-interrupt)))
+    (ok (null shutdown)))
+  #-sbcl
+  (ok t "this implementation has no interrupt condition"))
+
+(deftest a-sigterm-looks-like-a-shutdown-request ()
+  #+sbcl
+  (let ((shutdown nil))
+    (catch 'interrupt-test
+      (enchiridion.compat:with-interrupt-handler
+          ((lambda (condition)
+             (setf shutdown (enchiridion.compat:shutdown-interrupt-p condition))
+             (throw 'interrupt-test :ok)))
+        (enchiridion.compat:signal-shutdown-interrupt)))
+    (ok shutdown))
+  #-sbcl
+  (ok t "this implementation has no shutdown interrupt"))
+
+(deftest the-shutdown-signals-can-be-installed ()
+  ;; A BOOLEAN return and not the old handler: the entry point ignores it, and
+  ;; an implementation with no signal interface has to answer NIL rather than
+  ;; signal. A real SIGTERM is sent by the integration check, not here, so the
+  ;; suite does not end itself.
+  (ok (member (enchiridion.compat:install-shutdown-signals) '(t nil) :test #'eq)))

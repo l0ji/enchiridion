@@ -16,8 +16,8 @@ command table backs the shell and the REPL.
   files without git and skips only the commit.
 - Docker, when you want the container image. It builds on amd64 and arm64.
 
-The flake supplies SBCL and every Lisp library. The project does not use
-Quicklisp.
+The flake supplies SBCL 2.6.9 and every Lisp library for development, with no
+Quicklisp. The Docker image uses Quicklisp, because it has no Nix.
 
 ## Build, check, and test
 

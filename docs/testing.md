@@ -68,6 +68,12 @@ Neither file is a system component, because loading a system must never start
 an agent. The gate compiles both and checks `failure-p`, because
 `compile-file` returns a failure flag on a read error instead of signalling.
 
+The gate loads every dependency from the fasl that Nix built beside its source,
+so it compiles only this project's files. The flake sets
+`ASDF_OUTPUT_TRANSLATIONS` so the dependencies resolve to the store and the test
+sources resolve to the gate's writable cache. A gate log with a dependency's
+source file under a `compiling file` line means that setting stopped working.
+
 ## The warning gate
 
 The core system and both test systems carry the same `:around-compile` hook.

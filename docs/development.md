@@ -27,6 +27,20 @@ commit policy. [Testing](testing.md) covers the suite and the build gate.
 start an agent, and the top level form of this file is the program. The check
 gate compiles it explicitly, so the file is still covered.
 
+## The Nix inputs
+
+The flake tracks `github:NixOS/nixpkgs/nixpkgs-unstable` by branch, and
+`flake.lock` records the commit. Run `nix flake update nixpkgs` to move the lock
+to the branch tip, then run `nix run .#check` and `nix run .#test` before you
+commit the lock. The input is not updated by itself: a checkout keeps the commit
+in its lock, so a build is reproducible until someone updates it.
+
+nixpkgs carries SBCL 2.6.8. The flake builds SBCL 2.6.9 from the release tarball
+so the Nix build and the Docker image use one version, and it uses the nixpkgs
+SBCL as the bootstrap compiler. Every Lisp dependency comes from nixpkgs, built
+with that SBCL, and the gate loads the store fasls instead of compiling the
+dependencies itself.
+
 ### Generated and ignored paths
 
 These live beside the source. `.gitignore` excludes all of them:

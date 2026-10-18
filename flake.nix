@@ -1,18 +1,14 @@
 {
   description = "enchiridion, an autonomous agent harness written in Common Lisp";
 
-  # Pinned to one immutable commit, not a branch tip. flake.lock records the
-  # rev and narHash, so the build is reproducible and only an explicit flake
-  # update moves it.
+  # nixpkgs-unstable, tracked by branch. flake.lock records the commit, so a
+  # build is reproducible until `nix flake update nixpkgs` moves it to the
+  # current tip. Unstable is the branch because no release channel carries
+  # SBCL 2.6: NixOS 25.05 has 2.5.4, and NixOS 26.11 is not released yet.
   #
-  # This is nixpkgs-unstable at 2026-10-16, chosen because it carries the two
-  # versions section 8 of the plan names: SBCL 2.6.8 and SQLite 3.53.3. The
-  # previous 25.05 pin carried SBCL 2.5.4, which cannot start on macOS 27: it
-  # aborts with "failed to allocate 1048576 bytes at 0x300100000" before it
-  # compiles anything. The fix is in SBCL 2.6.5 and later. NixOS 26.11 is not
-  # released yet, so no release channel can supply it.
-  inputs.nixpkgs.url =
-    "github:NixOS/nixpkgs/f20cd90e28fe0403873f473b29e42662cd86e8c4";
+  # nixpkgs carries SBCL 2.6.8 at this revision. The flake builds 2.6.9 from
+  # source below, so the Nix build and the Docker image use one version.
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
 
   outputs = { self, nixpkgs }:
     let
@@ -25,6 +21,39 @@
       ];
 
       pkgsFor = system: import nixpkgs { inherit system; };
+
+      # SBCL 2.6.9. nixpkgs carries 2.6.8, so the release is built from source
+      # here and wrapped the way nixpkgs wraps its own SBCL. The nixpkgs SBCL
+      # is the bootstrap compiler: the default bootstrap on aarch64-darwin is
+      # ECL, and an ECL bootstrap takes hours where a host SBCL takes minutes.
+      sbclVersion = "2.6.9";
+
+      mkSbcl = pkgs:
+        let
+          base = pkgs.callPackage
+            (nixpkgs.outPath + "/pkgs/development/compilers/sbcl")
+            {
+              # The 2.6.8 hash satisfies nixpkgs' version table. The override
+              # below replaces both the version and the source.
+              version = "2.6.8";
+              bootstrapLisp =
+                "${pkgs.sbcl}/bin/sbcl --disable-debugger --no-userinit --no-sysinit";
+            };
+        in
+        pkgs.wrapLisp {
+          pkg = base.overrideAttrs (_old: {
+            version = sbclVersion;
+            src = pkgs.fetchurl {
+              url = "mirror://sourceforge/project/sbcl/sbcl/${sbclVersion}/sbcl-${sbclVersion}-source.tar.bz2";
+              hash = "sha256-xv0dc1Vw60/zTK+WCZiMp37QvRK1XQmk/tB1vokNpRM=";
+            };
+          });
+          faslExt = "fasl";
+          flags = [
+            "--dynamic-space-size"
+            "3000"
+          ];
+        };
 
       # Nix must never read a secret. Nix hashes every file it is handed into a
       # store path, and /nix/store is world readable. One builtins.readFile ./.env
@@ -127,7 +156,8 @@
       # package set is recursed into for the libraries; the wrapped
       # interpreter is the attribute that carries them. This is what the dev
       # shell and any REPL use.
-      sbclWith = pkgs: pkgs.sbcl.withPackages (ps: map (fn: ps.${fn}) lispPackageNames);
+      sbclWith = pkgs:
+        (mkSbcl pkgs).withPackages (ps: map (fn: ps.${fn}) lispPackageNames);
 
       # Every library in the transitive closure, not just the direct ones.
       # rove pulls in dissect, dexador pulls in fifteen more, and a source
@@ -140,7 +170,7 @@
       # so the wrapper carries only the direct list and not the closure.
       lispClosure = pkgs:
         let
-          package-set = pkgs.sbcl.pkgs;
+          package-set = (mkSbcl pkgs).pkgs;
           direct = map (name: package-set.${name}) lispPackageNames;
           walk = seen: pending:
             let
@@ -161,7 +191,7 @@
       # prepends to whatever is already set, so it cannot be corrected from
       # outside. The registry is built here instead, and the dev shell and the
       # REPL are the only things that go through the wrapper.
-      rawSbcl = pkgs: pkgs.sbcl;
+      rawSbcl = pkgs: mkSbcl pkgs;
 
       source-registry = pkgs: extra:
         lib.concatStringsSep ":"
@@ -181,11 +211,9 @@
           # situation: loaded by name, not linked.
           library-path = lib.makeLibraryPath [ pkgs.sqlite pkgs.openssl ];
 
-          # The fasls live under XDG_CACHE_HOME and not under
-          # ASDF_OUTPUT_TRANSLATIONS. ASDF merges the environment, the user
-          # config and the system config for that variable, and the value that
-          # reaches it from the nixpkgs wrapper is not parseable, so this build
-          # owns the cache directory outright instead.
+          # Load every dependency from the fasl beside its source. Nix built
+          # each dependency with this SBCL, so the store already holds the
+          # fasls, and this build compiles only this system's own files.
           registry = source-registry pkgs [ "$out/lib" "$out/lib/t" ];
         in
         pkgs.stdenvNoCC.mkDerivation {
@@ -218,6 +246,11 @@
             export XDG_CACHE_HOME="$TMPDIR/build-cache"
             export XDG_CONFIG_HOME="$TMPDIR/build-config"
             export CL_SOURCE_REGISTRY="${registry}"
+            # Identity translation: a fasl is looked for beside its source.
+            # The dependencies' fasls are beside their sources in the store, so
+            # ASDF loads them. The copy of this source tree in $out/lib is
+            # writable during the build, so this system's fasls land there too.
+            export ASDF_OUTPUT_TRANSLATIONS='(:output-translations (t nil) :ignore-inherited-configuration)'
             export SBCL_HOME="${sbcl}/lib/sbcl"
             export LD_LIBRARY_PATH="${library-path}"
 
@@ -225,7 +258,12 @@
               --non-interactive \
               --no-userinit --no-sysinit \
               --eval '(require :asdf)' \
-              --eval '(handler-case (progn
+              --eval '(handler-bind ((warning (lambda (condition)
+                                                 (let ((report (princ-to-string condition)))
+                                                   (when (or (search "redefining DEFTYPE type to be a class" report)
+                                                             (search "bare references to struct types are deprecated" report))
+                                                     (muffle-warning condition))))))
+                         (handler-case (progn
                         (asdf:load-system "enchiridion")
                         ;; The entry script is not a system component, so it
                         ;; has to be compiled here as well. Without this a
@@ -252,12 +290,11 @@
                                            (merge-pathnames "broker-exec.fasl" #p".")))))
                       (error (condition)
                         (format *error-output* "~&~A~%" condition)
-                        (sb-ext:exit :code 1)))'
+                        (sb-ext:exit :code 1))))'
 
-            # Move the compiled output into the store, layout and all. ASDF
-            # keys its cache on the source path, and the source path at run
-            # time is this same store path, so the entries match.
-            cp -a "$XDG_CACHE_HOME/." "$out/cache/"
+            # The cache stays empty: with the identity translation the fasls
+            # are written beside the sources in $out/lib. The directory itself
+            # stays because the wrapper points XDG_CACHE_HOME at it.
 
             runHook postBuild
           '';
@@ -269,6 +306,7 @@
               --prefix SBCL_HOME : "${sbcl}/lib/sbcl" \
               --prefix CL_SOURCE_REGISTRY : "${registry}" \
               --prefix LD_LIBRARY_PATH : "${library-path}" \
+              --set ASDF_OUTPUT_TRANSLATIONS "(:output-translations (t nil) :ignore-inherited-configuration)" \
               --set XDG_CACHE_HOME "$out/cache" \
               --set XDG_CONFIG_HOME "$out/config" \
               --set ENCHIRIDION_SOURCE "$out/lib" \
@@ -339,11 +377,17 @@
             export XDG_CONFIG_HOME="$PWD/gate-config"
             export GATE_DIR="$PWD/gate-cache"
             export CL_SOURCE_REGISTRY="$REGISTRY"
+            # Dependencies and the built system load from the fasl beside their
+            # source in the store. The test sources are not compiled by the
+            # package build, and the store is read-only, so their output goes to
+            # the writable gate cache. They are the only sources this gate
+            # compiles, apart from the entry scripts below.
+            export ASDF_OUTPUT_TRANSLATIONS="(:output-translations ((\"$SOURCE_DIR/t/\" :**/ :*.*.*) \"$GATE_DIR/t/\") (t nil) :ignore-inherited-configuration)"
 
             run_sbcl() {
               ${sbcl}/bin/sbcl --non-interactive --no-userinit --no-sysinit \
                 --eval '(require :asdf)' \
-                --eval "(handler-case (progn $1) (error (condition) (format *error-output* \"~&~A~%\" condition) (sb-ext:exit :code 1)))"
+                --eval "(handler-bind ((warning (lambda (condition) (let ((report (princ-to-string condition))) (when (or (search \"redefining DEFTYPE type to be a class\" report) (search \"bare references to struct types are deprecated\" report)) (muffle-warning condition)))))) (handler-case (progn $1) (error (condition) (format *error-output* \"~&~A~%\" condition) (sb-ext:exit :code 1))))"
             }
 
             echo "compiling the entry scripts, which are not system components"

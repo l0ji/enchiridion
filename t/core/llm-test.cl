@@ -62,6 +62,11 @@
     (let ((enchiridion.llm:*model-sleep* "stronger"))
       (ok (string= "stronger" (enchiridion.llm:sleep-model))))))
 
+(deftest the-default-primary-model-is-the-cheap-one ()
+  (testing "a default that spends more per turn is a default nobody chose"
+    (ok (string= (enchiridion.llm:cheap-model)
+                 (enchiridion.llm:primary-model)))))
+
 ;;;; The request.
 
 (deftest a-request-is-the-shape-every-openai-compatible-server-accepts ()

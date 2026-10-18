@@ -217,23 +217,76 @@ countable from the test."
     (testing "and the queue is empty afterwards"
       (ok (zerop (enchiridion.kernel:task-queue-length store))))))
 
-(deftest a-spent-cap-stops-the-tick-before-it-spends ()
+(deftest a-tick-cap-is-this-tick-and-not-the-process ()
+  ;; The cap bounds one pass. Measuring it from a timestamp put a one second
+  ;; window around the tick in which an operator's own turn counted as
+  ;; unattended spend, and measuring it from the whole in-memory ledger let one
+  ;; operator turn disable the sleep agent until the process restarted.
+  (with-scratch-world (store supervisor)
+    (setf (enchiridion.kernel:agent-budget (agent-of supervisor))
+          '(:max-tokens-per-tick 10 :max-tokens-per-day 400000))
+    (enchiridion.kernel:enqueue-task store "the first task")
+    (enchiridion.kernel:enqueue-task store "the second task")
+    (let ((first (enchiridion.kernel:heartbeat supervisor)))
+      (ok (getf first :ok-p))
+      (ok (search "done" (getf first :report)))
+      (testing "the pass spent the cap, so compaction waits for the next tick"
+        (ok (search "compaction skipped" (getf first :report)))
+        (ok (search "tick cap" (getf first :report)))))
+    (testing "and the next tick has its own budget"
+      (let ((second (enchiridion.kernel:heartbeat supervisor)))
+        (ok (getf second :ok-p))
+        (ok (search "done" (getf second :report)))))
+    (ok (= 2 (calls-made supervisor)))))
+
+(deftest a-spent-day-cap-stops-the-tick-before-it-spends ()
+  (with-scratch-world (store supervisor)
+    (setf (enchiridion.kernel:agent-budget (agent-of supervisor))
+          '(:max-tokens-per-tick 4000 :max-tokens-per-day 20))
+    ;; The day window is the rolling twenty-four hours, so a row written before
+    ;; the tick counts, which is the whole point of a day cap.
+    (enchiridion.memory.store:record-usage store :model "counting" :input 15 :output 15)
+    (enchiridion.kernel:enqueue-task store "a task that must wait")
+    (let ((report (enchiridion.kernel:heartbeat supervisor)))
+      (ok (search "sleep skipped" (getf report :report)))
+      (ok (search "day cap" (getf report :report)))
+      (ok (zerop (calls-made supervisor))))
+    (testing "and the task is still waiting rather than claimed"
+      (ok (= 1 (enchiridion.kernel:task-queue-length store)))
+      (ok (zerop (enchiridion.memory.store:count-tasks store :status :running))))))
+
+(deftest an-operator-turn-does-not-spend-the-sleep-budget ()
+  ;; The tick cap is about this tick. An operator turn recorded on the same
+  ;; agent used to count against it forever, which turned a busy afternoon into
+  ;; an agent that never slept again.
   (with-scratch-world (store supervisor)
     (let ((agent (agent-of supervisor)))
       (setf (enchiridion.kernel:agent-budget agent)
-            '(:max-tokens-per-tick 10 :max-tokens-per-day 400000))
-      ;; A cap is about work already done, so the ledger has to show some: a
-      ;; tick with an empty ledger starts and then stops before the next call.
-      (enchiridion.memory.store:record-usage store :model "counting"
-                                                   :input 8 :output 4)
-      (enchiridion.kernel:enqueue-task store "a task that must wait")
+            '(:max-tokens-per-tick 50 :max-tokens-per-day 400000))
+      (enchiridion.kernel:record-spend
+       agent
+       (enchiridion.llm::%make-completion :text "operator turn" :model "counting"
+                                          :input-tokens 40 :output-tokens 24)
+       :channel :http)
+      (enchiridion.memory.store:record-usage store :session "operator"
+                                                   :model "counting"
+                                                   :input 40 :output 24
+                                                   :channel :http)
+      (enchiridion.kernel:enqueue-task store "a task that must still run")
       (let ((report (enchiridion.kernel:heartbeat supervisor)))
-        (ok (search "sleep skipped" (getf report :report)))
-        (ok (search "tick cap" (getf report :report)))
-        (ok (zerop (calls-made supervisor))))
-      (testing "and the task is still waiting rather than claimed"
-        (ok (= 1 (enchiridion.kernel:task-queue-length store)))
-        (ok (zerop (enchiridion.memory.store:count-tasks store :status :running)))))))
+        (ok (getf report :ok-p))
+        (ok (search "done" (getf report :report)))
+        (ok (= 1 (calls-made supervisor)))))))
+
+(deftest an-oversized-task-body-says-it-was-cut ()
+  (with-scratch-world (store supervisor)
+    (enchiridion.kernel:enqueue-task store (make-string 9000 :initial-element #\x))
+    (let ((report (enchiridion.kernel:heartbeat supervisor)))
+      (ok (getf report :ok-p))
+      (ok (search "body cut" (getf report :report)))
+      (testing "and the row still holds the whole body"
+        (ok (= 9000 (length (enchiridion.memory.store:task-row-body
+                             (first (enchiridion.kernel:task-queue store))))))))))
 
 (deftest bootstrap-keeps-the-identity-files-out-of-reach ()
   (with-scratch-world (store supervisor)

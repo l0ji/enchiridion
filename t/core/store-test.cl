@@ -378,6 +378,16 @@ itself is what proves the trigger ran."
         (testing "the two that were not removed are still listed"
           (ok (= 2 (length (enchiridion.memory.store:list-tasks store)))))))))
 
+(deftest a-blank-task-is-refused ()
+  ;; A task with nothing in it costs a model call and does nothing, so it is
+  ;; refused where it is queued rather than run and reported afterwards.
+  (with-scratch-store (store)
+    (dolist (body (list "" "   " (format nil " ~% ")))
+      (testing (format nil "~S is refused" body)
+        (ok (handler-case (progn (enchiridion.memory.store:enqueue-task store body) nil)
+              (enchiridion.errors:usage-error () t)))))
+    (ok (zerop (enchiridion.memory.store:count-tasks store)))))
+
 (deftest the-ledger-can-be-summed-by-model-channel-and-day ()
   (with-scratch-store (store)
     (enchiridion.memory.store:record-usage store :model "one" :channel :cli

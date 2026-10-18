@@ -649,13 +649,22 @@ about the shape of a row the report sums.")
 (declaim (ftype (function (t) list) usage-totals))
 
 (defun usage-totals (row)
-  "Return ROW, one grouped usage row, as the plist a caller reports."
-  (list :input (or (field row "input") 0)
-        :output (or (field row "output") 0)
-        :cache-read (or (field row "cache_read") 0)
-        :cache-write (or (field row "cache_write") 0)
-        :calls (or (field row "calls") 0)
-        :total (+ (or (field row "input") 0) (or (field row "output") 0))))
+  "Return ROW, one grouped usage row, or zeroes when there is none.
+
+Every number is coerced to an integer. SQLite's SUM returns a float once the
+sum leaves the range of a 64 bit integer, and a caller that formats it with ~D
+signals on a float: a ledger that cannot be printed because it grew is the one
+moment the ledger matters. A count that is not a number at all answers zero for
+the same reason."
+  (flet ((number (name)
+           (let ((value (and row (field row name))))
+             (if (integerp value) value 0))))
+    (list :input (number "input")
+          :output (number "output")
+          :cache-read (number "cache_read")
+          :cache-write (number "cache_write")
+          :calls (number "calls")
+          :total (+ (number "input") (number "output")))))
 
 (declaim (ftype (function (store &key (:group-by keyword) (:since t) (:limit integer))
                           list)
@@ -799,10 +808,14 @@ one value, for the reason NORMALISE-CHANNEL gives."
   "Add BODY to the queue as a pending task and return it as a TASK-ROW.
 
 BODY is scrubbed like every other string this file writes: a task is text the
-agent wrote, and the queue is readable through the search tool."
+agent wrote, and the queue is readable through the search tool. A body that is
+empty, or that is only whitespace after the scrub, is refused rather than
+queued: it costs a model call to run and there is nothing in it to do."
   (check-type body string)
   (check-type ts integer)
   (let ((body (scrubbed body)))
+    (when (zerop (length (string-trim '(#\Space #\Tab #\Newline #\Return) body)))
+      (error 'enchiridion.errors:usage-error :argument body))
     (with-store-lock (store)
       (exec store
             "INSERT INTO tasks (body, status, ts) VALUES (?, 'pending', ?)"

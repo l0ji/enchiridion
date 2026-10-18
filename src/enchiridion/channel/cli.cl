@@ -684,6 +684,16 @@ report is the same whether a shell or the webhook asks for it."
           (print-usage-group store :day "day" "by day")
           0))))
 
+(declaim (ftype (function (t) string) one-line))
+
+(defun one-line (text)
+  "Return TEXT with every newline and tab turned into a space.
+A name a provider chose can contain a line break, and a table row that breaks
+in two shifts every number after it."
+  (substitute-if #\Space (lambda (character)
+                           (member character '(#\Newline #\Return #\Tab #\Page)))
+                 (if (stringp text) text (format nil "~A" text))))
+
 (declaim (ftype (function (t keyword string string) null) print-usage-group))
 
 (defun print-usage-group (store group-by key heading)
@@ -701,7 +711,12 @@ report is the same whether a shell or the webhook asks for it."
           (dolist (row rows)
             (say "  ~A"
                  (format nil "~12A ~10D ~10D ~11D ~12D ~6D"
-                         (format nil "~A" (getf row (intern (string-upcase key) :keyword)))
+                         ;; A model name is a provider's text and can contain a
+                         ;; newline, which would break the table into two lines
+                         ;; and shift every number after it.
+                         (one-line (format nil "~A"
+                                           (getf row (intern (string-upcase key)
+                                                             :keyword))))
                          (getf row :input) (getf row :output)
                          (getf row :cache-read) (getf row :cache-write)
                          (getf row :calls)))))
@@ -841,7 +856,14 @@ answer before: unattended work either happened, or said why it did not."
              (or (gethash "ticks" beat) 0)
              (or (gethash "last-tick" beat) 0)
              (let ((line (gethash "report" beat)))
-               (if (and (stringp line) (plusp (length line))) line nil)))))
+               (if (and (stringp line) (plusp (length line))) line nil)))
+        ;; A tick that never returns stops unattended work and leaves the
+        ;; status file looking healthy. How long it has been running is the one
+        ;; thing that makes it visible.
+        (when (gethash "running" beat)
+          (let ((started (gethash "started" beat)))
+            (say "  a tick has been running for ~D second~:P."
+                 (if (integerp started) (max 0 (- (get-universal-time) started)) 0))))))
     (dolist (row (enchiridion.supervisor:status-channels status))
       (say "channel ~A" (status-channel-line row)))
     0))

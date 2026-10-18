@@ -96,8 +96,10 @@ transcript, which is the thing summarising exists to prevent."
 
 (defun task-prompt (task)
   "Return the user text one queued task is run with.
-The body is cut at +TASK-PROMPT-LIMIT+; the row keeps all of it, and the
-heartbeat reports that the cut happened."
+The body is cut at +TASK-PROMPT-LIMIT+ and the row keeps all of it. RUN-SLEEP-
+PASS returns :CUT-P for the cut, and the tick report says so: a task answered
+from its first four thousand characters of a hundred thousand is something the
+operator has to be able to see."
   (let ((body (enchiridion.memory.store:task-row-body task)))
     (format nil "~A~%~A~%When you are done, say in one line what you did."
             +sleep-task-prompt+
@@ -162,8 +164,10 @@ unbounded and the cap meaningless.
 The session is the pass's own and is closed afterwards: the operator's session
 is never written to by unattended work, and the transcript still records every
 turn under the channel that made it."
-  (let ((session (make-session :agent agent))
-        (text (if task (task-prompt task) +sleep-maintenance-prompt+)))
+  (let* ((session (make-session :agent agent))
+         (cut-p (and task (> (length (enchiridion.memory.store:task-row-body task))
+                             +task-prompt-limit+)))
+         (text (if task (task-prompt task) +sleep-maintenance-prompt+)))
     (unwind-protect
          (handler-case
              (let ((completion (run-turn agent text
@@ -176,6 +180,7 @@ turn under the channel that made it."
                (list :ran-p t
                      :task-id (and task (enchiridion.memory.store:task-row-id task))
                      :status (if task :done :idle)
+                     :cut-p cut-p
                      :reply (enchiridion.llm:completion-text completion)))
            (error (condition)
              (when task
@@ -183,6 +188,7 @@ turn under the channel that made it."
              (list :ran-p t
                    :task-id (and task (enchiridion.memory.store:task-row-id task))
                    :status :failed
+                   :cut-p cut-p
                    :note (enchiridion.errors:condition-report-line condition)
                    :reply "")))
       (ignore-errors (end-session session)))))
@@ -270,32 +276,47 @@ queue is cheaper than the confusion. Compaction overwrites this."
 
 ;;;; The budget.
 
-(declaim (ftype (function (agent t integer) (or null string)) budget-refusal))
+(declaim (ftype (function (t) integer) store-total))
 
-(defun budget-refusal (agent store tick-start)
+(defun store-total (store)
+  "Return every token row the store holds, summed, or zero."
+  (if store
+      (handler-case (getf (enchiridion.memory.store:usage-total-since store 0) :total)
+        (error () 0))
+      0))
+
+(declaim (ftype (function (agent t integer integer) (or null string)) budget-refusal))
+
+(defun budget-refusal (agent store start-total tick-index)
   "Return why no model call may start, or NIL.
 
-Both the in-memory ledger and the store are consulted. The ledger only sees
-this process; the store spans restarts, and a cap that resets every restart is
-not a cap. The tick window starts where the caller says, which is the top of
-this tick, so a long pass cannot pay for the next one."
+START-TOTAL is the store's token total when this tick began, so what this tick
+has spent is the difference. Measuring from a timestamp instead put a one
+second window around the tick in which an operator's own turn counted as
+unattended spend: with the shipped cap, a busy second disabled the sleep agent.
+
+TICK-INDEX is the same idea for the in-memory ledger, which is the fallback
+when no store is open. Both windows are this tick and not the life of the
+process. The day window is the rolling twenty-four hours either way, because a
+cap that resets at midnight is a cap that can be spent twice in a minute."
   (let ((tick-cap (getf (agent-budget agent) :max-tokens-per-tick))
         (day-cap (getf (agent-budget agent) :max-tokens-per-day)))
-    (cond
-      ((budget-exhausted-p agent :window :tick) "the tick cap is spent")
-      ((budget-exhausted-p agent :window :day) "the day cap is spent")
-      ((and tick-cap store
-            (>= (getf (enchiridion.memory.store:usage-total-since store tick-start)
-                      :total)
-                tick-cap))
-       "the tick cap is spent")
-      ((and day-cap store
-            (>= (getf (enchiridion.memory.store:usage-total-since
-                       store (- (get-universal-time) 86400))
-                      :total)
-                day-cap))
-       "the day cap is spent")
-      (t nil))))
+    (labels ((tick-spend ()
+               (if store
+                   (max 0 (- (store-total store) start-total))
+                   (getf (spend-summary (spend-since agent tick-index)) :total)))
+             (day-spend ()
+               (if store
+                   (handler-case
+                       (getf (enchiridion.memory.store:usage-total-since
+                              store (- (get-universal-time) 86400))
+                             :total)
+                     (error () 0))
+                   (spend-total agent :window :day))))
+      (cond
+        ((and tick-cap (>= (tick-spend) tick-cap)) "the tick cap is spent")
+        ((and day-cap (>= (day-spend) day-cap)) "the day cap is spent")
+        (t nil)))))
 
 (declaim (ftype (function (t t t) (or null string)) sleep-refusal))
 
@@ -337,8 +358,10 @@ nothing, and the honest report for it is one word."
       (cond
         (task
          (let ((result (pass :task task)))
-           (format nil "task ~D ~(~A~)~@[: ~A~]"
-                   (getf result :task-id) (getf result :status) (getf result :note))))
+           (format nil "task ~D ~(~A~)~:[~; (body cut to ~D characters)~]~@[: ~A~]"
+                   (getf result :task-id) (getf result :status)
+                   (getf result :cut-p) +task-prompt-limit+
+                   (getf result :note))))
         ((and newest (> newest cursor))
          (let ((result (pass)))
            (setf (enchiridion.supervisor:supervisor-last-sleep-turn supervisor) newest)
@@ -386,7 +409,8 @@ session block."
   (let* ((store (enchiridion.supervisor:supervisor-store supervisor))
          (agent (enchiridion.supervisor:supervisor-agent supervisor))
          (directory (enchiridion.supervisor:supervisor-directory supervisor))
-         (tick-start (get-universal-time))
+         (tick-index (if agent (length (spend agent)) 0))
+         (start-total (store-total store))
          (notes '())
          (ok-p t))
     (labels ((say (control &rest arguments)
@@ -413,12 +437,31 @@ session block."
                    (write-session-fallback supervisor store)
                    nil)))
       (let ((refusal (or (sleep-refusal agent store directory)
-                         (and store (budget-refusal agent store tick-start)))))
+                         ;; The refusal reads the store, so a store that
+                         ;; refuses the read is a reason not to start, not a
+                         ;; reason to abandon the rest of the tick.
+                         (handler-case
+                             (and store (budget-refusal agent store start-total
+                                                        tick-index))
+                           (error (condition)
+                             (setf ok-p nil)
+                             (format nil "the budget is unreadable: ~A"
+                                     (enchiridion.errors:condition-report-line
+                                      condition)))))))
         (if refusal
             (say "sleep skipped: ~A" refusal)
             (attempt "the sleep agent"
                      (lambda () (run-sleep-phase supervisor store agent directory)))))
-      (when (and store agent (null (budget-refusal agent store tick-start)))
-        (attempt "compaction" (lambda () (compact-when-due supervisor store agent))))
+      (when (and store agent)
+        (let ((refusal (handler-case (budget-refusal agent store start-total
+                                                     tick-index)
+                         (error (condition)
+                           (format nil "the budget is unreadable: ~A"
+                                   (enchiridion.errors:condition-report-line
+                                    condition))))))
+          (if refusal
+              (say "compaction skipped: ~A" refusal)
+              (attempt "compaction"
+                       (lambda () (compact-when-due supervisor store agent))))))
       (list :ok-p ok-p
             :report (if notes (format nil "~{~A~^; ~}" (nreverse notes)) "idle")))))

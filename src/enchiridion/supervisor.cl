@@ -238,6 +238,7 @@ supervisor is up the answer is NIL and the caller says so and exits non-zero."
   (tick-report "" :type string)
   (ticks 0 :type integer)
   (last-tick 0 :type integer)
+  (tick-started 0 :type integer)
   (last-compacted-turn 0 :type integer)
   (last-sleep-turn 0 :type integer)
   (bootstrap-line "" :type string)
@@ -330,6 +331,8 @@ written, because the file is world readable."
             (setf (gethash "enabled" beat) (supervisor-heartbeat-p supervisor))
             (setf (gethash "ticks" beat) (supervisor-ticks supervisor))
             (setf (gethash "last-tick" beat) (supervisor-last-tick supervisor))
+            (setf (gethash "running" beat) (supervisor-tick-running-p supervisor))
+            (setf (gethash "started" beat) (supervisor-tick-started supervisor))
             (setf (gethash "ok" beat) (supervisor-tick-ok-p supervisor))
             (setf (gethash "report" beat)
                   (enchiridion.llm.secrets:scrub (supervisor-tick-report supervisor)))
@@ -376,6 +379,30 @@ a channel that fails at once from becoming a busy loop."
   (setf (enchiridion.channel:channel-state channel) :running)
   channel)
 
+(declaim (ftype (function (supervisor) supervisor) supervisor-ensure-heartbeat-thread))
+
+(defun supervisor-ensure-heartbeat-thread (supervisor)
+  "Start the heartbeat thread when a tick hook is attached and none runs.
+
+One place starts it, so `heartbeat on` can start a schedule that the
+configuration had disabled at startup: without that, an operator who begins
+with :sleep :enabled nil can never turn unattended work on, and the command
+that claims to have done it is lying.
+
+LAST-TICK is set first, so the first tick waits one interval rather than firing
+at t=0. A pass immediately after startup competes with the first operator turn
+and spends tokens before anyone asked for anything; `heartbeat run` still forces
+one at once."
+  (when (and (supervisor-tick-function supervisor)
+             (supervisor-running-p supervisor)
+             (null (supervisor-heartbeat-thread supervisor)))
+    (setf (supervisor-last-tick supervisor) (get-universal-time))
+    (setf (supervisor-heartbeat-thread supervisor)
+          (bordeaux-threads:make-thread
+           (lambda () (supervisor-heartbeat-loop supervisor))
+           :name "enchiridion heartbeat")))
+  supervisor)
+
 (declaim (ftype (function (supervisor) supervisor) supervisor-start))
 
 (defun supervisor-start (supervisor)
@@ -392,17 +419,8 @@ a channel that fails at once from becoming a busy loop."
   ;; reads to decide whether a supervisor is up, and it goes stale in ten
   ;; seconds, so a tick on that thread would make the agent look dead while it
   ;; worked.
-  (when (and (supervisor-tick-function supervisor)
-             (supervisor-heartbeat-p supervisor))
-    ;; LAST-TICK starts at the start time, so the first tick waits one interval
-    ;; rather than firing at t=0. A pass immediately after startup competes
-    ;; with the first operator turn and spends tokens before anyone asked for
-    ;; anything; `heartbeat run` still forces one at once.
-    (setf (supervisor-last-tick supervisor) (get-universal-time))
-    (setf (supervisor-heartbeat-thread supervisor)
-          (bordeaux-threads:make-thread
-           (lambda () (supervisor-heartbeat-loop supervisor))
-           :name "enchiridion heartbeat")))
+  (when (supervisor-heartbeat-p supervisor)
+    (supervisor-ensure-heartbeat-thread supervisor))
   (supervisor-write-status supervisor)
   supervisor)
 
@@ -455,7 +473,8 @@ A tick never signals. The thread that runs it is the whole scheduler for
 unattended work, and a scheduler that dies on one bad pass is a process that
 quietly stops doing any."
   (setf (supervisor-tick-requested-p supervisor) nil
-        (supervisor-tick-running-p supervisor) t)
+        (supervisor-tick-running-p supervisor) t
+        (supervisor-tick-started supervisor) (get-universal-time))
   (unwind-protect
        (let* ((hook (supervisor-tick-function supervisor))
               (result (if hook
@@ -580,7 +599,8 @@ request was explicit."
       ((string= action "on")
        (setf (supervisor-heartbeat-p supervisor) t)
        (if (supervisor-tick-function supervisor)
-           (values "heartbeat on." t)
+           (progn (supervisor-ensure-heartbeat-thread supervisor)
+                  (values "heartbeat on." t))
            (values "heartbeat on, but no sleep agent is attached to this process." nil)))
       ((string= action "off")
        (setf (supervisor-heartbeat-p supervisor) nil)
@@ -589,11 +609,15 @@ request was explicit."
        (cond
          ((null (supervisor-tick-function supervisor))
           (values "no sleep agent is attached to this process." nil))
-         ((supervisor-tick-running-p supervisor)
-          (values "a tick is already running." t))
          (t
+          ;; A request during a tick is queued rather than dropped: the
+          ;; operator asked, and a request that vanishes is worse than one that
+          ;; runs a minute later.
           (setf (supervisor-tick-requested-p supervisor) t)
-          (values "heartbeat tick requested; the answer lands in the status file." t))))
+          (supervisor-ensure-heartbeat-thread supervisor)
+          (if (supervisor-tick-running-p supervisor)
+              (values "a tick is running; one more is queued and the answer lands in the status file." t)
+              (values "heartbeat tick requested; the answer lands in the status file." t)))))
       (t
        (values "heartbeat takes on, off or run." nil)))))
 

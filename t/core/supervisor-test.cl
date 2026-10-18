@@ -234,18 +234,23 @@ and remove the directory. A failing test must not leave a thread behind."
            (enchiridion.supervisor:supervisor-start supervisor)
            (enchiridion.supervisor:queue-control "heartbeat run" :run run)
            (ok (= 1 (enchiridion.supervisor:supervisor-poll-control supervisor)))
-           (testing "the answer is immediate and the request is queued"
-             (ok (enchiridion.supervisor:supervisor-tick-requested-p supervisor))
+           (testing "the answer is immediate and names a request, not a result"
              (ok (enchiridion.supervisor:status-report-ok-p
-                  (enchiridion.supervisor:read-status run))))
+                  (enchiridion.supervisor:read-status run)))
+             (ok (search "requested"
+                         (enchiridion.supervisor:status-report
+                          (enchiridion.supervisor:read-status run)))))
            (testing "and the schedule being off does not refuse the request"
-             (ok (not (enchiridion.supervisor:supervisor-heartbeat-p supervisor)))
-             (ok (enchiridion.supervisor:supervisor-heartbeat-due-p supervisor)))
-           (testing "a tick clears the request"
-             (enchiridion.supervisor:supervisor-tick supervisor)
+             (ok (not (enchiridion.supervisor:supervisor-heartbeat-p supervisor))))
+           (testing "the request is honoured within a second"
+             (loop repeat 100
+                   until (plusp (enchiridion.supervisor:supervisor-ticks supervisor))
+                   do (sleep 0.05))
+             (ok (= 1 (enchiridion.supervisor:supervisor-ticks supervisor)))
              (ok (null (enchiridion.supervisor:supervisor-tick-requested-p supervisor)))
-             (ok (not (enchiridion.supervisor:supervisor-heartbeat-due-p supervisor))
-                 "an hour-long interval is not due a second later")))
+             (testing "and an hour-long interval is not due a second later"
+               (ok (not (enchiridion.supervisor:supervisor-heartbeat-due-p
+                         supervisor))))))
       (ignore-errors (enchiridion.supervisor:supervisor-stop supervisor))
       (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
@@ -272,6 +277,58 @@ and remove the directory. A failing test must not leave a thread behind."
              (ok (enchiridion.supervisor:supervisor-heartbeat-due-p supervisor))
              (enchiridion.supervisor:supervisor-tick supervisor)
              (ok (= 1 (enchiridion.supervisor:supervisor-ticks supervisor)))))
+      (ignore-errors (enchiridion.supervisor:supervisor-stop supervisor))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(deftest heartbeat-on-starts-a-schedule-the-configuration-disabled ()
+  ;; An operator who starts with :sleep :enabled nil must be able to turn
+  ;; unattended work on, or the command that says it did is lying.
+  (let* ((directory (scratch-directory))
+         (run (merge-pathnames "run/" directory))
+         (supervisor (enchiridion.supervisor:make-supervisor
+                      :directory (namestring directory)
+                      :run-directory (namestring run)
+                      :heartbeat-p nil
+                      :heartbeat-interval 3600
+                      :tick-function (lambda (supervisor)
+                                       (declare (ignore supervisor))
+                                       (list :ok-p t :report "ticked")))))
+    (unwind-protect
+         (progn
+           (enchiridion.supervisor:supervisor-start supervisor)
+           (ok (null (enchiridion.supervisor::supervisor-heartbeat-thread supervisor)))
+           (enchiridion.supervisor:queue-control "heartbeat on" :run run)
+           (enchiridion.supervisor:supervisor-poll-control supervisor)
+           (ok (enchiridion.supervisor:supervisor-heartbeat-p supervisor))
+           (testing "the thread is running now"
+             (ok (enchiridion.supervisor::supervisor-heartbeat-thread supervisor))
+             (ok (bordeaux-threads:thread-alive-p
+                  (enchiridion.supervisor::supervisor-heartbeat-thread supervisor)))))
+      (ignore-errors (enchiridion.supervisor:supervisor-stop supervisor))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(deftest a-tick-request-during-a-tick-is-queued ()
+  ;; The operator asked. Dropping the request makes the command that said
+  ;; "requested" a lie, and the tick it wanted never happens.
+  (let* ((directory (scratch-directory))
+         (run (merge-pathnames "run/" directory))
+         (supervisor (enchiridion.supervisor:make-supervisor
+                      :directory (namestring directory)
+                      :run-directory (namestring run)
+                      :heartbeat-p t
+                      :tick-function (lambda (supervisor)
+                                       (declare (ignore supervisor))
+                                       (list :ok-p t :report "ticked")))))
+    (unwind-protect
+         (progn
+           (enchiridion.supervisor:supervisor-start supervisor)
+           (setf (enchiridion.supervisor:supervisor-tick-running-p supervisor) t)
+           (enchiridion.supervisor:queue-control "heartbeat run" :run run)
+           (ok (= 1 (enchiridion.supervisor:supervisor-poll-control supervisor)))
+           (ok (enchiridion.supervisor:supervisor-tick-requested-p supervisor))
+           (let ((status (enchiridion.supervisor:read-status run)))
+             (ok (enchiridion.supervisor:status-report-ok-p status))
+             (ok (search "queued" (enchiridion.supervisor:status-report status)))))
       (ignore-errors (enchiridion.supervisor:supervisor-stop supervisor))
       (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 

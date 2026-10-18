@@ -354,6 +354,9 @@ the shell. It is the only writer of run/enchiridion.status, which is what lets
   (:use #:cl)
   (:export
    #:agent #:make-agent #:agent-name #:agent-turn #:run-turn #:agent-snapshot
+   ;; The parts of an agent a caller inspects: what answers, what the prompt is
+   ;; compiled from, what the caps are, and where it writes.
+   #:agent-backend #:agent-blocks #:agent-budget #:agent-directory
    #:compile-prompt #:prompt #:prompt-text #:prompt-tokens #:snapshot-p
    #:record-spend #:spend #:spend-since #:spend-summary #:reset-spend
    #:budget-exhausted-p #:spend-row

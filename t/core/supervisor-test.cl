@@ -45,7 +45,8 @@
     (uiop:ensure-directory-pathname *default-pathname-defaults*))))
 
 (defmacro with-scratch-supervisor ((supervisor &key (channels nil)
-                                                (reload-function nil))
+                                                (reload-function nil)
+                                                (tick-function nil))
                                    &body body)
   "Bind SUPERVISOR to a started supervisor in a scratch directory, then stop it
 and remove the directory. A failing test must not leave a thread behind."
@@ -57,6 +58,8 @@ and remove the directory. A failing test must not leave a thread behind."
                         :generation 3
                         :bootstrap-line "bootstrap step 0 of 8"
                         :reload-function ,reload-function
+                        :tick-function ,tick-function
+                        :heartbeat-p nil
                         :channels ,channels)))
      (unwind-protect
           (progn
@@ -105,7 +108,10 @@ and remove the directory. A failing test must not leave a thread behind."
 
 (deftest a-control-request-is-consumed-once ()
   (with-scratch-supervisor (supervisor
-                            :channels (list (make-stub-channel)))
+                            :channels (list (make-stub-channel))
+                            :tick-function (lambda (supervisor)
+                                             (declare (ignore supervisor))
+                                             (list :ok-p t :report "ticked")))
     (let ((run (enchiridion.supervisor:supervisor-run-directory supervisor)))
       (testing "the channel is known by name"
         (ok (enchiridion.supervisor:find-channel supervisor "stub-channel"))
@@ -190,6 +196,9 @@ and remove the directory. A failing test must not leave a thread behind."
            (ok (string= "one task done"
                         (enchiridion.supervisor:supervisor-tick-report supervisor)))
            (testing "the status file carries a heartbeat object"
+             ;; A tick publishes slots; the poll loop is the only writer of the
+             ;; status file, so a reader sees the tick after the next poll.
+             (enchiridion.supervisor:supervisor-write-status supervisor)
              (let ((beat (enchiridion.supervisor:status-heartbeat
                           (enchiridion.supervisor:read-status run))))
                (ok (hash-table-p beat))

@@ -172,16 +172,16 @@ turn under the channel that made it."
                                          :store store
                                          :channel channel)))
                (when task
-                 (enchiridion.memory.store:complete-task store (task-row-id task)))
+                 (enchiridion.memory.store:complete-task store (enchiridion.memory.store:task-row-id task)))
                (list :ran-p t
-                     :task-id (and task (task-row-id task))
+                     :task-id (and task (enchiridion.memory.store:task-row-id task))
                      :status (if task :done :idle)
                      :reply (enchiridion.llm:completion-text completion)))
            (error (condition)
              (when task
-               (enchiridion.memory.store:fail-task store (task-row-id task)))
+               (enchiridion.memory.store:fail-task store (enchiridion.memory.store:task-row-id task)))
              (list :ran-p t
-                   :task-id (and task (task-row-id task))
+                   :task-id (and task (enchiridion.memory.store:task-row-id task))
                    :status :failed
                    :note (enchiridion.errors:condition-report-line condition)
                    :reply "")))
@@ -228,7 +228,7 @@ or injected changes nothing and is reported instead."
 
 ;;;; The two harness blocks.
 
-(declaim (ftype (function (t) string) ledger-line))
+(declaim (ftype (function (t t) string) ledger-line))
 
 (defun ledger-line (store session)
   "Return the one line the ledger block carries.
@@ -245,14 +245,16 @@ that lies about the spend."
             (getf mine :cache-read) (getf mine :cache-write)
             (getf mine :calls) (getf day :total))))
 
-(declaim (ftype (function (supervisor t) string) write-ledger-block))
+(declaim (ftype (function (enchiridion.supervisor:supervisor t) string)
+                write-ledger-block))
 
 (defun write-ledger-block (supervisor store)
   "Write the ledger block for this session and return it."
   (enchiridion.memory.store:set-ledger-block
    store (ledger-line store (enchiridion.supervisor:supervisor-session supervisor))))
 
-(declaim (ftype (function (supervisor t) (or null string)) write-session-fallback))
+(declaim (ftype (function (enchiridion.supervisor:supervisor t) (or null string))
+                write-session-fallback))
 
 (defun write-session-fallback (supervisor store)
   "Put one line of state in the session block when nothing has compacted it.
@@ -295,7 +297,7 @@ this tick, so a long pass cannot pay for the next one."
        "the day cap is spent")
       (t nil))))
 
-(declaim (ftype (function (agent t t) (or null string)) sleep-refusal))
+(declaim (ftype (function (t t t) (or null string)) sleep-refusal))
 
 (defun sleep-refusal (agent store directory)
   "Return why the sleep agent must not run, or NIL.
@@ -311,7 +313,8 @@ not happen is never silent."
 
 ;;;; The tick.
 
-(declaim (ftype (function (supervisor t agent t) string) run-sleep-phase))
+(declaim (ftype (function (enchiridion.supervisor:supervisor t agent t) string)
+                run-sleep-phase))
 
 (defun run-sleep-phase (supervisor store agent directory)
   "Claim one task, or run a maintenance pass when there is something new.
@@ -342,7 +345,9 @@ nothing, and the honest report for it is one word."
            (format nil "maintenance pass~@[ (~A)~]" (getf result :note))))
         (t "idle")))))
 
-(declaim (ftype (function (supervisor t agent) (or null string)) compact-when-due))
+(declaim (ftype (function (enchiridion.supervisor:supervisor t agent)
+                          (or null string))
+                compact-when-due))
 
 (defun compact-when-due (supervisor store agent)
   "Rewrite the session block when enough new turns have arrived, else NIL.
@@ -363,7 +368,7 @@ turns once, which is harmless and bounded."
             "the session block was compacted"
             nil)))))
 
-(declaim (ftype (function (supervisor) list) heartbeat))
+(declaim (ftype (function (enchiridion.supervisor:supervisor) list) heartbeat))
 
 (defun heartbeat (supervisor)
   "Run one heartbeat tick and return a plist of :OK-P and :REPORT.

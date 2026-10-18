@@ -65,6 +65,10 @@ countable from the test."
                         :session session
                         :config ,config
                         :tick-function #'enchiridion.kernel:heartbeat)))
+     ;; IGNORABLE and not IGNORE: a test that only wants the store, or only the
+     ;; supervisor, is a normal test, and the binding the macro makes is not a
+     ;; variable the test has to use to be correct.
+     (declare (ignorable ,store ,supervisor))
      (unwind-protect
           (progn ,@body)
        (ignore-errors (enchiridion.memory.store:close-store ,store))
@@ -92,7 +96,6 @@ countable from the test."
 
 (deftest the-task-queue-is-the-store-under-another-name ()
   (with-scratch-world (store supervisor)
-    (declare (ignore supervisor))
     (let ((first (enchiridion.kernel:enqueue-task store "write the guide"))
           (second (enchiridion.kernel:enqueue-task store "read the journal")))
       (ok (= 2 (enchiridion.kernel:task-queue-length store)))
@@ -150,9 +153,11 @@ countable from the test."
 
 (deftest a-pass-with-a-task-runs-one-turn-and-completes-it ()
   (with-scratch-world (store supervisor)
-    (let* ((task (enchiridion.kernel:enqueue-task store "say hello"))
+    (let* ((queued (enchiridion.kernel:enqueue-task store "say hello"))
+           (task (enchiridion.kernel:dequeue-task store))
            (agent (agent-of supervisor))
            (result (enchiridion.kernel:run-sleep-pass agent store :task task)))
+      (declare (ignore queued))
       (ok (getf result :ran-p))
       (ok (eq :done (getf result :status)))
       (ok (eql (enchiridion.memory.store:task-row-id task) (getf result :task-id)))
@@ -167,7 +172,8 @@ countable from the test."
 
 (deftest a-pass-that-fails-marks-the-task-failed ()
   (with-scratch-world (store supervisor)
-    (let* ((task (enchiridion.kernel:enqueue-task store "do the impossible"))
+    (enchiridion.kernel:enqueue-task store "do the impossible")
+    (let* ((task (enchiridion.kernel:dequeue-task store))
            (agent (agent-of supervisor)))
       (setf (counting-backend-fail-p (backend-of supervisor)) t)
       (let ((result (enchiridion.kernel:run-sleep-pass agent store :task task)))
@@ -190,7 +196,6 @@ countable from the test."
 
 (deftest an-idle-tick-costs-nothing ()
   (with-scratch-world (store supervisor)
-    (declare (ignore store))
     (let ((report (enchiridion.kernel:heartbeat supervisor)))
       (ok (getf report :ok-p))
       (testing "no queued task and no new turn means no model call"
@@ -217,6 +222,10 @@ countable from the test."
     (let ((agent (agent-of supervisor)))
       (setf (enchiridion.kernel:agent-budget agent)
             '(:max-tokens-per-tick 10 :max-tokens-per-day 400000))
+      ;; A cap is about work already done, so the ledger has to show some: a
+      ;; tick with an empty ledger starts and then stops before the next call.
+      (enchiridion.memory.store:record-usage store :model "counting"
+                                                   :input 8 :output 4)
       (enchiridion.kernel:enqueue-task store "a task that must wait")
       (let ((report (enchiridion.kernel:heartbeat supervisor)))
         (ok (search "sleep skipped" (getf report :report)))
@@ -228,15 +237,19 @@ countable from the test."
 
 (deftest bootstrap-keeps-the-identity-files-out-of-reach ()
   (with-scratch-world (store supervisor)
-    (let ((directory (enchiridion.supervisor:supervisor-directory supervisor)))
-      ;; A directory with no state file is one where bootstrap has not run:
-      ;; the seed files still belong to the operator.
-      (enchiridion.kernel:enqueue-task store "rewrite SOUL.md")
-      (let ((report (enchiridion.kernel:heartbeat supervisor)))
-        (ok (search "bootstrap" (getf report :report)))
-        (ok (search "sleep skipped" (getf report :report)))
-        (ok (zerop (calls-made supervisor))))
-      (declare (ignore directory)))))
+    ;; A directory seeded by INIT-AGENT is one where bootstrap has not run yet:
+    ;; the seed files still belong to the operator. A directory with no
+    ;; BOOTSTRAP.md at all is not that case, because there are no steps to
+    ;; work through and nothing to refuse.
+    (enchiridion.memory:init-agent
+     (enchiridion.supervisor:supervisor-directory supervisor))
+    (ok (enchiridion.memory:bootstrap-refuse-writes-p
+         (enchiridion.supervisor:supervisor-directory supervisor)))
+    (enchiridion.kernel:enqueue-task store "rewrite SOUL.md")
+    (let ((report (enchiridion.kernel:heartbeat supervisor)))
+      (ok (search "bootstrap" (getf report :report)))
+      (ok (search "sleep skipped" (getf report :report)))
+      (ok (zerop (calls-made supervisor))))))
 
 ;;;; Compaction.
 

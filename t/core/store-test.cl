@@ -375,7 +375,8 @@ itself is what proves the trigger ran."
                                                    second)))
         (ok (not (enchiridion.memory.store:remove-task
                   store (enchiridion.memory.store:task-row-id second))))
-        (ok (= 3 (length (enchiridion.memory.store:list-tasks store))))))))
+        (testing "the two that were not removed are still listed"
+          (ok (= 2 (length (enchiridion.memory.store:list-tasks store)))))))))
 
 (deftest the-ledger-can-be-summed-by-model-channel-and-day ()
   (with-scratch-store (store)
@@ -388,39 +389,55 @@ itself is what proves the trigger ran."
                                                  :cache-read 5 :cache-write 6
                                                  :ts 2000)
     (enchiridion.memory.store:record-usage store :model "two" :channel :cli
-                                                 :input 30 :output 3
-                                                 :cache-read 7 :cache-write 8
+                                                 :input 5 :output 1
+                                                 :cache-read 1 :cache-write 1
                                                  :ts 3000)
-    (testing "by model, biggest first"
-      (let ((rows (enchiridion.memory.store:usage-summary store :group-by :model)))
-        (ok (= 2 (length rows)))
-        (ok (string= "one" (getf (first rows) :model)))
-        (ok (= 30 (getf (first rows) :input)))
-        (ok (= 3 (getf (first rows) :output)))
-        (ok (= 8 (getf (first rows) :cache-read)))
-        (ok (= 10 (getf (first rows) :cache-write)))
-        (ok (= 2 (getf (first rows) :calls)))
-        (ok (= 33 (getf (first rows) :total)))
-        (ok (string= "two" (getf (second rows) :model)))))
-    (testing "by channel"
-      (let ((rows (enchiridion.memory.store:usage-summary store :group-by :channel)))
-        (ok (= 2 (length rows)))
-        (ok (string= "cli" (getf (first rows) :channel)))
-        (ok (= 40 (getf (first rows) :input)))))
-    (testing "and by local day, which is what a person reads"
-      (let ((rows (enchiridion.memory.store:usage-summary store :group-by :day)))
-        (ok (plusp (length rows)))
-        (ok (stringp (getf (first rows) :day)))
-        (ok (plusp (length (getf (first rows) :day))))))
-    (testing "a window total answers the budget's question"
-      (ok (= 33 (getf (enchiridion.memory.store:usage-total-since store 1500) :total)))
-      (ok (= 66 (getf (enchiridion.memory.store:usage-total-since store 0) :total)))
-      (ok (= 0 (getf (enchiridion.memory.store:usage-total-since store 9999) :total))))
-    (testing "and a session total answers the ledger block's"
-      (enchiridion.memory.store:record-usage store :session "s-1" :model "one"
-                                                   :input 1 :output 1 :ts 4000)
-      (ok (= 2 (getf (enchiridion.memory.store:usage-session-total store "s-1")
-                     :total))))))
+    (flet ((row-for (rows key value)
+             (find value rows :key (lambda (row) (getf row key)) :test #'string=)))
+      (testing "by model, biggest first"
+        (let* ((rows (enchiridion.memory.store:usage-summary store :group-by :model))
+               (one (row-for rows :model "one"))
+               (two (row-for rows :model "two")))
+          (ok (= 2 (length rows)))
+          (ok (string= "one" (getf (first rows) :model))
+              "thirty-three tokens outranks six")
+          (ok one)
+          (ok two)
+          (ok (= 30 (getf one :input)))
+          (ok (= 3 (getf one :output)))
+          (ok (= 8 (getf one :cache-read)))
+          (ok (= 10 (getf one :cache-write)))
+          (ok (= 2 (getf one :calls)))
+          (ok (= 33 (getf one :total)))
+          (ok (= 6 (getf two :total)))))
+      (testing "by channel"
+        (let* ((rows (enchiridion.memory.store:usage-summary store :group-by :channel))
+               (cli (row-for rows :channel "cli"))
+               (http (row-for rows :channel "http")))
+          (ok (= 2 (length rows)))
+          (ok cli)
+          (ok http)
+          (ok (= 15 (getf cli :input)))
+          (ok (= 2 (getf cli :calls)))
+          (ok (= 20 (getf http :input)))
+          (ok (= 22 (getf http :total)))))
+      (testing "and by local day, which is what a person reads"
+        (let ((rows (enchiridion.memory.store:usage-summary store :group-by :day)))
+          (ok (plusp (length rows)))
+          (ok (stringp (getf (first rows) :day)))
+          (ok (plusp (length (getf (first rows) :day))))))
+      (testing "a window total answers the budget's question"
+        (ok (= 28 (getf (enchiridion.memory.store:usage-total-since store 1500)
+                        :total)))
+        (ok (= 39 (getf (enchiridion.memory.store:usage-total-since store 0)
+                        :total)))
+        (ok (= 0 (getf (enchiridion.memory.store:usage-total-since store 9999)
+                       :total))))
+      (testing "and a session total answers the ledger block's"
+        (enchiridion.memory.store:record-usage store :session "s-1" :model "one"
+                                                     :input 1 :output 1 :ts 4000)
+        (ok (= 2 (getf (enchiridion.memory.store:usage-session-total store "s-1")
+                       :total)))))))
 
 (deftest recent-turns-come-newest-first-and-can-skip-a-channel ()
   (with-scratch-store (store)

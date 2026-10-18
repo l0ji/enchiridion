@@ -67,7 +67,7 @@ stops the agent from starting; the plan requires that."
           (file-error () (enchiridion.memory:seed-template name)))
         (enchiridion.memory:seed-template name))))
 
-(defun blocks-from-directory (&optional directory &key store)
+(defun blocks-from-directory (&key directory store)
   "Return the five blocks for DIRECTORY. The first three are read from their
 Markdown files when those exist and fall back to the seed templates. The first
 three are not writable by the primary agent; the sleep agent gets its own
@@ -130,7 +130,7 @@ session and ledger text read from STORE when there is one.
 The agent is born with a lock, unless a caller brings one. An agent with no
 lock is a test that never runs two turns at once, and RUN-TURN says so rather
 than pretending to serialise."
-  (let* ((blocks (or blocks (blocks-from-directory directory :store store)))
+  (let* ((blocks (or blocks (blocks-from-directory :directory directory :store store)))
          (snapshot (compile-prompt blocks)))
     (%make-agent :name name
                  :backend backend

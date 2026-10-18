@@ -283,13 +283,15 @@ is not."
              (enchiridion.memory.store:dequeue-task store)
              (let ((enchiridion.channel.cli:*command-context*
                      (enchiridion.channel.cli:make-command-context :store store)))
+               ;; DEQUEUE-TASK claims the oldest pending task, which is the
+               ;; first one queued, so the one still waiting is the second.
                (multiple-value-bind (text status) (captured-run "tasks" '("list" "pending"))
                  (ok (eql 0 status))
-                 (ok (search "still waiting" text))
-                 (ng (search "being worked on" text)))
+                 (ok (search "being worked on" text))
+                 (ng (search "still waiting" text)))
                (multiple-value-bind (text status) (captured-run "tasks" '("list" "running"))
                  (ok (eql 0 status))
-                 (ok (search "being worked on" text)))
+                 (ok (search "still waiting" text)))
                (testing "a status nobody has heard of is refused with the four"
                  (multiple-value-bind (text status) (captured-run "tasks" '("list" "nope"))
                    (ok (eql 2 status))

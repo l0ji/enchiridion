@@ -911,7 +911,19 @@ the operator has had a chance to edit the seed files."
                (verify-plugin-directory directory)))
             ((plusp (length command))
              (if (supervisor-command-p command)
-                 (run-supervised-command command (rest arguments) options)
+                 ;; The flags come before the command, which is what the plan
+                 ;; prints. They are also read after it, because `serve
+                 ;; --channel http` is what a person types and silently serving
+                 ;; with no channels is worse than accepting both spellings.
+                 (multiple-value-bind (later rest-arguments) (split-options (rest arguments))
+                   (let ((all (append options later))
+                         (later-problem nil))
+                     (setf later-problem (validate-options all))
+                     (when later-problem
+                       (format *error-output* "~&enchiridion: ~A~%" later-problem)
+                       (finish-output *error-output*)
+                       (return-from main 2))
+                     (run-supervised-command command rest-arguments all)))
                  (run-command command (rest arguments))))
             ((first-launch-p) (print-first-launch))
             ;; The plan prints `enchiridion --channel http --bind 127.0.0.1

@@ -236,3 +236,62 @@ is not."
         (ok (search "5678" text)))
       (testing "and it is not reported as none"
         (ng (search "none" text))))))
+
+;;;; The ledger report.
+
+(deftest the-usage-report-names-the-cache-columns ()
+  ;; The definition of done asks for cache read and cache write by name, and
+  ;; the grouping is what turns rows into an answer.
+  (with-scratch-directory (directory)
+    (let ((store (enchiridion.memory.store:open-store
+                  :path (merge-pathnames "memory.db" directory))))
+      (unwind-protect
+           (progn
+             (enchiridion.memory.store:record-usage store :model "one"
+                                                          :channel :http
+                                                          :input 10 :output 2
+                                                          :cache-read 3 :cache-write 4)
+             (enchiridion.memory.store:record-usage store :model "two"
+                                                          :channel :cli
+                                                          :input 20 :output 5
+                                                          :cache-read 6 :cache-write 7)
+             (let ((enchiridion.channel.cli:*command-context*
+                     (enchiridion.channel.cli:make-command-context :store store)))
+               (multiple-value-bind (text status) (captured-run "usage" '())
+                 (ok (eql 0 status))
+                 (testing "the header names all four numbers"
+                   (ok (search "cache read" text))
+                   (ok (search "cache write" text))
+                   (ok (search "input" text)))
+                 (testing "every grouping is printed"
+                   (ok (search "by model" text))
+                   (ok (search "by channel" text))
+                   (ok (search "by day" text)))
+                 (testing "and the sums are the sums"
+                   (ok (search "30" text))
+                   (ok (search "9" text))))))
+        (ignore-errors (enchiridion.memory.store:close-store store))))))
+
+(deftest tasks-can-be-listed-by-status ()
+  (with-scratch-directory (directory)
+    (let ((store (enchiridion.memory.store:open-store
+                  :path (merge-pathnames "memory.db" directory))))
+      (unwind-protect
+           (progn
+             (enchiridion.memory.store:enqueue-task store "still waiting")
+             (enchiridion.memory.store:enqueue-task store "being worked on")
+             (enchiridion.memory.store:dequeue-task store)
+             (let ((enchiridion.channel.cli:*command-context*
+                     (enchiridion.channel.cli:make-command-context :store store)))
+               (multiple-value-bind (text status) (captured-run "tasks" '("list" "pending"))
+                 (ok (eql 0 status))
+                 (ok (search "still waiting" text))
+                 (ng (search "being worked on" text)))
+               (multiple-value-bind (text status) (captured-run "tasks" '("list" "running"))
+                 (ok (eql 0 status))
+                 (ok (search "being worked on" text)))
+               (testing "a status nobody has heard of is refused with the four"
+                 (multiple-value-bind (text status) (captured-run "tasks" '("list" "nope"))
+                   (ok (eql 2 status))
+                   (ok (search "pending, running, done or failed" text))))))
+        (ignore-errors (enchiridion.memory.store:close-store store))))))

@@ -187,9 +187,13 @@ the three loading tiers, and the bootstrap state machine."))
    #:search-sessions #:search-memories #:save-memory #:list-memories
    #:session-block #:set-session-block #:ledger-block #:set-ledger-block
    #:record-usage #:usage-rows #:usage-since #:drop-store
+   ;; The ledger, summed. The CLI prints it and the heartbeat budgets against
+   ;; it, so the grouping lives in one place and the two cannot disagree.
+   #:usage-summary #:usage-total-since #:usage-session-total #:recent-turns
    ;; The task queue. The CLI writes it and the sleep agent drains it in
    ;; milestone 10, so the storage and the command land together.
-   #:enqueue-task #:dequeue-task #:list-tasks #:remove-task
+   #:enqueue-task #:dequeue-task #:complete-task #:fail-task #:recover-tasks
+   #:count-tasks #:list-tasks #:remove-task
    #:task-row #:task-row-id #:task-row-body #:task-row-status #:task-row-ts)
   (:documentation
    "SQLite with FTS5 over raw messages. Returns real text: no summarisation and
@@ -325,15 +329,22 @@ reactions are all out, so the allowlist is the whole authorisation story."))
    #:supervisor-agent #:supervisor-session #:supervisor-broker
    #:supervisor-run-directory
    #:supervisor-generation #:supervisor-channels #:supervisor-running-p
-   #:supervisor-heartbeat-p #:supervisor-poll-control #:supervisor-poll-loop
+   #:supervisor-heartbeat-p #:supervisor-heartbeat-interval
+   #:supervisor-poll-control #:supervisor-poll-loop
    #:supervisor-write-status #:supervisor-started #:channel-row
+   #:supervisor-tick #:supervisor-tick-function
+   #:supervisor-heartbeat-due-p #:supervisor-heartbeat-loop
+   #:supervisor-ticks #:supervisor-last-tick #:supervisor-tick-report
+   #:supervisor-tick-ok-p #:supervisor-tick-requested-p #:supervisor-tick-running-p
+   #:supervisor-last-compacted-turn #:supervisor-last-sleep-turn
    #:supervisor-reload #:find-channel
    ;; The two files that let a one-shot shell command talk to a process that is
    ;; already up. A file, not a socket, so tail and grep work on it.
    #:control-file #:status-file #:read-status #:status-fresh-p #:request-control
    #:queue-control
    #:status-generation #:status-channels #:status-bootstrap #:status-pid
-   #:status-updated #:status-report #:status-handled #:status-report-ok-p)
+   #:status-updated #:status-report #:status-handled #:status-report-ok-p
+   #:status-heartbeat)
   (:documentation
    "The process that owns the channels, and the two run/ files it exchanges with
 the shell. It is the only writer of run/enchiridion.status, which is what lets

@@ -665,16 +665,48 @@ file a block is backed by."
 (declaim (ftype (function (list) integer) cmd-usage))
 
 (defun cmd-usage (arguments)
-  "Print the token ledger, oldest first."
+  "Print the token ledger grouped by model, by channel and by day.
+
+The four numbers a provider reports are the point of the ledger, so cache read
+and cache write are named in the header: a report that hides them cannot answer
+whether the frozen prompt is keeping the prefix cache warm, which is the most
+expensive quiet failure this system has.
+
+The rows come from one SQL grouping rather than from the raw rows, so the
+report is the same whether a shell or the webhook asks for it."
   (declare (ignore arguments))
   (let ((missing (require-store "usage")))
     (if missing
         missing
-        (let ((rows (enchiridion.memory.store:usage-rows
-                     (command-context-store (context)) :limit 50)))
-          (if rows
-              (progn (dolist (row rows) (print-row row)) 0)
-              (progn (say "the ledger is empty.") 0))))))
+        (let ((store (command-context-store (context))))
+          (print-usage-group store :model "model" "by model")
+          (print-usage-group store :channel "channel" "by channel")
+          (print-usage-group store :day "day" "by day")
+          0))))
+
+(declaim (ftype (function (t keyword string string) null) print-usage-group))
+
+(defun print-usage-group (store group-by key heading)
+  "Print one grouped ledger section for GROUP-BY."
+  (let ((rows (handler-case (enchiridion.memory.store:usage-summary
+                              store :group-by group-by)
+                (error () '()))))
+    (say "~A" heading)
+    (if rows
+        (progn
+          ;; One line per group, built as a string and printed with ~A: a model
+          ;; name is text a provider chose, and text is never a format control.
+          (say "  ~A" (format nil "~12A ~10@A ~10@A ~11@A ~12@A ~6@A"
+                              key "input" "output" "cache read" "cache write" "calls"))
+          (dolist (row rows)
+            (say "  ~A"
+                 (format nil "~12A ~10D ~10D ~11D ~12D ~6D"
+                         (format nil "~A" (getf row (intern (string-upcase key) :keyword)))
+                         (getf row :input) (getf row :output)
+                         (getf row :cache-read) (getf row :cache-write)
+                         (getf row :calls)))))
+        (say "  the ledger is empty.")))
+  nil)
 
 (declaim (ftype (function (list) integer) cmd-budget))
 
@@ -701,7 +733,11 @@ for a cap that was configured, which made an unattended budget look uncapped."
 (declaim (ftype (function (list) integer) cmd-tasks))
 
 (defun cmd-tasks (arguments)
-  "List the task queue, add a task, or remove one by id."
+  "List the task queue, add a task, or remove one by id.
+
+`tasks list failed` and its three siblings exist because a task now has a
+status that matters: a task the sleep agent failed is not a task that finished,
+and the operator has to be able to see which is which."
   (let ((missing (require-store "tasks")))
     (if missing
         missing
@@ -709,14 +745,22 @@ for a cap that was configured, which made an unattended budget look uncapped."
               (store (command-context-store (context))))
           (cond
             ((string= action "list")
-             (let ((tasks (enchiridion.memory.store:list-tasks store)))
-               (if tasks
-                   (dolist (task tasks)
-                     (say "~D ~(~A~) ~A"
-                          (enchiridion.memory.store:task-row-id task)
-                          (enchiridion.memory.store:task-row-status task)
-                          (enchiridion.memory.store:task-row-body task)))
-                   (say "the task queue is empty.")))
+             (let* ((word (second arguments))
+                    (status (and word (intern (string-upcase word) :keyword))))
+               (when (and status
+                          (not (member status '(:pending :running :done :failed)
+                                       :test #'eq)))
+                 (say "tasks list takes pending, running, done or failed.")
+                 (return-from cmd-tasks 2))
+               (let ((tasks (enchiridion.memory.store:list-tasks
+                             store :status status)))
+                 (if tasks
+                     (dolist (task tasks)
+                       (say "~D ~(~A~) ~A"
+                            (enchiridion.memory.store:task-row-id task)
+                            (enchiridion.memory.store:task-row-status task)
+                            (enchiridion.memory.store:task-row-body task)))
+                     (say "no tasks~@[ with status ~(~A~)~]." status))))
              0)
             ((string= action "add")
              (unless (rest arguments)
@@ -776,7 +820,10 @@ for a cap that was configured, which made an unattended budget look uncapped."
 (declaim (ftype (function (list) integer) cmd-health))
 
 (defun cmd-health (arguments)
-  "Read the status file and report whether a supervisor is up."
+  "Read the status file and report whether a supervisor is up.
+
+The heartbeat line is the answer to the question the status file could never
+answer before: unattended work either happened, or said why it did not."
   (declare (ignore arguments))
   (let ((status (supervisor-status)))
     (unless status
@@ -787,6 +834,14 @@ for a cap that was configured, which made an unattended budget look uncapped."
          (enchiridion.supervisor:status-generation status))
     (let ((report (enchiridion.supervisor:status-report status)))
       (when report (say "~A" report)))
+    (let ((beat (enchiridion.supervisor:status-heartbeat status)))
+      (when (hash-table-p beat)
+        (say "heartbeat ~:[off~;on~], ~D tick~:P, last at ~A~@[: ~A~]"
+             (gethash "enabled" beat)
+             (or (gethash "ticks" beat) 0)
+             (or (gethash "last-tick" beat) 0)
+             (let ((line (gethash "report" beat)))
+               (if (and (stringp line) (plusp (length line))) line nil)))))
     (dolist (row (enchiridion.supervisor:status-channels status))
       (say "channel ~A" (status-channel-line row)))
     0))

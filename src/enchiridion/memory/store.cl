@@ -546,6 +546,24 @@ Each entry is a plist with :ID, :NAME, :BODY, :SESSION, and :TS."
             (list name text (get-universal-time)))
       text)))
 
+(declaim (ftype (function (store keyword string) string) store-checked-block))
+
+(defun store-checked-block (store label text)
+  "Write TEXT as the harness block LABEL and return it, after the checks.
+
+The two harness blocks are written by the heartbeat rather than by an agent, so
+nothing else would scan them: a write that skipped the injection scan would be
+the one write the scan never saw, and the block is in every prompt. The limit
+is enforced here for the same reason, and it fails with the exact shortfall
+rather than truncating."
+  (check-type text string)
+  (enchiridion.memory:scan-block-text label text)
+  (let ((limit (enchiridion.memory:default-block-limit label)))
+    (when (> (length text) limit)
+      (error 'enchiridion.errors:block-overflow
+             :label label :current limit :wanted (length text))))
+  (store-block store (string-downcase (string label)) text))
+
 (declaim (ftype (function (store) string) session-block))
 
 (defun session-block (store)
@@ -556,10 +574,8 @@ Each entry is a plist with :ID, :NAME, :BODY, :SESSION, and :TS."
 
 (defun set-session-block (store text)
   "Replace the session block with TEXT and return it.
-
-The character limit and the injection scan live in the block layer, which
-knows the label and the limit; this layer stores what it is given."
-  (store-block store "session" text))
+Scanned and limited, because the harness writes this one."
+  (store-checked-block store :session text))
 
 (declaim (ftype (function (store) string) ledger-block))
 
@@ -570,8 +586,9 @@ knows the label and the limit; this layer stores what it is given."
 (declaim (ftype (function (store string) string) set-ledger-block))
 
 (defun set-ledger-block (store text)
-  "Replace the ledger block with TEXT and return it."
-  (store-block store "ledger" text))
+  "Replace the ledger block with TEXT and return it.
+Scanned and limited, because the harness writes this one."
+  (store-checked-block store :ledger text))
 
 ;;;; The usage ledger.
 
@@ -626,6 +643,114 @@ about the shape of a row the report sums.")
   "Return ledger rows at or after SINCE, a universal time, oldest first."
   (check-type since integer)
   (usage-select store "WHERE ts >= ?" (list since) limit))
+
+;;;; The ledger, summed.
+
+(declaim (ftype (function (t) list) usage-totals))
+
+(defun usage-totals (row)
+  "Return ROW, one grouped usage row, as the plist a caller reports."
+  (list :input (or (field row "input") 0)
+        :output (or (field row "output") 0)
+        :cache-read (or (field row "cache_read") 0)
+        :cache-write (or (field row "cache_write") 0)
+        :calls (or (field row "calls") 0)
+        :total (+ (or (field row "input") 0) (or (field row "output") 0))))
+
+(declaim (ftype (function (store &key (:group-by keyword) (:since t) (:limit integer))
+                          list)
+                usage-summary))
+
+(defun usage-summary (store &key (group-by :model) since (limit 100))
+  "Return the ledger summed by GROUP-BY, which is :MODEL, :CHANNEL or :DAY.
+
+The day is the local calendar day of the row's time, because a report is read
+by a person looking at a date. The budget's own window stays the rolling
+twenty-four hours SPEND-TOTAL uses, where a burst over midnight has to count in
+full: the two answer different questions and neither is wrong.
+
+GROUP-BY is an ECASE and the SQL column comes from a fixed table rather than
+from the argument, so the grouping is never a string a caller supplies."
+  (check-type limit (integer 1 *))
+  (let* ((column (ecase group-by
+                   (:model "model")
+                   (:channel "channel")
+                   (:day "date(ts - 2208988800, 'unixepoch', 'localtime')")))
+         (key (ecase group-by (:model :model) (:channel :channel) (:day :day)))
+         (where (if since "WHERE ts >= ?" ""))
+         (order (if (eq group-by :day) "grouped DESC" "SUM(input + output) DESC"))
+         (rows (query-rows
+                store
+                (format nil "SELECT ~A AS grouped,
+                                    SUM(input) AS input,
+                                    SUM(output) AS output,
+                                    SUM(cache_read) AS cache_read,
+                                    SUM(cache_write) AS cache_write,
+                                    COUNT(*) AS calls
+                               FROM usage ~A
+                              GROUP BY grouped
+                              ORDER BY ~A
+                              LIMIT ?"
+                        column where order)
+                (if since (list since limit) (list limit)))))
+    (mapcar (lambda (row)
+              (append (list key (or (field row "grouped") ""))
+                      (usage-totals row)))
+            rows)))
+
+(declaim (ftype (function (store integer) list) usage-total-since))
+
+(defun usage-total-since (store since)
+  "Return every column of the ledger summed from SINCE, a universal time.
+A store with no rows answers zeroes rather than NIL, so a caller that prints
+the number never has to ask whether the ledger exists."
+  (check-type since integer)
+  (usage-totals
+   (first (query-rows store
+                      "SELECT SUM(input) AS input, SUM(output) AS output,
+                              SUM(cache_read) AS cache_read,
+                              SUM(cache_write) AS cache_write,
+                              COUNT(*) AS calls
+                         FROM usage WHERE ts >= ?"
+                      (list since)))))
+
+(declaim (ftype (function (store t) list) usage-session-total))
+
+(defun usage-session-total (store session)
+  "Return every column of the ledger summed for SESSION, a session id."
+  (usage-totals
+   (first (query-rows store
+                      "SELECT SUM(input) AS input, SUM(output) AS output,
+                              SUM(cache_read) AS cache_read,
+                              SUM(cache_write) AS cache_write,
+                              COUNT(*) AS calls
+                         FROM usage WHERE session = ?"
+                      (list (scrubbed (or session "")))))))
+
+;;;; Turns, newest first.
+
+(declaim (ftype (function (store &key (:limit integer) (:not-channel t)) list)
+                recent-turns))
+
+(defun recent-turns (store &key (limit 4) not-channel)
+  "Return the newest turns first, for a prompt that summarises them.
+
+NOT-CHANNEL drops the rows one channel wrote, so a summariser reading the
+transcript back does not read its own output and summarise that."
+  (check-type limit (integer 1 *))
+  (let ((rows (if not-channel
+                  (query-rows store
+                              "SELECT id, session, role, body, model, channel, ts
+                                 FROM turns
+                                WHERE channel <> ?
+                                ORDER BY id DESC LIMIT ?"
+                              (list (string-downcase (string not-channel)) limit))
+                  (query-rows store
+                              "SELECT id, session, role, body, model, channel, ts
+                                 FROM turns
+                                ORDER BY id DESC LIMIT ?"
+                              (list limit)))))
+    (mapcar #'turn-row-from rows)))
 
 ;;;; Dropping everything.
 
@@ -699,19 +824,71 @@ agent wrote, and the queue is readable through the search tool."
     (mapcar #'task-row-from rows)))
 
 (defun dequeue-task (store)
-  "Take the oldest pending task, mark it done, and return it as a TASK-ROW.
+  "Take the oldest pending task, mark it running, and return it as a TASK-ROW.
 Return NIL when there is nothing pending. An empty queue is the normal state,
-not an error, so nothing is signalled."
-  (let ((row (first (query-rows store
-                                "SELECT id, body, status, ts FROM tasks
-                                   WHERE status = 'pending'
-                                   ORDER BY id ASC LIMIT 1"))))
-    (when row
-      (let ((task (task-row-from row)))
-        (exec store "UPDATE tasks SET status = 'done' WHERE id = ?"
-              (list (task-row-id task)))
-        (setf (task-row-status task) :done)
-        task))))
+not an error, so nothing is signalled.
+
+Claiming is not finishing. A task marked done here and run afterwards is a task
+that disappears when the work crashes: the row says done and nothing ever did
+it. The update is conditional on the row still being pending, so two claimants
+cannot both win, and the loser looks again rather than taking work twice."
+  (loop repeat 5
+        do (let ((row (first (query-rows store
+                                        "SELECT id, body, status, ts FROM tasks
+                                           WHERE status = 'pending'
+                                           ORDER BY id ASC LIMIT 1"))))
+             (when (null row)
+               (return nil))
+             (let ((task (task-row-from row)))
+               (when (plusp (exec store
+                                  "UPDATE tasks SET status = 'running'
+                                     WHERE id = ? AND status = 'pending'"
+                                  (list (task-row-id task))))
+                 (setf (task-row-status task) :running)
+                 (return task))))
+        finally (return nil)))
+
+(declaim (ftype (function (store integer) boolean) complete-task))
+
+(defun complete-task (store id)
+  "Mark task ID done and return T when a running task was finished."
+  (check-type id integer)
+  (plusp (exec store "UPDATE tasks SET status = 'done'
+                        WHERE id = ? AND status = 'running'"
+               (list id))))
+
+(declaim (ftype (function (store integer) boolean) fail-task))
+
+(defun fail-task (store id)
+  "Mark task ID failed and return T when a running task was failed.
+The row stays, so the operator can read what was attempted and decide whether
+to add it again. Nothing is requeued: unattended work is at-most-once, and a
+task that crashes its worker would otherwise loop until the day budget stops
+it."
+  (check-type id integer)
+  (plusp (exec store "UPDATE tasks SET status = 'failed'
+                        WHERE id = ? AND status = 'running'"
+               (list id))))
+
+(declaim (ftype (function (store) integer) recover-tasks))
+
+(defun recover-tasks (store)
+  "Mark every running task failed and return how many.
+A task left running by a process that stopped is not running: nothing will
+finish it. This runs at the start of every heartbeat tick, so the state a
+previous process left behind is visible rather than silently in progress."
+  (exec store "UPDATE tasks SET status = 'failed' WHERE status = 'running'"))
+
+(declaim (ftype (function (store &key (:status t)) integer) count-tasks))
+
+(defun count-tasks (store &key status)
+  "Return how many tasks STORE holds, or how many have STATUS."
+  (let ((row (if status
+                 (first (query-rows store
+                                    "SELECT COUNT(*) AS n FROM tasks WHERE status = ?"
+                                    (list (string-downcase (string status)))))
+                 (first (query-rows store "SELECT COUNT(*) AS n FROM tasks")))))
+    (or (field row "n") 0)))
 
 (defun remove-task (store id)
   "Delete task ID and return T when a row was removed."

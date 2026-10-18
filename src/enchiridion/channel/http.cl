@@ -44,13 +44,25 @@ fifty rows, so the two surfaces answer the same question the same way.")
   "The largest ?limit= GET /usage will honour. A caller may ask for fewer rows
 than the default, not for the whole table in one response.")
 
-(defparameter +http-drain-seconds+ 5
+(defparameter +http-drain-seconds+ 30
   "How long CHANNEL-STOP waits for a turn already in flight.
 
 hunchentoot:stop closes the listener and returns without killing a handler
 thread, so a turn that started before the stop still finishes and still writes
-its ledger row. The caller closes the store after this, and closing it under a
-running turn would lose the row.")
+its ledger row. The supervisor closes the store immediately after this returns,
+which is why the wait counts turns and not only connections: a turn lost here is
+a token row that never reaches the ledger. A turn that outlasts even this is
+reported, and the operator can read why the shutdown was slow.")
+
+(defparameter +http-read-timeout+ 5
+  "How long a connection may take to send its request line, headers and body.
+
+A client that declares a body and then sends nothing holds a handler thread for
+this long. Eight of those exhaust the taskmaster before authentication had a
+chance to refuse them, so the timeout is short: a real caller on a real network
+sends a webhook request in milliseconds, and one that needs longer than five
+seconds is one that is not sending. hunchentoot requires the read and write
+timeouts to be equal, so the same number is used for both.")
 
 ;;;; The one condition this file signals.
 
@@ -113,6 +125,9 @@ body this file returns is an object."
 ;; turn answers one message and returns (:ok-p :reply :error :reason :usage).
 ;; health reports the process, usage reads the ledger, token is the shared
 ;; secret or NIL, and the rest is where to listen and how much to read.
+;; in-flight counts the turns a stop has to wait for, which hunchentoot's own
+;; requests-in-progress does not: a turn that has finished reading its body and
+;; is waiting on a model is a request hunchentoot considers answered.
 (defstruct (http-service (:constructor %make-http-service))
   (turn nil :type t)
   (health nil :type t)
@@ -120,7 +135,9 @@ body this file returns is an object."
   (token nil :type t)
   (bind "127.0.0.1" :type string)
   (port 8787 :type (integer 0 65535))
-  (body-limit +http-body-limit+ :type (integer 1 *)))
+  (body-limit +http-body-limit+ :type (integer 1 *))
+  (in-flight 0 :type integer)
+  (in-flight-lock nil :type t))
 
 (declaim (ftype (function (&key (:turn t) (:health t) (:usage t) (:token t)
                                 (:bind string) (:port integer) (:body-limit integer))
@@ -129,14 +146,42 @@ body this file returns is an object."
 
 (defun make-http-service (&key turn health usage token (bind "127.0.0.1") (port 8787)
                                (body-limit +http-body-limit+))
-  "Return an HTTP service. Nothing binds a port until a channel starts it."
+  "Return an HTTP service. Nothing binds a port until a channel starts it.
+
+The bind and the token are trimmed here, in one place, because both are read
+from a configuration file a person edited: a token with a trailing space is a
+token no header will ever match, and an empty bind would be handed to
+hunchentoot as a hostname. An empty token becomes no token, which the policy
+refuses on a reachable bind and allows on loopback."
   (check-type bind string)
   (check-type port (integer 0 65535))
   (check-type body-limit (integer 1 *))
-  (%make-http-service :turn turn :health health :usage usage :token token
-                      :bind (string-trim '(#\Space #\Tab) bind)
-                      :port port
-                      :body-limit body-limit))
+  (let ((bind (string-trim '(#\Space #\Tab) bind))
+        (token (and (stringp token)
+                    (string-trim '(#\Space #\Tab #\Newline #\Return) token))))
+    (%make-http-service :turn turn :health health :usage usage
+                        :token (if (and token (plusp (length token))) token nil)
+                        :bind (if (plusp (length bind)) bind "127.0.0.1")
+                        :port port
+                        :body-limit body-limit
+                        :in-flight-lock (bordeaux-threads:make-lock
+                                         "enchiridion http in flight"))))
+
+(declaim (ftype (function (http-service) null) enter-turn))
+
+(defun enter-turn (service)
+  "Count one turn as running. Return NIL."
+  (bordeaux-threads:with-lock-held ((http-service-in-flight-lock service))
+    (incf (http-service-in-flight service)))
+  nil)
+
+(declaim (ftype (function (http-service) null) leave-turn))
+
+(defun leave-turn (service)
+  "Count one turn as finished. Return NIL."
+  (bordeaux-threads:with-lock-held ((http-service-in-flight-lock service))
+    (decf (http-service-in-flight service)))
+  nil)
 
 ;;;; Authentication.
 
@@ -191,25 +236,38 @@ with no token and a request with the wrong one take the same path."
 (defun loopback-bind-p (bind)
   "Return T when BIND names only the loopback interface, or names nothing.
 
-Empty and NIL are loopback because the default is loopback and the acceptor is
-given 127.0.0.1 rather than NIL in that case. 0.0.0.0, ::, a hostname other
-than localhost, and every other address are not: a name that resolves to the
-loopback today can resolve elsewhere tomorrow, and a name server in a startup
-security check is a network call in a security check."
-  (let ((text (string-trim '(#\Space #\Tab) (if (stringp bind) bind ""))))
-    (cond
-      ((zerop (length text)) t)
-      ((string-equal "localhost" text) t)
-      ((string= "::1" text) t)
-      ((string= "::ffff:127.0.0.1" text) t)
-      ((and (>= (length text) 5)
-            (string= "127." text :end2 4)
-            (= 3 (count #\. text))
-            (every (lambda (character)
-                     (or (digit-char-p character) (char= character #\.)))
-                   text))
-       t)
-      (t nil))))
+The empty string is loopback because MAKE-HTTP-SERVICE replaces it with
+127.0.0.1 before an acceptor is made. NIL is NOT loopback: hunchentoot reads a
+NIL address as the wildcard and binds every interface, so classifying NIL as
+the safe default would make one spelling silently open the port to the network
+while the policy said it was local.
+
+0.0.0.0, ::, a hostname other than localhost, and every other address are not
+loopback either: a name that resolves to the loopback today can resolve
+elsewhere tomorrow, and a name server inside a startup security check is a
+network call inside a security check.
+
+The digit test is bounded to ASCII on purpose. DIGIT-CHAR-P accepts every
+Unicode decimal digit, so a spelling such as 127.0.0.<arabic-indic one> would
+be called loopback by a looser check; it does not resolve today, but the check
+must not be the reason that stays true."
+  (if (not (stringp bind))
+      nil
+      (let ((text (string-trim '(#\Space #\Tab) bind)))
+        (cond
+          ((zerop (length text)) t)
+          ((string-equal "localhost" text) t)
+          ((string= "::1" text) t)
+          ((string= "::ffff:127.0.0.1" text) t)
+          ((and (>= (length text) 5)
+                (string= "127." text :end2 4)
+                (= 3 (count #\. text))
+                (every (lambda (character)
+                         (or (char= character #\.)
+                             (char<= #\0 character #\9)))
+                       text))
+           t)
+          (t nil)))))
 
 (declaim (ftype (function (http-service) null) check-http-policy))
 
@@ -460,7 +518,10 @@ tool makes several model calls, and the completion is only the last one."
                      :author (if (stringp author) author "webhook")
                      :text text))
            (result (if turn
-                       (funcall turn message)
+                       (progn
+                         (enter-turn service)
+                         (unwind-protect (funcall turn message)
+                           (leave-turn service)))
                        (list :ok-p nil
                              :error "no agent is attached to this webhook."))))
       (cond
@@ -540,17 +601,24 @@ is the throw that delivers the body."
 (defmethod hunchentoot:acceptor-dispatch-request ((acceptor http-acceptor) request)
   "Answer one request as JSON and never let a condition escape.
 
+The token is checked from the header before the body is read. That order is the
+difference between an anonymous caller being refused and an anonymous caller
+holding a handler thread for the read timeout: a client that announces a body
+and then sends nothing costs nothing until the body is wanted, and the
+taskmaster is small.
+
 An uncaught condition is rendered by hunchentoot as its own HTML error page,
 with the server version and a backtrace on stderr: an API that answers HTML
 when it fails is an API whose caller cannot tell a bug from a shutdown."
   (let ((service (http-acceptor-service acceptor)))
     (handler-case
-        (let ((parsed (request-from-hunchentoot service request)))
-          (unless (authorized-p service (http-request-authorization parsed))
+        (progn
+          (unless (authorized-p service (hunchentoot:header-in* :authorization request))
             (setf (hunchentoot:header-out :www-authenticate) "Bearer")
             (http-fail 401 "A bearer token is required."))
-          (multiple-value-bind (status body) (handle-http-request service parsed)
-            (abort-with status body)))
+          (let ((parsed (request-from-hunchentoot service request)))
+            (multiple-value-bind (status body) (handle-http-request service parsed)
+              (abort-with status body))))
       (http-error (condition)
         (abort-with (http-error-status condition)
                     (error-body (http-error-message condition))
@@ -586,18 +654,33 @@ loop and a start that returned at once would bind the port again every second.")
 (declaim (ftype (function (http-channel) null) stop-http-acceptor))
 
 (defun stop-http-acceptor (channel)
-  "Stop CHANNEL's acceptor and wait, briefly, for the turns in flight.
+  "Stop CHANNEL's acceptor and wait, briefly, for the work in flight.
+
+Two things are waited for. hunchentoot's own count of requests in progress
+covers a connection still inside the handler; the service's turn count covers
+the longer and more expensive case, a turn that has read its body and is
+waiting on a model. The supervisor closes the store as soon as this returns, so
+a turn still running would write its ledger row into a closed store.
 
 The slot is cleared first so that a stop from CHANNEL-STOP and a stop from the
 start loop cannot both drive the same acceptor."
-  (let ((acceptor (shiftf (http-channel-acceptor channel) nil)))
+  (let ((acceptor (shiftf (http-channel-acceptor channel) nil))
+        (service (http-channel-service channel)))
     (when acceptor
       (ignore-errors (hunchentoot:stop acceptor))
       (let ((deadline (+ (get-internal-real-time)
                          (* +http-drain-seconds+ internal-time-units-per-second))))
-        (loop while (and (plusp (or (hunchentoot:acceptor-requests-in-progress acceptor) 0))
+        (loop while (and (or (plusp (or (hunchentoot:acceptor-requests-in-progress
+                                         acceptor)
+                                        0))
+                             (and service (plusp (http-service-in-flight service))))
                          (< (get-internal-real-time) deadline))
-              do (sleep 0.05)))))
+              do (sleep 0.05))
+        (when (and service (plusp (http-service-in-flight service)))
+          (format *error-output*
+                  "~&enchiridion: a webhook turn outlasted the ~D second drain; it may not reach the ledger.~%"
+                  +http-drain-seconds+)
+          (finish-output *error-output*)))))
   nil)
 
 (defmethod enchiridion.channel:channel-start ((channel http-channel) &key config)
@@ -627,8 +710,8 @@ unreadable exactly when it is needed."
                                          'hunchentoot:one-thread-per-connection-taskmaster
                                          :max-thread-count 8
                                          :max-accept-count 16)
-                            :read-timeout 30
-                            :write-timeout 30
+                            :read-timeout +http-read-timeout+
+                            :write-timeout +http-read-timeout+
                             :access-log-destination nil
                             :message-log-destination nil
                             :persistent-connections-p t)))

@@ -67,23 +67,35 @@ stops the agent from starting; the plan requires that."
           (file-error () (enchiridion.memory:seed-template name)))
         (enchiridion.memory:seed-template name))))
 
-(defun blocks-from-directory (&optional directory)
+(defun blocks-from-directory (&optional directory &key store)
   "Return the five blocks for DIRECTORY. The first three are read from their
 Markdown files when those exist and fall back to the seed templates. The first
 three are not writable by the primary agent; the sleep agent gets its own
-writable copy later."
+writable copy later.
+
+The last two blocks come from STORE when there is one. They are harness
+written and stored as rows rather than files, and reading them here is what
+puts the session and the ledger into a prompt at all: without STORE they are
+the empty strings the shape has always allowed."
   (let ((directory (and directory (uiop:ensure-directory-pathname directory))))
     (flet ((read-block (name label writable-p)
              (enchiridion.memory:make-block
               :label label
               :text (block-text-from directory name)
               :file (and directory (merge-pathnames name directory))
-              :writable-p writable-p)))
+              :writable-p writable-p))
+           (stored-block (name reader)
+             (enchiridion.memory:make-block
+              :label name
+              :text (if store
+                        (handler-case (funcall reader store) (error () ""))
+                        "")
+              :writable-p t)))
       (list (read-block "SOUL.md" :persona nil)
             (read-block "OPERATOR.md" :operator nil)
             (read-block "WORLD.md" :world nil)
-            (enchiridion.memory:make-block :label :session :text "" :writable-p t)
-            (enchiridion.memory:make-block :label :ledger :text "" :writable-p t)))))
+            (stored-block :session #'enchiridion.memory.store:session-block)
+            (stored-block :ledger #'enchiridion.memory.store:ledger-block)))))
 
 ;;;; The agent.
 
@@ -107,17 +119,18 @@ writable copy later."
   (lock nil :type t))
 
 (defun make-agent (&key (name "default") backend blocks directory budget
-                          broker (tools-p t) (tool-rounds 8) lock)
+                          broker (tools-p t) (tool-rounds 8) lock store)
   "Return an AGENT with a prompt compiled from BLOCKS, or from DIRECTORY.
 
 The prompt is compiled here, once. Callers that pass BLOCKS usually pass the
 same list to a test; callers that pass DIRECTORY get the three Markdown blocks
-and the two harness blocks, with seed templates for absent files.
+and the two harness blocks, with seed templates for absent files and the
+session and ledger text read from STORE when there is one.
 
 The agent is born with a lock, unless a caller brings one. An agent with no
 lock is a test that never runs two turns at once, and RUN-TURN says so rather
 than pretending to serialise."
-  (let* ((blocks (or blocks (blocks-from-directory directory)))
+  (let* ((blocks (or blocks (blocks-from-directory directory :store store)))
          (snapshot (compile-prompt blocks)))
     (%make-agent :name name
                  :backend backend

@@ -77,15 +77,42 @@ before this is reached"
       (ng (enchiridion.channel.http:authorized-p locked nil))
       (ng (enchiridion.channel.http:authorized-p locked "s3cret")))))
 
+(deftest a-token-is-trimmed-and-a-blank-one-is-no-token ()
+  ;; A token comes from a file a person edited, and a stray space in it used to
+  ;; be a permanent 401 that looks exactly like a wrong token. It is trimmed
+  ;; now; a token that is only whitespace is no token at all, which the bind
+  ;; policy refuses on anything but loopback.
+  (let ((service (service-with :token "  s3cret	")))
+    (testing "the surrounding whitespace does not matter"
+      (ok (enchiridion.channel.http:authorized-p service "Bearer s3cret"))
+      (testing "and a different token is still refused"
+        (ng (enchiridion.channel.http:authorized-p service "Bearer s3cret2"))
+        (ng (enchiridion.channel.http:authorized-p service "Bearer s3cre")))))
+  (testing "a blank token is no token"
+    (ok (enchiridion.channel.http:authorized-p (service-with :token "   ") nil))
+    (testing "and a reachable bind with a blank token is refused rather than locked"
+      (ok (handler-case
+              (progn (enchiridion.channel.http:check-http-policy
+                      (service-with :token "   " :bind "0.0.0.0"))
+                     nil)
+            (enchiridion.errors:configuration-error () t)))))
+  (testing "an empty bind is the loopback default, not the wildcard"
+    (ok (string= "127.0.0.1"
+                 (enchiridion.channel.http:http-service-bind
+                  (service-with :bind ""))))))
+
 ;;;; Binding.
 
 (deftest only-the-loopback-names-count-as-loopback ()
-  (dolist (bind '("" nil "127.0.0.1" "127.0.0.2" "127.1.2.3" "localhost"
-                  "LOCALHOST" "::1" "::ffff:127.0.0.1" " 127.0.0.1 "))
+  (dolist (bind '("" "   " "127.0.0.1" "127.0.0.2" "127.1.2.3" "127.000.000.001"
+                  "localhost" "LOCALHOST" "::1" "::ffff:127.0.0.1" " 127.0.0.1 "))
     (testing (format nil "~S is loopback" bind)
       (ok (enchiridion.channel.http:loopback-bind-p bind))))
-  (dolist (bind '("0.0.0.0" "::" "*" "example.test" "10.0.0.1" "128.0.0.1"
-                  "127.0.0.1.example.test" "127.0.0" "1270.0.1"))
+  ;; NIL is the wildcard to hunchentoot, so it is not the safe default; the
+  ;; last entry is a Unicode digit, which DIGIT-CHAR-P would accept.
+  (dolist (bind '(nil "0.0.0.0" "::" "*" "example.test" "10.0.0.1" "128.0.0.1"
+                  "127.0.0.1.example.test" "127.0.0" "1270.0.1"
+                  "127.0.0.١"))
     (testing (format nil "~S is not loopback" bind)
       (ng (enchiridion.channel.http:loopback-bind-p bind)))))
 

@@ -166,3 +166,97 @@ and remove the directory. A failing test must not leave a thread behind."
       (let ((status (enchiridion.supervisor:read-status run)))
         (ok (enchiridion.supervisor:status-report-ok-p status))
         (ok (= 4 (enchiridion.supervisor:status-generation status)))))))
+
+;;;; The heartbeat.
+
+(deftest a-tick-runs-the-hook-and-records-what-it-said ()
+  (let* ((directory (scratch-directory))
+         (run (merge-pathnames "run/" directory))
+         (ticks 0)
+         (supervisor (enchiridion.supervisor:make-supervisor
+                      :directory (namestring directory)
+                      :run-directory (namestring run)
+                      :tick-function (lambda (supervisor)
+                                       (declare (ignore supervisor))
+                                       (incf ticks)
+                                       (list :ok-p t :report "one task done")))))
+    (unwind-protect
+         (progn
+           (enchiridion.supervisor:supervisor-start supervisor)
+           (enchiridion.supervisor:supervisor-tick supervisor)
+           (ok (= 1 ticks))
+           (ok (= 1 (enchiridion.supervisor:supervisor-ticks supervisor)))
+           (ok (enchiridion.supervisor:supervisor-tick-ok-p supervisor))
+           (ok (string= "one task done"
+                        (enchiridion.supervisor:supervisor-tick-report supervisor)))
+           (testing "the status file carries a heartbeat object"
+             (let ((beat (enchiridion.supervisor:status-heartbeat
+                          (enchiridion.supervisor:read-status run))))
+               (ok (hash-table-p beat))
+               (ok (eql 1 (gethash "ticks" beat)))
+               (ok (string= "one task done" (gethash "report" beat)))
+               (ok (integerp (gethash "last-tick" beat)))))
+           (testing "a hook that signals does not take the scheduler with it"
+             (setf (enchiridion.supervisor:supervisor-tick-function supervisor)
+                   (lambda (supervisor)
+                     (declare (ignore supervisor))
+                     (error "the tick exploded")))
+             (let ((report (enchiridion.supervisor:supervisor-tick supervisor)))
+               (ok (null (getf report :ok-p)))
+               (ok (search "the tick exploded" (getf report :report)))
+               (ok (= 2 (enchiridion.supervisor:supervisor-ticks supervisor)))
+               (ok (null (enchiridion.supervisor:supervisor-tick-ok-p supervisor))))))
+      (ignore-errors (enchiridion.supervisor:supervisor-stop supervisor))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(deftest heartbeat-run-asks-for-one-tick-without-waiting ()
+  (let* ((directory (scratch-directory))
+         (run (merge-pathnames "run/" directory))
+         (supervisor (enchiridion.supervisor:make-supervisor
+                      :directory (namestring directory)
+                      :run-directory (namestring run)
+                      :heartbeat-p nil
+                      :heartbeat-interval 3600
+                      :tick-function (lambda (supervisor)
+                                       (declare (ignore supervisor))
+                                       (list :ok-p t :report "ticked")))))
+    (unwind-protect
+         (progn
+           (enchiridion.supervisor:supervisor-start supervisor)
+           (enchiridion.supervisor:queue-control "heartbeat run" :run run)
+           (ok (= 1 (enchiridion.supervisor:supervisor-poll-control supervisor)))
+           (testing "the answer is immediate and the request is queued"
+             (ok (enchiridion.supervisor:supervisor-tick-requested-p supervisor))
+             (ok (enchiridion.supervisor:status-report-ok-p
+                  (enchiridion.supervisor:read-status run))))
+           (testing "and the schedule being off does not refuse the request"
+             (ok (not (enchiridion.supervisor:supervisor-heartbeat-p supervisor)))
+             (ok (enchiridion.supervisor:supervisor-heartbeat-due-p supervisor)))
+           (testing "a tick clears the request"
+             (enchiridion.supervisor:supervisor-tick supervisor)
+             (ok (null (enchiridion.supervisor:supervisor-tick-requested-p supervisor)))
+             (ok (not (enchiridion.supervisor:supervisor-heartbeat-due-p supervisor))
+                 "an hour-long interval is not due a second later")))
+      (ignore-errors (enchiridion.supervisor:supervisor-stop supervisor))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(deftest heartbeat-on-without-a-hook-is-not-a-success ()
+  ;; The operator script that turns the heartbeat on deserves to know that
+  ;; nothing will happen: a channel with no sleep agent attached is a schedule
+  ;; with nothing to run.
+  (let* ((directory (scratch-directory))
+         (run (merge-pathnames "run/" directory))
+         (supervisor (enchiridion.supervisor:make-supervisor
+                      :directory (namestring directory)
+                      :run-directory (namestring run))))
+    (unwind-protect
+         (progn
+           (enchiridion.supervisor:supervisor-start supervisor)
+           (enchiridion.supervisor:queue-control "heartbeat on" :run run)
+           (enchiridion.supervisor:supervisor-poll-control supervisor)
+           (let ((status (enchiridion.supervisor:read-status run)))
+             (ok (enchiridion.supervisor:supervisor-heartbeat-p supervisor))
+             (ok (search "no sleep agent" (enchiridion.supervisor:status-report status)))
+             (ok (null (enchiridion.supervisor:status-report-ok-p status)))))
+      (ignore-errors (enchiridion.supervisor:supervisor-stop supervisor))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))

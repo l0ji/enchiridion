@@ -240,11 +240,37 @@ PLAN.md section 5.2 promises: a child inherits nothing and a later read of
   (generation 0 :type integer)
   (started-p nil :type boolean))
 
+(declaim (ftype (function (t) list) agent-budget-plist))
+
+(defun agent-budget-plist (config)
+  "Return the token caps from the :BUDGET section, as the plist an agent takes.
+
+The caps live outside the :LLM section, so CONFIG-SECTION-VALUE reads them.
+An agent built without them answers BUDGET-EXHAUSTED-P with NIL forever, which
+is how a configured cap becomes no cap at all."
+  (list :max-tokens-per-tick
+        (enchiridion:config-section-value config :budget :max-tokens-per-tick)
+        :max-tokens-per-day
+        (enchiridion:config-section-value config :budget :max-tokens-per-day)))
+
+(declaim (ftype (function (t) integer) heartbeat-interval))
+
+(defun heartbeat-interval (config)
+  "Return the sleep interval in whole seconds from the :SLEEP section.
+Anything that is not a positive whole number of seconds is the shipped fifteen
+minutes: an interval of zero is a tick loop and a string is a mistyped key."
+  (let ((value (enchiridion:config-section-value config :sleep :interval-seconds 900)))
+    (if (and (integerp value) (plusp value)) value 900)))
+
 (defun make-context ()
-  "Build the context for one command. Start nothing and open no socket."
+  "Build the context for one command. Start nothing and open no socket.
+
+The store is opened before the agent because the agent's prompt is compiled
+from the blocks, and two of those blocks are rows in the store."
   (let* ((config (load-config))
          (directory (agent-directory))
          (key (load-configured-secrets config))
+         (store (open-agent-store config))
          (backend (when (plusp (length key))
                     (enchiridion.llm:resolve-backend :config config :api-key key)))
          (broker (enchiridion.tools.broker:make-broker
@@ -255,11 +281,13 @@ PLAN.md section 5.2 promises: a child inherits nothing and a later read of
                  :name "default"
                  :backend backend
                  :directory directory
+                 :budget (agent-budget-plist config)
+                 :store store
                  :broker broker)))
     (enchiridion.tools.builtin:register-builtin-tools)
     (%make-context :directory directory
                    :config config
-                   :store (open-agent-store config)
+                   :store store
                    :backend backend
                    :broker broker
                    :agent agent
@@ -682,18 +710,25 @@ restarts every second."
 
 (defun make-application-supervisor (context)
   "Return the supervisor this process owns, with the broker round trip as its
-reload hook.
+reload hook and the heartbeat as its tick hook.
 
 RELOAD-FUNCTION is the whole reason the supervisor is generic: it calls a
-function, and this process supplies one that never loads agent code here."
-  (enchiridion.supervisor:make-supervisor
-   :directory (context-directory context)
-   :config (context-config context)
-   :store (context-store context)
-   :agent (context-agent context)
-   :generation (context-generation context)
-   :bootstrap-line (bootstrap-line (context-directory context))
-   :reload-function (lambda (supervisor) (broker-reload context supervisor))))
+function, and this process supplies one that never loads agent code here. The
+tick hook is the same idea one step further: the supervisor schedules the
+heartbeat, and the kernel owns what a tick does."
+  (let ((config (context-config context)))
+    (enchiridion.supervisor:make-supervisor
+     :directory (context-directory context)
+     :config config
+     :store (context-store context)
+     :agent (context-agent context)
+     :session (context-session context)
+     :generation (context-generation context)
+     :heartbeat-p (enchiridion:config-section-value config :sleep :enabled t)
+     :heartbeat-interval (heartbeat-interval config)
+     :tick-function #'enchiridion.kernel:heartbeat
+     :bootstrap-line (bootstrap-line (context-directory context))
+     :reload-function (lambda (supervisor) (broker-reload context supervisor)))))
 
 (defun command-context-for (context &key supervisor respond cancel)
   "Return the command table's view of CONTEXT."

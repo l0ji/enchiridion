@@ -52,7 +52,8 @@
      (:file "seed-test")
      (:file "secrets-test")
      (:file "http-test")
-     (:file "fluxer-test"))))
+     (:file "fluxer-test")
+     (:file "sleep-test"))))
 
   ;; Every suite rove collected is run, and the count is checked first. The
   ;; obvious implementation, (rove:run "enchiridion-tests"), finds nothing

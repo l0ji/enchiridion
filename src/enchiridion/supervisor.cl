@@ -139,6 +139,14 @@ A reload that refused a generation is the refusal this exists for: the operator
 script that asked has to be able to tell it from a reload that landed."
   (and (hash-table-p status) (gethash "report-ok" status)))
 
+(declaim (ftype (function (t) t) status-heartbeat))
+
+(defun status-heartbeat (status)
+  "Return the heartbeat object the status file holds, or NIL.
+A reader that wants one field asks for it here rather than walking the JSON:
+the shape is written in SUPERVISOR-WRITE-STATUS and read in one place."
+  (and (hash-table-p status) (gethash "heartbeat" status)))
+
 (declaim (ftype (function (t &key (:seconds integer)) boolean) status-fresh-p))
 
 (defun status-fresh-p (status &key (seconds +status-fresh-seconds+))
@@ -203,6 +211,12 @@ supervisor is up the answer is NIL and the caller says so and exits non-zero."
 ;; live, channels is the list of live channel objects, and reload-function is
 ;; the hook that produces a new generation. The supervisor itself never loads
 ;; agent code, so a daemon passes a function that asks the broker.
+;;
+;; tick-function is the second such hook: the heartbeat's work lives in the
+;; kernel, and this file loads before it, so the caller supplies the function
+;; rather than the supervisor reaching forward for it. last-tick is measured
+;; from the end of a tick, so a pass that takes longer than the interval runs
+;; again when it finishes rather than piling up behind itself.
 (defstruct (supervisor (:constructor %make-supervisor))
   (directory "" :type string)
   (run-directory nil :type (or null string))
@@ -215,6 +229,17 @@ supervisor is up the answer is NIL and the caller says so and exits non-zero."
   (channels '() :type list)
   (running-p nil :type boolean)
   (heartbeat-p nil :type boolean)
+  (heartbeat-interval 900 :type integer)
+  (heartbeat-thread nil :type t)
+  (tick-function nil :type t)
+  (tick-running-p nil :type boolean)
+  (tick-requested-p nil :type boolean)
+  (tick-ok-p t :type boolean)
+  (tick-report "" :type string)
+  (ticks 0 :type integer)
+  (last-tick 0 :type integer)
+  (last-compacted-turn 0 :type integer)
+  (last-sleep-turn 0 :type integer)
   (bootstrap-line "" :type string)
   (report "" :type string)
   (report-ok-p t :type boolean)
@@ -225,15 +250,22 @@ supervisor is up the answer is NIL and the caller says so and exits non-zero."
 (declaim (ftype (function (&key (:directory string) (:run-directory t)
                                 (:config t) (:store t) (:agent t) (:session t)
                                 (:broker t) (:generation integer) (:channels list)
-                                (:bootstrap-line string) (:reload-function t))
+                                (:heartbeat-p t) (:heartbeat-interval integer)
+                                (:tick-function t) (:bootstrap-line string)
+                                (:reload-function t))
                           supervisor)
                 make-supervisor))
 
 (defun make-supervisor (&key (directory "") (run-directory nil) (config nil)
                              (store nil) (agent nil) (session nil) (broker nil)
-                             (generation 0) (channels '()) (bootstrap-line "")
-                             (reload-function nil))
-  "Return a SUPERVISOR. Nothing starts until SUPERVISOR-START."
+                             (generation 0) (channels '()) (heartbeat-p nil)
+                             (heartbeat-interval 900) (tick-function nil)
+                             (bootstrap-line "") (reload-function nil))
+  "Return a SUPERVISOR. Nothing starts until SUPERVISOR-START.
+
+HEARTBEAT-INTERVAL is a positive whole number of seconds; anything else is the
+fifteen minutes the shipped configuration names, because an interval of zero
+is a tick loop and a string is a mis-typed configuration key."
   (%make-supervisor :directory directory
                     :run-directory (or run-directory (enchiridion:run-directory))
                     :config config
@@ -243,6 +275,12 @@ supervisor is up the answer is NIL and the caller says so and exits non-zero."
                     :broker broker
                     :generation generation
                     :channels channels
+                    :heartbeat-p (not (null heartbeat-p))
+                    :heartbeat-interval (if (and (integerp heartbeat-interval)
+                                                 (plusp heartbeat-interval))
+                                            heartbeat-interval
+                                            900)
+                    :tick-function tick-function
                     :bootstrap-line bootstrap-line
                     :reload-function reload-function))
 
@@ -273,9 +311,22 @@ written, because the file is world readable."
     (setf (gethash "updated" table) (get-universal-time))
     (setf (gethash "generation" table) (supervisor-generation supervisor))
     (setf (gethash "bootstrap" table) (supervisor-bootstrap-line supervisor))
-    (setf (gethash "report" table) (supervisor-report supervisor))
+    ;; The report strings come from control lines and from the tick, and both
+    ;; can quote a failure that mentions a token. The status file is world
+    ;; readable, so it is scrubbed on the way out like every other text path.
+    (setf (gethash "report" table)
+          (enchiridion.llm.secrets:scrub (supervisor-report supervisor)))
     (setf (gethash "report-ok" table) (supervisor-report-ok-p supervisor))
     (setf (gethash "handled" table) (supervisor-handled supervisor))
+    (setf (gethash "heartbeat" table)
+          (let ((beat (make-hash-table :test #'equal)))
+            (setf (gethash "enabled" beat) (supervisor-heartbeat-p supervisor))
+            (setf (gethash "ticks" beat) (supervisor-ticks supervisor))
+            (setf (gethash "last-tick" beat) (supervisor-last-tick supervisor))
+            (setf (gethash "ok" beat) (supervisor-tick-ok-p supervisor))
+            (setf (gethash "report" beat)
+                  (enchiridion.llm.secrets:scrub (supervisor-tick-report supervisor)))
+            beat))
     (setf (gethash "root" table) (supervisor-directory supervisor))
     (setf (gethash "config" table) (enchiridion:config-digest (supervisor-config supervisor)))
     (setf (gethash "channels" table)
@@ -328,6 +379,18 @@ a channel that fails at once from becoming a busy loop."
   (setf (supervisor-running-p supervisor) t)
   (dolist (channel (supervisor-channels supervisor))
     (start-channel supervisor channel))
+  ;; The heartbeat runs on its own thread and never on the poll thread: a tick
+  ;; is one or more model calls, and a poll loop held inside one stops
+  ;; rewriting the status file. The status file is what every shell command
+  ;; reads to decide whether a supervisor is up, and it goes stale in ten
+  ;; seconds, so a tick on that thread would make the agent look dead while it
+  ;; worked.
+  (when (and (supervisor-tick-function supervisor)
+             (supervisor-heartbeat-p supervisor))
+    (setf (supervisor-heartbeat-thread supervisor)
+          (bordeaux-threads:make-thread
+           (lambda () (supervisor-heartbeat-loop supervisor))
+           :name "enchiridion heartbeat")))
   (supervisor-write-status supervisor)
   supervisor)
 
@@ -335,8 +398,17 @@ a channel that fails at once from becoming a busy loop."
 
 (defun supervisor-stop (supervisor)
   "Stop every channel, clear the running flag, and write the last status.
-Return SUPERVISOR."
+Return SUPERVISOR.
+
+The heartbeat thread is destroyed before the last status is written, and the
+tick in flight, if there is one, is left to unwind: its task is claimed as
+running and the next process marks it failed. Killing it mid-write would leave
+the store locked by a dead thread."
   (setf (supervisor-running-p supervisor) nil)
+  (let ((beat (supervisor-heartbeat-thread supervisor)))
+    (when (and beat (bordeaux-threads:thread-alive-p beat))
+      (ignore-errors (bordeaux-threads:destroy-thread beat)))
+    (setf (supervisor-heartbeat-thread supervisor) nil))
   (dolist (channel (supervisor-channels supervisor))
     (handler-case (enchiridion.channel:channel-stop channel)
       (error () nil))
@@ -346,6 +418,59 @@ Return SUPERVISOR."
     (setf (enchiridion.channel:channel-thread channel) nil)
     (setf (enchiridion.channel:channel-state channel) :stopped))
   (supervisor-write-status supervisor)
+  supervisor)
+
+;;;; The heartbeat.
+
+(declaim (ftype (function (supervisor) boolean) supervisor-heartbeat-due-p))
+
+(defun supervisor-heartbeat-due-p (supervisor)
+  "Return T when a tick should run now.
+A request runs one whatever the schedule says: the operator asked for it. The
+schedule measures from the end of the last tick, so a pass that takes longer
+than the interval is never overlapped by the next one."
+  (or (supervisor-tick-requested-p supervisor)
+      (and (supervisor-heartbeat-p supervisor)
+           (>= (- (get-universal-time) (supervisor-last-tick supervisor))
+               (supervisor-heartbeat-interval supervisor)))))
+
+(declaim (ftype (function (supervisor) t) supervisor-tick))
+
+(defun supervisor-tick (supervisor)
+  "Run one tick through the hook and record what it said. Return its plist.
+
+A tick never signals. The thread that runs it is the whole scheduler for
+unattended work, and a scheduler that dies on one bad pass is a process that
+quietly stops doing any."
+  (setf (supervisor-tick-requested-p supervisor) nil
+        (supervisor-tick-running-p supervisor) t)
+  (unwind-protect
+       (let* ((hook (supervisor-tick-function supervisor))
+              (result (if hook
+                          (handler-case (funcall hook supervisor)
+                            (error (condition)
+                              (list :ok-p nil
+                                    :report (enchiridion.errors:condition-report-line
+                                             condition))))
+                          (list :ok-p nil :report "no heartbeat hook is attached"))))
+         (setf (supervisor-last-tick supervisor) (get-universal-time)
+               (supervisor-ticks supervisor) (1+ (supervisor-ticks supervisor))
+               (supervisor-tick-ok-p supervisor) (not (null (getf result :ok-p)))
+               (supervisor-tick-report supervisor) (or (getf result :report) ""))
+         result)
+    (setf (supervisor-tick-running-p supervisor) nil)))
+
+(declaim (ftype (function (supervisor &key (:interval real)) supervisor)
+                supervisor-heartbeat-loop))
+
+(defun supervisor-heartbeat-loop (supervisor &key (interval 1))
+  "Run a tick whenever one is due, until SUPERVISOR stops.
+The loop wakes once a second, which is free, and is the same cadence the poll
+loop uses: a shutdown and a forced tick are both noticed within a second."
+  (loop while (supervisor-running-p supervisor)
+        do (when (supervisor-heartbeat-due-p supervisor)
+             (supervisor-tick supervisor))
+           (sleep interval))
   supervisor)
 
 ;;;; The control file.
@@ -427,19 +552,38 @@ a keyword, because both spellings reach here."
 (declaim (ftype (function (supervisor t) t) handle-heartbeat))
 
 (defun handle-heartbeat (supervisor arguments)
-  "Act on `heartbeat on|off|run` and return a one line report. The tick itself
-arrives with the sleep agent; until then `run` records the request."
+  "Act on `heartbeat on|off|run` and return two values: a report, and whether
+the request was answered.
+
+`run` asks for a tick and answers at once. Waiting for the tick here would hold
+the control poll inside a sleep pass, and the poll loop is what keeps the
+status file fresh: a shell command that asked for a tick would then find a
+supervisor that looks dead. The outcome lands in the status file within a
+second of the tick finishing, which is what `health` prints.
+
+`off` stops the schedule and not the operator: `run` still ticks, because the
+request was explicit."
   (let ((action (string-downcase (or (first arguments) "on"))))
     (cond
       ((string= action "on")
        (setf (supervisor-heartbeat-p supervisor) t)
-       "heartbeat on.")
+       (if (supervisor-tick-function supervisor)
+           (values "heartbeat on." t)
+           (values "heartbeat on, but no sleep agent is attached to this process." nil)))
       ((string= action "off")
        (setf (supervisor-heartbeat-p supervisor) nil)
-       "heartbeat off.")
+       (values "heartbeat off." t))
       ((string= action "run")
-       "heartbeat tick requested; the sleep agent answers this in milestone 10.")
-      (t "heartbeat takes on, off or run."))))
+       (cond
+         ((null (supervisor-tick-function supervisor))
+          (values "no sleep agent is attached to this process." nil))
+         ((supervisor-tick-running-p supervisor)
+          (values "a tick is already running." t))
+         (t
+          (setf (supervisor-tick-requested-p supervisor) t)
+          (values "heartbeat tick requested; the answer lands in the status file." t))))
+      (t
+       (values "heartbeat takes on, off or run." nil)))))
 
 (declaim (ftype (function (supervisor t) t) apply-reload-result))
 
@@ -503,7 +647,7 @@ that reloads and continues deserves a non-zero status from a refusal."
       ((string= verb "channels")
        (values (handle-channels supervisor (rest parts)) t))
       ((string= verb "heartbeat")
-       (values (handle-heartbeat supervisor (rest parts)) t))
+       (handle-heartbeat supervisor (rest parts)))
       (t (values (format nil "unknown control request: ~A" line) nil)))))
 
 (declaim (ftype (function (supervisor) integer) supervisor-poll-control))

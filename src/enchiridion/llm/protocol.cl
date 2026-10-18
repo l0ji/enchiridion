@@ -121,10 +121,13 @@ default, and the default is the point: the sleep agent has no deadline.")
 Unknown names become :PRIMARY rather than signalling. A typo in a config key
 should cost a cheap turn on a strong model, not stop the agent from starting,
 and a tier is never a security decision."
+  ;; One key per clause. SBCL 2.6.9 warns about a repeated CASE key, and this
+  ;; system makes every compiler warning an error, so the repetition that 2.6.8
+  ;; accepted stops the build on the newer compiler.
   (case (or name :primary)
-    ((:primary :primary) :primary)
-    ((:cheap :cheap) :cheap)
-    ((:sleep :sleep) :sleep)
+    (:primary :primary)
+    (:cheap :cheap)
+    (:sleep :sleep)
     (t :primary)))
 
 (declaim (ftype (function () string) primary-model cheap-model sleep-model))

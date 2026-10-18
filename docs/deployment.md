@@ -12,12 +12,12 @@ the volumes, the isolation test, and the flags for `serve`.
 The flake builds the image with `pkgs.dockerTools.buildImage`. The image has the
 name `enchiridion` and the tag `0.1.0`.
 
-| Item | Value |
-| --- | --- |
-| Attribute | `packages.<system>.container` |
-| Build command | `nix build .#container` |
-| Load command | `docker image load -i result` |
-| Platform | Linux only |
+| Item          | Value                         |
+| ------------- | ----------------------------- |
+| Attribute     | `packages.<system>.container` |
+| Build command | `nix build .#container`       |
+| Load command  | `docker image load -i result` |
+| Platform      | Linux only                    |
 
 The attribute exists under `lib.optionalAttrs` for a Linux host platform. An
 image needs a Linux builder, and a darwin host reaches one through Colima rather
@@ -31,14 +31,14 @@ around `${sbcl}/bin/sbcl`.
 
 ## What the image contains
 
-| Path | Contents |
-| --- | --- |
-| `/bin/enchiridion` | The installed program |
-| `/usr/local/bin/entrypoint.sh` | The entry script from `docker/` |
-| `/usr/local/bin/isolation-test.sh` | The isolation test |
-| `/usr/local/bin/enchiridion` | A symlink to `/bin/enchiridion` |
-| `/bin/sh` | A symlink to the Nix bash |
-| `/etc/ssl/certs/ca-bundle.crt` | The trust anchor from `pkgs.cacert` |
+| Path                               | Contents                            |
+| ---------------------------------- | ----------------------------------- |
+| `/bin/enchiridion`                 | The installed program               |
+| `/usr/local/bin/entrypoint.sh`     | The entry script from `docker/`     |
+| `/usr/local/bin/isolation-test.sh` | The isolation test                  |
+| `/usr/local/bin/enchiridion`       | A symlink to `/bin/enchiridion`     |
+| `/bin/sh`                          | A symlink to the Nix bash           |
+| `/etc/ssl/certs/ca-bundle.crt`     | The trust anchor from `pkgs.cacert` |
 
 The image also carries `bash`, `coreutils`, `gnugrep`, `findutils`,
 `util-linux`, and `git`. The agent directory is a git repository, so `journey`
@@ -48,27 +48,26 @@ for the model call and the Fluxer gateway.
 
 The image sets these values:
 
-| Setting | Value |
-| --- | --- |
-| `User` | `0:0` |
-| `Entrypoint` | `/usr/local/bin/entrypoint.sh` |
-| `PATH` | `/usr/local/bin:/usr/bin:/bin` |
-| `ENCHIRIDION_HOME` | `/var/lib/enchiridion` |
-| `SSL_CERT_FILE` | `/etc/ssl/certs/ca-bundle.crt` |
-| `ExposedPorts` | `8787/tcp` |
-| `Volumes` | `/var/lib/enchiridion` |
-| `WorkingDir` | `/var/lib/enchiridion` |
+| Setting            | Value                          |
+| ------------------ | ------------------------------ |
+| `User`             | `0:0`                          |
+| `Entrypoint`       | `/usr/local/bin/entrypoint.sh` |
+| `PATH`             | `/usr/local/bin:/usr/bin:/bin` |
+| `ENCHIRIDION_HOME` | `/var/lib/enchiridion`         |
+| `SSL_CERT_FILE`    | `/etc/ssl/certs/ca-bundle.crt` |
+| `ExposedPorts`     | `8787/tcp`                     |
+| `Volumes`          | `/var/lib/enchiridion`         |
+| `WorkingDir`       | `/var/lib/enchiridion`         |
 
 ## The two users and the uid split
 
-| User | uid | Job |
-| --- | --- | --- |
-| root | 0 | The supervisor, the secrets, and the broker socket |
-| agent | 1000 | Agent code, tools, and the model client |
+| User  | uid  | Job                                                |
+| ----- | ---- | -------------------------------------------------- |
+| root  | 0    | The supervisor, the secrets, and the broker socket |
+| agent | 1000 | Agent code, tools, and the model client            |
 
 The `:sandbox` section names the split. `:agent-uid` holds 1000 and
-`:proc-hidepid` holds 2. Every child process that runs agent code drops to uid
-1000.
+`:proc-hidepid` holds 2. Every child process that runs agent code drops to uid 1000.
 
 The entrypoint creates the agent user when the image does not hold one:
 
@@ -88,11 +87,11 @@ in `exec`, so pid 1 is the supervisor and not a shell that wraps it.
 
 ## The secret file and its tmpfs
 
-| Item | Path |
-| --- | --- |
-| The secrets directory | `/run/secrets` |
-| The secret file | `/run/secrets/.env` |
-| The state directory | `$ENCHIRIDION_HOME`, or `/var/lib/enchiridion` |
+| Item                  | Path                                           |
+| --------------------- | ---------------------------------------------- |
+| The secrets directory | `/run/secrets`                                 |
+| The secret file       | `/run/secrets/.env`                            |
+| The state directory   | `$ENCHIRIDION_HOME`, or `/var/lib/enchiridion` |
 
 The secrets directory must be a tmpfs, and the entrypoint refuses to continue
 without one:
@@ -139,10 +138,10 @@ it does not pretend to. The isolation test fails when uid 1000 can read
 
 ## The volumes
 
-| Path | Kind | Contents |
-| --- | --- | --- |
-| `/var/lib/enchiridion` | A named volume | The agent directory, the memory store, and `run/` |
-| `/run/enchiridion` | A directory in the container | Mode 700, and the agent user owns it |
+| Path                   | Kind                         | Contents                                          |
+| ---------------------- | ---------------------------- | ------------------------------------------------- |
+| `/var/lib/enchiridion` | A named volume               | The agent directory, the memory store, and `run/` |
+| `/run/enchiridion`     | A directory in the container | Mode 700, and the agent user owns it              |
 
 The state volume is the writable tree. It holds `agents/default`, the seed
 Markdown files, the SQLite database, and the `run/` directory with the control
@@ -177,15 +176,15 @@ docker exec -u 0 enchiridion /usr/local/bin/isolation-test.sh
 The script reads seven guarantees. Tests 1 to 4 and 7 live in this script. Test
 5 is the scrubber unit test. Test 6 checks the missing file at steady state.
 
-| Test | What it checks |
-| --- | --- |
-| 1 | The agent user cannot read `/run/secrets/.env` |
-| 2 | A shell cannot read `/run/secrets/.env` |
-| 3 | `/proc/1/environ` is not readable, so hidepid works |
-| 4 | The agent environment holds no secret name |
-| 5 | The scrubber unit test, which runs outside this script |
-| 6 | `/run/secrets/.env` is gone at steady state |
-| 7 | No `.env` copy exists anywhere else |
+| Test | What it checks                                         |
+| ---- | ------------------------------------------------------ |
+| 1    | The agent user cannot read `/run/secrets/.env`         |
+| 2    | A shell cannot read `/run/secrets/.env`                |
+| 3    | `/proc/1/environ` is not readable, so hidepid works    |
+| 4    | The agent environment holds no secret name             |
+| 5    | The scrubber unit test, which runs outside this script |
+| 6    | `/run/secrets/.env` is gone at steady state            |
+| 7    | No `.env` copy exists anywhere else                    |
 
 Test 6 and the absent phase cannot pass on this code. The check fails when
 `/run/secrets/.env` exists, and nothing deletes that file. The present phase
@@ -218,11 +217,11 @@ A `config.cl` that renames one of those names must add the new name to
 `serve` starts the supervisor and its channels. The flags come before the
 command or after it, because `serve --channel http` is what a person types.
 
-| Flag | Value | Default |
-| --- | --- | --- |
-| `--channel` | `cli`, `http`, or `fluxer` | The configuration |
-| `--bind` | An address for the webhook | `127.0.0.1` |
-| `--port` | A number from 1 to 65535 | 8787 |
+| Flag          | Value                                     | Default                  |
+| ------------- | ----------------------------------------- | ------------------------ |
+| `--channel`   | `cli`, `http`, or `fluxer`                | The configuration        |
+| `--bind`      | An address for the webhook                | `127.0.0.1`              |
+| `--port`      | A number from 1 to 65535                  | 8787                     |
 | `--token-env` | The variable that names the webhook token | `ENCHIRIDION_HTTP_TOKEN` |
 
 The `--bind`, `--port`, and `--token-env` flags belong to `--channel http`. Any
@@ -258,15 +257,15 @@ wants the proc guarantee.
 
 The flake exposes four checks and three apps:
 
-| Name | Kind | What it does |
-| --- | --- | --- |
-| `flake` | Check | Evaluates the flake for the system |
-| `enchiridion` | Check | Builds the package |
-| `check` | Check | Compiles every file, and a warning fails |
-| `default` | Check | Runs the test suite |
-| `default` | App | Runs the program |
-| `check` | App | Runs the compile gate |
-| `test` | App | Runs the suite |
+| Name          | Kind  | What it does                             |
+| ------------- | ----- | ---------------------------------------- |
+| `flake`       | Check | Evaluates the flake for the system       |
+| `enchiridion` | Check | Builds the package                       |
+| `check`       | Check | Compiles every file, and a warning fails |
+| `default`     | Check | Runs the test suite                      |
+| `default`     | App   | Runs the program                         |
+| `check`       | App   | Runs the compile gate                    |
+| `test`        | App   | Runs the suite                           |
 
 The container attribute stays out of the checks, because it needs a Linux
 builder. Both gates compile the entry script as well as the system, and a

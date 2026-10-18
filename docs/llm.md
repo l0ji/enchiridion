@@ -12,11 +12,11 @@ key shape, out of text before that text reaches a model or a channel.
 The package `enchiridion.llm` defines three generic functions. A backend
 implements all three.
 
-| Generic function | Returns |
-| --- | --- |
-| `complete` | a `completion` for a list of messages |
+| Generic function     | Returns                                                |
+| -------------------- | ------------------------------------------------------ |
+| `complete`           | a `completion` for a list of messages                  |
 | `model-capabilities` | `:tools`, `:cache`, `:streaming`, `:cache-breakpoints` |
-| `backend-name` | a short name for logs |
+| `backend-name`       | a short name for logs                                  |
 
 `complete` receives the backend, `messages`, and the keywords `model`, `tools`,
 and `budget`. It returns a `completion`. `backendp` answers whether an object
@@ -44,14 +44,14 @@ not start.
 
 `openai-backend` builds the connection.
 
-| Keyword | Default | Effect |
-| --- | --- | --- |
-| `:base-url` | `https://api.openai.com/v1/` | the endpoint prefix, and the builder adds a trailing slash when it is absent |
-| `:api-key` | `""` | the bearer token |
-| `:model` | `*model-primary*` | the default model for the connection |
-| `:session-id` | a new 32 character id | the routing and prompt cache key |
-| `:timeout` | 60 | the read timeout and the connect timeout in seconds |
-| `:retries` | 2 | extra attempts that a 429 or a 5xx earns |
+| Keyword       | Default                      | Effect                                                                       |
+| ------------- | ---------------------------- | ---------------------------------------------------------------------------- |
+| `:base-url`   | `https://api.openai.com/v1/` | the endpoint prefix, and the builder adds a trailing slash when it is absent |
+| `:api-key`    | `""`                         | the bearer token                                                             |
+| `:model`      | `*model-primary*`            | the default model for the connection                                         |
+| `:session-id` | a new 32 character id        | the routing and prompt cache key                                             |
+| `:timeout`    | 60                           | the read timeout and the connect timeout in seconds                          |
+| `:retries`    | 2                            | extra attempts that a 429 or a 5xx earns                                     |
 
 `new-session-id` returns 32 hexadecimal characters. One connection reuses one
 session id for every turn. `model-capabilities` reports `:tools` true, `:streaming`
@@ -64,9 +64,9 @@ present and ignored.
 Two providers speak the OpenAI shape. The plist `+provider-defaults+` holds the
 three facts that differ.
 
-| Provider | Base URL | Default model | Key variable |
-| --- | --- | --- | --- |
-| `:openai` | `https://api.openai.com/v1/` | `gpt-5.6-luna` | `OPENAI_API_KEY` |
+| Provider    | Base URL                        | Default model         | Key variable       |
+| ----------- | ------------------------------- | --------------------- | ------------------ |
+| `:openai`   | `https://api.openai.com/v1/`    | `gpt-5.6-luna`        | `OPENAI_API_KEY`   |
 | `:opencode` | `https://opencode.ai/zen/go/v1` | `deepseek-v4.1-flash` | `OPENCODE_API_KEY` |
 
 `detect-provider` picks one in this order. It reads an explicit `:provider`, then
@@ -90,11 +90,11 @@ model name, and it never reads the provider.
 
 Three tiers name the work, not the model. Each tier maps to one model name.
 
-| Tier | Work | Default model |
-| --- | --- | --- |
-| `:primary` | a reasoning turn | `deepseek-v4.1-flash` |
-| `:cheap` | memory digests and compaction | `deepseek-v4.1-flash` |
-| `:sleep` | the sleep agent | `*model-cheap*` |
+| Tier       | Work                          | Default model         |
+| ---------- | ----------------------------- | --------------------- |
+| `:primary` | a reasoning turn              | `deepseek-v4.1-flash` |
+| `:cheap`   | memory digests and compaction | `deepseek-v4.1-flash` |
+| `:sleep`   | the sleep agent               | `*model-cheap*`       |
 
 `*model-primary*` and `*model-cheap*` both hold `deepseek-v4.1-flash`.
 `*model-sleep*` holds nil, and `sleep-model` answers `*model-cheap*` when it does,
@@ -112,11 +112,11 @@ falls back to the shipped defaults.
 
 Where each tier runs:
 
-| Caller | Tier |
-| --- | --- |
-| a kernel turn | the model the caller passes, or the backend default |
-| `run-sleep-pass` | `:sleep` |
-| `compact-session` | `:cheap` |
+| Caller            | Tier                                                |
+| ----------------- | --------------------------------------------------- |
+| a kernel turn     | the model the caller passes, or the backend default |
+| `run-sleep-pass`  | `:sleep`                                            |
+| `compact-session` | `:cheap`                                            |
 
 ## Request and reply
 
@@ -128,12 +128,12 @@ neither key to any other message, because some servers refuse an unexpected fiel
 
 `parse-completion` reads the first choice and fills the completion.
 
-| Completion slot | Source field |
-| --- | --- |
-| `input-tokens` | `usage.prompt_tokens` |
-| `output-tokens` | `usage.completion_tokens` |
-| `cache-read-tokens` | `usage.prompt_tokens_details.cached_tokens` |
-| `cache-write-tokens` | `usage.cache_creation_input_tokens` |
+| Completion slot      | Source field                                |
+| -------------------- | ------------------------------------------- |
+| `input-tokens`       | `usage.prompt_tokens`                       |
+| `output-tokens`      | `usage.completion_tokens`                   |
+| `cache-read-tokens`  | `usage.prompt_tokens_details.cached_tokens` |
+| `cache-write-tokens` | `usage.cache_creation_input_tokens`         |
 
 A reply with no choices signals `backend-error`, because an empty completion and
 a model that said nothing are the same thing to the caller. `parse-json` turns an
@@ -162,15 +162,15 @@ The kernel records each completion as a `spend-row` on the agent, and it writes
 the same numbers to the `usage` table. The ledger keeps four provider numbers
 apart: input, output, cache read, and cache write.
 
-| Function | Returns |
-| --- | --- |
-| `record-spend` | one `spend-row` on the agent |
-| `spend` | every row, oldest first |
-| `spend-since` | the rows from an index onwards |
-| `spend-summary` | the rows summed, with the last model and the round count |
-| `spend-total` | the tokens in one window |
-| `budget-exhausted-p` | true when the spend reached a cap |
-| `persist-usage` | one `usage` row in the store |
+| Function             | Returns                                                  |
+| -------------------- | -------------------------------------------------------- |
+| `record-spend`       | one `spend-row` on the agent                             |
+| `spend`              | every row, oldest first                                  |
+| `spend-since`        | the rows from an index onwards                           |
+| `spend-summary`      | the rows summed, with the last model and the round count |
+| `spend-total`        | the tokens in one window                                 |
+| `budget-exhausted-p` | true when the spend reached a cap                        |
+| `persist-usage`      | one `usage` row in the store                             |
 
 `spend-since` takes an index. A caller records `(length (spend agent))` before a
 turn. It asks for the tail after the turn, because one turn with tool calls makes
@@ -203,14 +203,14 @@ that starts with `#` or `;`, and a malformed line. It also removes a matching
 pair of quotes. `load-secrets-from` reads a stream. A malformed line never stops
 the start, so one typo in `.env` costs one secret and not the run.
 
-| Function | Returns |
-| --- | --- |
-| `register-secret` | the name, after it stores the value and the source |
-| `secret-present-p` | true when the name is loaded |
-| `secret-value` | the value, or nil |
-| `secret-source` | `:file`, `:env`, or `:argument` |
-| `secret-names` | every loaded name, sorted |
-| `clear-secrets` | nothing, after it forgets every value |
+| Function           | Returns                                            |
+| ------------------ | -------------------------------------------------- |
+| `register-secret`  | the name, after it stores the value and the source |
+| `secret-present-p` | true when the name is loaded                       |
+| `secret-value`     | the value, or nil                                  |
+| `secret-source`    | `:file`, `:env`, or `:argument`                    |
+| `secret-names`     | every loaded name, sorted                          |
+| `clear-secrets`    | nothing, after it forgets every value              |
 
 `register-secret` ignores an empty value and a value that is not a string. A new
 secret clears the combined pattern, so the next scrub rebuilds it.
@@ -233,11 +233,11 @@ value, and `enchiridion secrets` prints a name and its source.
 `scrub` replaces every match with `[redacted]`. Three filters feed one combined
 pattern.
 
-| Filter | What it matches |
-| --- | --- |
-| Literal | a loaded value of at least `*minimum-secret-length*` characters |
-| Shape | `Bearer` tokens, `sk-` keys, `ghp_` tokens, `xox` tokens, JWTs, and `key=value` pairs that name a credential |
-| Role | a field named token, secret, password, or api_key, whatever the value looks like |
+| Filter  | What it matches                                                                                              |
+| ------- | ------------------------------------------------------------------------------------------------------------ |
+| Literal | a loaded value of at least `*minimum-secret-length*` characters                                              |
+| Shape   | `Bearer` tokens, `sk-` keys, `ghp_` tokens, `xox` tokens, JWTs, and `key=value` pairs that name a credential |
+| Role    | a field named token, secret, password, or api_key, whatever the value looks like                             |
 
 `*minimum-secret-length*` is 8. A shorter loaded value never reaches the literal
 filter, because one short secret would turn the whole transcript into

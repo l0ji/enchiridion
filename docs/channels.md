@@ -1,10 +1,10 @@
 # Channels
 
-A channel turns one surface into the one message shape and hands that message to
-the agent. The supervisor starts every channel on its own thread and restarts a
-channel that stops. Nothing above the channel files learns which surface a turn
-came from. A new channel is a new file and not a branch in the kernel. Three
-channels ship today: `cli`, `http`, and `fluxer`.
+A channel turns external messages into a uniform struct and hands that struct
+to the agent. The supervisor starts every channel on its own thread and
+restarts any channel that stops. Nothing above the channel files learns which
+surface a turn came from. A new channel is a new file and not a branch in the
+kernel. Three channels ship today: `cli`, `http`, and `fluxer`.
 
 ## The message shape
 
@@ -12,16 +12,16 @@ channels ship today: `cli`, `http`, and `fluxer`.
 A caller that holds a plist from a queue and a caller that writes a call site
 are both normal.
 
-| Slot | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `id` | string | `""` | The channel's own id for this message |
-| `channel` | keyword | `:cli` | The surface that received it |
-| `target` | string | `""` | Where a reply goes |
-| `thread` | string | `""` | A thread id, or empty |
-| `author` | string | `""` | Who sent it |
-| `text` | string | `""` | The body |
-| `ts` | fixnum | `0` | A time value |
-| `reply-to` | string | `""` | The message this one answers |
+| Slot       | Type    | Default | Meaning                               |
+| ---------- | ------- | ------- | ------------------------------------- |
+| `id`       | string  | `""`    | The channel's own id for this message |
+| `channel`  | keyword | `:cli`  | The surface that received it          |
+| `target`   | string  | `""`    | Where a reply goes                    |
+| `thread`   | string  | `""`    | A thread id, or empty                 |
+| `author`   | string  | `""`    | Who sent it                           |
+| `text`     | string  | `""`    | The body                              |
+| `ts`       | fixnum  | `0`     | A time value                          |
+| `reply-to` | string  | `""`    | The message this one answers          |
 
 The struct carries no `:documentation` option. A trailing documentation string
 would read as a ninth slot, so each slot keeps a comment instead.
@@ -29,11 +29,11 @@ would read as a ninth slot, so each slot keeps a comment instead.
 `normalize` fills a missing or empty id through `next-message-id`. That function
 returns a short name such as `cli-1`, with the channel name and a number. One
 counter, `*message-counter*`, numbers every channel, so two channels cannot mint
-the same id. A missing or zero timestamp comes from `get-universal-time`. Every
-other absent slot keeps the empty string.
+the same id. A missing or zeroed timestamp comes from `get-universal-time`.
+Every other absent slot keeps the empty string.
 
 ```lisp
-(normalize :author "sam" :text "hello")
+(normalize :author "sama" :text "hello")
 (normalize '(:channel :http :author "webhook" :text "hello"))
 ```
 
@@ -46,7 +46,7 @@ characters, and adds an ellipsis when it cut. A full body would bury the next
 log line.
 
 ```text
-cli/sam: hello
+cli/sama: hello
 ```
 
 ## The channel class
@@ -55,12 +55,12 @@ cli/sam: hello
 channel. The slot accessor is `channel-state`, and `channel-status` is the
 protocol method that asks a channel how it does.
 
-| Slot | Accessor | Default | Meaning |
-| --- | --- | --- | --- |
-| `name` | `channel-name` | `""` | The name config and the status file use |
-| `live-p` | `channel-live-p` | `nil` | True while the channel accepts traffic |
-| `state` | `channel-state` | `:stopped` | Where the channel is |
-| `thread` | `channel-thread` | `nil` | The thread it runs on, or `nil` |
+| Slot     | Accessor         | Default    | Meaning                                 |
+| -------- | ---------------- | ---------- | --------------------------------------- |
+| `name`   | `channel-name`   | `""`       | The name config and the status file use |
+| `live-p` | `channel-live-p` | `nil`      | True while the channel accepts traffic  |
+| `state`  | `channel-state`  | `:stopped` | Where the channel is                    |
+| `thread` | `channel-thread` | `nil`      | The thread it runs on, or `nil`         |
 
 `define-channel` defines the subclass and its constructor in one step. The
 constructor name defaults to `make-<name>` in the package that reads the name.
@@ -72,12 +72,12 @@ four base slots.
 Four generic functions carry every channel. Each one has a default method, so a
 channel that implements nothing says so by name instead of dropping a send.
 
-| Function | Arguments | What it does |
-| --- | --- | --- |
-| `channel-start` | channel, `:config` | Starts the channel and returns it |
-| `channel-stop` | channel | Stops the channel and releases what it holds |
-| `channel-send` | channel, target, text, `:reply-to` | Sends text to a target |
-| `channel-status` | channel | Returns the state keyword |
+| Function         | Arguments                          | What it does                                 |
+| ---------------- | ---------------------------------- | -------------------------------------------- |
+| `channel-start`  | channel, `:config`                 | Starts the channel and returns it            |
+| `channel-stop`   | channel                            | Stops the channel and releases what it holds |
+| `channel-send`   | channel, target, text, `:reply-to` | Sends text to a target                       |
+| `channel-status` | channel                            | Returns the state keyword                    |
 
 The default method calls `unimplemented-channel-operation`. That function
 signals a `configuration-error` with the channel name in `:key` and the
@@ -91,12 +91,12 @@ a line on a terminal.
 
 ## Channel states
 
-| State | Set by | Meaning |
-| --- | --- | --- |
-| `:stopped` | The class default, and every stop method | The channel does no work |
-| `:running` | `start-channel` in the supervisor | The channel thread runs |
-| `:live` | `channel-start` of `cli`, `http` and `fluxer` | The channel accepts traffic |
-| `:failed` | The `fluxer` channel | A refused start, or a spent reconnect budget |
+| State      | Set by                                        | Meaning                                      |
+| ---------- | --------------------------------------------- | -------------------------------------------- |
+| `:stopped` | The class default, and every stop method      | The channel does no work                     |
+| `:running` | `start-channel` in the supervisor             | The channel thread runs                      |
+| `:live`    | `channel-start` of `cli`, `http` and `fluxer` | The channel accepts traffic                  |
+| `:failed`  | The `fluxer` channel                          | A refused start, or a spent reconnect budget |
 
 The slot documentation in `protocol.cl` also names `:starting`. No method
 assigns that keyword now.
@@ -128,12 +128,12 @@ context the REPL reads, and `output` holds the stream for command output and the
 prompt. The function `make-cli-channel` returns a stopped channel over a
 context.
 
-| Method | Behavior |
-| --- | --- |
-| `channel-start` | Runs the REPL to completion |
-| `channel-stop` | Marks the channel stopped |
-| `channel-send` | Prints the text and returns it |
-| `channel-status` | Returns `channel-state` |
+| Method           | Behavior                       |
+| ---------------- | ------------------------------ |
+| `channel-start`  | Runs the REPL to completion    |
+| `channel-stop`   | Marks the channel stopped      |
+| `channel-send`   | Prints the text and returns it |
+| `channel-status` | Returns `channel-state`        |
 
 A terminal makes this channel real. `channel-start` checks
 `interactive-stream-p` on `*standard-input*` before it starts the REPL. Without
@@ -168,11 +168,11 @@ response body, so this channel implements no `channel-send`. The protocol
 default refuses a send from it with a `configuration-error`, which is the right
 answer for a surface that has nothing to send to.
 
-| Method | Path | What it does |
-| --- | --- | --- |
-| POST | `/message` | Runs one turn and returns the reply |
-| GET | `/health` | Reports the live supervisor |
-| GET | `/usage` | Returns rows from the token ledger |
+| Method | Path       | What it does                        |
+| ------ | ---------- | ----------------------------------- |
+| POST   | `/message` | Runs one turn and returns the reply |
+| GET    | `/health`  | Reports the live supervisor         |
+| GET    | `/usage`   | Returns rows from the token ledger  |
 
 A request to a known path with the wrong method answers 405 and an `Allow`
 header. Any other path answers 404.
@@ -183,17 +183,17 @@ object, and the `text` field must hold a non-empty string after a trim. The
 content type answers 415, a body that is not a JSON object answers 400, and an
 empty `text` answers 400.
 
-| Status | Body |
-| --- | --- |
-| 200 | A `reply` string and a `usage` object |
-| 400 | A bad object, or an empty `text` field |
-| 401 | A missing or wrong bearer token |
-| 404 | A path with no route |
-| 405 | A known path with the wrong method |
-| 413 | A body larger than the limit |
-| 415 | A content type that is not JSON |
-| 502 | A turn that failed |
-| 503 | The agent answers another turn, with `Retry-After: 1` |
+| Status | Body                                                  |
+| ------ | ----------------------------------------------------- |
+| 200    | A `reply` string and a `usage` object                 |
+| 400    | A bad object, or an empty `text` field                |
+| 401    | A missing or wrong bearer token                       |
+| 404    | A path with no route                                  |
+| 405    | A known path with the wrong method                    |
+| 413    | A body larger than the limit                          |
+| 415    | A content type that is not JSON                       |
+| 502    | A turn that failed                                    |
+| 503    | The agent answers another turn, with `Retry-After: 1` |
 
 The `usage` object carries `model`, `input`, `output`, `cache-read`,
 `cache-write`, `rounds`, and `total`. The object sums the turn's rows and not
@@ -218,11 +218,11 @@ no token, and the refusal is a `configuration-error` with `:key :http-token`.
 The check runs before a socket opens, so the process exits 2 instead of serving
 the network without a token.
 
-| Bind | Loopback |
-| --- | --- |
-| The empty string, `localhost`, `::1`, `::ffff:127.0.0.1` | Yes |
-| `127.` with a dotted quad of ASCII digits | Yes |
-| `0.0.0.0`, `::`, a hostname, or `nil` | No |
+| Bind                                                     | Loopback |
+| -------------------------------------------------------- | -------- |
+| The empty string, `localhost`, `::1`, `::ffff:127.0.0.1` | Yes      |
+| `127.` with a dotted quad of ASCII digits                | Yes      |
+| `0.0.0.0`, `::`, a hostname, or `nil`                    | No       |
 
 The token comes from the `:http` channel entry. `:token-env` names the variable
 and defaults to `ENCHIRIDION_HTTP_TOKEN`. The code accepts a literal `:token`
@@ -231,13 +231,13 @@ loader, so the scrubber knows the value.
 
 ### Limits and timeouts
 
-| Limit | Default | Source |
-| --- | --- | --- |
-| Body size | 65536 bytes | `+http-body-limit+`, overridden by `:max-body-bytes` |
-| Read and write timeout | 5 seconds | `+http-read-timeout+` |
-| Handler threads | 8 | The taskmaster |
-| Waiting connections | 16 | The taskmaster |
-| Stop drain | 30 seconds | `+http-drain-seconds+` |
+| Limit                  | Default     | Source                                               |
+| ---------------------- | ----------- | ---------------------------------------------------- |
+| Body size              | 65536 bytes | `+http-body-limit+`, overridden by `:max-body-bytes` |
+| Read and write timeout | 5 seconds   | `+http-read-timeout+`                                |
+| Handler threads        | 8           | The taskmaster                                       |
+| Waiting connections    | 16          | The taskmaster                                       |
+| Stop drain             | 30 seconds  | `+http-drain-seconds+`                               |
 
 The code checks the declared `Content-Length` before it reads one byte, because
 the server allocates what the header claims. A chunked body declares nothing, so
@@ -276,16 +276,16 @@ The channel appends `?v=1&encoding=json` to the advertised URL when that URL
 carries no query string. The scheme stays as advertised, because a self-hosted
 deployment may advertise `ws://`.
 
-| Opcode | Name | Meaning |
-| --- | --- | --- |
-| 0 | Dispatch | An event, such as `READY` or `MESSAGE_CREATE` |
-| 1 | Heartbeat | The client reports its last processed sequence |
-| 2 | Identify | The first frame after Hello |
-| 6 | Resume | Rejoins a session the gateway still holds |
-| 7 | Reconnect | The gateway asks for a reconnect |
-| 9 | Invalid session | The session is gone |
-| 10 | Hello | Names the heartbeat interval |
-| 11 | Heartbeat ack | Confirms a heartbeat |
+| Opcode | Name            | Meaning                                        |
+| ------ | --------------- | ---------------------------------------------- |
+| 0      | Dispatch        | An event, such as `READY` or `MESSAGE_CREATE`  |
+| 1      | Heartbeat       | The client reports its last processed sequence |
+| 2      | Identify        | The first frame after Hello                    |
+| 6      | Resume          | Rejoins a session the gateway still holds      |
+| 7      | Reconnect       | The gateway asks for a reconnect               |
+| 9      | Invalid session | The session is gone                            |
+| 10     | Hello           | Names the heartbeat interval                   |
+| 11     | Heartbeat ack   | Confirms a heartbeat                           |
 
 Identify carries the token and a properties object with `os`, `browser`, and
 `device`. The gateway closes the socket with 4002 when the properties object is
@@ -329,13 +329,13 @@ supervisor down.
 
 ### Queues, replies, and reconnects
 
-| Limit | Value | Source |
-| --- | --- | --- |
-| Queued messages | 32 | `+max-pending-messages+` |
-| Reply piece | 2000 characters | `+message-limit+` |
-| Reconnect attempts | 5 | `+max-reconnect-attempts+` |
-| Backoff | 1 to 60 seconds | `+reconnect-base-seconds+`, `+reconnect-max-seconds+` |
-| Worker join | 5 seconds | `+stop-join-seconds+` |
+| Limit              | Value           | Source                                                |
+| ------------------ | --------------- | ----------------------------------------------------- |
+| Queued messages    | 32              | `+max-pending-messages+`                              |
+| Reply piece        | 2000 characters | `+message-limit+`                                     |
+| Reconnect attempts | 5               | `+max-reconnect-attempts+`                            |
+| Backoff            | 1 to 60 seconds | `+reconnect-base-seconds+`, `+reconnect-max-seconds+` |
+| Worker join        | 5 seconds       | `+stop-join-seconds+`                                 |
 
 The read thread parses a frame, notes what the channel needs, and hands a
 payload to the worker. It never runs a turn and never waits, because a read

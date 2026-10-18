@@ -5,19 +5,19 @@ commit policy. [Testing](testing.md) covers the suite and the build gate.
 
 ## Repository layout
 
-| Path | Holds |
-| --- | --- |
-| `enchiridion.asd` | The core system and its load order |
-| `src/main.cl` | The entry script. ASDF does not load it |
-| `src/broker-exec.cl` | The agent-side half of the broker |
-| `src/enchiridion/` | The core, one file or one directory per subsystem |
-| `t/` | The test systems and the suites |
-| `config.example.cl` | The tracked template for the configuration |
-| `flake.nix` | Build, check, test, and the container image |
-| `docker/entrypoint.sh` | The two users, then the supervisor |
-| `docker/isolation-test.sh` | The isolation checks, run by hand in the image |
-| `docs/` | This documentation |
-| `LICENSE` | The BSD Zero Clause License |
+| Path                       | Holds                                             |
+| -------------------------- | ------------------------------------------------- |
+| `enchiridion.asd`          | The core system and its load order                |
+| `src/main.cl`              | The entry script. ASDF does not load it           |
+| `src/broker-exec.cl`       | The agent-side half of the broker                 |
+| `src/enchiridion/`         | The core, one file or one directory per subsystem |
+| `t/`                       | The test systems and the suites                   |
+| `config.example.cl`        | The tracked template for the configuration        |
+| `flake.nix`                | Build, check, test, and the container image       |
+| `docker/entrypoint.sh`     | The two users, then the supervisor                |
+| `docker/isolation-test.sh` | The isolation checks, run by hand in the image    |
+| `docs/`                    | This documentation                                |
+| `LICENSE`                  | The BSD Zero Clause License                       |
 
 `src/main.cl` is not a system component on purpose. Loading a system must never
 start an agent, and the top level form of this file is the program. The check
@@ -27,14 +27,14 @@ gate compiles it explicitly, so the file is still covered.
 
 These live beside the source. `.gitignore` excludes all of them:
 
-| Path | Holds |
-| --- | --- |
-| `config.cl` | Your configuration. The tracked template is `config.example.cl` |
-| `.env` | Secret values, mode 600 |
-| `agents/` | The agent directory, written on first launch |
-| `run/` | The control file and the status file of a running supervisor |
-| `PLAN.md` | The design record. It holds rationale, not instructions |
-| `research/`, `enchiridion-property/` | Local working directories |
+| Path                                 | Holds                                                           |
+| ------------------------------------ | --------------------------------------------------------------- |
+| `config.cl`                          | Your configuration. The tracked template is `config.example.cl` |
+| `.env`                               | Secret values, mode 600                                         |
+| `agents/`                            | The agent directory, written on first launch                    |
+| `run/`                               | The control file and the status file of a running supervisor    |
+| `PLAN.md`                            | The design record. It holds rationale, not instructions         |
+| `research/`, `enchiridion-property/` | Local working directories                                       |
 
 ## Packages
 
@@ -120,13 +120,13 @@ conditionals. Everything above it is standard Common Lisp.
 
 ## The validation stack
 
-| Layer | Tool |
-| --- | --- |
-| Compile-time types | SBCL `declaim` specifiers |
-| Warnings as errors | The `:around-compile` hook in each `.asd` file |
-| Tool argument schemas | `cl-jschema` |
-| Unit tests | `rove` |
-| Property tests | `rove` loops and `random`. The system declares `cl-quickcheck`, and no property file calls it |
+| Layer                 | Tool                                                                                          |
+| --------------------- | --------------------------------------------------------------------------------------------- |
+| Compile-time types    | SBCL `declaim` specifiers                                                                     |
+| Warnings as errors    | The `:around-compile` hook in each `.asd` file                                                |
+| Tool argument schemas | `cl-jschema`                                                                                  |
+| Unit tests            | `rove`                                                                                        |
+| Property tests        | `rove` loops and `random`. The system declares `cl-quickcheck`, and no property file calls it |
 
 `plugin/verify.cl` proclaims `(optimize (safety 3) (debug 3))` while it loads
 one plugin file. A bad plugin therefore hits a bounds check or a slot type
@@ -163,7 +163,7 @@ covers both, the rove bridge, and the coverage of each file.
 - Every commit is signed. The global configuration sets `commit.gpgsign` to
   true, `gpg.format` to `ssh`, and `user.signingkey` to the operator's key.
 - Signature verification needs an allowed signers file. Without one, `git log
-  --show-signature` reports `N` even when the signature is present. Set it with:
+--show-signature` reports `N` even when the signature is present. Set it with:
 
 ```sh
 git config --global gpg.ssh.allowedSignersFile ~/.ssh/allowed_signers

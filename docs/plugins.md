@@ -40,27 +40,27 @@ the file, so a file cannot run by being read.
 `define-plugin` builds a plugin struct, registers the tool, and records the
 plugin.
 
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `name` | string | The tool name, in lowercase. |
-| `tool` | tool | The descriptor the model sees. |
-| `handler` | function | The function that runs. |
-| `self-test` | function | The function that verification calls. |
-| `generation` | integer | The generation that installed the plugin. |
+| Field        | Type     | Meaning                                   |
+| ------------ | -------- | ----------------------------------------- |
+| `name`       | string   | The tool name, in lowercase.              |
+| `tool`       | tool     | The descriptor the model sees.            |
+| `handler`    | function | The function that runs.                   |
+| `self-test`  | function | The function that verification calls.     |
+| `generation` | integer  | The generation that installed the plugin. |
 
 The tool form accepts two spellings. The first is `(tool "name" "description"
 schema)`. The second is a plain plist with `:name`, `:description`, and
 `:schema`. `tool-form-parts` and `normalize-plugin-tool` reduce both to one
 shape. A plugin with no tool form still has a name and an empty object schema.
 
-| Function | Result |
-| --- | --- |
-| `plugin-manifests` | The manifest of every file in a list of paths. |
-| `file-manifests` | The manifests in one file, in order. |
-| `plugin-form-p` | True for a `(define-plugin ...)` form. |
-| `manifest-name` | The name a manifest declares. |
-| `manifest-description` | The one line description. |
-| `manifest-schema` | The schema form, exactly as the file wrote it. |
+| Function               | Result                                         |
+| ---------------------- | ---------------------------------------------- |
+| `plugin-manifests`     | The manifest of every file in a list of paths. |
+| `file-manifests`       | The manifests in one file, in order.           |
+| `plugin-form-p`        | True for a `(define-plugin ...)` form.         |
+| `manifest-name`        | The name a manifest declares.                  |
+| `manifest-description` | The one line description.                      |
+| `manifest-schema`      | The schema form, exactly as the file wrote it. |
 
 `file-manifests` reads with `*read-eval*` bound to NIL and the package bound
 to `enchiridion.plugin`. A file that will not read signals
@@ -72,19 +72,19 @@ broken plugin as an absent one.
 A generation is one load of the agent directory. Generation 0 is the builtins,
 so a fresh process holds only builtins.
 
-| Function | Result |
-| --- | --- |
-| `agent-source-files` | The skills, then the tools, each sorted by name. |
-| `files-under` | The `.cl` files directly in one directory, sorted. |
-| `package-name-for-generation` | `ENCHIRIDION.DYN.` plus the generation. |
-| `ensure-generation-package` | The package for a generation, made when absent. |
-| `load-agent-code` | Loads every file and returns the pathnames. |
-| `current-generation` | The live generation, or 0. |
-| `discard-generation` | Removes the tools and plugins of one generation. |
-| `load-generation` | Verifies and loads the next generation. |
-| `reload` | Loads the generation after the current one. |
-| `plugin-registry` | The plugins this process loaded, newest first. |
-| `generation-history` | Every load attempt, newest first. |
+| Function                      | Result                                             |
+| ----------------------------- | -------------------------------------------------- |
+| `agent-source-files`          | The skills, then the tools, each sorted by name.   |
+| `files-under`                 | The `.cl` files directly in one directory, sorted. |
+| `package-name-for-generation` | `ENCHIRIDION.DYN.` plus the generation.            |
+| `ensure-generation-package`   | The package for a generation, made when absent.    |
+| `load-agent-code`             | Loads every file and returns the pathnames.        |
+| `current-generation`          | The live generation, or 0.                         |
+| `discard-generation`          | Removes the tools and plugins of one generation.   |
+| `load-generation`             | Verifies and loads the next generation.            |
+| `reload`                      | Loads the generation after the current one.        |
+| `plugin-registry`             | The plugins this process loaded, newest first.     |
+| `generation-history`          | Every load attempt, newest first.                  |
 
 Order matters in three places. `agent-source-files` reads skills before tools,
 so one directory always produces the same generation. The file name decides
@@ -98,13 +98,13 @@ interns into the package of its own generation.
 
 `load-generation` returns a `generation-result`.
 
-| Field | Meaning |
-| --- | --- |
-| `ok-p` | True when the generation loaded. |
-| `report` | Why it loaded or did not. |
-| `generation` | The number live after the call. |
-| `loaded` | The pathnames that arrived. |
-| `manifests` | The manifests of the loaded files. |
+| Field        | Meaning                            |
+| ------------ | ---------------------------------- |
+| `ok-p`       | True when the generation loaded.   |
+| `report`     | Why it loaded or did not.          |
+| `generation` | The number live after the call.    |
+| `loaded`     | The pathnames that arrived.        |
+| `manifests`  | The manifests of the loaded files. |
 
 A directory with no agent files is not a failure. The result says `no agent
 files to load`, and the generation stays where it was.
@@ -118,15 +118,15 @@ A plugin adds a tool under a new name. It may also replace a builtin by name,
 because the registry is a hash table and `register-tool` replaces the earlier
 entry. Nothing in the loader refuses that collision.
 
-| Surface | Change allowed |
-| --- | --- |
-| A tool name | Yes. A new name, or one that shadows a builtin. |
-| The tool schema of an agent plugin | Yes. The manifest carries it. |
-| The tool handler of an agent plugin | Yes. The broker child runs it. |
-| The core system under `src/` | No. The loader reads only agent files. |
-| The channel set | No. A plugin cannot add a channel. |
-| The supervisor process | No. The supervisor holds no agent handler. |
-| The memory engine and the store | No. A handler may call it, not replace it. |
+| Surface                             | Change allowed                                  |
+| ----------------------------------- | ----------------------------------------------- |
+| A tool name                         | Yes. A new name, or one that shadows a builtin. |
+| The tool schema of an agent plugin  | Yes. The manifest carries it.                   |
+| The tool handler of an agent plugin | Yes. The broker child runs it.                  |
+| The core system under `src/`        | No. The loader reads only agent files.          |
+| The channel set                     | No. A plugin cannot add a channel.              |
+| The supervisor process              | No. The supervisor holds no agent handler.      |
+| The memory engine and the store     | No. A handler may call it, not replace it.      |
 
 The shadow rule is worth care. A plugin named `read-file` replaces the builtin
 in the registry for that process. A later `discard-generation` then removes
@@ -149,13 +149,13 @@ Verification proves a generation before it loads. `verify-directory` compiles
 and loads every agent file, then runs each self-test. The result is a
 `verify-result`.
 
-| Field | Meaning |
-| --- | --- |
-| `ok-p` | True when every file and self-test passed. |
-| `report` | The failure lines, or the count of files and tests. |
-| `tests` | The names of the plugins that ran a self-test. |
-| `failures` | The failure lines. |
-| `directory` | The directory under test. |
+| Field       | Meaning                                             |
+| ----------- | --------------------------------------------------- |
+| `ok-p`      | True when every file and self-test passed.          |
+| `report`    | The failure lines, or the count of files and tests. |
+| `tests`     | The names of the plugins that ran a self-test.      |
+| `failures`  | The failure lines.                                  |
+| `directory` | The directory under test.                           |
 
 `verify-file` loads one file at `(safety 3) (debug 3)`. It collects warnings
 and muffles them. A file that does not compile, and a file that warns, both

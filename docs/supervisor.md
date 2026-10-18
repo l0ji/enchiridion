@@ -8,37 +8,37 @@ process. The heartbeat is the only place unattended work starts.
 
 ## What the supervisor owns
 
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `directory` | string | The agent directory |
-| `run-directory` | string | Where the control and status files live |
-| `config` | plist | The active configuration |
-| `store` | store | The memory store, or `nil` |
-| `agent` | agent | The live agent, or `nil` |
-| `session` | session | The live session, or `nil` |
-| `broker` | broker | The broker handle, or `nil` |
-| `generation` | integer | The loaded code generation |
-| `channels` | list | The channel objects this process runs |
-| `running-p` | boolean | True between start and stop |
-| `heartbeat-p` | boolean | Whether the schedule runs |
-| `heartbeat-interval` | integer | Seconds between ticks |
-| `heartbeat-thread` | thread | The heartbeat thread, or `nil` |
-| `tick-function` | function | The hook one tick calls, or `nil` |
-| `ticks` | integer | How many ticks finished |
-| `last-tick` | integer | When the last tick finished |
-| `tick-started` | integer | When the running tick started |
-| `tick-running-p` | boolean | True while a tick runs |
-| `tick-requested-p` | boolean | True when a tick request waits |
-| `tick-ok-p` | boolean | False when a tick phase failed |
-| `tick-report` | string | What the last tick said |
-| `last-compacted-turn` | integer | The last turn that compaction read |
-| `last-sleep-turn` | integer | The last turn the sleep agent read |
-| `bootstrap-line` | string | One line of bootstrap state |
-| `report` | string | The last control report |
-| `report-ok-p` | boolean | True when the process answered the last request |
-| `handled` | integer | How many control requests the process answered |
-| `reload-function` | function | The hook that produces a generation |
-| `started` | integer | When the process started |
+| Field                 | Type     | Meaning                                         |
+| --------------------- | -------- | ----------------------------------------------- |
+| `directory`           | string   | The agent directory                             |
+| `run-directory`       | string   | Where the control and status files live         |
+| `config`              | plist    | The active configuration                        |
+| `store`               | store    | The memory store, or `nil`                      |
+| `agent`               | agent    | The live agent, or `nil`                        |
+| `session`             | session  | The live session, or `nil`                      |
+| `broker`              | broker   | The broker handle, or `nil`                     |
+| `generation`          | integer  | The loaded code generation                      |
+| `channels`            | list     | The channel objects this process runs           |
+| `running-p`           | boolean  | True between start and stop                     |
+| `heartbeat-p`         | boolean  | Whether the schedule runs                       |
+| `heartbeat-interval`  | integer  | Seconds between ticks                           |
+| `heartbeat-thread`    | thread   | The heartbeat thread, or `nil`                  |
+| `tick-function`       | function | The hook one tick calls, or `nil`               |
+| `ticks`               | integer  | How many ticks finished                         |
+| `last-tick`           | integer  | When the last tick finished                     |
+| `tick-started`        | integer  | When the running tick started                   |
+| `tick-running-p`      | boolean  | True while a tick runs                          |
+| `tick-requested-p`    | boolean  | True when a tick request waits                  |
+| `tick-ok-p`           | boolean  | False when a tick phase failed                  |
+| `tick-report`         | string   | What the last tick said                         |
+| `last-compacted-turn` | integer  | The last turn that compaction read              |
+| `last-sleep-turn`     | integer  | The last turn the sleep agent read              |
+| `bootstrap-line`      | string   | One line of bootstrap state                     |
+| `report`              | string   | The last control report                         |
+| `report-ok-p`         | boolean  | True when the process answered the last request |
+| `handled`             | integer  | How many control requests the process answered  |
+| `reload-function`     | function | The hook that produces a generation             |
+| `started`             | integer  | When the process started                        |
 
 `make-supervisor` takes these fields and starts nothing. `supervisor-start`
 starts the work. The heartbeat interval must be a positive whole number of
@@ -65,13 +65,13 @@ marks that task `failed` in the recovery phase below.
 
 ## Threads and processes
 
-| Work | Where it runs | Thread name |
-| --- | --- | --- |
-| The REPL, under `chat` | The main thread | none |
-| The control poll, under `serve` | The main thread | none |
-| The control poll, under `chat` | One extra thread | `enchiridion control poll` |
-| The heartbeat | One extra thread | `enchiridion heartbeat` |
-| One channel | One thread for each channel | `enchiridion channel <name>` |
+| Work                            | Where it runs               | Thread name                  |
+| ------------------------------- | --------------------------- | ---------------------------- |
+| The REPL, under `chat`          | The main thread             | none                         |
+| The control poll, under `serve` | The main thread             | none                         |
+| The control poll, under `chat`  | One extra thread            | `enchiridion control poll`   |
+| The heartbeat                   | One extra thread            | `enchiridion heartbeat`      |
+| One channel                     | One thread for each channel | `enchiridion channel <name>` |
 
 `chat` starts the supervisor itself and puts the control poll on a thread beside
 the REPL. The `serve` command receives the supervisor from the command context.
@@ -85,10 +85,10 @@ exits zero reaches the broker.
 
 ## The two files
 
-| File | Path | Purpose |
-| --- | --- | --- |
+| File             | Path                      | Purpose                               |
+| ---------------- | ------------------------- | ------------------------------------- |
 | The control file | `run/enchiridion.control` | A caller appends one request per line |
-| The status file | `run/enchiridion.status` | The state a reader asks about |
+| The status file  | `run/enchiridion.status`  | The state a reader asks about         |
 
 Both files live under `run/`, which is `<home>/run/`. The home is
 `ENCHIRIDION_HOME`, or the current directory when that variable is unset.
@@ -106,21 +106,21 @@ file, and that file is milliseconds old.
 
 ## The status file fields
 
-| Key | Type | Meaning |
-| --- | --- | --- |
-| `pid` | integer | The process id |
-| `running` | boolean | True while the supervisor runs |
-| `started` | integer | When `supervisor-start` ran |
-| `updated` | integer | When the process last wrote the file |
-| `generation` | integer | The loaded code generation |
-| `bootstrap` | string | One line of bootstrap state |
-| `report` | string | The last control report |
-| `report-ok` | boolean | True when the process answered the last request |
-| `handled` | integer | How many control requests the process answered |
-| `heartbeat` | object | The tick state in the table below |
-| `root` | string | The agent directory |
-| `config` | string | A digest of the configuration |
-| `channels` | array | One row for each channel |
+| Key          | Type    | Meaning                                         |
+| ------------ | ------- | ----------------------------------------------- |
+| `pid`        | integer | The process id                                  |
+| `running`    | boolean | True while the supervisor runs                  |
+| `started`    | integer | When `supervisor-start` ran                     |
+| `updated`    | integer | When the process last wrote the file            |
+| `generation` | integer | The loaded code generation                      |
+| `bootstrap`  | string  | One line of bootstrap state                     |
+| `report`     | string  | The last control report                         |
+| `report-ok`  | boolean | True when the process answered the last request |
+| `handled`    | integer | How many control requests the process answered  |
+| `heartbeat`  | object  | The tick state in the table below               |
+| `root`       | string  | The agent directory                             |
+| `config`     | string  | A digest of the configuration                   |
+| `channels`   | array   | One row for each channel                        |
 
 A channel row holds `name`, `state`, and `enabled`. The key `enabled` is true
 when the configuration enables the channel or when this process runs it. A
@@ -130,15 +130,15 @@ contradicting itself.
 
 The heartbeat object:
 
-| Key | Type | Meaning |
-| --- | --- | --- |
-| `enabled` | boolean | Whether the schedule runs |
-| `ticks` | integer | How many ticks finished |
-| `last-tick` | integer | When the last tick finished |
-| `running` | boolean | True while a tick runs |
-| `started` | integer | When the running tick started |
-| `ok` | boolean | False when a tick phase failed |
-| `report` | string | What the last tick said |
+| Key         | Type    | Meaning                        |
+| ----------- | ------- | ------------------------------ |
+| `enabled`   | boolean | Whether the schedule runs      |
+| `ticks`     | integer | How many ticks finished        |
+| `last-tick` | integer | When the last tick finished    |
+| `running`   | boolean | True while a tick runs         |
+| `started`   | integer | When the running tick started  |
+| `ok`        | boolean | False when a tick phase failed |
+| `report`    | string  | What the last tick said        |
 
 The file holds nothing secret. It is world readable, so the scrubber cleans the
 control report and the tick report on the way out. The `health` command shows
@@ -157,15 +157,15 @@ The supervisor reads the control file once a second, acts on each line, and
 empties the file. The last report lands in the status file, so a shell command
 that only appended a line learns what happened.
 
-| Request | Effect |
-| --- | --- |
-| `reload` | Produce a new generation through the reload hook |
-| `channels list` | Report the channels |
-| `channels enable <name>` | Start the named channel |
-| `channels disable <name>` | Stop the named channel |
-| `heartbeat on` | Start the schedule |
-| `heartbeat off` | Stop the schedule |
-| `heartbeat run` | Ask for one tick now |
+| Request                   | Effect                                           |
+| ------------------------- | ------------------------------------------------ |
+| `reload`                  | Produce a new generation through the reload hook |
+| `channels list`           | Report the channels                              |
+| `channels enable <name>`  | Start the named channel                          |
+| `channels disable <name>` | Stop the named channel                           |
+| `heartbeat on`            | Start the schedule                               |
+| `heartbeat off`           | Stop the schedule                                |
+| `heartbeat run`           | Ask for one tick now                             |
 
 An unknown verb answers one line and reports a refusal. `channels enable` with
 no name answers `which channel?`. A name the process does not hold answers
@@ -196,12 +196,12 @@ answered.
 
 ## The operator commands
 
-| Command | What it reads or asks | Exit status |
-| --- | --- | --- |
-| `health` | The status file | 1 when no supervisor runs |
-| `reload` | `request-control "reload"` | 1 when the supervisor refused |
-| `channels ...` | `request-control "channels ..."` | 1 when no supervisor runs |
-| `heartbeat ...` | `request-control "heartbeat ..."` | 1 when no supervisor runs |
+| Command         | What it reads or asks             | Exit status                   |
+| --------------- | --------------------------------- | ----------------------------- |
+| `health`        | The status file                   | 1 when no supervisor runs     |
+| `reload`        | `request-control "reload"`        | 1 when the supervisor refused |
+| `channels ...`  | `request-control "channels ..."`  | 1 when no supervisor runs     |
+| `heartbeat ...` | `request-control "heartbeat ..."` | 1 when no supervisor runs     |
 
 `health` prints the pid, the generation, the last report, the heartbeat line,
 and one line for each channel. It also reports a tick that runs for a long
@@ -238,12 +238,12 @@ grows, and the report lands in the status file.
 its own guard. A failed phase adds a note, sets `:ok-p` false, and the later
 phases still run.
 
-| Order | Phase | What it does |
-| --- | --- | --- |
-| 1 | Task recovery | Marks every running task failed |
-| 2 | The harness blocks | Writes the ledger block and the session fallback |
-| 3 | The sleep agent | Claims one task, or runs a maintenance pass |
-| 4 | Compaction | Rewrites the session block after new turns |
+| Order | Phase              | What it does                                     |
+| ----- | ------------------ | ------------------------------------------------ |
+| 1     | Task recovery      | Marks every running task failed                  |
+| 2     | The harness blocks | Writes the ledger block and the session fallback |
+| 3     | The sleep agent    | Claims one task, or runs a maintenance pass      |
+| 4     | Compaction         | Rewrites the session block after new turns       |
 
 The report joins the notes with `; `. A tick with nothing to do answers `idle`.
 The budget caps below bound the whole tick.
@@ -271,11 +271,11 @@ change the thing it summarises.
 
 The sleep agent refuses to run for four reasons, and each reason names a fact:
 
-| Reason | Condition |
-| --- | --- |
-| `no memory store is open` | No store |
-| `no agent is attached` | No agent |
-| `no model backend is configured` | No backend |
+| Reason                              | Condition                                   |
+| ----------------------------------- | ------------------------------------------- |
+| `no memory store is open`           | No store                                    |
+| `no agent is attached`              | No agent                                    |
+| `no model backend is configured`    | No backend                                  |
 | `bootstrap has not handed over ...` | The seed files still belong to the operator |
 
 A refused sleep phase writes `sleep skipped: <reason>`. A refused compaction
@@ -283,12 +283,12 @@ writes `compaction skipped: <reason>`.
 
 ## The task queue
 
-| Status | Meaning |
-| --- | --- |
-| `:pending` | Waiting for a tick |
-| `:running` | A tick claimed it |
-| `:done` | Finished |
-| `:failed` | The pass failed, or a dead process left the row running |
+| Status     | Meaning                                                 |
+| ---------- | ------------------------------------------------------- |
+| `:pending` | Waiting for a tick                                      |
+| `:running` | A tick claimed it                                       |
+| `:done`    | Finished                                                |
+| `:failed`  | The pass failed, or a dead process left the row running |
 
 `dequeue-task` claims the oldest pending task and marks it `running`. A claim is
 not a completion. A process that dies mid-task leaves evidence instead of a task
@@ -316,10 +316,10 @@ line, built to fit the block limit by construction rather than by truncation:
 session in 1200 out 340 cache r 0 w 0 calls 4 · day 15400
 ```
 
-| Cap | Key | Default |
-| --- | --- | --- |
-| The tick cap | `:max-tokens-per-tick` | 4000 |
-| The day cap | `:max-tokens-per-day` | 400000 |
+| Cap          | Key                    | Default |
+| ------------ | ---------------------- | ------- |
+| The tick cap | `:max-tokens-per-tick` | 4000    |
+| The day cap  | `:max-tokens-per-day`  | 400000  |
 
 The caps live in the `:budget` section. A missing cap is not a cap, so only the
 operator's own limit bounds unattended work.
@@ -349,15 +349,15 @@ the queue and the ledger are not model calls.
 
 ## Refusal paths
 
-| Situation | Result |
-| --- | --- |
-| No supervisor answers | One line, exit 1 |
-| A reload refused the generation | The report goes back, exit 1 |
-| An unknown control verb | One line and a refused report |
-| An unknown channel name | `channel <name> is not implemented yet.` |
-| `heartbeat run` with no tick hook | `no sleep agent is attached to this process.` |
-| A spent cap | The tick skips the phase with its reason |
-| Bootstrap has not handed over | The tick skips the sleep agent with its reason |
+| Situation                         | Result                                         |
+| --------------------------------- | ---------------------------------------------- |
+| No supervisor answers             | One line, exit 1                               |
+| A reload refused the generation   | The report goes back, exit 1                   |
+| An unknown control verb           | One line and a refused report                  |
+| An unknown channel name           | `channel <name> is not implemented yet.`       |
+| `heartbeat run` with no tick hook | `no sleep agent is attached to this process.`  |
+| A spent cap                       | The tick skips the phase with its reason       |
+| Bootstrap has not handed over     | The tick skips the sleep agent with its reason |
 
 The process also refuses to start a webhook that would answer the network
 without a token. The function `check-http-policy` raises that refusal before the

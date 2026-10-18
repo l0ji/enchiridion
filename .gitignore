@@ -33,6 +33,7 @@ run/
 # workspace is the one workaround that needs no permission outside it.
 /.nix-cache/
 /scratch/
+/.scratch/
 
 # Sandbox scratch. Agent-authored code is verified here before it loads.
 /tmp/enchiridion/

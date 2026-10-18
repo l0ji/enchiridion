@@ -61,15 +61,15 @@ interval, the heartbeat flag, and the agent uid.
 
 ## The `:llm` section
 
-| Key | Type | Default | Effect |
-| --- | --- | --- | --- |
-| `:provider` | keyword or string | `:openai` | Select the provider. The code recognizes only `:openai` and `:opencode`. |
-| `:backend` | keyword | `:openai` | Select the wire protocol. Only `:openai` has an implementation. |
-| `:base-url` | string or `nil` | `nil` | Set the endpoint. The backend adds a trailing slash when the value has none. |
-| `:model-primary` | string | `"deepseek-v4.1-flash"` | Set the model for reasoning turns. |
-| `:model-cheap` | string | `"deepseek-v4.1-flash"` | Set the model for memory digests and compaction. |
-| `:model-sleep` | string | `"deepseek-v4.1-flash"` | Set the model for the sleep agent. |
-| `:api-key-env` | string | `"OPENAI_API_KEY"` | Name the variable that holds the API key. |
+| Key              | Type              | Default                 | Effect                                                                       |
+| ---------------- | ----------------- | ----------------------- | ---------------------------------------------------------------------------- |
+| `:provider`      | keyword or string | `:openai`               | Select the provider. The code recognizes only `:openai` and `:opencode`.     |
+| `:backend`       | keyword           | `:openai`               | Select the wire protocol. Only `:openai` has an implementation.              |
+| `:base-url`      | string or `nil`   | `nil`                   | Set the endpoint. The backend adds a trailing slash when the value has none. |
+| `:model-primary` | string            | `"deepseek-v4.1-flash"` | Set the model for reasoning turns.                                           |
+| `:model-cheap`   | string            | `"deepseek-v4.1-flash"` | Set the model for memory digests and compaction.                             |
+| `:model-sleep`   | string            | `"deepseek-v4.1-flash"` | Set the model for the sleep agent.                                           |
+| `:api-key-env`   | string            | `"OPENAI_API_KEY"`      | Name the variable that holds the API key.                                    |
 
 Each model tier starts equal to the cheap model. The key to raise for a
 stronger turn is `:model-primary`.
@@ -114,20 +114,20 @@ explicit `nil` is a value and wins. A channel with no entry is disabled.
 
 ### `:cli`
 
-| Key | Type | Default | Effect |
-| --- | --- | --- | --- |
-| `:enabled` | boolean | `t` | Start the terminal channel. Only `serve` supervises it. |
+| Key        | Type    | Default | Effect                                                  |
+| ---------- | ------- | ------- | ------------------------------------------------------- |
+| `:enabled` | boolean | `t`     | Start the terminal channel. Only `serve` supervises it. |
 
 ### `:http`
 
-| Key | Type | Default | Effect |
-| --- | --- | --- | --- |
-| `:enabled` | boolean | `nil` | Start the webhook. |
-| `:bind` | string | `"127.0.0.1"` | Set the bind address. |
-| `:port` | integer | `8787` | Set the port. |
-| `:token-env` | string | `"ENCHIRIDION_HTTP_TOKEN"` | Name the variable that holds the bearer token. |
-| `:token` | string or `nil` | `nil` | Set a literal bearer token. The program registers the value with the scrubber. |
-| `:max-body-bytes` | integer | `65536` | Set the number of request body bytes the webhook reads. |
+| Key               | Type            | Default                    | Effect                                                                         |
+| ----------------- | --------------- | -------------------------- | ------------------------------------------------------------------------------ |
+| `:enabled`        | boolean         | `nil`                      | Start the webhook.                                                             |
+| `:bind`           | string          | `"127.0.0.1"`              | Set the bind address.                                                          |
+| `:port`           | integer         | `8787`                     | Set the port.                                                                  |
+| `:token-env`      | string          | `"ENCHIRIDION_HTTP_TOKEN"` | Name the variable that holds the bearer token.                                 |
+| `:token`          | string or `nil` | `nil`                      | Set a literal bearer token. The program registers the value with the scrubber. |
+| `:max-body-bytes` | integer         | `65536`                    | Set the number of request body bytes the webhook reads.                        |
 
 A bind address other than loopback needs a token. The process refuses to start
 without one. That check runs before the supervisor starts, so a bad flag costs
@@ -137,21 +137,21 @@ The routes, the methods, and the reply shape live in [Channels](channels.md).
 
 ### `:fluxer`
 
-| Key | Type | Default | Effect |
-| --- | --- | --- | --- |
-| `:enabled` | boolean | `nil` | Start the Fluxer gateway channel. |
-| `:allowed-users` | list of strings | `nil` | Set the user ids that may send a direct message. |
-| `:token-env` | string | `"FLUXER_BOT_TOKEN"` | Name the variable that holds the bot token. |
+| Key              | Type            | Default              | Effect                                           |
+| ---------------- | --------------- | -------------------- | ------------------------------------------------ |
+| `:enabled`       | boolean         | `nil`                | Start the Fluxer gateway channel.                |
+| `:allowed-users` | list of strings | `nil`                | Set the user ids that may send a direct message. |
+| `:token-env`     | string          | `"FLUXER_BOT_TOKEN"` | Name the variable that holds the bot token.      |
 
 Deny by default: an empty or absent allowlist means nobody may talk to the
 agent.
 
 ## The `:budget` section
 
-| Key | Type | Default | Effect |
-| --- | --- | --- | --- |
-| `:max-tokens-per-tick` | integer | `4000` | Cap the tokens one heartbeat tick may spend. |
-| `:max-tokens-per-day` | integer | `400000` | Cap the tokens one day may spend. |
+| Key                    | Type    | Default  | Effect                                       |
+| ---------------------- | ------- | -------- | -------------------------------------------- |
+| `:max-tokens-per-tick` | integer | `4000`   | Cap the tokens one heartbeat tick may spend. |
+| `:max-tokens-per-day`  | integer | `400000` | Cap the tokens one day may spend.            |
 
 The heartbeat starts no new phase when the spend reaches a cap. A phase
 already under way finishes. The program reads both keys with
@@ -159,10 +159,10 @@ already under way finishes. The program reads both keys with
 
 ## The `:sandbox` section
 
-| Key | Type | Default | Effect |
-| --- | --- | --- | --- |
-| `:agent-uid` | integer | `1000` | Set the uid for the broker and for agent code. The supervisor runs as uid 0. |
-| `:proc-hidepid` | integer | `2` | Record the hidepid value for `/proc`. |
+| Key             | Type    | Default | Effect                                                                       |
+| --------------- | ------- | ------- | ---------------------------------------------------------------------------- |
+| `:agent-uid`    | integer | `1000`  | Set the uid for the broker and for agent code. The supervisor runs as uid 0. |
+| `:proc-hidepid` | integer | `2`     | Record the hidepid value for `/proc`.                                        |
 
 The harness reads `:agent-uid` and passes the value to the broker. The harness
 does not read `:proc-hidepid` and does not mount `/proc`. The deployment
@@ -170,10 +170,10 @@ supplies that mount. See [Deployment](deployment.md).
 
 ## The `:memory` section
 
-| Key | Type | Default | Effect |
-| --- | --- | --- | --- |
-| `:db` | string or `nil` | `nil` | Set the SQLite store path. A `nil` value selects the store beside the agent files. |
-| `:block-limits` | plist of label to integer | see below | Record the character limit for each memory block. |
+| Key             | Type                      | Default   | Effect                                                                             |
+| --------------- | ------------------------- | --------- | ---------------------------------------------------------------------------------- |
+| `:db`           | string or `nil`           | `nil`     | Set the SQLite store path. A `nil` value selects the store beside the agent files. |
+| `:block-limits` | plist of label to integer | see below | Record the character limit for each memory block.                                  |
 
 The default `:block-limits` plist holds `:persona 1200`, `:operator 800`,
 `:world 1500`, `:session 400`, and `:ledger 250`.
@@ -187,10 +187,10 @@ entry. Raising a limit raises the fixed token cost of every prompt. See
 
 ## The `:sleep` section
 
-| Key | Type | Default | Effect |
-| --- | --- | --- | --- |
-| `:enabled` | boolean | `t` | Start the heartbeat schedule with the supervisor. |
-| `:interval-seconds` | integer | `900` | Set the seconds between sleep ticks. |
+| Key                 | Type    | Default | Effect                                            |
+| ------------------- | ------- | ------- | ------------------------------------------------- |
+| `:enabled`          | boolean | `t`     | Start the heartbeat schedule with the supervisor. |
+| `:interval-seconds` | integer | `900`   | Set the seconds between sleep ticks.              |
 
 The supervisor reads `:enabled` as its heartbeat flag. `heartbeat-interval`
 reads `:interval-seconds`. A value that is not a positive whole number becomes
@@ -203,15 +203,15 @@ the variables instead. That rule keeps a secret out of a file that a person
 copies between hosts. The repository ignores `config.cl`. The tracked template
 is the only copy of the format.
 
-| Variable | Effect |
-| --- | --- |
-| `ENCHIRIDION_HOME` | Set the home root for the agent directory and `run/`. |
-| `ENCHIRIDION_SOURCE` | Set the project root for a copy with no checkout above it. |
-| `ENCHIRIDION_SBCL` | Set the SBCL binary the wrapper installed. |
-| `OPENAI_API_KEY` | Hold the OpenAI key, when the file names this variable. |
-| `OPENCODE_API_KEY` | Hold the OpenCode Go key, when the file names this variable. |
-| `ENCHIRIDION_HTTP_TOKEN` | Hold the webhook bearer token by default. |
-| `FLUXER_BOT_TOKEN` | Hold the Fluxer bot token by default. |
+| Variable                 | Effect                                                       |
+| ------------------------ | ------------------------------------------------------------ |
+| `ENCHIRIDION_HOME`       | Set the home root for the agent directory and `run/`.        |
+| `ENCHIRIDION_SOURCE`     | Set the project root for a copy with no checkout above it.   |
+| `ENCHIRIDION_SBCL`       | Set the SBCL binary the wrapper installed.                   |
+| `OPENAI_API_KEY`         | Hold the OpenAI key, when the file names this variable.      |
+| `OPENCODE_API_KEY`       | Hold the OpenCode Go key, when the file names this variable. |
+| `ENCHIRIDION_HTTP_TOKEN` | Hold the webhook bearer token by default.                    |
+| `FLUXER_BOT_TOKEN`       | Hold the Fluxer bot token by default.                        |
 
 The program reads the secret file in this order:
 

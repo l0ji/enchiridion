@@ -11,15 +11,15 @@ tool for the whole process, so a builtin and an agent tool share one namespace.
 `make-tool` builds a tool struct. `define-tool` registers one and keeps the
 schema as a Lisp form.
 
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `name` | string | The lookup key, in lowercase. |
-| `description` | string | The one line the model reads. |
-| `schema` | form | The declaration below. |
-| `handler` | function | The function that dispatch calls. |
-| `self-test` | function | The function that verification calls. |
-| `generation` | integer | The generation that installed the tool. |
-| `broker-side-p` | boolean | True when the handler lives in the child. |
+| Field           | Type     | Meaning                                   |
+| --------------- | -------- | ----------------------------------------- |
+| `name`          | string   | The lookup key, in lowercase.             |
+| `description`   | string   | The one line the model reads.             |
+| `schema`        | form     | The declaration below.                    |
+| `handler`       | function | The function that dispatch calls.         |
+| `self-test`     | function | The function that verification calls.     |
+| `generation`    | integer  | The generation that installed the tool.   |
+| `broker-side-p` | boolean  | True when the handler lives in the child. |
 
 The plugin loader builds the same struct, so an agent tool and a builtin tool
 are the same object to the registry.
@@ -37,27 +37,27 @@ source means the two cannot drift.
               (:to :integer)))
 ```
 
-| Form | JSON Schema | Note |
-| --- | --- | --- |
-| `:string` | `"type": "string"` | A keyword is a type. |
-| `(:object ...)` | `"type": "object"` | Adds `additionalProperties` false. |
-| `(:array :items F)` | `"type": "array"` | Items holds one schema form. |
-| `:required (a b)` | `"required"` | Names sit in a list. |
-| `:properties ((k F))` | `"properties"` | Each pair is a name and a form. |
+| Form                  | JSON Schema        | Note                               |
+| --------------------- | ------------------ | ---------------------------------- |
+| `:string`             | `"type": "string"` | A keyword is a type.               |
+| `(:object ...)`       | `"type": "object"` | Adds `additionalProperties` false. |
+| `(:array :items F)`   | `"type": "array"`  | Items holds one schema form.       |
+| `:required (a b)`     | `"required"`       | Names sit in a list.               |
+| `:properties ((k F))` | `"properties"`     | Each pair is a name and a form.    |
 
 An unknown object key, an unknown array key, and a form that is not a keyword
 or a list all signal `schema-error`. The object form sets
 `additionalProperties` false, because a tool that ignores a misspelled
 argument runs with the wrong argument and reports success.
 
-| Function | Result |
-| --- | --- |
-| `schema-to-json` | The schema as a hash table. |
-| `schema-json-string` | The schema as JSON text. |
-| `schema-tokens` | A token estimate, one per four characters. |
-| `arguments-to-json` | The arguments as a hash table. |
-| `validate-arguments` | True, or `schema-error` with the reasons. |
-| `schema-error-message` | The detail string of a `schema-error`. |
+| Function               | Result                                     |
+| ---------------------- | ------------------------------------------ |
+| `schema-to-json`       | The schema as a hash table.                |
+| `schema-json-string`   | The schema as JSON text.                   |
+| `schema-tokens`        | A token estimate, one per four characters. |
+| `arguments-to-json`    | The arguments as a hash table.             |
+| `validate-arguments`   | True, or `schema-error` with the reasons.  |
+| `schema-error-message` | The detail string of a `schema-error`.     |
 
 `validate-arguments` passes the JSON text to `cl-jschema`. A failure carries
 the JSON pointer and the reason, so the model can correct the call.
@@ -67,12 +67,12 @@ the JSON pointer and the reason, so the model can correct the call.
 `*schema-budget*` is 2000 tokens. The budget is a soft cap for a report and a
 hard cap at the model boundary.
 
-| Function | Result |
-| --- | --- |
-| `registry-schema-tokens` | The estimate for every tool. |
-| `schema-budget-report` | A plist of `:used`, `:budget`, `:remaining`. |
+| Function                    | Result                                          |
+| --------------------------- | ----------------------------------------------- |
+| `registry-schema-tokens`    | The estimate for every tool.                    |
+| `schema-budget-report`      | A plist of `:used`, `:budget`, `:remaining`.    |
 | `registry-tool-definitions` | Every tool for the model, or `budget-exceeded`. |
-| `registry-schema` | Every tool as one JSON array. |
+| `registry-schema`           | Every tool as one JSON array.                   |
 
 `registry-tool-definitions` checks the budget. A registry over the cap signals
 `budget-exceeded` with `:cap` and `:window :schema`, and the turn stops there.
@@ -94,12 +94,12 @@ starts with `error: `, and the model can correct the call.
 
 `dispatch` fails in four named ways.
 
-| Failure | Condition |
-| --- | --- |
-| The name is unknown | `not-found`, with `:kind "tool"`. |
-| The generation is wrong | `configuration-error`, with `:key :generation`. |
-| The arguments do not match | `schema-error`. |
-| The handler signals | `tool-error`, with `:tool`. |
+| Failure                    | Condition                                       |
+| -------------------------- | ----------------------------------------------- |
+| The name is unknown        | `not-found`, with `:kind "tool"`.               |
+| The generation is wrong    | `configuration-error`, with `:key :generation`. |
+| The arguments do not match | `schema-error`.                                 |
+| The handler signals        | `tool-error`, with `:tool`.                     |
 
 A handler that signals an `enchiridion-error` keeps its own condition. Any
 other error becomes `tool-error`, so the caller never guesses which layer
@@ -107,18 +107,18 @@ failed.
 
 ## The registry
 
-| Function | Result |
-| --- | --- |
-| `registry` | The live hash table. |
-| `register-tool` | Adds a tool and returns it. |
-| `find-tool` | The tool, or NIL. |
-| `tool-names` | Every name, sorted. |
-| `list-tools` | Every tool, sorted by name. |
-| `unregister-tool` | True when the name was there. |
-| `clear-registry` | Removes every tool. Tests use this. |
-| `normalize-tool-name` | The lowercase string form of a name. |
-| `tool-definition` | One tool as a model definition object. |
-| `dispatch` | Validates and calls one tool. |
+| Function              | Result                                 |
+| --------------------- | -------------------------------------- |
+| `registry`            | The live hash table.                   |
+| `register-tool`       | Adds a tool and returns it.            |
+| `find-tool`           | The tool, or NIL.                      |
+| `tool-names`          | Every name, sorted.                    |
+| `list-tools`          | Every tool, sorted by name.            |
+| `unregister-tool`     | True when the name was there.          |
+| `clear-registry`      | Removes every tool. Tests use this.    |
+| `normalize-tool-name` | The lowercase string form of a name.   |
+| `tool-definition`     | One tool as a model definition object. |
+| `dispatch`            | Validates and calls one tool.          |
 
 A later registration with the same name replaces the earlier tool. That is
 what a reload needs, and it is also how a plugin shadows a builtin.
@@ -149,15 +149,15 @@ FORMAT LIST IDENTITY IF AND OR NOT NULL T NIL
 = /= > < >= <= + - * /
 ```
 
-| Function | Result |
-| --- | --- |
-| `read-filter` | One checked form, or `schema-error`. |
-| `check-form` | Walks a form and rejects a foreign symbol. |
+| Function           | Result                                          |
+| ------------------ | ----------------------------------------------- |
+| `read-filter`      | One checked form, or `schema-error`.            |
+| `check-form`       | Walks a form and rejects a foreign symbol.      |
 | `allowed-symbol-p` | True for the line variable and the names above. |
-| `filter-form` | The expression inside `(filter ...)`. |
-| `make-sandbox` | A fresh package that holds `$` and `NTH4`. |
-| `pipe-safe-eval` | One form with `$` bound to one line. |
-| `pipe-eval` | The text with only the kept lines. |
+| `filter-form`      | The expression inside `(filter ...)`.           |
+| `make-sandbox`     | A fresh package that holds `$` and `NTH4`.      |
+| `pipe-safe-eval`   | One form with `$` bound to one line.            |
+| `pipe-eval`        | The text with only the kept lines.              |
 
 `read-filter` binds `*read-eval*` to NIL. An empty filter and a string with
 two forms both fail.
@@ -179,14 +179,14 @@ process as uid 1000. Only a length prefixed JSON request and its response
 cross the line. The supervisor never loads the code of the child and never
 sends a secret in a request.
 
-| Item | Value |
-| --- | --- |
-| Default socket | `/run/enchiridion/broker.sock` |
-| Child uid | 1000 |
-| Frame | Four byte big endian length, then UTF-8 bytes. |
-| Frame cap | 16 MiB |
-| Operations | `ping`, `load-generation`, and any tool name. |
-| `ping` reply | The string `ok`. |
+| Item           | Value                                          |
+| -------------- | ---------------------------------------------- |
+| Default socket | `/run/enchiridion/broker.sock`                 |
+| Child uid      | 1000                                           |
+| Frame          | Four byte big endian length, then UTF-8 bytes. |
+| Frame cap      | 16 MiB                                         |
+| Operations     | `ping`, `load-generation`, and any tool name.  |
+| `ping` reply   | The string `ok`.                               |
 
 `make-broker` accepts a `:socket` argument, and the daemon passes its own
 path. The daemon uses `$ENCHIRIDION_HOME/run/broker.sock` when that variable
@@ -197,17 +197,17 @@ the builtin tools, sets `*load-generation-function*`, and serves the socket.
 The environment of the child comes from `child-environment`, which sets `PATH`
 and `HOME` and copies a short list of names. Nothing else is inherited.
 
-| Function | Result |
-| --- | --- |
-| `make-broker` | A descriptor. Nothing starts yet. |
-| `broker-start` | Starts the child, or a test server in process. |
-| `broker-stop` | Closes the socket, the thread, and the child. |
-| `broker-call` | Sends one operation and returns its result. |
-| `broker-health` | True when a ping answers. |
-| `broker-verify-plugin` | Verifies a directory in a one-shot child. |
-| `broker-load-generation` | Asks the child to load a generation. |
-| `serve-broker` | Binds a socket and serves. Child entry point. |
-| `write-frame`, `read-frame` | The wire format. |
+| Function                    | Result                                         |
+| --------------------------- | ---------------------------------------------- |
+| `make-broker`               | A descriptor. Nothing starts yet.              |
+| `broker-start`              | Starts the child, or a test server in process. |
+| `broker-stop`               | Closes the socket, the thread, and the child.  |
+| `broker-call`               | Sends one operation and returns its result.    |
+| `broker-health`             | True when a ping answers.                      |
+| `broker-verify-plugin`      | Verifies a directory in a one-shot child.      |
+| `broker-load-generation`    | Asks the child to load a generation.           |
+| `serve-broker`              | Binds a socket and serves. Child entry point.  |
+| `write-frame`, `read-frame` | The wire format.                               |
 
 `broker-call` holds one lock, because a request is one frame out and one frame
 back on one stream. Two callers at once would interleave and one would read
@@ -221,18 +221,18 @@ read. The caller sets a process deadline around the call instead.
 
 `register-builtin-tools` calls six registrars. It registers ten tools.
 
-| Tool | Required | Optional |
-| --- | --- | --- |
-| `index` | `path` | none |
-| `read-file` | `path` | `from`, `to` |
-| `write-file` | `path`, `text` | none |
-| `edit-file` | `path`, `old`, `new` | none |
-| `glob` | `pattern` | none |
-| `shell` | `command` | `timeout` |
-| `search` | `query` | `scope`, `path`, `limit` |
-| `blockops` | none | `action`, `label`, `old`, `new`, `text`, `directory` |
-| `meta` | none | `action`, `directory`, `limit`, `name`, `kind`, `text`, `confirm` |
-| `web` | none | `action`, `url`, `query`, `limit` |
+| Tool         | Required             | Optional                                                          |
+| ------------ | -------------------- | ----------------------------------------------------------------- |
+| `index`      | `path`               | none                                                              |
+| `read-file`  | `path`               | `from`, `to`                                                      |
+| `write-file` | `path`, `text`       | none                                                              |
+| `edit-file`  | `path`, `old`, `new` | none                                                              |
+| `glob`       | `pattern`            | none                                                              |
+| `shell`      | `command`            | `timeout`                                                         |
+| `search`     | `query`              | `scope`, `path`, `limit`                                          |
+| `blockops`   | none                 | `action`, `label`, `old`, `new`, `text`, `directory`              |
+| `meta`       | none                 | `action`, `directory`, `limit`, `name`, `kind`, `text`, `confirm` |
+| `web`        | none                 | `action`, `url`, `query`, `limit`                                 |
 
 Most results pass through `cap-result`. `+result-cap+` is 8000 characters. A
 larger result spills to a file, and the model gets the head and the path.
@@ -290,12 +290,12 @@ unknown scope.
 Reads and edits the memory blocks. `action` is `list` by default and accepts
 `read`, `patch`, and `add`.
 
-| Label | File |
-| --- | --- |
-| `soul` | `SOUL.md` |
-| `persona` | `SOUL.md` |
+| Label      | File          |
+| ---------- | ------------- |
+| `soul`     | `SOUL.md`     |
+| `persona`  | `SOUL.md`     |
 | `operator` | `OPERATOR.md` |
-| `world` | `WORLD.md` |
+| `world`    | `WORLD.md`    |
 
 `list` shows each block with its size and limit. `read` returns the text.
 `patch` replaces one unique occurrence. `add` appends a line.

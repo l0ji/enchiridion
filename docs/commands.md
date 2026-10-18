@@ -34,11 +34,11 @@ without `--channel http`. The fourth mistake is a port outside 1 to 65535.
 
 ## Exit statuses
 
-| Status | Meaning |
-| --- | --- |
-| 0 | The command finished. |
-| 1 | The command refused its situation, and it said why. A refused reload also returns 1. An unexpected error prints the condition and a short backtrace, then returns 1. |
-| 2 | The call was not usable: unknown name, wrong argument count, bad flag, or refused configuration. |
+| Status | Meaning                                                                                                                                                              |
+| ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 0      | The command finished.                                                                                                                                                |
+| 1      | The command refused its situation, and it said why. A refused reload also returns 1. An unexpected error prints the condition and a short backtrace, then returns 1. |
+| 2      | The call was not usable: unknown name, wrong argument count, bad flag, or refused configuration.                                                                     |
 
 A command that returns no integer becomes 0. `run-command` checks the argument
 count before it calls the handler. A name that is not in the table prints this
@@ -53,34 +53,34 @@ returns 2.
 
 ## The command table
 
-| Command | Arguments | What it prints | Exit |
-| --- | --- | --- | --- |
-| `init` | 0 or 1 | The status line, then each created and kept file, then each problem. | 0, or 1 with a problem |
-| `ask` | 1 or more | The reply on standard output, the token line on standard error. | 0, or 1 on failure |
-| `check` | none | The output of `nix run .#check`. | 0, or 1 when the build fails |
-| `skills` | 0 to 2: `list`, `show NUMBER` | A numbered skill list with trigger lines, or one skill file. | 0, 1, or 2 |
-| `tools` | 0 to 2: `list`, `show NAME` | Every tool with its schema token cost, or one tool schema as JSON. | 0, 1, or 2 |
-| `blocks` | 0 to 2: `show`, `edit NUMBER` | Each block with its character count and limit, or the path of one block file. | 0, 1, or 2 |
-| `persona` | 0 or 1: `show`, `edit` | The text of `SOUL.md`, or its path. | 0, or 2 for another action |
-| `operator` | 0 or 1: `show`, `edit` | The text of `OPERATOR.md`, or its path. | 0, or 2 |
-| `world` | 0 or 1: `show`, `edit` | The text of `WORLD.md`, or its path. | 0, or 2 |
-| `memory` | 1 or more | Matching memories and stored turns, with two counts. | 0, or 1 without a store |
-| `sessions` | none | Each stored session with its turn count, then the session count. | 0, or 1 without a store |
-| `journey` | 0 to 2: `list`, `show REV`, `edit REV`, `rm REV` | The history, one revision, or the result of a revert. | 0, 1, or 2 |
-| `undo` | exactly 1: `NUMBER` | `reverted REV.` or `could not revert REV.` | 0, 1, or 2 |
-| `usage` | none | The token ledger by model, by channel, and by day. | 0, or 1 without a store |
-| `budget` | none | The tick cap, the day cap, and the spend against each cap. | 0 |
-| `tasks` | 0 or more: `list [STATUS]`, `add TEXT`, `rm ID` | The task rows, or one line about the change. | 0, 1 without a store, or 2 for a bad call |
-| `secrets` | none | Each loaded secret name and its source. | 0 |
-| `version` | none | `enchiridion 0.1.0`, the source root, the branch, and the head. | 0 |
-| `help` | 0 or 1: `NAME` | Every command with a summary, or the detail for one command. | 0, or 2 for an unknown name |
-| `bootstrap` | 0 or 1: `status`, `run`, `reset` | The bootstrap state, the remaining steps, or a reset line. | 0, or 2 for another action |
-| `health` | none | The supervisor pid, generation, heartbeat, and channels. | 0, or 1 with no supervisor |
-| `reload` | none | The supervisor report, then the generation. | 0, or 1 when refused or absent |
-| `channels` | 0 to 2: `list`, `enable NAME`, `disable NAME` | The channel report from the supervisor. | 0, or 1 with no supervisor |
-| `heartbeat` | 0 or 1: `on`, `off`, `run` | The supervisor report. | 0, or 1 with no supervisor |
-| `chat` | none | The REPL. | 0 when the REPL ends |
-| `serve` | none | Channel reports and heartbeat reports as they happen. | 0 when the process stops |
+| Command     | Arguments                                        | What it prints                                                                | Exit                                      |
+| ----------- | ------------------------------------------------ | ----------------------------------------------------------------------------- | ----------------------------------------- |
+| `init`      | 0 or 1                                           | The status line, then each created and kept file, then each problem.          | 0, or 1 with a problem                    |
+| `ask`       | 1 or more                                        | The reply on standard output, the token line on standard error.               | 0, or 1 on failure                        |
+| `check`     | none                                             | The output of `nix run .#check`.                                              | 0, or 1 when the build fails              |
+| `skills`    | 0 to 2: `list`, `show NUMBER`                    | A numbered skill list with trigger lines, or one skill file.                  | 0, 1, or 2                                |
+| `tools`     | 0 to 2: `list`, `show NAME`                      | Every tool with its schema token cost, or one tool schema as JSON.            | 0, 1, or 2                                |
+| `blocks`    | 0 to 2: `show`, `edit NUMBER`                    | Each block with its character count and limit, or the path of one block file. | 0, 1, or 2                                |
+| `persona`   | 0 or 1: `show`, `edit`                           | The text of `SOUL.md`, or its path.                                           | 0, or 2 for another action                |
+| `operator`  | 0 or 1: `show`, `edit`                           | The text of `OPERATOR.md`, or its path.                                       | 0, or 2                                   |
+| `world`     | 0 or 1: `show`, `edit`                           | The text of `WORLD.md`, or its path.                                          | 0, or 2                                   |
+| `memory`    | 1 or more                                        | Matching memories and stored turns, with two counts.                          | 0, or 1 without a store                   |
+| `sessions`  | none                                             | Each stored session with its turn count, then the session count.              | 0, or 1 without a store                   |
+| `journey`   | 0 to 2: `list`, `show REV`, `edit REV`, `rm REV` | The history, one revision, or the result of a revert.                         | 0, 1, or 2                                |
+| `undo`      | exactly 1: `NUMBER`                              | `reverted REV.` or `could not revert REV.`                                    | 0, 1, or 2                                |
+| `usage`     | none                                             | The token ledger by model, by channel, and by day.                            | 0, or 1 without a store                   |
+| `budget`    | none                                             | The tick cap, the day cap, and the spend against each cap.                    | 0                                         |
+| `tasks`     | 0 or more: `list [STATUS]`, `add TEXT`, `rm ID`  | The task rows, or one line about the change.                                  | 0, 1 without a store, or 2 for a bad call |
+| `secrets`   | none                                             | Each loaded secret name and its source.                                       | 0                                         |
+| `version`   | none                                             | `enchiridion 0.1.0`, the source root, the branch, and the head.               | 0                                         |
+| `help`      | 0 or 1: `NAME`                                   | Every command with a summary, or the detail for one command.                  | 0, or 2 for an unknown name               |
+| `bootstrap` | 0 or 1: `status`, `run`, `reset`                 | The bootstrap state, the remaining steps, or a reset line.                    | 0, or 2 for another action                |
+| `health`    | none                                             | The supervisor pid, generation, heartbeat, and channels.                      | 0, or 1 with no supervisor                |
+| `reload`    | none                                             | The supervisor report, then the generation.                                   | 0, or 1 when refused or absent            |
+| `channels`  | 0 to 2: `list`, `enable NAME`, `disable NAME`    | The channel report from the supervisor.                                       | 0, or 1 with no supervisor                |
+| `heartbeat` | 0 or 1: `on`, `off`, `run`                       | The supervisor report.                                                        | 0, or 1 with no supervisor                |
+| `chat`      | none                                             | The REPL.                                                                     | 0 when the REPL ends                      |
+| `serve`     | none                                             | Channel reports and heartbeat reports as they happen.                         | 0 when the process stops                  |
 
 A command with an optional argument uses the default when the argument is
 absent. The defaults are `list` for `skills`, `tools`, `journey`, and `tasks`.
@@ -89,13 +89,13 @@ They are `show` for `blocks`, `persona`, `operator`, and `world`. They are
 
 ## Commands that need a live process
 
-| Command | What it needs | Without it |
-| --- | --- | --- |
-| `reload`, `channels`, `heartbeat` | A supervisor and its control file. The request waits up to 5 seconds. | `NAME: no supervisor is running, so nothing was asked.` Exit 1. |
-| `health` | A fresh status file. The file stays fresh for 10 seconds. | `no supervisor is running.` Exit 1. |
-| `serve` | A supervisor in the command context. | `serve needs a supervisor in the command context.` Exit 1. |
-| `memory`, `sessions`, `usage`, `tasks` | An open memory store. | `NAME needs the memory store, and none is open in this process.` Exit 1. |
-| `ask` | A backend and an API key. | `No API key. Put NAME in .env or the environment.` Exit 1. |
+| Command                                | What it needs                                                         | Without it                                                               |
+| -------------------------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `reload`, `channels`, `heartbeat`      | A supervisor and its control file. The request waits up to 5 seconds. | `NAME: no supervisor is running, so nothing was asked.` Exit 1.          |
+| `health`                               | A fresh status file. The file stays fresh for 10 seconds.             | `no supervisor is running.` Exit 1.                                      |
+| `serve`                                | A supervisor in the command context.                                  | `serve needs a supervisor in the command context.` Exit 1.               |
+| `memory`, `sessions`, `usage`, `tasks` | An open memory store.                                                 | `NAME needs the memory store, and none is open in this process.` Exit 1. |
+| `ask`                                  | A backend and an API key.                                             | `No API key. Put NAME in .env or the environment.` Exit 1.               |
 
 `chat` and `serve` own a supervisor. The configuration and the flags decide
 which channels the supervisor starts. Every other command runs in a short-lived
@@ -137,12 +137,12 @@ runs, so the line repeats about once per second.
 
 ### `journey`
 
-| Action | What it prints |
-| --- | --- |
-| `list` | Up to 20 revisions as `REV SUBJECT`. With no history, one line says so. |
-| `show REV` | The revision text. Without a revision, exit 2. |
-| `edit REV` | The directory path and a line that names the revision to edit by hand. |
-| `rm REV` | The output of the revert. |
+| Action     | What it prints                                                          |
+| ---------- | ----------------------------------------------------------------------- |
+| `list`     | Up to 20 revisions as `REV SUBJECT`. With no history, one line says so. |
+| `show REV` | The revision text. Without a revision, exit 2.                          |
+| `edit REV` | The directory path and a line that names the revision to edit by hand.  |
+| `rm REV`   | The output of the revert.                                               |
 
 A revision is a 1-based position in the log, or a hash.
 
@@ -168,11 +168,11 @@ returns 2. A number past the end returns 1.
 
 ### `bootstrap`
 
-| Action | What it prints |
-| --- | --- |
-| `status` | The one line bootstrap state. |
-| `run` | The remaining steps, or one line that says bootstrap is complete. |
-| `reset` | `bootstrap reset to its first step.` |
+| Action   | What it prints                                                    |
+| -------- | ----------------------------------------------------------------- |
+| `status` | The one line bootstrap state.                                     |
+| `run`    | The remaining steps, or one line that says bootstrap is complete. |
+| `reset`  | `bootstrap reset to its first step.`                              |
 
 Any other action returns 2. The agent marks a step done with the meta tool, and
 not from this command.
@@ -202,12 +202,12 @@ holds one line per group with the columns `input`, `output`, `cache read`,
 
 ### `tasks`
 
-| Action | What it prints |
-| --- | --- |
-| `list` | One row per task as `ID (status) body`. |
+| Action        | What it prints                                                                               |
+| ------------- | -------------------------------------------------------------------------------------------- |
+| `list`        | One row per task as `ID (status) body`.                                                      |
 | `list STATUS` | The rows with that status. The four statuses are `pending`, `running`, `done`, and `failed`. |
-| `add TEXT` | `task ID queued.` |
-| `rm ID` | `task ID removed.`, or `there is no task ID.` Both return 0. |
+| `add TEXT`    | `task ID queued.`                                                                            |
+| `rm ID`       | `task ID removed.`, or `there is no task ID.` Both return 0.                                 |
 
 A bad status word returns 2. `add` with no text returns 2. `rm` without an id
 returns 2.
@@ -238,22 +238,22 @@ and returns 1.
 
 ### `channels`
 
-| Action | What it prints |
-| --- | --- |
-| `list` | Each supervised channel with its state. |
-| `enable NAME` | `NAME is up.` or `NAME is already up.` |
-| `disable NAME` | `NAME is down.` |
+| Action         | What it prints                          |
+| -------------- | --------------------------------------- |
+| `list`         | Each supervised channel with its state. |
+| `enable NAME`  | `NAME is up.` or `NAME is already up.`  |
+| `disable NAME` | `NAME is down.`                         |
 
 A name that no channel matches prints `channel NAME is not implemented yet.`
 The request still returns 0. Any other action returns 2.
 
 ### `heartbeat`
 
-| Action | What it prints |
-| --- | --- |
-| `on` | `heartbeat on.` |
-| `off` | `heartbeat off.` |
-| `run` | A line that says the supervisor takes the tick or queues it. |
+| Action | What it prints                                               |
+| ------ | ------------------------------------------------------------ |
+| `on`   | `heartbeat on.`                                              |
+| `off`  | `heartbeat off.`                                             |
+| `run`  | A line that says the supervisor takes the tick or queues it. |
 
 `off` stops the schedule and not the operator, so `run` still asks for a tick.
 A process with no sleep agent attached answers with a refusal line, and the
@@ -304,12 +304,12 @@ The prompt is `enchiridion> `. A line that starts with `/` is a command, and
 the rest of the line is the argument list. The REPL folds the command name to
 lower case.
 
-| Line | What it does |
-| --- | --- |
-| `/help` | Prints the command list. |
+| Line    | What it does                                                                                                                                                       |
+| ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `/help` | Prints the command list.                                                                                                                                           |
 | `/stop` | Asks the turn in flight to stop. It prints `cancellation requested.` and returns 0. Without a cancel function it prints `there is no turn to stop.` and returns 1. |
-| `/quit` | Leaves the session. `run-repl` returns `:quit`. |
-| `/who` | Prints the attached channel and the supervisor state, then returns 0. |
+| `/quit` | Leaves the session. `run-repl` returns `:quit`.                                                                                                                    |
+| `/who`  | Prints the attached channel and the supervisor state, then returns 0.                                                                                              |
 
 `stop`, `quit`, and `who` are REPL-only, because they act on the live turn. The
 other commands are the table above, and the REPL calls the same handler the

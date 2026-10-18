@@ -12,13 +12,13 @@ A block is one named piece of memory. `make-block` builds one, scans its text, a
 takes the limit from `*default-block-limits*`. The kernel builds five blocks for an
 agent directory.
 
-| Label | File | Limit | Writer |
-| --- | --- | --- | --- |
-| `:persona` | `SOUL.md` | 1200 | sleep agent, after handover |
-| `:operator` | `OPERATOR.md` | 800 | sleep agent, after handover |
-| `:world` | `WORLD.md` | 1500 | sleep agent, after handover |
-| `:session` | a `blocks` row | 400 | heartbeat |
-| `:ledger` | a `blocks` row | 250 | heartbeat |
+| Label       | File           | Limit | Writer                      |
+| ----------- | -------------- | ----- | --------------------------- |
+| `:persona`  | `SOUL.md`      | 1200  | sleep agent, after handover |
+| `:operator` | `OPERATOR.md`  | 800   | sleep agent, after handover |
+| `:world`    | `WORLD.md`     | 1500  | sleep agent, after handover |
+| `:session`  | a `blocks` row | 400   | heartbeat                   |
+| `:ledger`   | a `blocks` row | 250   | heartbeat                   |
 
 `*default-block-limits*` is a plist of six labels. It also holds `:bootstrap` with
 300 characters. `default-block-limit` returns the plist value for a label, or 1200
@@ -72,16 +72,16 @@ completes a half finished setup and reports what was already there.
 
 `*seed-templates*` holds eight files, in this order.
 
-| File | Kind | Description |
-| --- | --- | --- |
-| `GUIDE.md` | markdown | operator walkthrough |
-| `SOUL.md` | markdown | identity |
-| `OPERATOR.md` | markdown | who it works for |
-| `WORLD.md` | markdown | the environment |
-| `BOOTSTRAP.md` | markdown | first steps |
-| `skills/example-welcome.cl` | lisp | example skill |
-| `tools/example-echo.cl` | lisp | example tool |
-| `state.json` | json | runtime state |
+| File                        | Kind     | Description          |
+| --------------------------- | -------- | -------------------- |
+| `GUIDE.md`                  | markdown | operator walkthrough |
+| `SOUL.md`                   | markdown | identity             |
+| `OPERATOR.md`               | markdown | who it works for     |
+| `WORLD.md`                  | markdown | the environment      |
+| `BOOTSTRAP.md`              | markdown | first steps          |
+| `skills/example-welcome.cl` | lisp     | example skill        |
+| `tools/example-echo.cl`     | lisp     | example tool         |
+| `state.json`                | json     | runtime state        |
 
 The templates live as Lisp string constants in `seed.cl`, so init needs no file
 lookup. `seed-template`, `seed-description`, and `seed-kind` read one row each.
@@ -110,15 +110,15 @@ and refuses to adopt a file that is not a database. `drop-store` drops every tab
 `+schema+` holds seventeen statements. Five create a table, two create an FTS
 table, four create an index, and six create a trigger.
 
-| Table | Columns |
-| --- | --- |
-| `turns` | `id`, `session`, `role`, `body`, `model`, `channel`, `ts` |
-| `memories` | `id`, `name`, `body`, `session`, `ts` |
-| `blocks` | `name`, `body`, `ts` |
-| `usage` | `id`, `session`, `model`, `input`, `output`, `cache_read`, `cache_write`, `channel`, `ts` |
-| `tasks` | `id`, `body`, `status`, `ts` |
-| `turns_fts` | FTS5 over `turns.body` |
-| `memories_fts` | FTS5 over `memories.name` and `memories.body` |
+| Table          | Columns                                                                                   |
+| -------------- | ----------------------------------------------------------------------------------------- |
+| `turns`        | `id`, `session`, `role`, `body`, `model`, `channel`, `ts`                                 |
+| `memories`     | `id`, `name`, `body`, `session`, `ts`                                                     |
+| `blocks`       | `name`, `body`, `ts`                                                                      |
+| `usage`        | `id`, `session`, `model`, `input`, `output`, `cache_read`, `cache_write`, `channel`, `ts` |
+| `tasks`        | `id`, `body`, `status`, `ts`                                                              |
+| `turns_fts`    | FTS5 over `turns.body`                                                                    |
+| `memories_fts` | FTS5 over `memories.name` and `memories.body`                                             |
 
 The schema also creates four indexes: `turns_session`, `memories_name`,
 `usage_ts`, and `tasks_status`. The two FTS tables are external content tables
@@ -134,29 +134,29 @@ search tool, so this is the last gate before the disk.
 
 The turn and search functions:
 
-| Function | Returns |
-| --- | --- |
-| `record-turn` | one `turns` row as a `turn-row` |
+| Function          | Returns                                                           |
+| ----------------- | ----------------------------------------------------------------- |
+| `record-turn`     | one `turns` row as a `turn-row`                                   |
 | `recent-sessions` | sessions newest first, with `:id`, `:started`, `:ended`, `:turns` |
-| `session-count` | the number of distinct sessions |
-| `delete-session` | the turns removed |
-| `search-sessions` | matches best first, as `turn-row` values |
-| `recent-turns` | the newest turns, optionally not from one channel |
+| `session-count`   | the number of distinct sessions                                   |
+| `delete-session`  | the turns removed                                                 |
+| `search-sessions` | matches best first, as `turn-row` values                          |
+| `recent-turns`    | the newest turns, optionally not from one channel                 |
 
 The memory, block, and ledger functions:
 
-| Function | Returns |
-| --- | --- |
-| `save-memory` | the new row id, or a `configuration-error` |
-| `list-memories` | memories newest first |
-| `search-memories` | matches best first, with `:id`, `:name`, `:body`, `:session`, `:ts` |
-| `session-block` / `set-session-block` | the `session` row |
-| `ledger-block` / `set-ledger-block` | the `ledger` row |
-| `record-usage` | the new ledger row id |
-| `usage-rows` / `usage-since` | ledger rows oldest first |
-| `usage-summary` | the ledger summed by `:model`, `:channel`, or `:day` |
-| `usage-total-since` | the ledger summed from a time |
-| `usage-session-total` | the ledger summed for one session |
+| Function                              | Returns                                                             |
+| ------------------------------------- | ------------------------------------------------------------------- |
+| `save-memory`                         | the new row id, or a `configuration-error`                          |
+| `list-memories`                       | memories newest first                                               |
+| `search-memories`                     | matches best first, with `:id`, `:name`, `:body`, `:session`, `:ts` |
+| `session-block` / `set-session-block` | the `session` row                                                   |
+| `ledger-block` / `set-ledger-block`   | the `ledger` row                                                    |
+| `record-usage`                        | the new ledger row id                                               |
+| `usage-rows` / `usage-since`          | ledger rows oldest first                                            |
+| `usage-summary`                       | the ledger summed by `:model`, `:channel`, or `:day`                |
+| `usage-total-since`                   | the ledger summed from a time                                       |
+| `usage-session-total`                 | the ledger summed for one session                                   |
 
 `set-session-block` and `set-ledger-block` call `store-checked-block`, which runs
 the injection scan and the block limit before the write. The heartbeat writes
@@ -164,16 +164,16 @@ those two rows, so nothing else would scan them.
 
 The task queue functions:
 
-| Function | Returns |
-| --- | --- |
-| `enqueue-task` | a pending `task-row` |
-| `list-tasks` | tasks oldest first, or only one status |
-| `dequeue-task` | the oldest pending task, marked `running` |
-| `complete-task` | true when a `running` task became `done` |
-| `fail-task` | true when a `running` task became `failed` |
+| Function        | Returns                                      |
+| --------------- | -------------------------------------------- |
+| `enqueue-task`  | a pending `task-row`                         |
+| `list-tasks`    | tasks oldest first, or only one status       |
+| `dequeue-task`  | the oldest pending task, marked `running`    |
+| `complete-task` | true when a `running` task became `done`     |
+| `fail-task`     | true when a `running` task became `failed`   |
 | `recover-tasks` | the count of `running` tasks marked `failed` |
-| `count-tasks` | the number of tasks, or of one status |
-| `remove-task` | true when a row was deleted |
+| `count-tasks`   | the number of tasks, or of one status        |
+| `remove-task`   | true when a row was deleted                  |
 
 `dequeue-task` marks a task `running` rather than `done`, and the update carries
 `AND status = 'pending'`, so two claimants cannot both win. `recover-tasks` marks
@@ -201,8 +201,7 @@ passes it as L0.
 
 `tier-for` returns the text of one named tier, and defaults to the tier in use.
 `note-tier-miss` counts one index read that came back empty. `promote-tier` moves
-one tier up, and it moves only after `+misses-before-promotion+` misses, which is
-2. A move clears the count. At L2 a further call clears the count and returns
+one tier up, and it moves only after `+misses-before-promotion+` misses, which is 2. A move clears the count. At L2 a further call clears the count and returns
 `:l2` rather than signalling. `reset-tier-misses` clears the count without a move.
 
 The derivation is mechanical: the same body always yields the same three strings.

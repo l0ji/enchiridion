@@ -9,9 +9,9 @@ warning into an error, and both run through the rove bridge in
 
 ## The two systems
 
-| System | Files | Depends on |
-| --- | --- | --- |
-| `enchiridion-tests` | `t/core/*.cl` | `enchiridion`, `rove` |
+| System                       | Files             | Depends on                           |
+| ---------------------------- | ----------------- | ------------------------------------ |
+| `enchiridion-tests`          | `t/core/*.cl`     | `enchiridion`, `rove`                |
 | `enchiridion-tests/property` | `t/property/*.cl` | `enchiridion-tests`, `cl-quickcheck` |
 
 `t/enchiridion-tests.asd` names every file. The core module lists 25 files and
@@ -29,12 +29,12 @@ system is not in that chain, so the gate asks for it by name.
 
 ## How to run the suite
 
-| Command | Effect |
-| --- | --- |
-| `nix run .#check` | Compiles every file. Runs no test. |
-| `nix run .#test` | Compiles and runs both systems. |
-| `nix build .#check` | The same gate as a derivation. |
-| `nix build .#default` | The test gate as a derivation. |
+| Command               | Effect                             |
+| --------------------- | ---------------------------------- |
+| `nix run .#check`     | Compiles every file. Runs no test. |
+| `nix run .#test`      | Compiles and runs both systems.    |
+| `nix build .#check`   | The same gate as a derivation.     |
+| `nix build .#default` | The test gate as a derivation.     |
 
 `nix run .#test` runs two commands in order.
 
@@ -59,10 +59,10 @@ test signals, and ASDF exits non-zero.
 
 `nix run .#check` compiles the system and also compiles two files by hand.
 
-| File | Why |
-| --- | --- |
-| `src/main.cl` | The wrapper runs it. It is not a system component. |
-| `src/broker-exec.cl` | The broker child runs it. It is not a component. |
+| File                 | Why                                                |
+| -------------------- | -------------------------------------------------- |
+| `src/main.cl`        | The wrapper runs it. It is not a system component. |
+| `src/broker-exec.cl` | The broker child runs it. It is not a component.   |
 
 Neither file is a system component, because loading a system must never start
 an agent. The gate compiles both and checks `failure-p`, because
@@ -100,12 +100,12 @@ suite that ran nothing hides the next real failure.
 
 The bridge runs what rove collected instead.
 
-| Function | Result |
-| --- | --- |
-| `run-suites` | Runs every registered suite and returns the count. |
-| `suite-count` | How many suites rove registered. |
-| `test-count` | How many `deftest` forms rove registered. |
-| `missing-bridge-symbol` | True when rove no longer exports a name. |
+| Function                | Result                                             |
+| ----------------------- | -------------------------------------------------- |
+| `run-suites`            | Runs every registered suite and returns the count. |
+| `suite-count`           | How many suites rove registered.                   |
+| `test-count`            | How many `deftest` forms rove registered.          |
+| `missing-bridge-symbol` | True when rove no longer exports a name.           |
 
 `run-suites` reads `rove:all-suites` and the `suite-tests` accessor, then
 calls `rove:run-tests` on the collected names. It signals an error when rove
@@ -118,35 +118,35 @@ reader error at load time.
 
 ## What each test file covers
 
-| File | Subject |
-| --- | --- |
-| `errors-test` | The condition hierarchy and every report. |
-| `compat-test` | The implementation extensions in `compat.cl`. |
-| `config-test` | The sectioned and flat configuration readers. |
-| `llm-test` | Protocol shapes, the OpenAI wire format, backend choice. |
-| `blocks-test` | Block limits, the write scan, prompt stability. |
-| `store-test` | SQLite, FTS5, sessions, memories, and the ledger. |
-| `tiers-test` | L0, L1, L2, and the two miss rule. |
-| `kernel-test` | The prompt compiler, the snapshot, and one turn. |
-| `schema-test` | The tool schema as JSON and as a check. |
-| `registry-test` | Registration, the schema budget, and dispatch. |
-| `pipe-test` | The filter sandbox and its refusals. |
-| `file-test` | The file tools, starting with the index. |
-| `broker-test` | The frame format and the in-process transport. |
-| `builtin-test` | Search, blockops, meta, and web. |
-| `git-test` | The nested agent repository. |
-| `loader-test` | Generations, verification, and manifests. |
-| `channel-test` | The message shape and the channel protocol. |
-| `cli-test` | The shared command table and the REPL. |
-| `supervisor-test` | The control file, the status file, and channels. |
-| `tool-loop-test` | The model asks, the kernel runs, the model answers. |
-| `seed-test` | The seed files, the first launch, and bootstrap. |
-| `secrets-test` | The scrubber on every path a secret can take. |
-| `http-test` | The webhook routes, the token, and the limits. |
-| `fluxer-test` | The Fluxer direct-message rules. |
-| `sleep-test` | The heartbeat, the sleep agent, and compaction. |
-| `seed-property` | Seed round trips and bootstrap completeness. |
-| `prompt-property` | Byte stable prompts and the frozen snapshot. |
+| File              | Subject                                                  |
+| ----------------- | -------------------------------------------------------- |
+| `errors-test`     | The condition hierarchy and every report.                |
+| `compat-test`     | The implementation extensions in `compat.cl`.            |
+| `config-test`     | The sectioned and flat configuration readers.            |
+| `llm-test`        | Protocol shapes, the OpenAI wire format, backend choice. |
+| `blocks-test`     | Block limits, the write scan, prompt stability.          |
+| `store-test`      | SQLite, FTS5, sessions, memories, and the ledger.        |
+| `tiers-test`      | L0, L1, L2, and the two miss rule.                       |
+| `kernel-test`     | The prompt compiler, the snapshot, and one turn.         |
+| `schema-test`     | The tool schema as JSON and as a check.                  |
+| `registry-test`   | Registration, the schema budget, and dispatch.           |
+| `pipe-test`       | The filter sandbox and its refusals.                     |
+| `file-test`       | The file tools, starting with the index.                 |
+| `broker-test`     | The frame format and the in-process transport.           |
+| `builtin-test`    | Search, blockops, meta, and web.                         |
+| `git-test`        | The nested agent repository.                             |
+| `loader-test`     | Generations, verification, and manifests.                |
+| `channel-test`    | The message shape and the channel protocol.              |
+| `cli-test`        | The shared command table and the REPL.                   |
+| `supervisor-test` | The control file, the status file, and channels.         |
+| `tool-loop-test`  | The model asks, the kernel runs, the model answers.      |
+| `seed-test`       | The seed files, the first launch, and bootstrap.         |
+| `secrets-test`    | The scrubber on every path a secret can take.            |
+| `http-test`       | The webhook routes, the token, and the limits.           |
+| `fluxer-test`     | The Fluxer direct-message rules.                         |
+| `sleep-test`      | The heartbeat, the sleep agent, and compaction.          |
+| `seed-property`   | Seed round trips and bootstrap completeness.             |
+| `prompt-property` | Byte stable prompts and the frozen snapshot.             |
 
 The container isolation test is separate. `docker/isolation-test.sh` needs
 uid 1000 and a real secret tmpfs, so it does not run in this suite.

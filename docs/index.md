@@ -33,37 +33,37 @@ file. [Tools](tools.md) covers the broker and its wire protocol.
 
 ## Where the code lives
 
-| Area | Files | Covered by |
-| --- | --- | --- |
-| The turn and the prompt | `src/enchiridion/kernel.cl` | [Memory](memory.md) |
-| The process and the schedule | `src/enchiridion/supervisor.cl`, `src/enchiridion/sleep.cl` | [Supervisor and heartbeat](supervisor.md) |
-| Channels | `src/enchiridion/channel/` | [Channels](channels.md) |
-| Memory | `src/enchiridion/memory/` | [Memory](memory.md) |
-| Tools and the broker | `src/enchiridion/tools/`, `src/broker-exec.cl` | [Tools](tools.md) |
-| Plugins | `src/enchiridion/plugin/` | [Plugins and self-modification](plugins.md) |
-| Models and secrets | `src/enchiridion/llm/` | [Models and secrets](llm.md) |
-| Configuration | `src/enchiridion/config.cl` | [Configuration](configuration.md) |
-| The command table | `src/enchiridion/channel/cli.cl`, `src/main.cl` | [Commands](commands.md) |
-| Conditions | `src/enchiridion/errors.cl` | [Commands](commands.md) |
-| Portability | `src/enchiridion/compat.cl` | [Development](development.md) |
-| The agent directory as a repository | `src/enchiridion/git.cl` | [Development](development.md) |
+| Area                                | Files                                                       | Covered by                                  |
+| ----------------------------------- | ----------------------------------------------------------- | ------------------------------------------- |
+| The turn and the prompt             | `src/enchiridion/kernel.cl`                                 | [Memory](memory.md)                         |
+| The process and the schedule        | `src/enchiridion/supervisor.cl`, `src/enchiridion/sleep.cl` | [Supervisor and heartbeat](supervisor.md)   |
+| Channels                            | `src/enchiridion/channel/`                                  | [Channels](channels.md)                     |
+| Memory                              | `src/enchiridion/memory/`                                   | [Memory](memory.md)                         |
+| Tools and the broker                | `src/enchiridion/tools/`, `src/broker-exec.cl`              | [Tools](tools.md)                           |
+| Plugins                             | `src/enchiridion/plugin/`                                   | [Plugins and self-modification](plugins.md) |
+| Models and secrets                  | `src/enchiridion/llm/`                                      | [Models and secrets](llm.md)                |
+| Configuration                       | `src/enchiridion/config.cl`                                 | [Configuration](configuration.md)           |
+| The command table                   | `src/enchiridion/channel/cli.cl`, `src/main.cl`             | [Commands](commands.md)                     |
+| Conditions                          | `src/enchiridion/errors.cl`                                 | [Commands](commands.md)                     |
+| Portability                         | `src/enchiridion/compat.cl`                                 | [Development](development.md)               |
+| The agent directory as a repository | `src/enchiridion/git.cl`                                    | [Development](development.md)               |
 
 ## The documentation set
 
-| Page | Covers |
-| --- | --- |
-| [Getting started](getting-started.md) | Build, first launch, the first run, and the first failures |
-| [Configuration](configuration.md) | Every key of `config.cl`, and the secret rules |
-| [Commands](commands.md) | The shell commands and the REPL commands |
-| [Channels](channels.md) | The channel protocol, the terminal, HTTP, and Fluxer |
-| [Supervisor and heartbeat](supervisor.md) | The process, the status file, the schedule, the budget |
-| [Memory](memory.md) | Blocks, seed files, tiers, the store, and compaction |
-| [Models and secrets](llm.md) | Backends, model tiers, token accounting, the scrubber |
-| [Tools](tools.md) | The schema, the registry, the pipe, the broker, and every builtin |
-| [Plugins and self-modification](plugins.md) | The manifest, verification, and the extension surface |
-| [Deployment](deployment.md) | The container, the two users, and the isolation test |
-| [Testing](testing.md) | The two test systems, the bridge, and the gate |
-| [Development](development.md) | Layout, packages, load order, style, and commits |
+| Page                                        | Covers                                                            |
+| ------------------------------------------- | ----------------------------------------------------------------- |
+| [Getting started](getting-started.md)       | Build, first launch, the first run, and the first failures        |
+| [Configuration](configuration.md)           | Every key of `config.cl`, and the secret rules                    |
+| [Commands](commands.md)                     | The shell commands and the REPL commands                          |
+| [Channels](channels.md)                     | The channel protocol, the terminal, HTTP, and Fluxer              |
+| [Supervisor and heartbeat](supervisor.md)   | The process, the status file, the schedule, the budget            |
+| [Memory](memory.md)                         | Blocks, seed files, tiers, the store, and compaction              |
+| [Models and secrets](llm.md)                | Backends, model tiers, token accounting, the scrubber             |
+| [Tools](tools.md)                           | The schema, the registry, the pipe, the broker, and every builtin |
+| [Plugins and self-modification](plugins.md) | The manifest, verification, and the extension surface             |
+| [Deployment](deployment.md)                 | The container, the two users, and the isolation test              |
+| [Testing](testing.md)                       | The two test systems, the bridge, and the gate                    |
+| [Development](development.md)               | Layout, packages, load order, style, and commits                  |
 
 ## Reading order
 

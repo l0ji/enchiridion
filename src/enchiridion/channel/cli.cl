@@ -786,10 +786,21 @@ file a block is backed by."
 (declaim (ftype (function (list) integer) cmd-reload))
 
 (defun cmd-reload (arguments)
-  "Ask the running supervisor to verify and load the agent code again."
+  "Ask the running supervisor to verify and load the agent code again.
+
+Return 1 when the supervisor refused the generation. A refused reload keeps the
+last good code serving, which is the right behaviour and the wrong exit status:
+an operator script that reloads and carries on has to be able to see that the
+agent is still running the old code."
   (declare (ignore arguments))
   (let ((status (enchiridion.supervisor:request-control "reload")))
-    (if status (report-control status) (no-supervisor "reload"))))
+    (cond
+      ((null status) (no-supervisor "reload"))
+      ((enchiridion.supervisor:status-report-ok-p status)
+       (report-control status))
+      (t
+       (report-control status)
+       1))))
 
 (declaim (ftype (function (list) integer) cmd-channels))
 

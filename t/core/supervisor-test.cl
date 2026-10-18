@@ -44,7 +44,9 @@
     (format nil "enchiridion-supervisor-test-~D/" (random most-positive-fixnum))
     (uiop:ensure-directory-pathname *default-pathname-defaults*))))
 
-(defmacro with-scratch-supervisor ((supervisor &key (channels nil)) &body body)
+(defmacro with-scratch-supervisor ((supervisor &key (channels nil)
+                                                (reload-function nil))
+                                   &body body)
   "Bind SUPERVISOR to a started supervisor in a scratch directory, then stop it
 and remove the directory. A failing test must not leave a thread behind."
   `(let* ((directory (scratch-directory))
@@ -54,6 +56,7 @@ and remove the directory. A failing test must not leave a thread behind."
                         :run-directory (namestring run)
                         :generation 3
                         :bootstrap-line "bootstrap step 0 of 8"
+                        :reload-function ,reload-function
                         :channels ,channels)))
      (unwind-protect
           (progn
@@ -115,6 +118,8 @@ and remove the directory. A failing test must not leave a thread behind."
         (ok (search "heartbeat on"
                     (enchiridion.supervisor:status-report
                      (enchiridion.supervisor:read-status run))))
+        (ok (enchiridion.supervisor:status-report-ok-p
+             (enchiridion.supervisor:read-status run)))
         (ok (enchiridion.supervisor:supervisor-heartbeat-p supervisor)))
       (testing "channels list names the channel"
         (enchiridion.supervisor:queue-control "channels list" :run run)
@@ -128,3 +133,36 @@ and remove the directory. A failing test must not leave a thread behind."
         (ok (search "unknown control request"
                     (enchiridion.supervisor:status-report
                      (enchiridion.supervisor:read-status run))))))))
+
+(deftest a-refused-reload-says-so-in-the-status ()
+  ;; The operator script that asked has to be able to tell a refused generation
+  ;; from a loaded one, and the generation number is the same either way.
+  (with-scratch-supervisor
+      (supervisor
+       :reload-function (lambda (supervisor)
+                          (declare (ignore supervisor))
+                          (list :ok-p nil :generation 3
+                                :report "broken.cl: READ error during LOAD.")))
+    (let ((run (enchiridion.supervisor:supervisor-run-directory supervisor)))
+      (enchiridion.supervisor:queue-control "reload" :run run)
+      (ok (= 1 (enchiridion.supervisor:supervisor-poll-control supervisor)))
+      (let ((status (enchiridion.supervisor:read-status run)))
+        (testing "the report carries the reason and not a success"
+          (ok (search "reload refused" (enchiridion.supervisor:status-report status)))
+          (ok (search "broken.cl" (enchiridion.supervisor:status-report status)))
+          (ok (null (enchiridion.supervisor:status-report-ok-p status))))
+        (testing "and the generation did not move"
+          (ok (= 3 (enchiridion.supervisor:status-generation status))))))))
+
+(deftest a-loaded-generation-is-reported-as-answered ()
+  (with-scratch-supervisor
+      (supervisor
+       :reload-function (lambda (supervisor)
+                          (declare (ignore supervisor))
+                          (list :ok-p t :generation 4 :report "generation 4 loaded, 2 files")))
+    (let ((run (enchiridion.supervisor:supervisor-run-directory supervisor)))
+      (enchiridion.supervisor:queue-control "reload" :run run)
+      (ok (= 1 (enchiridion.supervisor:supervisor-poll-control supervisor)))
+      (let ((status (enchiridion.supervisor:read-status run)))
+        (ok (enchiridion.supervisor:status-report-ok-p status))
+        (ok (= 4 (enchiridion.supervisor:status-generation status)))))))

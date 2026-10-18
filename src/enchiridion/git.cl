@@ -151,9 +151,16 @@ output. An existing repository is left alone."
     (when (eql 0 status)
       (string-trim '(#\Space #\Newline #\Return #\Tab) output))))
 
+(defparameter *commit-environment* nil
+  "The child environment GIT-COMMIT-ALL gives git, or NIL to inherit.
+
+Tests bind this to GIT-TEST-ENVIRONMENT, because a nix build sandbox has no
+global git configuration and therefore no identity to commit under. Production
+leaves it NIL, so the operator's own configuration and signing key are used.")
+
 (declaim (ftype (function (t string &key (:environment t)) t) git-commit-all))
 
-(defun git-commit-all (directory message &key environment)
+(defun git-commit-all (directory message &key (environment *commit-environment*))
   "Stage everything in DIRECTORY and commit it with MESSAGE.
 
 Return the commit hash, or :NONE when there was nothing to commit, or NIL when

@@ -165,3 +165,54 @@
     (ok (string= "echo" (getf (getf tool-call :function) :name)))
     (ok (string= "{\"text\":\"hi\"}"
                  (getf (getf tool-call :function) :arguments)))))
+
+(deftest a-turn-that-edits-soul-md-lands-in-the-agent-repository ()
+  ;; Definition of done, PLAN section 16.11: the agent edits SOUL.md after
+  ;; bootstrap hands over, and the change lands in git. The backend is
+  ;; scripted, so what this proves is the harness chain - kernel, tool, file,
+  ;; commit - and not a model's willingness to cooperate.
+  ;;
+  ;; The commit itself needs an identity, and the build sandbox has no global
+  ;; git configuration, so *COMMIT-ENVIRONMENT* carries the test one. In
+  ;; production it is NIL and the operator's own key signs the commit.
+  (let ((directory (uiop:ensure-directory-pathname
+                    (merge-pathnames
+                     (format nil "enchiridion-handover-test-~D/"
+                             (random most-positive-fixnum))
+                     (uiop:ensure-directory-pathname *default-pathname-defaults*))))
+        (enchiridion.git:*commit-environment*
+          (enchiridion.git:git-test-environment)))
+    (unwind-protect
+         (progn
+           (enchiridion.memory:init-agent directory)
+           (dotimes (step 8)
+             (enchiridion.memory:mark-bootstrap-step directory (1+ step)))
+           (enchiridion.tools:clear-registry)
+           (enchiridion.tools.builtin:register-builtin-tools)
+           (let* ((arguments (format nil "{\"action\":\"patch\",\"label\":\"soul\",\"old\":\"This file is a placeholder.\",\"new\":\"Written by the agent itself.\",\"directory\":~S}"
+                                     (namestring directory)))
+                  (backend (make-scripted-backend
+                            :replies (list (completion
+                                            "" :tool-calls
+                                            (list (call "c1" "blockops" arguments)))
+                                           (completion "done"))))
+                  (agent (enchiridion.kernel:make-agent
+                          :blocks (list (enchiridion.memory:make-block
+                                         :label :persona :text "identity"))
+                          :backend backend :directory directory)))
+             (testing "after handover the write is allowed and the turn finishes"
+               (ok (string= "done"
+                            (enchiridion.llm:completion-text
+                             (enchiridion.kernel:run-turn
+                              agent "write down who you are"))))
+               (ok (search "Written by the agent itself."
+                           (uiop:read-file-string
+                            (merge-pathnames "SOUL.md" directory)))))
+             (testing "and the turn that wrote it is a commit in the repository"
+               (let ((entry (first (enchiridion.git:git-log directory :limit 5))))
+                 (ok entry)
+                 (ok (search "Turn 1" (cdr entry)))))))
+      (enchiridion.tools:clear-registry)
+      (uiop:delete-directory-tree directory
+                                  :validate t
+                                  :if-does-not-exist :ignore))))

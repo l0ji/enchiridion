@@ -51,7 +51,7 @@ able to rewrite itself without rewriting the porting layer."))
   (:export
    #:git-available-p #:repository-p #:git-init #:git-commit-all
    #:git-log #:git-show #:git-diff #:git-revert #:git-head
-   #:git-run #:git-current-branch #:git-test-environment)
+   #:git-run #:git-current-branch #:git-test-environment #:*commit-environment*)
   (:documentation
    "The agent directory is its own git repository, so personality evolution and
 authored code are a diff the operator can read and revert. Every call goes
@@ -316,7 +316,7 @@ reactions are all out, so the allowlist is the whole authorisation story."))
    #:control-file #:status-file #:read-status #:status-fresh-p #:request-control
    #:queue-control
    #:status-generation #:status-channels #:status-bootstrap #:status-pid
-   #:status-updated #:status-report #:status-handled)
+   #:status-updated #:status-report #:status-handled #:status-report-ok-p)
   (:documentation
    "The process that owns the channels, and the two run/ files it exchanges with
 the shell. It is the only writer of run/enchiridion.status, which is what lets

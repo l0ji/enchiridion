@@ -129,6 +129,16 @@ particular request was handled."
 command that only appended a line learns what happened by reading this."
   (and (hash-table-p status) (gethash "report" status)))
 
+(declaim (ftype (function (t) t) status-report-ok-p))
+
+(defun status-report-ok-p (status)
+  "Return T when the last control request was answered, NIL when it was
+refused or when the status file answers nothing.
+
+A reload that refused a generation is the refusal this exists for: the operator
+script that asked has to be able to tell it from a reload that landed."
+  (and (hash-table-p status) (gethash "report-ok" status)))
+
 (declaim (ftype (function (t &key (:seconds integer)) boolean) status-fresh-p))
 
 (defun status-fresh-p (status &key (seconds +status-fresh-seconds+))
@@ -207,6 +217,7 @@ supervisor is up the answer is NIL and the caller says so and exits non-zero."
   (heartbeat-p nil :type boolean)
   (bootstrap-line "" :type string)
   (report "" :type string)
+  (report-ok-p t :type boolean)
   (handled 0 :type integer)
   (reload-function nil :type t)
   (started 0 :type integer))
@@ -263,6 +274,7 @@ written, because the file is world readable."
     (setf (gethash "generation" table) (supervisor-generation supervisor))
     (setf (gethash "bootstrap" table) (supervisor-bootstrap-line supervisor))
     (setf (gethash "report" table) (supervisor-report supervisor))
+    (setf (gethash "report-ok" table) (supervisor-report-ok-p supervisor))
     (setf (gethash "handled" table) (supervisor-handled supervisor))
     (setf (gethash "root" table) (supervisor-directory supervisor))
     (setf (gethash "config" table) (enchiridion:config-digest (supervisor-config supervisor)))
@@ -470,7 +482,12 @@ never loads agent code itself."
 (declaim (ftype (function (supervisor t) t) handle-control))
 
 (defun handle-control (supervisor line)
-  "Act on one control LINE and return a one line report, or NIL."
+  "Act on one control LINE and return two values: a one line report, and
+whether the request was answered.
+
+A reload that refused a generation is a report and not a success, and the shell
+command that asked has to be able to tell the two apart: an operator script
+that reloads and continues deserves a non-zero status from a refusal."
   (let* ((parts (remove-if (lambda (part) (zerop (length part)))
                            (uiop:split-string line :separator " ")))
          (verb (string-downcase (or (first parts) ""))))
@@ -478,11 +495,16 @@ never loads agent code itself."
       ((string= verb "reload")
        (let ((result (supervisor-reload supervisor)))
          (if (getf result :ok-p)
-             (format nil "reload done, generation ~D." (getf result :generation))
-             (format nil "reload refused: ~A" (getf result :report)))))
-      ((string= verb "channels") (handle-channels supervisor (rest parts)))
-      ((string= verb "heartbeat") (handle-heartbeat supervisor (rest parts)))
-      (t (format nil "unknown control request: ~A" line)))))
+             (values (format nil "reload done, generation ~D."
+                             (getf result :generation))
+                     t)
+             (values (format nil "reload refused: ~A" (getf result :report))
+                     nil))))
+      ((string= verb "channels")
+       (values (handle-channels supervisor (rest parts)) t))
+      ((string= verb "heartbeat")
+       (values (handle-heartbeat supervisor (rest parts)) t))
+      (t (values (format nil "unknown control request: ~A" line) nil)))))
 
 (declaim (ftype (function (supervisor) integer) supervisor-poll-control))
 
@@ -494,7 +516,8 @@ that only appended a line learns what happened."
   (let ((lines (consume-control-lines (supervisor-run-directory supervisor))))
     (dolist (line lines)
       (incf (supervisor-handled supervisor))
-      (let ((report (handle-control supervisor line)))
+      (multiple-value-bind (report ok-p) (handle-control supervisor line)
+        (setf (supervisor-report-ok-p supervisor) ok-p)
         (when report
           (setf (supervisor-report supervisor) report)
           (format *error-output* "~&enchiridion: ~A~%" report)

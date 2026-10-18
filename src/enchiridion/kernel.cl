@@ -294,7 +294,27 @@ answered, which is empty for the operator's own turn."
         (format *error-output* "~&enchiridion: could not record a turn: ~A~%"
                 condition)))))
 
-(defun run-turn (agent text &key model session store (cancel-p nil))
+(declaim (ftype (function (agent t) t) commit-agent-turn))
+
+(defun commit-agent-turn (agent channel)
+  "Commit whatever the turn changed under AGENT's directory, and return the
+hash, or NIL.
+
+Every change the agent makes lands in git under the operator's key, and it
+lands here and not in the entry script: a turn typed at the REPL and a turn
+that wrote SOUL.md through a tool are the same turn, and neither should depend
+on a caller remembering to commit. A directory that is not a repository, a
+host with no git, and a tree with nothing to commit are all normal, all silent,
+and none of them may cost the operator the reply."
+  (let ((directory (agent-directory agent)))
+    (when directory
+      (handler-case
+          (enchiridion.git:git-commit-all
+           directory
+           (format nil "Turn ~D via ~A" (agent-turn agent) channel))
+        (error () nil)))))
+
+(defun run-turn (agent text &key model session store (channel :cli) (cancel-p nil))
   "Send TEXT to AGENT and run any tool calls the model asks for.
 
 The system message is the snapshot compiled by MAKE-AGENT. A block written
@@ -370,4 +390,5 @@ keeps asking for tools without answering."
                                    result
                                    (enchiridion.llm:tool-call-id call)))))))))
       (incf (agent-turn agent))
+      (commit-agent-turn agent channel)
       completion)))

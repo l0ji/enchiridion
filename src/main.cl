@@ -336,22 +336,10 @@ turn: the builtins still work, and the agent is told what happened."
 
 ;;;; The agent repository.
 ;;;;
-;;;; The repository itself is created by ENCHIRIDION.MEMORY:INIT-AGENT, so that
-;;;; `init` and the first launch cannot disagree about whether one exists. What
-;;;; lives here is the commit that follows a turn.
-
-(defun commit-agent-turn (context label)
-  "Commit whatever the turn changed in the agent directory.
-
-Every change the agent makes lands in git under the operator's key. A turn
-with nothing to commit, and a host with no git, both leave the turn alone."
-  (handler-case
-      (enchiridion.git:git-commit-all
-       (context-directory context)
-       (format nil "Turn ~D via ~A"
-               (enchiridion.kernel:agent-turn (context-agent context))
-               label))
-    (error () nil)))
+;;;; The repository is created by ENCHIRIDION.MEMORY:INIT-AGENT, so that `init`
+;;;; and the first launch cannot disagree about whether one exists, and the
+;;;; commit that follows a turn lives in the kernel, so that every path to a
+;;;; turn commits and no caller has to remember to.
 
 (defun verify-plugin-directory (directory)
   "Verify DIRECTORY in a child process and print its report. Return an exit
@@ -454,9 +442,9 @@ tokens are spent either way, and the operator asked for it."
                              (context-agent context) text
                              :session (context-session context)
                              :store (context-store context)
+                             :channel :cli
                              :cancel-p (lambda () (car cancelled)))))
             (print-completion completion (context-config context))
-            (commit-agent-turn context :cli)
             0))
       (enchiridion.errors:turn-cancelled (condition)
         (format *error-output* "~&~A~%" condition)

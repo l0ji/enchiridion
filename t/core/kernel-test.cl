@@ -180,3 +180,81 @@
       (uiop:delete-directory-tree directory
                                   :validate t
                                   :if-does-not-exist :ignore))))
+
+;;;; One turn at a time.
+
+;; A backend that stays inside COMPLETE until the test lets it go, so a second
+;; turn arrives while the first is really in flight rather than racing a fast
+;; one.
+(defstruct (blocking-backend (:constructor make-blocking-backend))
+  (entered nil :type boolean)
+  (release nil :type boolean))
+
+(defmethod enchiridion.llm:complete ((backend blocking-backend) messages
+                                     &key model tools budget)
+  (declare (ignore messages model tools budget))
+  (setf (blocking-backend-entered backend) t)
+  (loop until (blocking-backend-release backend) do (sleep 0.01))
+  (enchiridion.llm::%make-completion
+   :text "released"
+   :model "blocking-model"
+   :input-tokens 5
+   :output-tokens 2))
+
+(defmethod enchiridion.llm:model-capabilities ((backend blocking-backend))
+  (declare (ignore backend))
+  '(:tools nil))
+
+(defmethod enchiridion.llm:backend-name ((backend blocking-backend))
+  (declare (ignore backend))
+  "blocking")
+
+(deftest a-busy-agent-refuses-rather-than-queueing ()
+  (let* ((backend (make-blocking-backend))
+         (agent (enchiridion.kernel:make-agent
+                 :backend backend
+                 :blocks (list (make-test-block "voice"))
+                 :tools-p nil))
+         (thread (bordeaux-threads:make-thread
+                  (lambda () (enchiridion.kernel:run-turn agent "first")))))
+    (unwind-protect
+         (progn
+           (loop repeat 500 until (blocking-backend-entered backend) do (sleep 0.01))
+           (ok (blocking-backend-entered backend))
+           (testing "a caller that will not wait is told the agent is busy"
+             (ok (handler-case
+                     (progn (enchiridion.kernel:run-turn agent "second" :block-p nil)
+                            nil)
+                   (enchiridion.errors:turn-busy () t))))
+           (testing "and a caller that waits gets its turn afterwards"
+             (setf (blocking-backend-release backend) t)
+             (bordeaux-threads:join-thread thread)
+             (enchiridion.kernel:run-turn agent "third")
+             (ok (= 2 (enchiridion.kernel:agent-turn agent)))))
+      (setf (blocking-backend-release backend) t)
+      (when (bordeaux-threads:thread-alive-p thread)
+        (bordeaux-threads:join-thread thread)))))
+
+(deftest many-turns-through-one-agent-keep-every-ledger-row ()
+  ;; The spend list, the turn counter and the session's turn list are pushed
+  ;; without a lock of their own, so the agent's lock is the only thing that
+  ;; stops two channels from losing each other's rows.
+  (let* ((agent (enchiridion.kernel:make-agent
+                 :backend (make-fake-backend)
+                 :blocks (list (make-test-block "voice"))
+                 :tools-p nil))
+         (session (enchiridion.kernel:make-session :agent agent))
+         (threads (loop for index from 1 to 8
+                        collect (bordeaux-threads:make-thread
+                                 (lambda ()
+                                   (enchiridion.kernel:run-turn
+                                    agent (format nil "turn ~D" index)
+                                    :session session))))))
+    (dolist (thread threads)
+      (bordeaux-threads:join-thread thread))
+    (testing "every turn's spend row survived"
+      (ok (= 8 (length (enchiridion.kernel:spend agent)))))
+    (testing "and every turn was counted"
+      (ok (= 8 (enchiridion.kernel:agent-turn agent))))
+    (testing "and every completion is in the session"
+      (ok (= 8 (length (enchiridion.kernel:session-turns session)))))))

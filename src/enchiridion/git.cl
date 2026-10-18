@@ -158,6 +158,15 @@ Tests bind this to GIT-TEST-ENVIRONMENT, because a nix build sandbox has no
 global git configuration and therefore no identity to commit under. Production
 leaves it NIL, so the operator's own configuration and signing key are used.")
 
+(defparameter *commit-lock* (bordeaux-threads:make-lock "enchiridion commit")
+  "The lock around GIT-COMMIT-ALL, one per process.
+
+Every agent directory is one repository with one index. A turn on a channel
+thread and a sleep pass on the heartbeat thread both end in a commit, and two
+git commands at once collide on .git/index.lock: git refuses, the handler here
+returns NIL, and one turn's changes silently never land. The lock makes the
+second commit wait instead of losing the work.")
+
 (declaim (ftype (function (t string &key (:environment t)) t) git-commit-all))
 
 (defun git-commit-all (directory message &key (environment *commit-environment*))
@@ -166,20 +175,25 @@ leaves it NIL, so the operator's own configuration and signing key are used.")
 Return the commit hash, or :NONE when there was nothing to commit, or NIL when
 git refused: a host with no identity, no key, or no git at all. Nothing here
 signals. A turn that changed nothing is the normal case, and neither that nor a
-missing git may cost the operator the reply."
-  (let ((path (uiop:ensure-directory-pathname directory)))
-    (unless (repository-p path)
-      (return-from git-commit-all nil))
-    (handler-case
-        (progn
-          (git-run path (list "add" "-A") :environment environment)
-          (multiple-value-bind (output status)
-              (git-run path (list "commit" "-m" message) :environment environment)
-            (cond
-              ((eql 0 status) (git-head path :environment environment))
-              ((search "nothing to commit" output) :none)
-              (t nil))))
-      (error () nil))))
+missing git may cost the operator the reply.
+
+The whole stage-and-commit pair is one unit under *COMMIT-LOCK*: another
+thread's `git add` between this one's add and commit would commit the wrong
+set of files."
+  (bordeaux-threads:with-lock-held (*commit-lock*)
+    (let ((path (uiop:ensure-directory-pathname directory)))
+      (unless (repository-p path)
+        (return-from git-commit-all nil))
+      (handler-case
+          (progn
+            (git-run path (list "add" "-A") :environment environment)
+            (multiple-value-bind (output status)
+                (git-run path (list "commit" "-m" message) :environment environment)
+              (cond
+                ((eql 0 status) (git-head path :environment environment))
+                ((search "nothing to commit" output) :none)
+                (t nil))))
+        (error () nil)))))
 
 (declaim (ftype (function (t &key (:limit t) (:pathspec t)) list) git-log))
 

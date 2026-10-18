@@ -90,7 +90,8 @@ writable copy later."
 ;; backend is the object that answers COMPLETE. blocks are the live block
 ;; objects, snapshot is the frozen prompt compiled from them, spend is the
 ;; ledger for this agent, turn counts turns, budget is the cap plist, and
-;; directory is where the Markdown files live when there is one.
+;; directory is where the Markdown files live when there is one. lock is what
+;; keeps two channels from answering through one agent at the same time.
 (defstruct (agent (:constructor %make-agent))
   (name "default" :type string)
   (backend nil :type t)
@@ -102,15 +103,20 @@ writable copy later."
   (directory nil :type (or null pathname))
   (broker nil :type t)
   (tools-p t :type boolean)
-  (tool-rounds 8 :type (integer 0 *)))
+  (tool-rounds 8 :type (integer 0 *))
+  (lock nil :type t))
 
 (defun make-agent (&key (name "default") backend blocks directory budget
-                          broker (tools-p t) (tool-rounds 8))
+                          broker (tools-p t) (tool-rounds 8) lock)
   "Return an AGENT with a prompt compiled from BLOCKS, or from DIRECTORY.
 
 The prompt is compiled here, once. Callers that pass BLOCKS usually pass the
 same list to a test; callers that pass DIRECTORY get the three Markdown blocks
-and the two harness blocks, with seed templates for absent files."
+and the two harness blocks, with seed templates for absent files.
+
+The agent is born with a lock, unless a caller brings one. An agent with no
+lock is a test that never runs two turns at once, and RUN-TURN says so rather
+than pretending to serialise."
   (let* ((blocks (or blocks (blocks-from-directory directory)))
          (snapshot (compile-prompt blocks)))
     (%make-agent :name name
@@ -122,7 +128,9 @@ and the two harness blocks, with seed templates for absent files."
                                  (uiop:ensure-directory-pathname directory))
                  :broker broker
                  :tools-p tools-p
-                 :tool-rounds tool-rounds)))
+                 :tool-rounds tool-rounds
+                 :lock (or lock
+                           (bordeaux-threads:make-lock "enchiridion agent")))))
 
 ;;;; The ledger.
 
@@ -314,26 +322,14 @@ and none of them may cost the operator the reply."
            (format nil "Turn ~D via ~A" (agent-turn agent) channel))
         (error () nil)))))
 
-(defun run-turn (agent text &key model session store (channel :cli) (cancel-p nil))
-  "Send TEXT to AGENT and run any tool calls the model asks for.
+(declaim (ftype (function (agent string t t t keyword t) t) run-turn-locked))
 
-The system message is the snapshot compiled by MAKE-AGENT. A block written
-after that point is visible in the block object and on disk, but not here.
-Both the prompt and the user text go through the scrubber before they leave
-this process. When SESSION is supplied, every completion is appended to its
-turns, and a closed or foreign session is refused. When STORE is supplied, the
-turn and what the model answered are written to the transcript, which is what
-makes a later search able to find them.
+(defun run-turn-locked (agent text model session store channel cancel-p)
+  "Run one turn on AGENT with the agent's lock already held.
 
-CANCEL-P is a function of no arguments, or NIL. It is asked before each round
-and a true answer signals TURN-CANCELLED, which is what /stop needs: the round
-in flight finishes, the turn does not start another one, and nothing already
-spent is undone.
-
-Each round is one backend call and one spend row. A tool call appends the
-assistant message that asked for it and one tool message per result, in the
-provider's order. The loop stops after AGENT-TOOL-ROUNDS to bound a model that
-keeps asking for tools without answering."
+The body of RUN-TURN, separated so that the lock is taken in exactly one place
+and every path out of the body releases it. Nothing else may call this: a
+caller that does is a caller that runs two turns at once."
   (check-type text string)
   (let ((backend (agent-backend agent)))
     (unless backend
@@ -392,3 +388,43 @@ keeps asking for tools without answering."
       (incf (agent-turn agent))
       (commit-agent-turn agent channel)
       completion)))
+
+;; No F-TYPE on RUN-TURN, for the reason PERSIST-TURN has none: the keyword
+;; list is long, and a declaration that has to name every keyword catches less
+;; than it costs.
+
+(defun run-turn (agent text &key model session store (channel :cli) (cancel-p nil)
+                             (block-p t))
+  "Send TEXT to AGENT and run any tool calls the model asks for.
+
+The system message is the snapshot compiled by MAKE-AGENT. A block written
+after that point is visible in the block object and on disk, but not here.
+Both the prompt and the user text go through the scrubber before they leave
+this process. When SESSION is supplied, every completion is appended to its
+turns, and a closed or foreign session is refused. When STORE is supplied, the
+turn and what the model answered are written to the transcript, which is what
+makes a later search able to find them.
+
+CANCEL-P is a function of no arguments, or NIL. It is asked before each round
+and a true answer signals TURN-CANCELLED, which is what /stop needs: the round
+in flight finishes, the turn does not start another one, and nothing already
+spent is undone.
+
+One agent answers one turn at a time. The prompt is frozen per agent, the
+spend ledger and the turn counter are pushed without a lock, and the store is
+one connection, so two turns at once lose rows and interleave statements.
+BLOCK-P decides what a second caller gets: T waits for its turn, which is what
+the REPL and the sleep agent want, and NIL signals TURN-BUSY at once, which is
+what the webhook wants so it can answer 503 instead of holding a client open.
+A turn that signals still releases the lock: the unwind-protect is the whole
+reason the body lives in RUN-TURN-LOCKED."
+  (let ((lock (agent-lock agent)))
+    (when lock
+      ;; The two argument spelling is the bordeaux-threads v1 API this tree
+      ;; uses everywhere else: lock, then whether to wait for it.
+      (unless (bordeaux-threads:acquire-lock lock block-p)
+        (error 'enchiridion.errors:turn-busy :agent (agent-name agent))))
+    (unwind-protect
+         (run-turn-locked agent text model session store channel cancel-p)
+      (when lock
+        (bordeaux-threads:release-lock lock)))))

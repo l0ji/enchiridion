@@ -30,7 +30,8 @@
     (enchiridion.errors:bootstrap-pending  (:label :soul))
     (enchiridion.errors:duplicate-message  (:id "m-1"))
     (enchiridion.errors:not-found          (:kind "skill" :name "welcome"))
-    (enchiridion.errors:unauthorized       nil))
+    (enchiridion.errors:unauthorized       nil)
+    (enchiridion.errors:turn-busy          nil))
   "Every leaf condition, paired with the initargs that construct it.")
 
 (defparameter *leaves-with-slots*
@@ -128,3 +129,16 @@
                                 :wanted 1000))))
     (ok (search "OPERATOR" text))
     (ng (search (format nil "~%") text) "a report line is a line")))
+
+(deftest turn-busy-names-the-agent-when-it-knows ()
+  ;; One agent answers one turn at a time, and the caller that is refused has
+  ;; to be able to say which agent was busy: the sleep agent, the webhook and
+  ;; the REPL all share this condition.
+  (let ((anonymous (princ-to-string (make-condition 'enchiridion.errors:turn-busy)))
+        (named (princ-to-string (make-condition 'enchiridion.errors:turn-busy
+                                                :agent "default"))))
+    (ok (search "already answering a turn" anonymous))
+    (ok (search "default" named))
+    (ok (string= "default" (enchiridion.errors:busy-agent
+                            (make-condition 'enchiridion.errors:turn-busy
+                                            :agent "default"))))))

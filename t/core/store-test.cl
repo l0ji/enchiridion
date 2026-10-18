@@ -356,3 +356,36 @@ itself is what proves the trigger ran."
         (ok (not (enchiridion.memory.store:remove-task
                   store (enchiridion.memory.store:task-row-id second))))
         (ok (= 1 (length (enchiridion.memory.store:list-tasks store))))))))
+
+(deftest one-connection-with-many-writers-keeps-every-row-id ()
+  ;; The supervisor shares one connection with its channel threads, the
+  ;; control poll and the heartbeat. A record is an INSERT and then
+  ;; LAST_INSERT_ROWID, so without the store's lock two writers interleave and
+  ;; one of them reports the other's row id. The count alone would not catch
+  ;; that; the ids have to be distinct.
+  (with-scratch-store (store)
+    (let* ((writers 4)
+           (each 10)
+           (threads (loop for writer from 1 to writers
+                          collect (bordeaux-threads:make-thread
+                                   (lambda ()
+                                     (loop for turn from 1 to each
+                                           do (enchiridion.memory.store:record-turn
+                                               store
+                                               :session (format nil "s~D" writer)
+                                               :role "user"
+                                               :body (format nil "writer ~D turn ~D"
+                                                             writer turn))))))))
+      (dolist (thread threads)
+        (bordeaux-threads:join-thread thread))
+      (testing "every turn landed"
+        (ok (= (* writers each)
+               (getf (first (enchiridion.memory.store::query-rows
+                             store "SELECT COUNT(*) AS n FROM turns"))
+                     :n))))
+      (testing "and every row id is its own"
+        (let ((ids (mapcar (lambda (row) (getf row :id))
+                           (enchiridion.memory.store::query-rows
+                            store "SELECT id FROM turns"))))
+          (ok (= (* writers each) (length ids)))
+          (ok (= (* writers each) (length (remove-duplicates ids)))))))))

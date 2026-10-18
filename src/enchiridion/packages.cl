@@ -67,7 +67,7 @@ global configuration and signing key are the only ones used."))
    #:backend-error #:transport-error #:tool-error #:schema-error
    #:block-overflow #:block-frozen #:bootstrap-pending #:budget-exceeded
    #:duplicate-message #:not-found #:unauthorized #:condition-report-line
-   #:turn-cancelled
+   #:turn-cancelled #:turn-busy #:busy-agent
    ;; The note every condition carries. The report line stays one line so it can
    ;; go in a log; this is the part that says what to do about it.
    #:error-detail)

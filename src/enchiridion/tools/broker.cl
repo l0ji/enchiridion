@@ -36,12 +36,20 @@ load happens in the child, as the agent user.")
   (server nil :type t)
   (server-thread nil :type t)
   (child nil :type t)
-  (running-p nil :type boolean))
+  (running-p nil :type boolean)
+  (call-lock nil :type t))
 
 (defun make-broker (&key (socket #p"/run/enchiridion/broker.sock")
                            (uid 1000) (timeout 30))
-  "Return a BROKER descriptor. Nothing starts until BROKER-START."
-  (%make-broker :socket (pathname socket) :uid uid :timeout timeout))
+  "Return a BROKER descriptor. Nothing starts until BROKER-START.
+
+The descriptor carries a lock because it carries one socket. A request is a
+frame out and a frame back on the same stream, and two threads doing that at
+once interleave the writes and one of them reads the other's answer. The REPL
+and the reload poll could already collide; a second channel and the heartbeat
+make it certain."
+  (%make-broker :socket (pathname socket) :uid uid :timeout timeout
+                :call-lock (bordeaux-threads:make-lock "enchiridion broker call")))
 
 (defun json-object (&rest pairs)
   "Return PAIRS as the JSON object shape JZON writes."
@@ -342,29 +350,40 @@ parsed model call. Both become one object on the wire."
 
 TIMEOUT is accepted for the protocol but not yet enforced on the socket read;
 the caller can set the process deadline around it. The frame itself is capped
-at 16 MiB by READ-FRAME."
+at 16 MiB by READ-FRAME.
+
+The whole call holds the broker's lock. A request is one frame written and one
+frame read on one stream, so two callers at once would interleave their writes
+and one would read the other's answer, which is a wrong answer and not a
+visible error."
   (declare (ignore timeout))
   (unless (broker-running-p broker)
     (error 'enchiridion.errors:configuration-error
            :key :broker
            :detail "The broker is not running."))
-  (let ((stream (broker-stream broker)))
-    (write-frame stream
-                 (com.inuoe.jzon:stringify
-                  (json-object "op" (string operation)
-                               "arguments" (arguments-object arguments))))
-    (let ((response (read-frame stream)))
-      (unless response
-        (error 'enchiridion.errors:transport-error
-               :detail "The broker closed without a response."))
-      (let ((data (com.inuoe.jzon:parse response)))
-        (if (gethash "ok" data)
-            (gethash "result" data)
-            (error 'enchiridion.errors:tool-error
-                   :tool operation
-                   :detail (or (gethash "detail" data)
-                               (gethash "error" data)
-                               "The broker reported an error.")))))))
+  (let ((lock (broker-call-lock broker)))
+    (when lock
+      (bordeaux-threads:acquire-lock lock))
+    (unwind-protect
+         (let ((stream (broker-stream broker)))
+           (write-frame stream
+                        (com.inuoe.jzon:stringify
+                         (json-object "op" (string operation)
+                                      "arguments" (arguments-object arguments))))
+           (let ((response (read-frame stream)))
+             (unless response
+               (error 'enchiridion.errors:transport-error
+                      :detail "The broker closed without a response."))
+             (let ((data (com.inuoe.jzon:parse response)))
+               (if (gethash "ok" data)
+                   (gethash "result" data)
+                   (error 'enchiridion.errors:tool-error
+                          :tool operation
+                          :detail (or (gethash "detail" data)
+                                      (gethash "error" data)
+                                      "The broker reported an error."))))))
+      (when lock
+        (bordeaux-threads:release-lock lock)))))
 
 (defun broker-health (broker)
   "Return T when BROKER answers a ping."

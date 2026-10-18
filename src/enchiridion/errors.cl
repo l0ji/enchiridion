@@ -186,3 +186,20 @@ went wrong, and the reply that would have been printed will not arrive."))
   (:documentation
    "An allowlist said no. Deny by default: an empty allowlist means nobody may
 talk to the agent, and that case is tested."))
+
+(define-condition turn-busy (enchiridion-error)
+  ((agent :initarg :agent :initform nil :reader busy-agent))
+  (:report (lambda (condition stream)
+             (let ((agent (busy-agent condition)))
+               (if agent
+                   (format stream "~A is already answering a turn." agent)
+                   (format stream "This agent is already answering a turn.")))))
+  (:documentation
+   "A second turn arrived while one was in flight.
+
+One agent answers one turn at a time: the prompt snapshot, the spend ledger,
+the turn counter and the SQLite connection are all shared, and two turns at
+once lose rows and interleave statements. The caller decides what a busy agent
+means to it. The webhook answers 503 and the caller tries later, while the
+sleep agent and the REPL wait their turn, because dropping the work would be
+worse than being slow."))

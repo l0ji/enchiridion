@@ -22,10 +22,29 @@
 ;;;; The store object.
 
 ;; path is the database file and connection is the DBI connection. The accessor
-;; is STORE-PATH, the name a caller asks a question with.
+;; is STORE-PATH, the name a caller asks a question with. lock is what makes
+;; one connection safe for the several threads that share it.
 (defstruct (store (:constructor %make-store))
   (path #p"" :type pathname)
-  (connection nil :type t))
+  (connection nil :type t)
+  (lock nil :type t))
+
+(defmacro with-store-lock ((store) &body body)
+  "Run BODY while holding STORE's lock, recursively.
+
+The supervised process has one connection and several threads: a channel per
+surface, the control poll, and the heartbeat. A DBI connection and its
+prepared statements are not safe to use from two threads at once, and an
+INSERT followed by LAST_INSERT_ROWID is two statements that must not be
+interleaved, or one thread reports another thread's row id. The lock is
+recursive so a writer can call EXEC and QUERY-ROWS without deadlocking on
+itself. A store with no lock is one a test built by hand, and it says so
+rather than pretending to serialise."
+  (let ((lock (gensym "LOCK")))
+    `(let ((,lock (store-lock ,store)))
+       (if ,lock
+           (bordeaux-threads:with-recursive-lock-held (,lock) ,@body)
+           (progn ,@body)))))
 
 (defparameter *store-path* nil
   "The store a caller gets when OPEN-STORE is not given a path. Main binds this
@@ -194,7 +213,8 @@ column that skips it is a column that leaks."
 
 (defun exec (store statement &optional parameters)
   "Run one statement on STORE and return the number of rows it changed."
-  (dbi:do-sql (store-connection store) statement parameters))
+  (with-store-lock (store)
+    (dbi:do-sql (store-connection store) statement parameters)))
 
 (declaim (ftype (function (list) list) normalise-row))
 
@@ -213,9 +233,10 @@ write it the way it appears in this file. One door, one shape."
 
 (defun query-rows (store statement &optional parameters)
   "Run one query on STORE and return every row as a plist keyed by column."
-  (let ((query (dbi:prepare (store-connection store) statement)))
-    (dbi:execute query parameters)
-    (mapcar #'normalise-row (dbi:fetch-all query))))
+  (with-store-lock (store)
+    (let ((query (dbi:prepare (store-connection store) statement)))
+      (dbi:execute query parameters)
+      (mapcar #'normalise-row (dbi:fetch-all query)))))
 
 (declaim (ftype (function (t string) t) field))
 
@@ -309,7 +330,9 @@ not an exposure."
                       :key :memory
                       :detail (format nil "Cannot open the memory store ~A: ~A"
                                       path condition))))))
-    (let ((store (%make-store :path path :connection connection)))
+    (let ((store (%make-store :path path :connection connection
+                              :lock (bordeaux-threads:make-recursive-lock
+                                     "enchiridion store"))))
       (handler-case
           (dolist (statement +schema+)
             (exec store statement))
@@ -384,17 +407,20 @@ secret that reached a turn must not reach the disk, whatever field it sits in."
         (model (scrubbed (or model "")))
         (channel (normalise-channel (scrubbed (string channel)))))
     (check-type model string)
-    (exec store
-          "INSERT INTO turns (session, role, body, model, channel, ts)
-             VALUES (?, ?, ?, ?, ?, ?)"
-          (list session role body model (string-downcase (string channel)) ts))
-    (%make-turn-row :id (last-row-id store)
-                    :session session
-                    :role role
-                    :body body
-                    :model model
-                    :channel channel
-                    :ts ts)))
+    ;; The insert and the row id are one unit: another thread's insert between
+    ;; them would hand this caller a row id that belongs to a different turn.
+    (with-store-lock (store)
+      (exec store
+            "INSERT INTO turns (session, role, body, model, channel, ts)
+               VALUES (?, ?, ?, ?, ?, ?)"
+            (list session role body model (string-downcase (string channel)) ts))
+      (%make-turn-row :id (last-row-id store)
+                      :session session
+                      :role role
+                      :body body
+                      :model model
+                      :channel channel
+                      :ts ts))))
 
 (declaim (ftype (function (store) integer) session-count))
 
@@ -471,10 +497,13 @@ name is searchable."
               :key :memory
               :detail (format nil "Memory ~A already holds that text." name)))
       (t
-       (exec store
-             "INSERT INTO memories (name, body, session, ts) VALUES (?, ?, ?, ?)"
-             (list name body (or session "") ts))
-       (last-row-id store)))))
+       ;; The duplicate check, the insert and the row id are one unit; a
+       ;; second writer between any two of them would pass the check twice.
+       (with-store-lock (store)
+         (exec store
+               "INSERT INTO memories (name, body, session, ts) VALUES (?, ?, ?, ?)"
+               (list name body (or session "") ts))
+         (last-row-id store))))))
 
 (defun list-memories (store &key (limit 100))
   "Return stored memories newest first, each a plist with :ID, :NAME, :BODY,
@@ -511,10 +540,11 @@ Each entry is a plist with :ID, :NAME, :BODY, :SESSION, and :TS."
   "Write the block called NAME as TEXT and return the text that was stored."
   (check-type text string)
   (let ((text (scrubbed text)))
-    (exec store
-          "INSERT OR REPLACE INTO blocks (name, body, ts) VALUES (?, ?, ?)"
-          (list name text (get-universal-time)))
-    text))
+    (with-store-lock (store)
+      (exec store
+            "INSERT OR REPLACE INTO blocks (name, body, ts) VALUES (?, ?, ?)"
+            (list name text (get-universal-time)))
+      text)))
 
 (declaim (ftype (function (store) string) session-block))
 
@@ -567,13 +597,14 @@ file writes, because a model name is text and text can hold a key."
     (check-type cache-read integer)
     (check-type cache-write integer)
     (check-type ts integer)
-    (exec store
-          "INSERT INTO usage
-             (session, model, input, output, cache_read, cache_write, channel, ts)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-          (list session model input output cache-read cache-write
-                (string-downcase (string channel)) ts))
-    (last-row-id store)))
+    (with-store-lock (store)
+      (exec store
+            "INSERT INTO usage
+               (session, model, input, output, cache_read, cache_write, channel, ts)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            (list session model input output cache-read cache-write
+                  (string-downcase (string channel)) ts))
+      (last-row-id store))))
 
 (defparameter +usage-columns+
   "id, session, model, input, output, cache_read, cache_write, channel, ts"
@@ -647,10 +678,11 @@ agent wrote, and the queue is readable through the search tool."
   (check-type body string)
   (check-type ts integer)
   (let ((body (scrubbed body)))
-    (exec store
-          "INSERT INTO tasks (body, status, ts) VALUES (?, 'pending', ?)"
-          (list body ts))
-    (%make-task-row :id (last-row-id store) :body body :status :pending :ts ts)))
+    (with-store-lock (store)
+      (exec store
+            "INSERT INTO tasks (body, status, ts) VALUES (?, 'pending', ?)"
+            (list body ts))
+      (%make-task-row :id (last-row-id store) :body body :status :pending :ts ts))))
 
 (defun list-tasks (store &key status (limit 100))
   "Return STORE's tasks oldest first, or only the ones with STATUS."

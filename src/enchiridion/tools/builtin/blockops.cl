@@ -44,9 +44,27 @@
       (uiop:read-file-string path :external-format :utf-8)
       ""))
 
-(defun block-write-text (path text label)
-  "Check TEXT against LABEL's scan and limit, then write PATH."
+(declaim (ftype (function (t) boolean) seed-backed-label-p))
+
+(defun seed-backed-label-p (label)
+  "Return T when LABEL is one of the four seed files the operator owns until
+bootstrap hands over: soul, persona, operator, and world."
+  (not (null (assoc (string-downcase (string label)) +block-files+ :test #'string=))))
+
+(declaim (ftype (function (t string t t) string) block-write-text))
+
+(defun block-write-text (path text label directory)
+  "Check TEXT against LABEL's scan and limit, then write PATH.
+
+DIRECTORY is the agent directory the bootstrap gate reads. While the first
+steps are pending, the seed-backed labels belong to the operator: the write
+signals BOOTSTRAP-PENDING with the label and nothing is touched. The CLI writes
+these files directly and does not come through here, because the rule protects
+the operator from the agent, not the operator from themselves."
   (let ((label (intern (string-upcase (string label)) :keyword)))
+    (when (and (seed-backed-label-p label)
+               (enchiridion.memory:bootstrap-refuse-writes-p directory))
+      (error 'enchiridion.errors:bootstrap-pending :label label))
     (enchiridion.memory:scan-block-text label text)
     (when (> (length text) (block-limit-for label))
       (error 'enchiridion.errors:block-overflow
@@ -104,7 +122,7 @@
                                      (subseq text 0 position)
                                      new
                                      (subseq text (+ position (length old))))))
-           (block-write-text path updated label)
+           (block-write-text path updated label directory)
            (format nil "patched ~A" (namestring path)))))
       ((string= action "add")
        (unless path (error 'enchiridion.errors:schema-error :detail "label is required."))
@@ -114,7 +132,7 @@
          (let ((updated (if (zerop (length text))
                             addition
                             (concatenate 'string text (string #\Newline) addition))))
-           (block-write-text path updated label)
+           (block-write-text path updated label directory)
            (format nil "added to ~A" (namestring path)))))
       (t (error 'enchiridion.errors:schema-error
                 :detail (format nil "Unknown block action ~A." action))))))

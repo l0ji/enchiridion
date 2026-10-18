@@ -14,7 +14,7 @@
   (schema nil :type t)
   (handler nil :type t)
   (self-test nil :type t)
-  (generation 1 :type (integer 0 *))
+  (generation 0 :type (integer 0 *))
   (broker-side-p nil :type boolean))
 
 (defparameter *registry* (make-hash-table :test #'equal)

@@ -168,6 +168,15 @@ finish is a tick that does not start."))
   (:documentation "A lookup by name failed. Named separately so that a missing
 skill is not reported as a crash."))
 
+(define-condition turn-cancelled (enchiridion-error)
+  ((turn :initarg :turn :initform 0 :reader cancelled-turn))
+  (:report (lambda (condition stream)
+             (format stream "The turn was cancelled after ~D round~:P."
+                     (cancelled-turn condition))))
+  (:documentation
+   "The operator stopped a turn in progress. Distinct from a failure: nothing
+went wrong, and the reply that would have been printed will not arrive."))
+
 (define-condition unauthorized (enchiridion-error)
   ((channel :initarg :channel :initform nil :reader unauthorized-channel))
   (:report (lambda (condition stream)

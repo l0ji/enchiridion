@@ -40,6 +40,7 @@
       ((:file "packages")
        (:file "compat")
        (:file "config")
+       (:file "git")
        (:file "errors")
        (:module "llm"
         :serial t
@@ -55,7 +56,8 @@
         ((:file "blocks")
          (:file "store")
          (:file "tiers")
-         (:file "seed")))
+         (:file "seed")
+         (:file "state")))
        (:module "tools"
         :serial t
         :default-component-class "cl-source-file.cl"
@@ -75,6 +77,20 @@
            (:file "meta")
            (:file "web")
            (:file "register")))))
+       (:module "plugin"
+        :serial t
+        :default-component-class "cl-source-file.cl"
+        :components
+        ((:file "loader")
+         (:file "verify")
+         (:file "manifest")))
+       (:module "channel"
+        :serial t
+        :default-component-class "cl-source-file.cl"
+        :components
+        ((:file "protocol")
+         (:file "cli")))
+       (:file "supervisor")
        (:file "kernel"))))))
 
   ;; A warning is a failure. Style warnings nobody reads are warnings nobody

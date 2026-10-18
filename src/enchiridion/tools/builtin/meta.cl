@@ -10,6 +10,16 @@
 
 (in-package #:enchiridion.tools.builtin)
 
+(defun commit-author-change (directory path)
+  "Commit the file just written when DIRECTORY is a git repository.
+A directory that is not a repository is not an error: the file is written
+either way, and the commit is what turns it into a journey entry."
+  (handler-case
+      (enchiridion.git:git-commit-all
+       directory
+       (format nil "Author ~A" (file-namestring path)))
+    (error () nil)))
+
 (defun meta-directory (args)
   "Return the agent repository META acts on."
   (let ((path (argument args "directory")))
@@ -79,7 +89,9 @@
                                       :if-does-not-exist :create
                                       :external-format :utf-8)
            (write-string text stream))
-         (format nil "wrote ~A" (namestring path))))
+         (format nil "wrote ~A~@[ and committed ~A~]"
+                 (namestring path)
+                 (commit-author-change directory path))))
       ((string= action "undo")
        (unless (string= (or (argument args "confirm") "") "yes")
          (error 'enchiridion.errors:schema-error
@@ -94,13 +106,14 @@
                  (error 'enchiridion.errors:tool-error
                         :tool "meta" :detail output)))))
       ((string= action "reload")
-       (let ((request (merge-pathnames "reload.request" directory)))
-         (ensure-directories-exist request)
-         (with-open-file (stream request :direction :output
-                                         :if-exists :supersede
-                                         :if-does-not-exist :create)
-           (format stream "~D~%" (get-universal-time)))
-         (format nil "reload requested at ~A" (namestring request))))
+       (let ((path (enchiridion:control-path)))
+         (ensure-directories-exist path)
+         (with-open-file (stream path :direction :output :if-exists :append
+                                      :if-does-not-exist :create
+                                      :external-format :utf-8)
+           (write-string "reload" stream)
+           (terpri stream))
+         (format nil "reload requested in ~A" (namestring path))))
       (t (error 'enchiridion.errors:schema-error
                 :detail (format nil "Unknown meta action ~A." action))))))
 

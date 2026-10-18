@@ -7,7 +7,7 @@
 
 (defpackage #:enchiridion-seed-test
   (:use #:cl)
-  (:import-from #:rove #:deftest #:ok #:ng #:testing)
+  (:import-from #:rove #:deftest #:ok #:ng #:testing #:signals)
   (:export #:run))
 
 (in-package #:enchiridion-seed-test)
@@ -196,10 +196,160 @@ demands :VALIDATE T, and signals unless the directory is really there, so
   ;; Both files ship with the harness and the agent will read them before it
   ;; writes its own, and the tool loader compiles them. A template that does
   ;; not balance would fail on the agent's first attempt at using it, which is
-  ;; the worst possible time to find out.
+  ;; the worst possible time to find out. Both are plugins now, so each one has
+  ;; to carry the extension form and still keep its own package.
   (dolist (entry '("skills/example-welcome.cl" "tools/example-echo.cl"))
     (testing entry
       (let ((text (enchiridion.memory:seed-template entry)))
         (ok (search "defpackage" text))
         (ok (search "in-package" text))
+        (ok (search "enchiridion.plugin:define-plugin" text))
         (ok (zerop (paren-balance text)))))))
+
+(deftest the-example-tool-keeps-its-package-and-self-test ()
+  (let ((text (enchiridion.memory:seed-template "tools/example-echo.cl")))
+    (ok (search "(defpackage #:example-echo" text))
+    (ok (search "(defun echo-self-test ()" text))))
+
+(deftest the-guide-describes-the-nested-repository ()
+  ;; The agent directory is its own repository inside the checkout, and the
+  ;; guide is the operator's only written account of how to read its history.
+  (let ((text (enchiridion.memory:seed-template "GUIDE.md")))
+    (ok (search "own git repository" text))
+    (ok (search "git -C agents/default log" text))))
+
+;;;; Runtime state.
+
+(deftest state-round-trips-through-the-file ()
+  (with-scratch-directory (scratch)
+    (let ((directory (merge-pathnames "agents/default/" scratch)))
+      (enchiridion.memory:init-agent directory)
+      (let ((state (enchiridion.memory:read-state directory)))
+        (ok (zerop (enchiridion.memory:state-generation state)))
+        (ok (= 7 (enchiridion.memory:set-state-generation state 7)))
+        (ok (= 7 (enchiridion.memory:state-generation state)))
+        (enchiridion.memory:write-state directory state))
+      (ok (= 7 (enchiridion.memory:state-generation directory)))
+      (ok (= 7 (enchiridion.memory:state-generation (enchiridion.memory:read-state directory)))))))
+
+(deftest write-state-leaves-no-temporary-file-behind ()
+  (with-scratch-directory (scratch)
+    (let ((directory (merge-pathnames "agents/default/" scratch)))
+      (enchiridion.memory:init-agent directory)
+      (let ((state (enchiridion.memory:read-state directory)))
+        (enchiridion.memory:write-state directory state)
+        (enchiridion.memory:write-state directory state))
+      (ok (probe-file (merge-pathnames "state.json" directory)))
+      (ng (probe-file (merge-pathnames "state.json.new" directory))))))
+
+(deftest a-missing-or-corrupt-state-file-reads-as-defaults ()
+  (with-scratch-directory (scratch)
+    (let ((directory (merge-pathnames "agents/default/" scratch)))
+      (enchiridion.memory:init-agent directory)
+      (let ((path (merge-pathnames "state.json" directory)))
+        (dolist (contents (list "" "{ this is not json" "[]" "{\"generation\": \"nine\"}"))
+          (testing (format nil "~S" contents)
+            (with-open-file (stream path :direction :output
+                                         :if-exists :supersede
+                                         :if-does-not-exist :create
+                                         :external-format :utf-8)
+              (write-string contents stream))
+            (let ((state (enchiridion.memory:read-state directory)))
+              (ok (zerop (enchiridion.memory:state-generation state)))
+              (ok (zerop (getf (enchiridion.memory:bootstrap-status directory) :step)))
+              (ng (getf (enchiridion.memory:bootstrap-status directory) :complete))))))
+      (delete-file (merge-pathnames "state.json" directory))
+      (ok (zerop (enchiridion.memory:state-generation directory))))))
+
+;;;; Bootstrap.
+
+(deftest bootstrap-status-parses-the-shipped-template-steps ()
+  (with-scratch-directory (scratch)
+    (let ((directory (merge-pathnames "agents/default/" scratch)))
+      (enchiridion.memory:init-agent directory)
+      (let ((status (enchiridion.memory:bootstrap-status directory)))
+        (ok (plusp (getf status :total)))
+        (ok (= (getf status :total) (length (enchiridion.memory:bootstrap-steps directory))))
+        (ok (zerop (getf status :step)))
+        (ok (null (getf status :done)))
+        (ng (getf status :complete))
+        (ok (= (getf status :total) (length (getf status :remaining))))
+        (ok (= 1 (car (first (getf status :remaining)))))
+        (ok (stringp (cdr (first (getf status :remaining)))))
+        (ok (search "Bootstrap step 1 of" (enchiridion.memory:bootstrap-status-line directory)))))))
+
+(deftest mark-bootstrap-step-records-and-is-idempotent ()
+  (with-scratch-directory (scratch)
+    (let ((directory (merge-pathnames "agents/default/" scratch)))
+      (enchiridion.memory:init-agent directory)
+      (enchiridion.memory:mark-bootstrap-step directory 2)
+      (enchiridion.memory:mark-bootstrap-step directory 1)
+      (enchiridion.memory:mark-bootstrap-step directory 1)
+      (let ((status (enchiridion.memory:bootstrap-status directory)))
+        (ok (equal (getf status :done) '(1 2)))
+        (ok (= 2 (getf status :step)))
+        (ng (getf status :complete))
+        (ok (equal (mapcar #'car (getf status :remaining))
+                   '(3 4 5 6 7 8)))))))
+
+(deftest marking-every-step-completes-and-archives-the-file ()
+  (with-scratch-directory (scratch)
+    (let ((directory (merge-pathnames "agents/default/" scratch)))
+      (enchiridion.memory:init-agent directory)
+      (dolist (step (enchiridion.memory:bootstrap-steps directory))
+        (enchiridion.memory:mark-bootstrap-step directory (car step)))
+      (ok (enchiridion.memory:bootstrap-complete-p directory))
+      (ok (getf (enchiridion.memory:bootstrap-status directory) :complete))
+      (ok (probe-file (merge-pathnames "BOOTSTRAP.done.md" directory)))
+      (ng (probe-file (merge-pathnames "BOOTSTRAP.md" directory)))
+      (ok (search "Bootstrap complete" (enchiridion.memory:bootstrap-status-line directory))))))
+
+(deftest an-absent-bootstrap-file-means-complete ()
+  (with-scratch-directory (scratch)
+    (let ((directory (merge-pathnames "agents/default/" scratch)))
+      (ok (enchiridion.memory:bootstrap-complete-p directory))
+      (ng (enchiridion.memory:bootstrap-refuse-writes-p directory)))))
+
+(deftest bootstrap-refuse-writes-p-toggles-at-handover ()
+  (with-scratch-directory (scratch)
+    (let ((directory (merge-pathnames "agents/default/" scratch)))
+      (enchiridion.memory:init-agent directory)
+      (ok (enchiridion.memory:bootstrap-refuse-writes-p directory))
+      (dolist (step (enchiridion.memory:bootstrap-steps directory))
+        (enchiridion.memory:mark-bootstrap-step directory (car step)))
+      (ng (enchiridion.memory:bootstrap-refuse-writes-p directory)))))
+
+(deftest blockops-refuses-a-seed-write-before-handover-and-allows-it-after ()
+  (with-scratch-directory (scratch)
+    (let ((directory (merge-pathnames "agents/default/" scratch)))
+      (enchiridion.memory:init-agent directory)
+      (ok (signals (enchiridion.tools.builtin:block-ops
+                    (list :action "patch" :label "soul" :old "placeholder"
+                          :new "mine now" :directory (namestring directory)))
+                   'enchiridion.errors:bootstrap-pending))
+      (ok (search "placeholder"
+                  (uiop:read-file-string (merge-pathnames "SOUL.md" directory))))
+      (dolist (step (enchiridion.memory:bootstrap-steps directory))
+        (enchiridion.memory:mark-bootstrap-step directory (car step)))
+      (enchiridion.tools.builtin:block-ops
+       (list :action "patch" :label "soul" :old "placeholder"
+             :new "mine now" :directory (namestring directory)))
+      (ok (search "mine now" (uiop:read-file-string (merge-pathnames "SOUL.md" directory)))))))
+
+(deftest reset-bootstrap-restores-the-first-steps ()
+  (with-scratch-directory (scratch)
+    (let ((directory (merge-pathnames "agents/default/" scratch)))
+      (enchiridion.memory:init-agent directory)
+      (dolist (step (enchiridion.memory:bootstrap-steps directory))
+        (enchiridion.memory:mark-bootstrap-step directory (car step)))
+      (ok (enchiridion.memory:bootstrap-complete-p directory))
+      (enchiridion.memory:reset-bootstrap directory)
+      (ok (probe-file (merge-pathnames "BOOTSTRAP.md" directory)))
+      (ng (probe-file (merge-pathnames "BOOTSTRAP.done.md" directory)))
+      (ng (enchiridion.memory:bootstrap-complete-p directory))
+      (ok (enchiridion.memory:bootstrap-refuse-writes-p directory))
+      (let ((status (enchiridion.memory:bootstrap-status directory)))
+        (ok (zerop (getf status :step)))
+        (ok (null (getf status :done)))
+        (ok (string= "Bootstrap step 1 of 8: Read `SOUL.md`, `OPERATOR.md`, and `WORLD.md`."
+                     (enchiridion.memory:bootstrap-status-line directory)))))))

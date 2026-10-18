@@ -192,14 +192,18 @@ the host keeps using /tmp."
                         (uiop:getenv "ENCHIRIDION_HOME")))
       #p"/tmp/"))
 
-(defun run-program-capture (program arguments &key (timeout nil))
+(defun run-program-capture (program arguments &key (timeout nil) (environment nil))
   "Run PROGRAM with ARGUMENTS and return its combined output and exit status.
 
 TIMEOUT is seconds, or NIL for no limit. On expiry the child gets SIGTERM,
 then SIGKILL after a short grace period, and the second value is :TIMEOUT.
 Standard error goes to the same string stream as standard output: a shell
 command that fails usually explains why on stderr, and a caller that sees only
-stdout sees an empty string and no reason."
+stdout sees an empty string and no reason.
+
+ENVIRONMENT is a list of NAME=VALUE strings that replaces the child environment
+when it is given, or NIL to inherit. The git tests use it to supply an author
+and to switch signing off without writing any configuration file."
   #+sbcl
   (let* ((directory (temp-directory))
          (path (merge-pathnames
@@ -217,12 +221,14 @@ stdout sees an empty string and no reason."
            ;; flushed by the child's exit, and :PIPE is not an accepted
            ;; :OUTPUT value. A pathname is the one output sink that works for
            ;; a short lived child and keeps stderr on the same text.
-           (setf process (sb-ext:run-program program arguments
+           (setf process (apply #'sb-ext:run-program program arguments
                                              :search t
                                              :output path
                                              :error :output
                                              :if-output-exists :supersede
-                                             :wait nil))
+                                             :wait nil
+                                             (when environment
+                                               (list :environment environment))))
            (loop
              (let ((code (sb-ext:process-exit-code process)))
                (when code
@@ -242,7 +248,7 @@ stdout sees an empty string and no reason."
       (ignore-errors (delete-file path))))
   #-sbcl
   (progn
-    (declare (ignore program arguments timeout))
+    (declare (ignore program arguments timeout environment))
     (error "No process launcher is available in ~A." +implementation+)))
 
 ;;;; Process identity.
@@ -251,6 +257,14 @@ stdout sees an empty string and no reason."
 ;;;; are how the supervisor drops privilege and how a test proves the drop
 ;;;; happened, and they are the only reason the secret isolation is a
 ;;;; property rather than an intention.
+
+(declaim (ftype (function () (integer 0 *)) process-id))
+
+(defun process-id ()
+  "Return this process's id. The status file carries it so a reader can tell a
+stale file left by a dead supervisor from a live one."
+  #+sbcl (sb-posix:getpid)
+  #-sbcl (error "No process id reader is available in ~A." +implementation+))
 
 (defun process-uid ()
   "Return the effective user id of this process as an integer."

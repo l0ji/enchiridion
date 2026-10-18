@@ -85,10 +85,14 @@ off.
 
 ## Reverting
 
-Every change the agent makes lands in git under your key.
+This directory is its own git repository, nested inside the enchiridion
+checkout. Every change the agent makes here is a commit signed with your key,
+so its history is separate from the source tree's history and you can read it
+without reading the harness.
 
     git -C agents/default log
     git -C agents/default diff
+    git -C agents/default show HEAD
     enchiridion undo 3
 
 Personality evolution is a diff, not a mystery. Read it if you want to.
@@ -222,10 +226,14 @@ all three of the others.
 ;;;;
 ;;;; This file was written by enchiridion init. It is an example, not a
 ;;;; contribution. Replace it or delete it once you have written your own.
+;;;;
+;;;; A skill is a plugin that teaches the agent something it would otherwise
+;;;; work out again. The trigger line is what the index reads at L0, so it is
+;;;; charged on every turn and has to stay short.
 
 (defpackage #:example-welcome
   (:use #:cl)
-  (:export #:welcome-line #:welcome-p))
+  (:export #:welcome-line #:welcome-p #:welcome-self-test))
 
 (in-package #:example-welcome)
 
@@ -244,6 +252,20 @@ short: it is charged on every turn.\")
   \"Return the one line the agent says when this skill fires.\"
   \"Hello. I write my own skills and tools; this one is the example that came
 with the harness.\")
+
+(defun welcome-self-test ()
+  \"Return T when this skill still recognises a greeting and only a greeting.
+A self-test takes no arguments: the loader calls it with none.\"
+  (and (welcome-p \"hello\")
+       (not (welcome-p \"what time is it\"))))
+
+(enchiridion.plugin:define-plugin example-welcome
+  :tool (enchiridion.plugin:tool
+         \"welcome-line\"
+         \"Return the one line this skill teaches, when greeted.\"
+         (:object :properties ((:text :string))))
+  :handler #'welcome-line
+  :self-test #'welcome-self-test)
 "
   "The worked example skill.")
 
@@ -253,27 +275,49 @@ with the harness.\")
 ;;;; This file was written by enchiridion init. It is an example, not a
 ;;;; contribution. Replace it or delete it once you have written your own.
 ;;;;
-;;;; A tool is a name, a description, one schema, and a handler. The schema
+;;;; A plugin is a name, a description, one schema, and a handler. The schema
 ;;;; drives three things at once: the JSON the model sees, the validation of
 ;;;; whatever the model sends back, and the registry entry. They cannot
 ;;;; disagree, because there is only one of them.
 
 (defpackage #:example-echo
   (:use #:cl)
-  (:export #:echo-run #:echo-self-test))
+  (:export #:echo-text #:echo-run #:echo-self-test))
 
 (in-package #:example-echo)
 
+(defun echo-text (arguments)
+  \"Return the :text field of a validated call.
+
+The registry hands a handler the object the schema validated, which is a hash
+table with string keys. This accepts a plist too, so the file can be tried by
+hand at a REPL without pretending that is the production shape.\"
+  (let ((value (if (hash-table-p arguments)
+                   (gethash \"text\" arguments)
+                   (getf arguments :text))))
+    (if (stringp value) value \"\")))
+
 (defun echo-run (arguments)
   \"Return ARGUMENTS back, with a length, so the model can see that a call
-round tripped. ARGSUMENTS is a validated plist, never a raw object.\"
-  (let ((text (getf arguments :text :default \"\")))
-    (format nil \"echo: ~{~A~^ ~}~D characters\" (list text) (length text))))
+round tripped.\"
+  (let ((text (echo-text arguments)))
+    (format nil \"echo: ~A ~D characters\" text (length text))))
 
 (defun echo-self-test ()
   \"Return T when this file still does what the description says. The loader
-runs every self test in a sandbox before it loads anything for real.\"
-  (equal (echo-run '(:text \"hi\")) \"echo: hi 2 characters\"))
+runs every self test in a sandbox before it loads anything for real, and it
+calls one with no arguments.\"
+  (let ((arguments (make-hash-table :test #'equal)))
+    (setf (gethash \"text\" arguments) \"hi\")
+    (equal (echo-run arguments) \"echo: hi 2 characters\")))
+
+(enchiridion.plugin:define-plugin echo
+  :tool (enchiridion.plugin:tool
+         \"echo\"
+         \"Return the text it was given, with its length.\"
+         (:object :properties ((:text :string))))
+  :handler #'echo-run
+  :self-test #'echo-self-test)
 "
   "The worked example tool.")
 

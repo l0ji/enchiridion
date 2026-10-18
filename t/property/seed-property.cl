@@ -108,3 +108,37 @@ and a random suffix is added so that two cases never collide."
       (uiop:delete-directory-tree root
                                   :validate t
                                   :if-does-not-exist :ignore))))
+
+(deftest bootstrap-completeness-is-exactly-every-step-done ()
+  ;; Property 7 of the plan: the bootstrap is complete when every step is
+  ;; done, and at no other time. The done set is generated rather than written
+  ;; out, because the interesting case is a step missing from the middle, and
+  ;; a hand-written fixture almost never has one.
+  (let ((root (scratch-root))
+        (template (enchiridion.memory:seed-template "BOOTSTRAP.md")))
+    (unwind-protect
+         (loop repeat 25
+               do (let* ((directory (merge-pathnames
+                                      (format nil "case-~D/" (random most-positive-fixnum))
+                                      root))
+                         (boot (merge-pathnames "BOOTSTRAP.md" directory)))
+                    (ensure-directories-exist boot)
+                    (with-open-file (stream boot
+                                            :direction :output
+                                            :if-exists :supersede
+                                            :if-does-not-exist :create
+                                            :external-format :utf-8)
+                      (write-string template stream))
+                    (let* ((steps (enchiridion.memory:bootstrap-steps directory))
+                           (subset (remove-if (lambda (step)
+                                                (declare (ignore step))
+                                                (zerop (random 2)))
+                                              steps)))
+                      (dolist (step subset)
+                        (enchiridion.memory:mark-bootstrap-step directory (car step)))
+                      (testing (format nil "~D of ~D steps done" (length subset) (length steps))
+                        (ok (eq (enchiridion.memory:bootstrap-complete-p directory)
+                                (= (length subset) (length steps))))))))
+      (uiop:delete-directory-tree root
+                                  :validate t
+                                  :if-does-not-exist :ignore))))

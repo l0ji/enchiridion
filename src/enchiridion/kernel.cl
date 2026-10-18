@@ -294,7 +294,7 @@ answered, which is empty for the operator's own turn."
         (format *error-output* "~&enchiridion: could not record a turn: ~A~%"
                 condition)))))
 
-(defun run-turn (agent text &key model session store)
+(defun run-turn (agent text &key model session store (cancel-p nil))
   "Send TEXT to AGENT and run any tool calls the model asks for.
 
 The system message is the snapshot compiled by MAKE-AGENT. A block written
@@ -304,6 +304,11 @@ this process. When SESSION is supplied, every completion is appended to its
 turns, and a closed or foreign session is refused. When STORE is supplied, the
 turn and what the model answered are written to the transcript, which is what
 makes a later search able to find them.
+
+CANCEL-P is a function of no arguments, or NIL. It is asked before each round
+and a true answer signals TURN-CANCELLED, which is what /stop needs: the round
+in flight finishes, the turn does not start another one, and nothing already
+spent is undone.
 
 Each round is one backend call and one spend row. A tool call appends the
 assistant message that asked for it and one tool message per result, in the
@@ -335,6 +340,8 @@ keeps asking for tools without answering."
            (completion nil))
       (persist-turn store session "user" text)
       (loop
+        (when (and cancel-p (funcall cancel-p))
+          (error 'enchiridion.errors:turn-cancelled :turn rounds))
         (setf completion (complete-with-tools backend messages model tools))
         (persist-usage store session (record-spend agent completion))
         (when session

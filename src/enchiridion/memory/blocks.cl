@@ -17,9 +17,11 @@
 ;;;; Limits.
 
 (defparameter *default-block-limits*
-  '(:persona 1200 :operator 800 :world 1500 :session 400 :ledger 250)
+  '(:persona 1200 :operator 800 :world 1500 :session 400 :ledger 250 :bootstrap 300)
   "Character limits per block, as the plan fixes them. Raising a limit raises
-the fixed token cost of every prompt, which is why they live in one place.")
+the fixed token cost of every prompt, which is why they live in one place.
+The bootstrap block holds the status line, so it is small on purpose: it is
+resident in every prompt until the first steps are done.")
 
 (declaim (ftype (function (t) (integer 1 *)) default-block-limit))
 

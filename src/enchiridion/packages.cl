@@ -24,6 +24,7 @@
    #:*config* #:*config-source* #:default-config #:read-config #:config
    #:config-set #:channel-config #:channel-enabled-p #:model-for
    #:agent-directory #:run-directory #:load-config #:config-digest
+   #:control-path #:status-path #:project-root
    #:sectioned-config-p #:config-section #:config-value #:config-memory-db)
   (:documentation
    "Configuration. Paths and behaviour only; a secret never comes from here,
@@ -36,6 +37,7 @@ because a file in the repository is a file that ends up in a store path."))
    #:environment #:environment-value #:environment-bound-p
    #:run-program #:run-program-blocking #:process-uid #:set-process-uid
    #:process-user #:set-process-user #:implementation-dependency-p
+   #:process-id
    #:script-arguments #:exit-with #:backtrace-string
    #:encode-utf8 #:decode-utf8 #:run-program-capture #:temp-directory
    #:set-file-mode)
@@ -44,6 +46,18 @@ because a file in the repository is a file that ends up in a store path."))
 Everything above it is standard Common Lisp, which is what makes the agent
 able to rewrite itself without rewriting the porting layer."))
 
+(defpackage #:enchiridion.git
+  (:use #:cl)
+  (:export
+   #:git-available-p #:repository-p #:git-init #:git-commit-all
+   #:git-log #:git-show #:git-diff #:git-revert #:git-head
+   #:git-run #:git-current-branch #:git-test-environment)
+  (:documentation
+   "The agent directory is its own git repository, so personality evolution and
+authored code are a diff the operator can read and revert. Every call goes
+through ENCHIRIDION.COMPAT, and no call ever writes git identity: the operator's
+global configuration and signing key are the only ones used."))
+
 (defpackage #:enchiridion.errors
   (:use #:cl)
   (:export
@@ -51,6 +65,7 @@ able to rewrite itself without rewriting the porting layer."))
    #:backend-error #:transport-error #:tool-error #:schema-error
    #:block-overflow #:block-frozen #:bootstrap-pending #:budget-exceeded
    #:duplicate-message #:not-found #:unauthorized #:condition-report-line
+   #:turn-cancelled
    ;; The note every condition carries. The report line stays one line so it can
    ;; go in a log; this is the part that says what to do about it.
    #:error-detail)
@@ -131,6 +146,13 @@ did not think of."))
    ;; Templates, exported so that a test can assert on them without a disk.
    #:seed-templates #:*seed-templates* #:seed-template #:seed-description
    #:seed-kind
+   ;; Runtime state. state.json holds the generation counter the loader bumps
+   ;; and the bootstrap record the first turns work through. One reader and one
+   ;; writer, so a corrupt file has one place to fall back to defaults.
+   #:state-file #:default-state #:read-state #:write-state
+   #:state-generation #:set-state-generation
+   #:bootstrap-steps #:bootstrap-handover #:reset-bootstrap
+   #:bootstrap-status-line
    ;; Blocks. Written in milestone 2.
    #:block #:make-block #:block-label #:block-text #:block-limit
    #:block-file #:block-writable-p #:block-bytes #:block-full-p #:block-slack
@@ -161,7 +183,11 @@ the three loading tiers, and the bootstrap state machine."))
    #:turn-row-model #:turn-row-channel #:turn-row-ts
    #:search-sessions #:search-memories #:save-memory #:list-memories
    #:session-block #:set-session-block #:ledger-block #:set-ledger-block
-   #:record-usage #:usage-rows #:usage-since #:drop-store)
+   #:record-usage #:usage-rows #:usage-since #:drop-store
+   ;; The task queue. The CLI writes it and the sleep agent drains it in
+   ;; milestone 10, so the storage and the command land together.
+   #:enqueue-task #:dequeue-task #:list-tasks #:remove-task
+   #:task-row #:task-row-id #:task-row-body #:task-row-status #:task-row-ts)
   (:documentation
    "SQLite with FTS5 over raw messages. Returns real text: no summarisation and
 no model call, so a search costs nothing."))
@@ -193,7 +219,9 @@ this costs no interpreter of its own."))
   (:use #:cl)
   (:export
    #:broker #:broker-start #:broker-stop #:broker-call #:broker-running-p
-   #:make-broker #:broker-health #:serve-broker)
+   #:make-broker #:broker-health #:serve-broker
+   #:broker-verify-plugin #:broker-load-generation
+   #:*load-generation-function*)
   (:documentation
    "Supervisor side of the privilege boundary. Agent authored code runs in the
 child; the supervisor never loads it."))
@@ -214,7 +242,14 @@ middle of anything oversized to a file the agent can go and read."))
    #:plugin-self-test #:plugin-generation #:load-generation #:reload
    #:current-generation #:generation-history #:package-name-for-generation
    #:verify-directory #:verify-result #:verify-ok-p #:verify-report
-   #:discard-generation)
+   #:discard-generation
+   ;; The loader. Manifests are read from the source forms, so the supervisor
+   ;; can register a tool the model sees without ever loading a handler.
+   #:*generation* #:plugin-registry #:agent-source-files #:load-agent-code
+   #:load-generation #:generation-result #:generation-result-ok-p
+   #:generation-result-report #:generation-result-generation
+   #:plugin-manifests #:manifest-name #:manifest-description #:manifest-schema
+   #:verify-file #:run-self-tests #:tool)
   (:documentation
    "Hot reloadable agent code. Each generation loads into a fresh package, so
 a rename leaves no stale symbol behind and a bad edit costs one turn rather
@@ -224,6 +259,8 @@ than the process."))
   (:use #:cl)
   (:export
    #:channel #:channel-start #:channel-stop #:channel-send #:channel-status
+   #:define-channel #:channel-name #:channel-live-p #:channel-state
+   #:channel-thread
    #:msg #:make-msg #:msg-id #:msg-channel #:msg-target #:msg-thread #:msg-author
    #:msg-text #:msg-ts #:msg-reply-to #:normalize #:deliver #:message-digest)
   (:documentation
@@ -233,7 +270,16 @@ into. The agent loop never learns which channel a turn arrived on."))
 (defpackage #:enchiridion.channel.cli
   (:use #:cl)
   (:export #:start-cli #:run-repl #:run-command #:command-table #:command-names
-           #:command-help #:repl-only-commands)
+           #:command-help #:repl-only-commands
+           ;; The context a command reads. Handlers keep the one-argument
+           ;; shape the shared table promises, so the live objects a command
+           ;; needs travel in a special rather than in a second parameter.
+           #:*command-context* #:make-command-context
+           #:command-context-directory #:command-context-config
+           #:command-context-store #:command-context-agent
+           #:command-context-session #:command-context-broker
+           #:command-context-generation #:command-context-supervisor
+           #:command-context-channel #:repl-evaluate)
   (:documentation
    "The REPL and the shared command table that also backs the shell
 interface, so the two surfaces cannot drift."))
@@ -251,6 +297,27 @@ refused at startup rather than at first request."))
   (:documentation
    "Direct messages only. Group channels, guild events, mentions, and
 reactions are all out, so the allowlist is the whole authorisation story."))
+
+(defpackage #:enchiridion.supervisor
+  (:use #:cl)
+  (:export
+   #:supervisor #:make-supervisor #:supervisor-start #:supervisor-stop
+   #:supervisor-directory #:supervisor-config #:supervisor-store
+   #:supervisor-agent #:supervisor-session #:supervisor-broker
+   #:supervisor-run-directory
+   #:supervisor-generation #:supervisor-channels #:supervisor-running-p
+   #:supervisor-heartbeat-p #:supervisor-poll-control #:supervisor-write-status
+   #:supervisor-reload #:find-channel
+   ;; The two files that let a one-shot shell command talk to a process that is
+   ;; already up. A file, not a socket, so tail and grep work on it.
+   #:control-file #:status-file #:read-status #:status-fresh-p #:request-control
+   #:queue-control
+   #:status-generation #:status-channels #:status-bootstrap #:status-pid
+   #:status-updated #:status-report)
+  (:documentation
+   "The process that owns the channels, and the two run/ files it exchanges with
+the shell. It is the only writer of run/enchiridion.status, which is what lets
+`enchiridion health` answer whether or not the agent is up."))
 
 (defpackage #:enchiridion.kernel
   (:use #:cl)

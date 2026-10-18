@@ -230,14 +230,25 @@
                         ;; has to be compiled here as well. Without this a
                         ;; broken main.cl ships inside a derivation that built
                         ;; cleanly and only fails when it is run.
-                        (let ((root (uiop:pathname-directory-pathname
-                                      *default-pathname-defaults*)))
-                          (compile-file (merge-pathnames "src/main.cl" root)
-                                        :output-file
-                                        (merge-pathnames "main.fasl" #p"."))
-                          (compile-file (merge-pathnames "src/broker-exec.cl" root)
-                                        :output-file
-                                        (merge-pathnames "broker-exec.fasl" #p"."))))
+                        ;;
+                        ;; COMPILE-FILE reports a read error by returning with
+                        ;; FAILURE-P true, not by signalling. Ignoring that
+                        ;; value is how a gate reports success on a file it
+                        ;; never compiled, which is the one failure mode this
+                        ;; phase exists to prevent.
+                        (flet ((compile-entry (source output)
+                                 (multiple-value-bind (fasl warnings-p failure-p)
+                                     (compile-file source :output-file output)
+                                   (declare (ignore fasl warnings-p))
+                                   (when failure-p
+                                     (error "compile-file reported a failure for ~A"
+                                            source)))))
+                          (let ((root (uiop:pathname-directory-pathname
+                                        *default-pathname-defaults*)))
+                            (compile-entry (merge-pathnames "src/main.cl" root)
+                                           (merge-pathnames "main.fasl" #p"."))
+                            (compile-entry (merge-pathnames "src/broker-exec.cl" root)
+                                           (merge-pathnames "broker-exec.fasl" #p".")))))
                       (error (condition)
                         (format *error-output* "~&~A~%" condition)
                         (sb-ext:exit :code 1)))'
@@ -305,6 +316,10 @@
               pkgs.gnugrep
               pkgs.findutils
               pkgs.util-linux
+              # The agent directory is a git repository, so journey and undo
+              # need git inside the image. It is not on the host side of the
+              # boundary and it never holds a secret.
+              pkgs.git
             ];
             pathsToLink = [ "/bin" "/lib" "/cache" "/config" "/usr/local/bin" ];
           };
@@ -355,6 +370,9 @@
               pkgs.sqlite
               pkgs.bash
               pkgs.coreutils
+              # The git tests run inside the sandbox with no global git
+              # configuration, so git has to be an input here.
+              pkgs.git
             ];
             LD_LIBRARY_PATH = lib.makeLibraryPath [ pkgs.sqlite pkgs.openssl ];
             SBCL_HOME = "${sbcl}/lib/sbcl";
@@ -377,12 +395,23 @@
 
             echo "compiling the entry scripts, which are not system components"
             run_sbcl "(asdf:load-system \"enchiridion\")
-                       (let* ((root (pathname (format nil \"~A/\" (uiop:getenv \"SOURCE_DIR\"))))
-                              (out (pathname (uiop:getenv \"GATE_DIR\"))))
-                         (compile-file (merge-pathnames \"src/main.cl\" root)
-                                       :output-file (merge-pathnames \"main.fasl\" out))
-                         (compile-file (merge-pathnames \"src/broker-exec.cl\" root)
-                                       :output-file (merge-pathnames \"broker-exec.fasl\" out)))"
+                       ;; COMPILE-FILE returns with FAILURE-P true on a read
+                       ;; error instead of signalling, so the value has to be
+                       ;; checked here or this gate reports success on a file
+                       ;; it never compiled.
+                       (flet ((compile-entry (source output)
+                                (multiple-value-bind (fasl warnings-p failure-p)
+                                    (compile-file source :output-file output)
+                                  (declare (ignore fasl warnings-p))
+                                  (when failure-p
+                                    (error \"compile-file reported a failure for ~A\"
+                                           source)))))
+                         (let* ((root (pathname (format nil \"~A/\" (uiop:getenv \"SOURCE_DIR\"))))
+                                (out (pathname (uiop:getenv \"GATE_DIR\"))))
+                           (compile-entry (merge-pathnames \"src/main.cl\" root)
+                                          (merge-pathnames \"main.fasl\" out))
+                           (compile-entry (merge-pathnames \"src/broker-exec.cl\" root)
+                                          (merge-pathnames \"broker-exec.fasl\" out))))"
 
             ${if run-tests then ''
               echo "running the suite"
@@ -424,6 +453,7 @@
               pkgs.sly
               pkgs.clang-tools
               pkgs.nixfmt-rfc-style
+              pkgs.git
             ];
             shellHook = ''
               echo "enchiridion dev shell. Every dependency is in ASDF; there is no Quicklisp."

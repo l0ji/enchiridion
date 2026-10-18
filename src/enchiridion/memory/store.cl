@@ -156,13 +156,23 @@ size test, and it costs one read of sixteen bytes."
       cache_write INTEGER NOT NULL DEFAULT 0,
       channel TEXT NOT NULL DEFAULT 'cli',
       ts INTEGER NOT NULL)"
-   "CREATE INDEX IF NOT EXISTS usage_ts ON usage(ts)")
+   "CREATE INDEX IF NOT EXISTS usage_ts ON usage(ts)"
+
+   ;; The task queue. The CLI adds and removes, and the sleep agent drains it
+   ;; in milestone 10. Both go through the store, so a task survives a restart
+   ;; that a list in memory would not.
+   "CREATE TABLE IF NOT EXISTS tasks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      body TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      ts INTEGER NOT NULL)"
+   "CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status, id)")
   "Every table this store creates, one statement per element. Each is IF NOT
 EXISTS, so opening a store is safe on every start and needs no migration for
 the shape this milestone defines.")
 
 (defparameter +store-tables+
-  '("turns_fts" "turns" "memories_fts" "memories" "blocks" "usage")
+  '("turns_fts" "turns" "memories_fts" "memories" "blocks" "usage" "tasks")
   "What DROP-STORE removes, index table before row table. Dropping a table
 drops its triggers with it, so this list is also the whole trigger list.")
 
@@ -598,3 +608,80 @@ OPEN-STORE again. Tests use this; the sessions command will use it to forget."
   (dolist (table +store-tables+)
     (exec store (format nil "DROP TABLE IF EXISTS ~A" table)))
   t)
+
+;;;; The task queue.
+;;;;
+;;;; A task is one line of work the operator or the sleep agent wants done
+;;;; later. Status is a keyword and a done task stays in the table, so the
+;;;; operator can see what happened to it. REMOVE-TASK is the only delete.
+
+(defstruct (task-row (:constructor %make-task-row))
+  (id 0 :type integer)
+  (body "" :type string)
+  (status :pending :type keyword)
+  (ts 0 :type integer))
+
+(declaim (ftype (function (t) keyword) normalise-task-status))
+
+(defun normalise-task-status (status)
+  "Return STATUS as the keyword a task row carries. A keyword and a string are
+one value, for the reason NORMALISE-CHANNEL gives."
+  (check-type status (or string symbol))
+  (intern (string-upcase (string status)) :keyword))
+
+(declaim (ftype function task-row-from enqueue-task list-tasks dequeue-task
+                  remove-task))
+
+(defun task-row-from (row)
+  "Return ROW, one tasks row as a plist, as a TASK-ROW."
+  (%make-task-row :id (field row "id")
+                  :body (field row "body")
+                  :status (normalise-task-status (field row "status"))
+                  :ts (field row "ts")))
+
+(defun enqueue-task (store body &key (ts (get-universal-time)))
+  "Add BODY to the queue as a pending task and return it as a TASK-ROW.
+
+BODY is scrubbed like every other string this file writes: a task is text the
+agent wrote, and the queue is readable through the search tool."
+  (check-type body string)
+  (check-type ts integer)
+  (let ((body (scrubbed body)))
+    (exec store
+          "INSERT INTO tasks (body, status, ts) VALUES (?, 'pending', ?)"
+          (list body ts))
+    (%make-task-row :id (last-row-id store) :body body :status :pending :ts ts)))
+
+(defun list-tasks (store &key status (limit 100))
+  "Return STORE's tasks oldest first, or only the ones with STATUS."
+  (check-type limit (integer 1 *))
+  (let ((rows (if status
+                  (query-rows store
+                              "SELECT id, body, status, ts FROM tasks
+                                 WHERE status = ? ORDER BY id ASC LIMIT ?"
+                              (list (string-downcase (string status)) limit))
+                  (query-rows store
+                              "SELECT id, body, status, ts FROM tasks
+                                 ORDER BY id ASC LIMIT ?"
+                              (list limit)))))
+    (mapcar #'task-row-from rows)))
+
+(defun dequeue-task (store)
+  "Take the oldest pending task, mark it done, and return it as a TASK-ROW.
+Return NIL when there is nothing pending. An empty queue is the normal state,
+not an error, so nothing is signalled."
+  (let ((row (first (query-rows store
+                                "SELECT id, body, status, ts FROM tasks
+                                   WHERE status = 'pending'
+                                   ORDER BY id ASC LIMIT 1"))))
+    (when row
+      (let ((task (task-row-from row)))
+        (exec store "UPDATE tasks SET status = 'done' WHERE id = ?"
+              (list (task-row-id task)))
+        (setf (task-row-status task) :done)
+        task))))
+
+(defun remove-task (store id)
+  "Delete task ID and return T when a row was removed."
+  (check-type id integer)
+  (plusp (exec store "DELETE FROM tasks WHERE id = ?" (list id))))

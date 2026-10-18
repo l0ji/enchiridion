@@ -42,28 +42,72 @@ format control of a SIMPLE-WARNING in its own representation."
   (let ((tail (member name arguments :test #'string=)))
     (when tail (second tail))))
 
+(defun broker-exec-drop-uid (uid)
+  "Drop to UID when this process is root and UID is a real user.
+A non-root process stays where it is: dropping to a uid it does not own would
+only fail, and the tests run as an ordinary user."
+  (when (and uid (plusp uid) (zerop (enchiridion.compat:process-uid)))
+    (enchiridion.compat:set-process-uid uid)))
+
+(defun broker-exec-verify (directory uid)
+  "Compile and self-test every agent file in DIRECTORY and report.
+Return 0 when the generation is good and 1 when it is not. The uid is dropped
+before a single agent file is read, so a verification that runs away runs away
+as the agent and not as the process that holds the secrets."
+  (broker-exec-drop-uid uid)
+  (handler-case
+      (let ((result (enchiridion.plugin:verify-directory (pathname directory))))
+        (format t "~A~%" (enchiridion.plugin:verify-report result))
+        (finish-output)
+        (if (enchiridion.plugin:verify-ok-p result) 0 1))
+    (enchiridion.errors:enchiridion-error (condition)
+      (format *error-output* "~&verify: ~A~%" condition)
+      (let ((detail (enchiridion.errors:error-detail condition)))
+        (when (stringp detail)
+          (format *error-output* "~A~%" detail)))
+      1)
+    (error (condition)
+      (format *error-output* "~&verify: ~A~%" condition)
+      1)))
+
+(defun broker-exec-load-generation (directory generation)
+  "Load a generation through the plugin loader.
+Return two values, the ok flag and the report, which is the shape
+*LOAD-GENERATION-FUNCTION* promises the broker."
+  (let ((result (enchiridion.plugin:load-generation
+                 directory
+                 :generation (or generation
+                                 (1+ (enchiridion.plugin:current-generation))))))
+    (values (enchiridion.plugin:generation-result-ok-p result)
+            (enchiridion.plugin:generation-result-report result))))
+
 (defun broker-exec-main ()
-  "Parse the small command line and serve until killed."
+  "Parse the small command line and serve until killed, or verify and exit."
   (let* ((arguments (enchiridion.compat:script-arguments))
+         (verify (broker-exec-argument arguments "--verify-plugin"))
          (socket (broker-exec-argument arguments "--socket"))
-         (uid-text (broker-exec-argument arguments "--uid")))
+         (uid-text (broker-exec-argument arguments "--uid"))
+         (uid (and uid-text (parse-integer uid-text :junk-allowed t))))
+    (when verify
+      (return-from broker-exec-main (broker-exec-verify verify uid)))
     (unless socket
       (format *error-output* "broker-exec: --socket PATH is required.~%")
       (return-from broker-exec-main 2))
-    (let ((uid (and uid-text (parse-integer uid-text :junk-allowed t))))
-      (handler-case
-          (progn
-            (enchiridion.tools.builtin:register-builtin-tools)
-            (enchiridion.tools.broker:serve-broker (pathname socket) :uid uid)
-            0)
-        (enchiridion.errors:enchiridion-error (condition)
-          (format *error-output* "~&~A~%" condition)
-          (let ((detail (enchiridion.errors:error-detail condition)))
-            (when (stringp detail)
-              (format *error-output* "~A~%" detail)))
-          1)
-        (error (condition)
-          (format *error-output* "~&broker-exec: ~A~%" condition)
-          1)))))
+    (handler-case
+        (progn
+          (enchiridion.tools.builtin:register-builtin-tools)
+          (setf enchiridion.tools.broker:*load-generation-function*
+                #'broker-exec-load-generation)
+          (enchiridion.tools.broker:serve-broker (pathname socket) :uid uid)
+          0)
+      (enchiridion.errors:enchiridion-error (condition)
+        (format *error-output* "~&~A~%" condition)
+        (let ((detail (enchiridion.errors:error-detail condition)))
+          (when (stringp detail)
+            (format *error-output* "~A~%" detail)))
+        1)
+      (error (condition)
+        (format *error-output* "~&broker-exec: ~A~%" condition)
+        1))))
 
 (enchiridion.compat:exit-with (broker-exec-main))

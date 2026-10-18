@@ -327,3 +327,32 @@ itself is what proves the trigger ran."
   (testing "and without a directory it still names memory.db"
     (ok (string= "memory.db"
                  (file-namestring (enchiridion.memory.store:default-store-path))))))
+
+(deftest a-task-goes-in-comes-out-and-leaves ()
+  (with-scratch-store (store)
+    (let ((first (enchiridion.memory.store:enqueue-task store "write the world file"))
+          (second (enchiridion.memory.store:enqueue-task store "read the journal")))
+      (testing "both wait in order"
+        (ok (= 2 (length (enchiridion.memory.store:list-tasks store))))
+        (ok (= 2 (length (enchiridion.memory.store:list-tasks store :status :pending))))
+        (ok (string= "write the world file"
+                     (enchiridion.memory.store:task-row-body first)))
+        (ok (< (enchiridion.memory.store:task-row-id first)
+               (enchiridion.memory.store:task-row-id second))))
+      (testing "the oldest pending task leaves the queue done"
+        (let ((taken (enchiridion.memory.store:dequeue-task store)))
+          (ok (string= "write the world file"
+                       (enchiridion.memory.store:task-row-body taken)))
+          (ok (eq :done (enchiridion.memory.store:task-row-status taken)))
+          (ok (= 1 (length (enchiridion.memory.store:list-tasks store :status :pending))))
+          (ok (= 1 (length (enchiridion.memory.store:list-tasks store :status :done))))))
+      (testing "and an empty queue is not an error"
+        (enchiridion.memory.store:dequeue-task store)
+        (ok (null (enchiridion.memory.store:dequeue-task store))))
+      (testing "a removed task is gone"
+        (ok (enchiridion.memory.store:remove-task store
+                                                  (enchiridion.memory.store:task-row-id
+                                                   second)))
+        (ok (not (enchiridion.memory.store:remove-task
+                  store (enchiridion.memory.store:task-row-id second))))
+        (ok (= 1 (length (enchiridion.memory.store:list-tasks store))))))))

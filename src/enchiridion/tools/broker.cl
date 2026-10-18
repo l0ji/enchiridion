@@ -12,6 +12,22 @@
 
 (in-package #:enchiridion.tools.broker)
 
+;; BROKER-CALL is defined after the helpers that use it, and a forward
+;; reference inside one file needs a declaration or the compiler warns, which
+;; this tree makes fatal. The declaration is a bare FUNCTION, and it is the
+;; only proclamation for that name anywhere.
+(declaim (ftype function broker-call))
+
+;; The child's loader hook. The broker loads before the plugin module, because
+;; the plugin module registers the tools the broker dispatches, so a direct
+;; call from here would be a cycle. The child sets this to the plugin loader;
+;; a broker with no hook answers the op with a clear error instead of loading
+;; something in the wrong process.
+(defparameter *load-generation-function* nil
+  "A function of (directory generation) returning (values ok-p report), or NIL.
+BROKER-EXEC sets it to the plugin loader. The supervisor never calls it: the
+load happens in the child, as the agent user.")
+
 (defstruct (broker (:constructor %make-broker))
   (socket #p"/run/enchiridion/broker.sock" :type pathname)
   (uid 1000 :type (integer 0 *))
@@ -95,6 +111,35 @@ broker scrubs before it writes the response."
                "detail" (enchiridion.llm.secrets:scrub
                          (or (enchiridion.errors:error-detail condition) ""))))
 
+(declaim (ftype (function (t t &optional t) t) request-value))
+
+(defun request-value (request name &optional default)
+  "Return NAME from REQUEST, a parsed JSON object, or DEFAULT. JZON keys an
+object by the string as it was written, so the two sides agree on lowercase."
+  (let ((value (and (hash-table-p request) (gethash name request))))
+    (or value default)))
+
+(declaim (ftype (function (t) t) load-generation-response))
+
+(defun load-generation-response (arguments)
+  "Load a generation in this process from ARGUMENTS and return the report.
+
+This runs in the child, as the agent user, and it is the only place agent code
+is loaded for real. The supervisor asks for it over the socket, so the process
+that holds the secrets never compiles what the agent wrote. The loader itself
+arrives through *LOAD-GENERATION-FUNCTION*, which keeps this file free of the
+plugin module it would otherwise have to load before."
+  (let ((function *load-generation-function*)
+        (directory (request-value arguments "directory"))
+        (generation (request-value arguments "generation")))
+    (unless function
+      (error 'enchiridion.errors:configuration-error
+             :key :plugin
+             :detail "This process has no plugin loader attached."))
+    (multiple-value-bind (ok-p report)
+        (funcall function (pathname directory) generation)
+      (json-object "ok" ok-p "report" report))))
+
 (defun serve-connection (stream)
   "Answer requests on STREAM until the peer closes it.
 
@@ -107,9 +152,10 @@ second call into a race with the accept loop."
                   (op (gethash "op" request))
                   (arguments (gethash "arguments" request)))
              (handler-case
-                 (let ((result (if (and (stringp op) (string= op "ping"))
-                                   "ok"
-                                   (enchiridion.tools:dispatch op arguments))))
+                 (let ((result (cond ((and (stringp op) (string= op "ping")) "ok")
+                                     ((and (stringp op) (string= op "load-generation"))
+                                      (load-generation-response arguments))
+                                     (t (enchiridion.tools:dispatch op arguments)))))
                    (write-frame stream
                                 (com.inuoe.jzon:stringify
                                  (json-object "ok" t "result" (scrub-value result)))))
@@ -166,6 +212,39 @@ secret in the supervisor's environment must not be one of these strings."
         (when value
           (push (format nil "~A=~A" name value) entries))))
     entries))
+
+(declaim (ftype (function (pathname &key (:uid t) (:timeout t)) t)
+                broker-verify-plugin))
+
+(defun broker-verify-plugin (directory &key (uid 1000) (timeout 120))
+  "Verify DIRECTORY in a one-shot child that runs as UID, and return two
+values: whether the child exited zero, and the child's combined output.
+
+A separate process, and not the serving child, because a file that kills the
+compiler must not take the agent's running generation with it. The child gets
+the same minimal environment as the broker, so nothing this process holds
+crosses the boundary in either direction."
+  (let ((program (or (uiop:getenv "ENCHIRIDION_SBCL") "sbcl"))
+        (arguments (list "--script" (namestring (broker-exec-path))
+                         "--verify-plugin"
+                         (namestring (uiop:ensure-directory-pathname directory))
+                         "--uid" (princ-to-string uid))))
+    (multiple-value-bind (output status)
+        (enchiridion.compat:run-program-capture program arguments
+                                                :timeout timeout
+                                                :environment (child-environment))
+      (values (eql 0 status) output))))
+
+(declaim (ftype (function (broker t &key (:generation integer)) t)
+                broker-load-generation))
+
+(defun broker-load-generation (broker directory &key generation)
+  "Ask BROKER's child to load GENERATION from DIRECTORY and return the child's
+report, a hash table with the keys ok, generation and report."
+  (broker-call broker "load-generation"
+               (list :directory (namestring
+                                 (uiop:ensure-directory-pathname directory))
+                     :generation generation)))
 
 (defun wait-for-connection (broker)
   "Try to connect to BROKER's socket until it answers or the timeout expires."

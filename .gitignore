@@ -21,14 +21,10 @@
 # config.cl holds local paths, allowed user ids, and model choices.
 /config.cl
 
-# Agent runtime state. The agent owns this, git does not.
-agents/*/state.json
-agents/*/state.json.new
-agents/*/memory.db
-agents/*/memory.db-*
-agents/*/memory.db-shm
-agents/*/memory.db-wal
-agents/*/private/
+# The agent directory is its own git repository. It holds the agent's files,
+# its nested history, and its runtime state, so the project repository tracks
+# none of it. The nested repository ignores state.json and memory.db itself.
+/agents/
 run/
 
 # Sandbox scratch. Agent-authored code is verified here before it loads.

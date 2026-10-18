@@ -32,9 +32,9 @@
     ;;; afford a stronger model because nothing is waiting on it. Every tier
     ;;; defaults to the cheap model, and :model-primary is the one to raise
     ;;; when a turn is worth the stronger one.
-    (:model-primary "space-bunny")
-    (:model-cheap   "space-bunny")
-    (:model-sleep   "space-bunny")
+    (:model-primary "deepseek-v4.1-flash")
+    (:model-cheap   "deepseek-v4.1-flash")
+    (:model-sleep   "deepseek-v4.1-flash")
 
     ;;; Name of the variable in .env that holds the key. The file holds the
     ;;; name, never the value.

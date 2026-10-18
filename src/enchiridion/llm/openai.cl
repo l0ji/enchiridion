@@ -471,7 +471,7 @@ signature change the moment tools arrive."
      :api-key-env "OPENAI_API_KEY")
     :opencode
     (:base-url "https://opencode.ai/zen/go/v1"
-     :model "space-bunny"
+     :model "deepseek-v4.1-flash"
      :api-key-env "OPENCODE_API_KEY"))
   "Provider name to the endpoint, default model, and key variable it uses.
 Both speak the OpenAI chat completions shape; only these three facts differ.")

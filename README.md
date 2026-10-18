@@ -12,12 +12,25 @@ nix run .#enchiridion -- help   # list the commands
 
 ## Run
 
+### Nix
+
 ```sh
 nix run .#enchiridion                  # write the agent files on the first launch
 nix run .#enchiridion -- chat          # the terminal REPL
 nix run .#enchiridion -- ask "..."     # ask a question
 nix run .#enchiridion -- serve         # start the agent supervisor
 ```
+
+### Docker
+
+```sh
+docker compose build                   # build the image from docker/Dockerfile
+docker compose up -d                   # start the supervisor
+```
+
+`docker build -t enchiridion:0.1.0 -f docker/Dockerfile .` builds the same image
+on its own.
+[Deployment](docs/deployment.md) gives the full procedure.
 
 ## Documentation
 

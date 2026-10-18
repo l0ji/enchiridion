@@ -1,0 +1,79 @@
+# Deploy the enchiridion image with Compose. Docker builds the image from
+# docker/Dockerfile, so there is no registry to pull from:
+#
+#   docker compose build
+#   docker compose up -d
+#
+# docs/deployment.md gives the full procedure.
+
+name: enchiridion
+
+services:
+  enchiridion:
+    # Built from docker/Dockerfile. `docker compose up --build` rebuilds it,
+    # and `docker compose build` builds it alone.
+    image: ${ENCHIRIDION_IMAGE:-enchiridion:0.1.0}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+
+    container_name: enchiridion
+    restart: unless-stopped
+
+    # .env holds ENCHIRIDION_HTTP_TOKEN and the model key (OPENAI_API_KEY or
+    # OPENCODE_API_KEY). The file is optional. A non-loopback bind without a
+    # token exits 2. Compose also reads .env for ENCHIRIDION_IMAGE and
+    # ENCHIRIDION_PORT.
+    #
+    # env_file puts the values in the container environment. The loader unsets
+    # them in its own process, but Docker fixes the container environment at
+    # start, so `docker exec` still sees the names. docs/deployment.md gives the
+    # hardened route: mount .env at /run/secrets/.env instead.
+    env_file:
+      - path: .env
+        required: false
+
+    command:
+      - serve
+      - --channel
+      - http
+      - --bind
+      - 0.0.0.0
+      - --port
+      - "8787"
+
+    ports:
+      - "${ENCHIRIDION_PORT:-8787}:8787"
+
+    # The tmpfs is necessary. The entrypoint reads /proc/mounts and exits 1
+    # when /run/secrets is not a mount. This service uses env_file and not a
+    # bind mount of the host .env. The loader reads /run/secrets/.env when that
+    # file is there, and the environment when it is not. docs/deployment.md
+    # gives the hardened bind-mount route and its trade-offs.
+    tmpfs:
+      - /run/secrets:mode=0700
+
+    volumes:
+      - enchiridion-state:/var/lib/enchiridion
+
+    # Docker sends SIGTERM and waits 30 seconds before SIGKILL. The handler
+    # stops the supervisor and its channels, then closes the context.
+    stop_grace_period: 30s
+
+    # Cap the logs, so a long deployment does not fill the disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # hidepid stays off. To turn it on, add the capability below and run
+    # `mount -o remount,hidepid=2 /proc` in the container.
+    #
+    #   cap_add:
+    #     - SYS_ADMIN
+    #
+    # Without hidepid, uid 1000 can read /proc/1/environ.
+
+volumes:
+  enchiridion-state:

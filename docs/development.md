@@ -13,9 +13,13 @@ commit policy. [Testing](testing.md) covers the suite and the build gate.
 | `src/enchiridion/`         | The core, one file or one directory per subsystem |
 | `t/`                       | The test systems and the suites                   |
 | `config.example.cl`        | The tracked template for the configuration        |
-| `flake.nix`                | Build, check, test, and the container image       |
+| `flake.nix`                | Build, check, and test                            |
+| `docker/Dockerfile`        | The image build. Docker is the boundary           |
+| `.dockerignore`            | What the image build context excludes             |
 | `docker/entrypoint.sh`     | The two users, then the supervisor                |
+| `docker/enchiridion.sh`    | The wrapper the image installs as the program      |
 | `docker/isolation-test.sh` | The isolation checks, run by hand in the image    |
+| `compose.yml`              | The server deployment for the image               |
 | `docs/`                    | This documentation                                |
 | `LICENSE`                  | The BSD Zero Clause License                       |
 

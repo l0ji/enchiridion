@@ -289,74 +289,8 @@
           };
         };
 
-      # The container image. Docker is the isolation boundary and Nix performs
-      # every install inside it, so the result is a self contained closure with
-      # no SBCL, no Quicklisp, and nothing from the host on the host side.
-      # Linux only: an image needs a Linux builder, and a darwin host reaches
-      # one through Colima rather than by accident.
-      mkImage = { system }:
-        let pkgs = pkgsFor system;
-        in
-        pkgs.dockerTools.buildImage {
-          name = "enchiridion";
-          tag = "0.1.0";
-          copyToRoot = pkgs.buildEnv {
-            name = "enchiridion-root";
-            paths = [
-              (mkEnchiridion { inherit pkgs; })
-              (pkgs.runCommand "enchiridion-docker-files" { } ''
-                mkdir -p $out/usr/local/bin $out/bin
-                cp ${./docker/entrypoint.sh} $out/usr/local/bin/entrypoint.sh
-                cp ${./docker/isolation-test.sh} $out/usr/local/bin/isolation-test.sh
-                chmod +x $out/usr/local/bin/entrypoint.sh $out/usr/local/bin/isolation-test.sh
-                ln -s /bin/enchiridion $out/usr/local/bin/enchiridion
-                ln -s ${pkgs.bash}/bin/bash $out/bin/sh
-              '')
-              pkgs.bash
-              pkgs.coreutils
-              pkgs.gnugrep
-              pkgs.findutils
-              pkgs.util-linux
-              # The agent directory is a git repository, so journey and undo
-              # need git inside the image. It is not on the host side of the
-              # boundary and it never holds a secret.
-              pkgs.git
-              # The trust anchor for every TLS connection this process makes:
-              # the LLM call, the Fluxer gateway, and a webhook reply forwarded
-              # over HTTPS. The image is FROM scratch and does not inherit the
-              # host's /etc, so without this the handshake has nothing to
-              # verify a certificate against. Docker's buildImage copies the
-              # closure of copyToRoot into the layer, so the bundle arrives
-              # with the symlink that points at it.
-              pkgs.cacert
-            ];
-            # cacert keeps the bundle at /etc/ssl/certs/ca-bundle.crt. Linking
-            # the file's own directory rather than all of /etc keeps this list
-            # auditable: a package that installs something else under /etc does
-            # not reach the image root through it.
-            pathsToLink = [ "/bin" "/lib" "/cache" "/config" "/usr/local/bin" "/etc/ssl/certs" ];
-          };
-          config = {
-            User = "0:0";
-            Entrypoint = [ "/usr/local/bin/entrypoint.sh" ];
-            Env = [
-              "PATH=/usr/local/bin:/usr/bin:/bin"
-              "ENCHIRIDION_HOME=/var/lib/enchiridion"
-              # cl+ssl reads the bundle through OpenSSL, and OpenSSL reads
-              # SSL_CERT_FILE before its compiled-in default. The name is the
-              # file and not the directory: the directory form also needs the
-              # per-certificate hashes, and the file is the one the image
-              # ships.
-              "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
-            ];
-            ExposedPorts = { "8787/tcp" = { }; };
-            Volumes = { "/var/lib/enchiridion" = { }; };
-            WorkingDir = "/var/lib/enchiridion";
-          };
-        };
-
       # The flake evaluates for every supported system. Cheap, and it catches a
-      # broken attribute path long before a container build fails on it.
+      # broken attribute path long before a build fails on it.
       flake-check = { pkgs, system }:
         pkgs.runCommand "enchiridion-flake-check" { } ''
           echo "enchiridion flake evaluates for ${system}"
@@ -492,9 +426,6 @@
           enchiridion = mkEnchiridion { inherit pkgs; };
           enchiridion-aarch64-linux = mkEnchiridion { pkgs = pkgsFor "aarch64-linux"; };
           enchiridion-x86_64-linux = mkEnchiridion { pkgs = pkgsFor "x86_64-linux"; };
-        }
-        // lib.optionalAttrs (pkgs.stdenv.hostPlatform.isLinux) {
-          container = mkImage { inherit system; };
         }
       );
 

@@ -14,7 +14,7 @@ command table backs the shell and the REPL.
   `aarch64-darwin`.
 - Git, when you want history in the agent directory. The harness writes the
   files without git and skips only the commit.
-- A Linux builder, for the container image. The image is Linux only.
+- Docker, when you want the container image. It builds on amd64 and arm64.
 
 The flake supplies SBCL and every Lisp library. The project does not use
 Quicklisp.
@@ -36,7 +36,7 @@ nix run .#enchiridion -- help    # print the command list
 | `nix run .#enchiridion -- help` | Run the program with the `help` command.                                   |
 | `nix run .#enchiridion`         | Run the program with no command. This is the first launch.                 |
 | `nix run .`                     | Run the same program through the `default` app.                            |
-| `nix build .#container`         | Build the container image. Linux only.                                     |
+| `docker compose build`          | Build the container image from `docker/Dockerfile`.                        |
 
 `.#check` is the gate. It compiles every system file, then `src/main.cl` and
 `src/broker-exec.cl` on their own. A compiler warning becomes an error, so a

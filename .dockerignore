@@ -1,0 +1,28 @@
+# Build context for docker/Dockerfile. The Dockerfile copies only the system,
+# the source, and the container files, so the rest stays out of the context.
+# .env stays out on purpose: a secret must not reach the daemon.
+.git
+.gitignore
+.nix-cache
+.env
+.env.*
+agents
+run
+research
+docs
+t
+PLAN.md
+README.md
+LICENSE
+config.cl
+config.example.cl
+flake.nix
+flake.lock
+compose.yml
+compose.override.yml
+result
+result-*
+scratch
+*.fasl
+.docker-config
+.docker-build.log

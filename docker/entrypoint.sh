@@ -43,9 +43,10 @@ grep -q " $SECRETS_DIR " /proc/mounts 2>/dev/null || {
 
 chmod 700 "$SECRETS_DIR"
 
-# The host .env is copied in at start, never bind mounted. A bind mount would
-# put the operator's file at its host path inside the container, where the
-# source tree's shape makes it trivially findable.
+# The secret file is optional here. The operator supplies it as a read-only
+# bind mount at /run/secrets/.env, or copies it in after start, or puts the
+# values in the container environment. This script only reports an unexpected
+# mode; docs/deployment.md describes the routes and their trade-offs.
 if [ -f "$SECRETS_FILE" ]; then
   [ "$(stat -c '%a:%u' "$SECRETS_FILE")" = "600:0" ] || \
     log "$SECRETS_FILE has unexpected ownership; continuing"
@@ -63,7 +64,11 @@ fi
 AGENT_UID=$(id -u agent)
 AGENT_GID=$(id -g agent)
 
-mkdir -p "$STATE_DIR" "$STATE_DIR/agents/default" /run/enchiridion
+# run holds the broker socket and the control and status files. The broker
+# child drops to the agent uid and binds the socket there, so run must exist
+# before the chown and must belong to the agent. tmp is the agent's scratch
+# directory, because /tmp is not writable by uid 1000 in every image.
+mkdir -p "$STATE_DIR" "$STATE_DIR/agents/default" "$STATE_DIR/run" "$STATE_DIR/tmp" /run/enchiridion
 # The broker runs as the agent and must read and write the files it acts on.
 # The supervisor is root and reaches them anyway; the secrets tmpfs is the one
 # directory that stays 700 root.

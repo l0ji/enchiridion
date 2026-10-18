@@ -282,14 +282,15 @@ broken reply."
 ;; wants every keyword of an F-TYPE lambda list declared in an earlier one, and
 ;; a dummy declaration per keyword costs more than the annotation catches.
 
-(defun persist-turn (store session role body &key model)
+(defun persist-turn (store session role body &key model (channel :cli))
   "Record one turn in STORE when there is a store and text to record.
 
 An empty body is skipped: a tool-calling assistant message often has no words
 in it, and a row that matches nothing is noise in every later search. A store
 that refuses the write prints one line and lets the turn finish, because
 losing the transcript is bad and losing the reply is worse. MODEL names what
-answered, which is empty for the operator's own turn."
+answered, which is empty for the operator's own turn. CHANNEL names the
+surface the turn arrived on, so the usage report can group by it."
   (when (and store (stringp body) (plusp (length body)))
     (handler-case
         (enchiridion.memory.store:record-turn
@@ -297,7 +298,8 @@ answered, which is empty for the operator's own turn."
          :session (and session (session-id session))
          :role role
          :body body
-         :model (or model ""))
+         :model (or model "")
+         :channel channel)
       (error (condition)
         (format *error-output* "~&enchiridion: could not record a turn: ~A~%"
                 condition)))))
@@ -354,12 +356,12 @@ caller that does is a caller that runs two turns at once."
                             (enchiridion.llm.secrets:scrub text))))
            (rounds 0)
            (completion nil))
-      (persist-turn store session "user" text)
+      (persist-turn store session "user" text :channel channel)
       (loop
         (when (and cancel-p (funcall cancel-p))
           (error 'enchiridion.errors:turn-cancelled :turn rounds))
         (setf completion (complete-with-tools backend messages model tools))
-        (persist-usage store session (record-spend agent completion))
+        (persist-usage store session (record-spend agent completion :channel channel))
         (when session
           (push completion (session-turns session)))
         ;; Every round is written down, and the last one is the reply the
@@ -367,7 +369,8 @@ caller that does is a caller that runs two turns at once."
         ;; would store the questions and forget every answer.
         (persist-turn store session "assistant"
                       (enchiridion.llm:completion-text completion)
-                      :model (enchiridion.llm:completion-model completion))
+                      :model (enchiridion.llm:completion-model completion)
+                      :channel channel)
         (let ((calls (enchiridion.llm:completion-tool-calls completion)))
           (unless (and calls (< rounds (agent-tool-rounds agent)))
             (return completion))
@@ -379,7 +382,7 @@ caller that does is a caller that runs two turns at once."
                                calls))))
           (dolist (call calls)
             (let ((result (execute-tool agent call)))
-              (persist-turn store session "tool" result)
+              (persist-turn store session "tool" result :channel channel)
               (setf messages
                     (append messages
                             (list (enchiridion.llm:tool-message

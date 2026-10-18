@@ -428,11 +428,15 @@ agent user, and only a generation that exits zero is loaded for real."
                         :generation generation
                         :report (or (gethash "report" reply) "")))))))))
 
-(defun make-respond (context cancelled)
+(defun make-respond (context cancelled &key (channel :cli))
   "Return the function the command table calls for one turn.
 
 A turn the operator stopped is reported as stopped and not as a failure: the
-tokens are spent either way, and the operator asked for it."
+tokens are spent either way, and the operator asked for it.
+
+CHANNEL is the surface the turn arrived on. It is recorded on every spend row
+and every transcript row, and it names the git commit, so a turn that came in
+over the webhook is not filed as a turn typed at the terminal."
   (lambda (text)
     (handler-case
         (progn
@@ -447,7 +451,7 @@ tokens are spent either way, and the operator asked for it."
                              (context-agent context) text
                              :session (context-session context)
                              :store (context-store context)
-                             :channel :cli
+                             :channel channel
                              :cancel-p (lambda () (car cancelled)))))
             (print-completion completion (context-config context))
             0))

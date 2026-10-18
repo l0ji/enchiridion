@@ -181,6 +181,43 @@
                                   :validate t
                                   :if-does-not-exist :ignore))))
 
+;;;; The channel a turn arrived on.
+
+(deftest a-turn-records-the-channel-it-arrived-on ()
+  ;; Every surface normalises into one loop, so the only place a webhook turn
+  ;; and a typed turn differ is the channel they carry. A ledger grouped by
+  ;; channel is a lie if the loop does not pass it on.
+  (let* ((directory (uiop:ensure-directory-pathname
+                     (merge-pathnames
+                      (format nil "enchiridion-kernel-test-~D/"
+                              (random most-positive-fixnum))
+                      (uiop:ensure-directory-pathname *default-pathname-defaults*))))
+         (store (enchiridion.memory.store:open-store
+                 :path (merge-pathnames "memory.db" directory))))
+    (unwind-protect
+         (let ((agent (enchiridion.kernel:make-agent
+                       :backend (make-fake-backend)
+                       :blocks (list (make-test-block "voice"))
+                       :tools-p nil)))
+           (enchiridion.kernel:run-turn agent "who is asking" :channel :http
+                                                          :store store)
+           (testing "the transcript row names the channel"
+             (let ((row (first (enchiridion.memory.store:search-sessions
+                                store "who is asking"))))
+               (ok row)
+               ;; A turn row carries the channel as a keyword; the usage row
+               ;; below carries it as the string SQLite stores.
+               (ok (eq :http
+                       (enchiridion.memory.store:turn-row-channel row)))))
+           (testing "and the spend row names it too"
+             (let ((row (first (enchiridion.memory.store:usage-rows store))))
+               (ok row)
+               (ok (string= "http" (getf row :channel))))))
+      (ignore-errors (enchiridion.memory.store:close-store store))
+      (uiop:delete-directory-tree directory
+                                  :validate t
+                                  :if-does-not-exist :ignore))))
+
 ;;;; One turn at a time.
 
 ;; A backend that stays inside COMPLETE until the test lets it go, so a second

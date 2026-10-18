@@ -137,6 +137,12 @@ nix run .#enchiridion -- serve
 is a command, for example `/help`. The prompt is `enchiridion> `. The line
 `/quit` leaves the session. An end of input also leaves.
 
+`/help` prints every command in the slash form the REPL reads, and it adds the
+REPL-only `/stop`, `/quit`, and `/who`. The shell-only commands `chat` and
+`serve` are not on that list. A lone word that names a REPL command, such as
+`help`, prints ``Commands start with a slash: try `/help`.`` and sends no turn.
+Two or more words, and a word that names nothing, are still turns.
+
 The reply goes to standard output. A token line goes to standard error:
 
 ```text
@@ -153,7 +159,7 @@ The line shows the model, the input tokens, and the output tokens. It adds
 | `Configuration is wrong at :api-key.` and `No API key. Put OPENAI_API_KEY in .env or the environment.` The exit status is 1. | The process holds no API key.                                 | Put the key in `.env` or the environment. The variable name comes from `:api-key-env`.  |
 | `enchiridion: stdin is not a terminal, so the cli channel stays down.`                                                       | The terminal channel needs a terminal on standard input.      | Run `serve` from a terminal. In a pipe, `chat` reads an end of input and exits at once. |
 | `reload: no supervisor is running, so nothing was asked.` The exit status is 1.                                              | `reload`, `channels`, and `heartbeat` need a live supervisor. | Start `serve` in another terminal. `health` reads the status file only.                 |
-| There is no command called NAME. Try `help`. The exit status is 2.                                                           | The name is not in the command table.                         | Run `help`, or read [Commands](commands.md).                                            |
+| There is no command called NAME. Try `help`. The exit status is 2. At the REPL the last words are ``Try `/help`.``.                                     | The name is not in the command table.                         | Run `help`, or read [Commands](commands.md).                                            |
 | `The --bind, --port and --token-env flags belong to --channel http.` The exit status is 2.                                   | A webhook flag came without `--channel http`.                 | Add `--channel http` to the command.                                                    |
 | `There is no channel called NAME. The channels are cli, http and fluxer.` The exit status is 2.                              | The `--channel` value is not one of the three channels.       | Use `cli`, `http`, or `fluxer`.                                                         |
 | `The port must be a number between 1 and 65535, not X.` The exit status is 2.                                                | The `--port` value is not a port number.                      | Give a number in the range.                                                             |

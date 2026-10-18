@@ -43,6 +43,14 @@ The caller binds this around RUN-COMMAND or RUN-REPL. A handler never takes a
 second argument, so the shell path and the REPL path call the same function
 object with the same shape.")
 
+(defvar *repl-p* nil
+  "True when the command being read came from the REPL and not from a shell.
+
+One table backs both surfaces, and a command name is spelled differently on
+each: the operator types `/help` at the REPL and `enchiridion help` at a shell.
+This is the flag that lets a message name the command the way the surface in
+front of the operator spells it. REPL-EVALUATE binds it around a whole line.")
+
 ;; The table itself is filled at the end of this file, after every handler it
 ;; names exists. The special proclamation lets the lookup functions below refer
 ;; to it before the DEFPARAMETER that gives it a value.
@@ -57,6 +65,28 @@ object with the same shape.")
   (apply #'format *standard-output* control arguments)
   (terpri *standard-output*)
   nil)
+
+(declaim (ftype (function (t) string) command-label))
+
+(defun command-label (name)
+  "Return NAME as the operator types it: /name at the REPL, name at a shell.
+
+A table row holds a bare name, because the table does not know which surface is
+reading it. Every line that tells the operator to type a command goes through
+here, so the REPL and the shell each name the command their own way."
+  (if *repl-p*
+      (concatenate 'string "/" (string name))
+      (string name)))
+
+(declaim (ftype (function (t) t) strip-command-slash))
+
+(defun strip-command-slash (name)
+  "Return NAME without one leading slash, so /help and help name the same row.
+
+A name that is not a string, or has no slash, is returned unchanged."
+  (if (and (stringp name) (plusp (length name)) (char= #\/ (char name 0)))
+      (subseq name 1)
+      name))
 
 (declaim (ftype (function () t) context))
 
@@ -81,7 +111,11 @@ object with the same shape.")
 (defun require-respond (command)
   "Return 1 after one readable line when COMMAND has no live agent, else NIL."
   (unless (command-context-respond (context))
-    (say "~A needs a live agent. Start one with `chat`, or use `ask` from a shell." command)
+    ;; CHAT is shell-only, so it is named the way a shell invocation names it
+    ;; and not through COMMAND-LABEL: the fix is to leave the REPL, which the
+    ;; slash form would not say.
+    (say "~A needs a live agent. Start one with `enchiridion chat` in a shell, or run `ask`."
+         (command-label command))
     1))
 
 (declaim (ftype (function (string) (or null integer)) require-store))
@@ -89,7 +123,8 @@ object with the same shape.")
 (defun require-store (command)
   "Return 1 after one readable line when COMMAND has no store, else NIL."
   (unless (command-context-store (context))
-    (say "~A needs the memory store, and none is open in this process." command)
+    (say "~A needs the memory store, and none is open in this process."
+         (command-label command))
     1))
 
 (declaim (ftype (function () t) supervisor-status))
@@ -104,7 +139,8 @@ object with the same shape.")
 
 (defun no-supervisor (command)
   "Say that COMMAND found no running supervisor and return 1."
-  (say "~A: no supervisor is running, so nothing was asked." command)
+  (say "~A: no supervisor is running, so nothing was asked."
+       (command-label command))
   1)
 
 (declaim (ftype (function (t) integer) report-control))
@@ -256,24 +292,54 @@ their argument is free text."
       ((= minimum maximum) (format nil "exactly ~D argument~:P" minimum))
       (t (format nil "~D to ~D arguments" minimum maximum)))))
 
+(defparameter +repl-only-commands+
+  '(("stop" "Ask the turn in flight to stop")
+    ("quit" "Leave the session")
+    ("who" "Show the live channel and the supervisor"))
+  "The rows the REPL has and the shell does not, as (name summary).
+
+They act on the live turn, so they are not table rows: the shell has no turn in
+flight to stop and no session to leave. The REPL prints them with the rest of
+the help, which is why they live here as rows and not only as names.")
+
+(defparameter +not-in-repl+ '("chat" "serve")
+  "The table rows the REPL help leaves out, because they do not work there.
+
+`chat` starts a nested REPL and `serve` polls a control file forever, so a
+slash line that reached either one would not answer the operator who typed it.
+Both stay shell commands and keep their rows in the table.")
+
 (declaim (ftype (function (&optional t) integer) command-help))
 
 (defun command-help (&optional name)
   "Print the command list, or the detail for NAME.
 
-Return 0, or 2 for a name that is not a command. The detail is the summary and
-the argument range, which is all a caller needs to form a correct call."
+Return 0, or 2 for a name that is not a command. At the REPL the list labels
+every command with the slash the operator types, adds the REPL-only commands,
+and leaves out the shell-only ones; the shell keeps the bare names. The detail
+is the summary and the argument range, which is all a caller needs to form a
+correct call."
+  (fresh-line *standard-output*)
   (if name
-      (let ((row (find-command name)))
+      (let* ((label (strip-command-slash name))
+             (row (find-command label)))
         (unless row
-          (say "There is no command called ~A." name)
+          (say "There is no command called ~A." label)
           (return-from command-help 2))
-        (say "~A -- ~A" (first row) (fifth row))
+        (when (and *repl-p* (member label +not-in-repl+ :test #'string-equal))
+          (say "~A is a shell-only command, so the REPL does not have it." label)
+          (return-from command-help 2))
+        (say "~A -- ~A" (command-label (first row)) (fifth row))
         (say "  arguments: ~A" (arity-text row))
         0)
       (progn
         (dolist (row *commands*)
-          (say "~A~VT~A" (first row) 14 (fifth row)))
+          (unless (and *repl-p*
+                       (member (first row) +not-in-repl+ :test #'string-equal))
+            (say "~A~VT~A" (command-label (first row)) 14 (fifth row))))
+        (when *repl-p*
+          (dolist (row +repl-only-commands+)
+            (say "~A~VT~A" (command-label (first row)) 14 (second row))))
         0)))
 
 (declaim (ftype (function (t list) integer) run-command))
@@ -287,13 +353,14 @@ anything. A command that succeeded returns 0; a command that refused its
 situation returns 1 and says why."
   (let ((row (find-command name)))
     (unless row
-      (say "There is no command called ~A. Try `help`." name)
+      (say "There is no command called ~A. Try `~A`." name (command-label "help"))
       (return-from run-command 2))
     (let ((count (length arguments))
           (minimum (second row))
           (maximum (third row)))
       (unless (and (>= count minimum) (or (null maximum) (<= count maximum)))
-        (say "~A takes ~A; got ~D." (first row) (arity-text row) count)
+        (say "~A takes ~A; got ~D."
+             (command-label (first row)) (arity-text row) count)
         (return-from run-command 2))
       (let ((status (funcall (fourth row) arguments)))
         (if (integerp status) status 0)))))
@@ -304,7 +371,21 @@ situation returns 1 and says why."
 
 (defun repl-only-commands ()
   "Return the commands only the REPL has, because they act on the live turn."
-  '("stop" "quit" "who"))
+  (mapcar #'first +repl-only-commands+))
+
+(declaim (ftype (function (string) boolean) repl-command-name-p))
+
+(defun repl-command-name-p (name)
+  "Return T when the REPL accepts NAME as a command.
+
+A bare word earns the slash hint only when its slash form would work, so the
+shell-only rows are left out and a bare `chat` stays a turn like any other."
+  (and (not (member name +not-in-repl+ :test #'string-equal))
+       ;; NOT NULL and not the row itself: the proclamation promises BOOLEAN,
+       ;; and FIND-COMMAND returns the row, which is a list. Safety 3 catches
+       ;; the mismatch and the gate makes it fatal.
+       (not (null (or (find-command name)
+                      (member name (repl-only-commands) :test #'string-equal))))))
 
 (declaim (ftype (function () t) request-cancel))
 
@@ -368,15 +449,28 @@ and neither is worth an error."
   "Evaluate one REPL LINE. Return :QUIT to leave the session.
 
 A line beginning with a slash is a command; anything else is a turn sent
-through the respond function, so the REPL and the shell share one path."
-  (let ((trimmed (string-trim '(#\Space #\Tab #\Return) line)))
-    (cond
-      ((zerop (length trimmed)) 0)
-      ((char= #\/ (char trimmed 0))
-       (let ((parts (split-line trimmed)))
-         (evaluate-repl-command (string-downcase (subseq (first parts) 1))
-                                (rest parts))))
-      (t (run-plain-turn trimmed)))))
+through the respond function, so the REPL and the shell share one path. One
+bare word is the exception: when it names a command the REPL has, the operator
+left off the slash, and the REPL says so instead of spending a turn on it."
+  (let ((*repl-p* t))
+    (let ((trimmed (string-trim '(#\Space #\Tab #\Return) line)))
+      (cond
+        ((zerop (length trimmed)) 0)
+        ((char= #\/ (char trimmed 0))
+         (let ((parts (split-line trimmed)))
+           (evaluate-repl-command (string-downcase (subseq (first parts) 1))
+                                  (rest parts))))
+        (t
+         (let* ((parts (split-line trimmed))
+                (word (string-downcase (first parts))))
+           (if (and (= 1 (length parts)) (repl-command-name-p word))
+               (progn
+                 ;; The word the operator typed, not a fixed `help`: the slash
+                 ;; form of the command they reached for is the one they need.
+                 (say "Commands start with a slash: try `~A`."
+                      (command-label word))
+                 0)
+               (run-plain-turn trimmed))))))))
 
 (declaim (ftype (function (&key (:context t) (:input t) (:output t)) t) run-repl))
 

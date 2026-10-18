@@ -13,14 +13,26 @@ nix run .#enchiridion -- ask "What is in WORLD.md?"
 nix run .#enchiridion -- usage
 ```
 
-In the REPL, a command starts with a slash:
+In the REPL, a command starts with a slash. `/help` prints every REPL command
+in that form, so the list the operator reads is the list the operator can type:
 
 ```text
 enchiridion> /help
 enchiridion> /usage
 ```
 
-A line without a slash is a turn, and the REPL sends it to the agent.
+The REPL has three commands of its own that the shell does not: `/stop`,
+`/quit`, and `/who`. They act on the live turn, so a shell invocation cannot
+run them. `chat` and `serve` are the other way around. They are shell-only
+commands, because `chat` starts a nested REPL and `serve` starts a supervisor.
+The `/help` list leaves both off, and `/help chat` says that `chat` is a
+shell-only command and returns 2.
+
+A line without a slash is a turn, and the REPL sends it to the agent. A single
+word that is a REPL command name is the exception: the REPL prints
+``Commands start with a slash: try `/NAME`.``, where NAME is the word that was
+typed, returns 0, and sends no turn. Two or more words, and a word that names
+nothing, are turns as usual.
 
 The command line reads four flags: `--channel NAME`, `--bind ADDRESS`,
 `--port NUMBER`, and `--token-env NAME`. The flags come before the command.
@@ -48,8 +60,13 @@ line and returns 2:
 There is no command called NAME. Try `help`.
 ```
 
-A call outside the argument range prints `NAME takes ARGUMENTS; got N.` and
-returns 2.
+At the REPL the same line reads
+``There is no command called NAME. Try `/help`.``
+Every message that names a command names it the way the surface does: the REPL
+adds the slash, and the shell does not. So the arity line reads `NAME takes
+ARGUMENTS; got N.` at a shell and `/NAME takes ARGUMENTS; got N.` at the REPL.
+
+A call outside the argument range prints that line and returns 2.
 
 ## The command table
 
@@ -286,6 +303,12 @@ With a name it prints `NAME -- SUMMARY` and `  arguments: ARITY`. The arity
 text reads `no arguments`, `at least N arguments`, `exactly N arguments`, or
 `N to M arguments`. An unknown name returns 2.
 
+At the REPL the command name is printed as `/NAME`, the three REPL-only
+commands are appended to the list, `chat` and `serve` are left out, and the
+bare name and the slash form both resolve. In the REPL, `/help chat` and
+`/help serve` print one line that says the command is shell-only and return 2.
+At a shell, `enchiridion help chat` prints the detail as usual.
+
 ### `skills`
 
 `list` prints every skill file with a number and its trigger line. A skill with
@@ -306,15 +329,18 @@ lower case.
 
 | Line    | What it does                                                                                                                                                       |
 | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `/help` | Prints the command list.                                                                                                                                           |
+| `/help` | Prints the command list in its slash form, with the REPL-only commands and without `chat` and `serve`.                                                              |
 | `/stop` | Asks the turn in flight to stop. It prints `cancellation requested.` and returns 0. Without a cancel function it prints `there is no turn to stop.` and returns 1. |
 | `/quit` | Leaves the session. `run-repl` returns `:quit`.                                                                                                                    |
 | `/who`  | Prints the attached channel and the supervisor state, then returns 0.                                                                                              |
 
 `stop`, `quit`, and `who` are REPL-only, because they act on the live turn. The
 other commands are the table above, and the REPL calls the same handler the
-shell calls. A REPL-only name needs the slash. The word `quit` without a slash
-is a turn, and the agent answers it.
+shell calls. A REPL-only name needs the slash. A lone word that names a REPL
+command, `quit` and `help` among them, prints
+``Commands start with a slash: try `/NAME`.``, where NAME is the word that was
+typed, and does not reach the agent. `chat` and `serve` are shell-only, so a
+lone `chat` is an ordinary turn.
 
 An empty line does nothing. A line that names no command prints the
 unknown-command line, and the REPL reads the next one. `run-repl` ignores the

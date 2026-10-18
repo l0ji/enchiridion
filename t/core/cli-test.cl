@@ -60,6 +60,23 @@ is not."
               (setf status (enchiridion.channel.cli:run-command name arguments)))
             status)))
 
+(declaim (ftype (function (string &optional t) (values string t)) captured-repl))
+
+(defun captured-repl (lines &optional context)
+  "Run LINES through the REPL and return its output and its result.
+
+CONTEXT defaults to a fresh one that holds nothing live. The REPL binds
+*STANDARD-OUTPUT* to the capture stream, so a command that prints is read back
+here the way the operator would see it."
+  (let ((result nil)
+        (context (or context (enchiridion.channel.cli:make-command-context))))
+    (values (with-output-to-string (stream)
+              (setf result (enchiridion.channel.cli:run-repl
+                            :context context
+                            :input (make-string-input-stream lines)
+                            :output stream)))
+            result)))
+
 ;;;; The table.
 
 (deftest the-command-set-is-the-plan-set ()
@@ -150,6 +167,30 @@ is not."
         (dolist (name (enchiridion.channel.cli:command-names))
           (ok (search name text)))))))
 
+(deftest shell-help-keeps-the-bare-names ()
+  ;; The shell calls the program by name, so a slash form here would tell the
+  ;; operator to type something the shell does not accept.
+  (let ((status nil))
+    (let ((text (with-output-to-string (*standard-output*)
+                  (setf status (enchiridion.channel.cli:command-help)))))
+      (ok (eql 0 status))
+      (testing "every table command is listed"
+        (dolist (name (enchiridion.channel.cli:command-names))
+          (ok (search name text))))
+      (testing "and none of them carries a slash"
+        (ng (search "/" text))))))
+
+(deftest shell-help-still-resolves-a-listed-command ()
+  ;; CHAT and SERVE are shell-only for the REPL and ordinary rows for the
+  ;; shell, so `enchiridion help chat` has to keep working.
+  (dolist (name '("chat" "serve"))
+    (testing name
+      (let ((status nil))
+        (let ((text (with-output-to-string (*standard-output*)
+                      (setf status (enchiridion.channel.cli:command-help name)))))
+          (ok (eql 0 status))
+          (ok (search (format nil "~A -- " name) text)))))))
+
 ;;;; The REPL surface.
 
 (deftest repl-only-commands-stay-out-of-the-table ()
@@ -196,6 +237,112 @@ is not."
            (output (make-string-output-stream)))
       (ok (eq :quit (enchiridion.channel.cli:run-repl :input input :output output)))
       (ok (search "no channel is attached" (get-output-stream-string output))))))
+
+(deftest repl-help-lists-the-slash-form-and-the-repl-only-commands ()
+  ;; The bug this guards: `help` printed bare names, so the operator typed the
+  ;; one form the REPL does not read and spent a turn on it.
+  (multiple-value-bind (text result) (captured-repl (format nil "/help~%/quit~%"))
+    (ok (eq :quit result))
+    (testing "every command is labelled the way the operator types it"
+      (dolist (name '("/help" "/quit" "/stop" "/who"))
+        (ok (search name text))))
+    (testing "a command the REPL cannot run stays off the list"
+      (ng (search "/chat" text))
+      (ng (search "/serve" text)))))
+
+(deftest repl-help-detail-labels-the-command-and-takes-the-slash-form ()
+  (testing "the bare name resolves"
+    (multiple-value-bind (text result)
+        (captured-repl (format nil "/help skills~%/quit~%"))
+      (ok (eq :quit result))
+      (ok (search "/skills -- " text))
+      (ok (search "arguments:" text))))
+  (testing "the slash form resolves to the same row"
+    (multiple-value-bind (text result)
+        (captured-repl (format nil "/help /skills~%/quit~%"))
+      (ok (eq :quit result))
+      (ok (search "/skills -- " text)))))
+
+(deftest repl-help-refuses-a-shell-only-command ()
+  (with-empty-context
+    (dolist (name '("chat" "serve"))
+      (testing name
+        (let ((status nil))
+          (let ((text (with-output-to-string (*standard-output*)
+                        (setf status (enchiridion.channel.cli:repl-evaluate
+                                      (format nil "/help ~A" name))))))
+            (ok (eql 2 status))
+            (ok (search "shell-only" text))))))))
+
+(deftest a-bare-repl-command-word-hints-at-the-slash ()
+  (let* ((turns '())
+         (context (enchiridion.channel.cli:make-command-context
+                   :respond (lambda (text) (push text turns) 0))))
+    (multiple-value-bind (text result)
+        (captured-repl (format nil "help~%/quit~%") context)
+      (ok (eq :quit result))
+      (ok (search "Commands start with a slash" text))
+      (ok (search "try `/help`" text)))
+    (testing "the hint is not a turn, so the respond function is not called"
+      (ok (null turns)))))
+
+(deftest multi-word-and-unknown-repl-lines-stay-turns ()
+  (testing "two words are a turn even when the first names a command"
+    (let* ((turns '())
+           (context (enchiridion.channel.cli:make-command-context
+                     :respond (lambda (text) (push text turns) 0))))
+      (captured-repl (format nil "help me~%") context)
+      (ok (equal '("help me") turns))))
+  (testing "a lone word that names nothing is a turn"
+    (let* ((turns '())
+           (context (enchiridion.channel.cli:make-command-context
+                     :respond (lambda (text) (push text turns) 0))))
+      (captured-repl (format nil "nonesuch~%") context)
+      (ok (equal '("nonesuch") turns))))
+  (testing "a shell-only word is a turn, because the REPL cannot run it"
+    (let* ((turns '())
+           (context (enchiridion.channel.cli:make-command-context
+                     :respond (lambda (text) (push text turns) 0))))
+      (captured-repl (format nil "chat~%") context)
+      (ok (equal '("chat") turns)))))
+
+(deftest repl-messages-name-the-command-with-a-slash ()
+  (with-empty-context
+    (testing "the arity line labels the command"
+      (let ((status nil))
+        (let ((text (with-output-to-string (*standard-output*)
+                      (setf status (enchiridion.channel.cli:repl-evaluate "/undo")))))
+          (ok (eql 2 status))
+          (ok (search "/undo takes" text)))))
+    (testing "an unknown name points at the slash form of help"
+      (let ((status nil))
+        (let ((text (with-output-to-string (*standard-output*)
+                      (setf status (enchiridion.channel.cli:repl-evaluate "/nonesuch")))))
+          (ok (eql 2 status))
+          (ok (search "Try `/help`" text)))))
+    (testing "the store line labels the command"
+      (let ((status nil))
+        (let ((text (with-output-to-string (*standard-output*)
+                      (setf status (enchiridion.channel.cli:repl-evaluate "/memory q")))))
+          (ok (eql 1 status))
+          (ok (search "/memory needs the memory store" text)))))
+    (testing "the agent line labels the command and names the shell-only start"
+      (let ((status nil))
+        (let ((text (with-output-to-string (*standard-output*)
+                      (setf status (enchiridion.channel.cli:repl-evaluate "/ask hi")))))
+          (ok (eql 1 status))
+          (ok (search "/ask needs a live agent" text))
+          ;; CHAT is shell-only, so it is named as a shell invocation and not
+          ;; as `/chat`: the slash form would send the operator to a REPL
+          ;; command the REPL does not list.
+          (ok (search "`enchiridion chat`" text))
+          (ng (search "`/chat`" text)))))
+    (testing "the supervisor line labels the command"
+      (let ((status nil))
+        (let ((text (with-output-to-string (*standard-output*)
+                      (setf status (enchiridion.channel.cli:repl-evaluate "/reload")))))
+          (ok (eql 1 status))
+          (ok (search "/reload: no supervisor" text)))))))
 
 ;;;; The supervisor commands.
 

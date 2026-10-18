@@ -24,9 +24,16 @@
   ;; dbi and dbd-sqlite3 are the SQLite binding the memory store opens. The
   ;; driver is named rather than left to DBI's own loader, so opening a store
   ;; never depends on a system load inside a query.
+  ;;
+  ;; hunchentoot serves the webhook. clack was named in the plan for that job,
+  ;; but the core clack system ships no handler: clackup needs
+  ;; clack-handler-hunchentoot, which is the same hunchentoot plus a
+  ;; middleware layer nothing here uses. websocket-driver-client is the Fluxer
+  ;; gateway: dexador is an HTTP client and has no WebSocket support at all.
   :serial t
   :depends-on ("alexandria" "cl-ppcre" "dexador" "com.inuoe.jzon"
                "cl-jschema" "usocket" "bordeaux-threads"
+               "hunchentoot" "websocket-driver-client"
                "dbi" "dbd-sqlite3")
   :components
   ((:module "src"

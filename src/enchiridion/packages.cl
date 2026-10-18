@@ -297,7 +297,8 @@ refused at startup rather than at first request."))
 
 (defpackage #:enchiridion.channel.fluxer
   (:use #:cl)
-  (:export #:start-fluxer #:stop-fluxer #:fluxer-running-p #:allowed-p)
+  (:export #:start-fluxer #:stop-fluxer #:fluxer-running-p #:allowed-p
+           #:make-fluxer-channel)
   (:documentation
    "Direct messages only. Group channels, guild events, mentions, and
 reactions are all out, so the allowlist is the whole authorisation story."))

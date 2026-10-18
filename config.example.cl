@@ -49,10 +49,11 @@
     (:http
      (:enabled nil)
      ;;; Loopback only by default. A non-loopback bind requires a token, and
-     ;;; the harness refuses to start without one. The token comes from the
-     ;;; variable named here, or from .env, and never from this file: a
-     ;;; literal here would not pass through the scrubber. :token stays
-     ;;; accepted for a loopback bind and for tests.
+     ;;; the harness refuses to start without one. Name the variable here and
+     ;;; keep the value in .env or the environment: a token written into this
+     ;;; file is a token in a file a person copies between hosts. A literal
+     ;;; :token below is accepted and registered with the scrubber, and it is
+     ;;; meant for a loopback bind and for tests.
      (:bind "127.0.0.1")
      (:port 8787)
      (:token-env "ENCHIRIDION_HTTP_TOKEN")

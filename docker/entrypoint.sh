@@ -1,15 +1,17 @@
 #!/bin/sh
 # entrypoint.sh --- Container entry point.
 #
-# The two mount flags the security model depends on are set on the command
-# line rather than here, because only the runtime can honour them:
+# The two isolation flags the security model depends on belong on the run
+# command line rather than here, because only the runtime can honour them:
 #
 #   --tmpfs /run/secrets:mode=0700
-#   --mount type=proc,source=proc,destination=/proc,options=hidepid=2
+#   --cap-add SYS_ADMIN          # then: mount -o remount,hidepid=2 /proc
 #
-# A bind mount for /run/secrets defeats the isolation, and /proc without
-# hidepid lets the sandbox read the supervisor's environment. Both belong in
-# the run command, and docker/ is not the place to keep them.
+# A bind mount for /run/secrets defeats the isolation. So does /proc without
+# hidepid: it lets the sandbox read the supervisor's cmdline, file descriptors
+# and memory maps. Docker has no proc mount type, so the run line adds the
+# capability and the remount is the operator's next step, which is why this
+# script does not pretend to do it.
 #
 # What this script does is set up the two users and hand over. It never writes
 # a secret anywhere a later process could find it, and it never prints one.

@@ -24,8 +24,7 @@
   (:export
    #:main #:project-root #:resolve-project-root #:agent-directory
    #:environment-value #:load-config #:first-launch-p #:run-command
-   #:join-arguments #:secrets-api-key
-   #:*commands*)
+   #:join-arguments #:secrets-api-key)
   (:documentation
    "Process entry: roots, configuration, argument handling, and first launch."))
 
@@ -67,10 +66,8 @@ string the operator sees."
                             (muffle-warning condition)))))
   (asdf:load-system "enchiridion" :verbose nil))
 
-;; The table is defined after the handlers it names, and two of the
-;; handlers read the table, so the forward reference is real. Proclaiming
-;; it here is what keeps the compiler from warning about it.
-(declaim (special *commands*))
+;; The command table lives in the channel package now. This file only builds
+;; the context a command reads, so nothing here is forward referenced.
 
 ;;;; Roots.
 ;;;;
@@ -265,6 +262,30 @@ through .env would be the one that leaks."
                                    (enchiridion.memory:state-generation directory)
                                  (error () 0)))))
 
+(defun install-agent-proxies (context sources generation)
+  "Register one proxy tool per agent plugin and record GENERATION.
+
+The model has to see each authored schema, and the supervisor must not hold the
+handler. A proxy is the tool the model sees with a handler that refuses: every
+call is routed to the broker before dispatch reaches it."
+  (enchiridion.plugin:discard-generation (context-generation context))
+  (dolist (manifest (handler-case (enchiridion.plugin:plugin-manifests sources)
+                      (error () '())))
+    (enchiridion.tools:register-tool
+     (enchiridion.tools:make-tool
+      :name (enchiridion.plugin:manifest-name manifest)
+      :description (enchiridion.plugin:manifest-description manifest)
+      :schema (enchiridion.plugin:manifest-schema manifest)
+      :generation generation
+      :broker-side-p t
+      :handler (lambda (arguments)
+                 (declare (ignore arguments))
+                 (error 'enchiridion.errors:configuration-error
+                        :key :broker
+                        :detail "This tool runs in the broker.")))))
+  (setf (context-generation context) generation)
+  generation)
+
 (defun load-agent-generation (context)
   "Verify the agent's skills and tools in a one-shot child, then load them in
 the broker and register the proxy tools the model sees. Return the generation.
@@ -281,20 +302,7 @@ and only a generation that exits zero is loaded for real."
            :uid (agent-uid (context-config context)))
         (unless ok-p
           (error 'enchiridion.errors:tool-error :tool "reload" :detail output))
-        (enchiridion.plugin:discard-generation (context-generation context))
-        (dolist (manifest (enchiridion.plugin:plugin-manifests sources))
-          (enchiridion.tools:register-tool
-           (enchiridion.tools:make-tool
-            :name (enchiridion.plugin:manifest-name manifest)
-            :description (enchiridion.plugin:manifest-description manifest)
-            :schema (enchiridion.plugin:manifest-schema manifest)
-            :generation generation
-            :broker-side-p t
-            :handler (lambda (arguments)
-                       (declare (ignore arguments))
-                       (error 'enchiridion.errors:configuration-error
-                              :key :broker
-                              :detail "This tool runs in the broker.")))))
+        (install-agent-proxies context sources generation)
         (enchiridion.tools.broker:broker-load-generation
          (context-broker context) directory :generation generation)))
     (setf (context-generation context) generation)
@@ -363,78 +371,19 @@ status. The child drops to the agent uid before it reads a single agent file."
     (finish-output)
     (if ok-p 0 1)))
 
-;;;; The command table.
+;;;; Driving a command.
 ;;;;
-;;;; One table backs both the shell and the REPL, so the two surfaces cannot
-;;;; drift apart. Milestone 6 moves this table into the channel package; it is
-;;;; here now because the first launch needs something to call.
+;;;; One table backs both the shell and the REPL, and it lives in the channel
+;;;; package. This file builds the context that table reads, hands the command
+;;;; over, and closes what it opened. A command that needs a live agent gets
+;;;; one lazily through RESPOND, so `enchiridion version` opens no socket.
 
-(defun command-init (arguments)
-  "Create the agent directory, writing only the files that are missing."
-  (declare (ignore arguments))
-  (let ((result (enchiridion.memory:init-agent (agent-directory))))
-    (format t "~A~%" (enchiridion.memory:init-status-line result))
-    (dolist (name (enchiridion.memory:init-created result))
-      (format t "  created  ~A~%" name))
-    (dolist (name (enchiridion.memory:init-existing result))
-      (format t "  kept     ~A~%" name))
-    (when (enchiridion.memory:init-problems result)
-      (format t "~&Could not write:~%")
-      (dolist (problem (enchiridion.memory:init-problems result))
-        (format t "  ~A: ~A~%" (car problem) (cdr problem))))
-    (finish-output)
-    (unless (enchiridion.memory:init-problems result)
-      (ensure-agent-repository (agent-directory)))
-    (if (enchiridion.memory:init-problems result) 1 0)))
-
-(defun command-version (arguments)
-  "Print the version and where the binary was installed."
-  (declare (ignore arguments))
-  (format t "enchiridion ~A~%"
-          (asdf:component-version (asdf:find-system "enchiridion" nil)))
-  (format t "~A ~A~%" (lisp-implementation-type) (lisp-implementation-version))
-  (format t "source   ~A~%" (or (environment-value "ENCHIRIDION_SOURCE")
-                                 (resolve-project-root)))
-  (format t "agent    ~A~%" (agent-directory))
-  (finish-output)
-  0)
-
-(declaim (ftype (function (integer (or null integer)) string) argument-range))
-
-(defun argument-range (minimum maximum)
-  "Return the arity MINIMUM to MAXIMUM as a phrase. A NIL MAXIMUM means no
-upper bound, so the phrase says so instead of reading NIL as a number."
-  (if maximum
-      (format nil "between ~D and ~D" minimum maximum)
-      (format nil "at least ~D" minimum)))
-
-(defun command-help (arguments)
-  "Print the command list, or the detail for one command."
-  (if (first arguments)
-      (let ((entry (assoc (first arguments) *commands* :test #'string=)))
-        (unless entry
-          (format t "There is no command called ~A.~%" (first arguments))
-          (finish-output)
-          (return-from command-help 2))
-        (destructuring-bind (name minimum maximum handler summary) entry
-          (declare (ignore handler))
-          (format t "~A~%    ~A~%    arguments ~A~%"
-                  name summary (argument-range minimum maximum))))
-      (progn
-        (format t "~&Commands:~%")
-        (dolist (entry *commands*)
-          (destructuring-bind (name minimum maximum handler summary) entry
-            (declare (ignore handler))
-            (format t "  ~A~%    ~A~%    arguments ~A~%"
-                    name summary (argument-range minimum maximum))))))
-  (finish-output)
-  0)
-
-;;;; One turn.
-;;;;
-;;;; `ask` is the smallest thing that proves the whole outbound path: the key
-;;;; is read, the request is built, it goes out, the reply comes back parsed,
-;;;; and the tokens are on a record. Everything above it is an assembly of this.
+(defun bootstrap-line (directory)
+  "Return the one line bootstrap state for the status file, or an empty string.
+A directory that cannot answer is not an error here: the status file is a
+report, and a report that fails must not stop the agent."
+  (handler-case (enchiridion.memory:bootstrap-status-line directory)
+    (error () "")))
 
 (defun print-completion (completion config)
   "Print the reply and the token line for COMPLETION.
@@ -463,58 +412,101 @@ the count, which is worse than printing nothing."
     (finish-output)
     (finish-output *error-output*)))
 
-(defun command-ask (arguments)
-  "Send one turn to the configured backend and print the reply. Returns an
-exit status.
+(defun broker-reload (context supervisor)
+  "Verify the agent files in a one-shot child, load them in the broker, and
+return the plist the supervisor records: :OK-P, :GENERATION and :REPORT.
 
-The key is read here and nowhere else in the command path, and it is never
-printed. The scrubber runs over the reply on the way to the terminal as well
-as on the way to a provider, because a model that quotes a key back at you has
-already had it and showing it is what turns that into a screenshot.
+The supervisor process never compiles agent code. The child does it as the
+agent user, and only a generation that exits zero is loaded for real."
+  (let* ((directory (context-directory context))
+         (previous (enchiridion.supervisor:supervisor-generation supervisor))
+         (generation (1+ previous))
+         (sources (handler-case (enchiridion.plugin:agent-source-files directory)
+                    (error () '()))))
+    (if (null sources)
+        (progn
+          (enchiridion.plugin:discard-generation previous)
+          (setf (context-generation context) generation)
+          (list :ok-p t :generation generation :report "no agent files to load"))
+        (multiple-value-bind (ok-p output)
+            (enchiridion.tools.broker:broker-verify-plugin
+             (uiop:ensure-directory-pathname directory)
+             :uid (agent-uid (context-config context)))
+          (if (not ok-p)
+              (list :ok-p nil :generation previous :report output)
+              (progn
+                (install-agent-proxies context sources generation)
+                (let ((reply (enchiridion.tools.broker:broker-load-generation
+                              (context-broker context) directory
+                              :generation generation)))
+                  (list :ok-p (not (null (gethash "ok" reply)))
+                        :generation generation
+                        :report (or (gethash "report" reply) "")))))))))
 
-The turn is also written to the memory store, so that a later search can find
-what was asked and what was answered. A store that cannot be opened costs the
-transcript and not the turn: the reply prints either way. Whatever the turn
-wrote under the agent directory is committed when it lands."
-  ;; A provider that refuses the request is an expected outcome and is reported
-  ;; as the operator's problem to fix. MAIN prints a backtrace for everything
-  ;; else, and MAIN's backtrace stops at MAIN itself because the compiler
-  ;; inlines this function into it, so a missing key arrives as a stack of
-  ;; frames that name no library, no request and no reply.
-  (handler-case
-      (let ((question (join-arguments arguments)))
-        (unless (plusp (length question))
-          (format *error-output* "ask takes the question as its argument.~%")
-          (finish-output *error-output*)
-          (return-from command-ask 2))
-        (let ((context (make-context)))
-          (unwind-protect
-               (progn
-                 (unless (context-backend context)
-                   (error 'enchiridion.errors:configuration-error
-                          :key :api-key
-                          :detail (format nil "No API key. Put ~A in .env or the environment."
-                                          (enchiridion.llm:default-api-key-env
-                                           (context-config context)))))
-                 (ensure-started context)
-                 (let ((completion (enchiridion.kernel:run-turn
-                                    (context-agent context) question
-                                    :session (context-session context)
-                                    :store (context-store context))))
-                   (print-completion completion (context-config context))
-                   (commit-agent-turn context :cli)
-                   0))
-            (close-context context))))
-    (enchiridion.errors:enchiridion-error (condition)
-      (format *error-output* "~&~A~%" condition)
-      ;; The report line is one line so that it can go in a log. The detail is
-      ;; the part that says what to do, and for a provider that refuses the
-      ;; request it is the provider's own words, including the URL for the key.
-      (let ((detail (enchiridion.errors:error-detail condition)))
-        (when (stringp detail)
-          (format *error-output* "~A~%" detail)))
-      (finish-output *error-output*)
-      1)))
+(defun make-respond (context cancelled)
+  "Return the function the command table calls for one turn.
+
+A turn the operator stopped is reported as stopped and not as a failure: the
+tokens are spent either way, and the operator asked for it."
+  (lambda (text)
+    (handler-case
+        (progn
+          (unless (context-backend context)
+            (error 'enchiridion.errors:configuration-error
+                   :key :api-key
+                   :detail (format nil "No API key. Put ~A in .env or the environment."
+                                   (enchiridion.llm:default-api-key-env
+                                    (context-config context)))))
+          (ensure-started context)
+          (let ((completion (enchiridion.kernel:run-turn
+                             (context-agent context) text
+                             :session (context-session context)
+                             :store (context-store context)
+                             :cancel-p (lambda () (car cancelled)))))
+            (print-completion completion (context-config context))
+            (commit-agent-turn context :cli)
+            0))
+      (enchiridion.errors:turn-cancelled (condition)
+        (format *error-output* "~&~A~%" condition)
+        (finish-output *error-output*)
+        1)
+      (enchiridion.errors:enchiridion-error (condition)
+        (format *error-output* "~&~A~%" condition)
+        (let ((detail (enchiridion.errors:error-detail condition)))
+          (when (stringp detail)
+            (format *error-output* "~A~%" detail)))
+        (finish-output *error-output*)
+        1))))
+
+(defun make-application-supervisor (context)
+  "Return the supervisor this process owns, with the broker round trip as its
+reload hook.
+
+RELOAD-FUNCTION is the whole reason the supervisor is generic: it calls a
+function, and this process supplies one that never loads agent code here."
+  (enchiridion.supervisor:make-supervisor
+   :directory (context-directory context)
+   :config (context-config context)
+   :store (context-store context)
+   :agent (context-agent context)
+   :generation (context-generation context)
+   :bootstrap-line (bootstrap-line (context-directory context))
+   :reload-function (lambda (supervisor) (broker-reload context supervisor))))
+
+(defun command-context-for (context &key supervisor respond cancel)
+  "Return the command table's view of CONTEXT."
+  (enchiridion.channel.cli:make-command-context
+   :directory (context-directory context)
+   :config (context-config context)
+   :store (context-store context)
+   :agent (context-agent context)
+   :session (context-session context)
+   :broker (context-broker context)
+   :generation (context-generation context)
+   :channel :cli
+   :supervisor supervisor
+   :respond respond
+   :cancel cancel))
 
 (defun join-arguments (arguments)
   "Return ARGUMENTS as one string, so that an unquoted question still reads
@@ -525,29 +517,121 @@ the way the operator typed it."
           do (unless first (write-char #\Space stream))
              (write-string argument stream))))
 
+(declaim (ftype (function (string list) integer) run-command))
+
+(defun run-command (name arguments)
+  "Run NAME with ARGUMENTS through the shared command table.
+Return an exit status."
+  (let ((context (make-context)))
+    (unwind-protect
+         (let* ((cancelled (list nil))
+                (enchiridion.channel.cli:*command-context*
+                  (command-context-for
+                   context
+                   :respond (make-respond context cancelled)
+                   :cancel (lambda () (setf (car cancelled) t)))))
+           (enchiridion.channel.cli:run-command name arguments))
+      (close-context context))))
+
+(declaim (ftype (function (string) boolean) supervisor-command-p))
+
+(defun supervisor-command-p (name)
+  "Return T for the two commands that own a supervisor process."
+  (not (null (member name '("chat" "serve") :test #'string=))))
+
+(declaim (ftype (function (string list) integer) run-supervised-command))
+
+(defun run-supervised-command (name arguments)
+  "Run chat or serve with a supervisor this process owns.
+
+CHAT runs the REPL in the foreground with the control poll on a thread beside
+it, so a reload typed at the REPL reaches a supervisor that answers. SERVE
+hands the supervisor to the command, which starts it and polls in the
+foreground itself."
+  (let ((context (make-context)))
+    (unwind-protect
+         (progn
+           (ensure-started context)
+           (let* ((supervisor (make-application-supervisor context))
+                  (cancelled (list nil))
+                  (poll nil))
+             (unwind-protect
+                  (let ((enchiridion.channel.cli:*command-context*
+                          (command-context-for
+                           context
+                           :supervisor supervisor
+                           :respond (make-respond context cancelled)
+                           :cancel (lambda () (setf (car cancelled) t)))))
+                    (when (string= name "chat")
+                      (enchiridion.supervisor:supervisor-start supervisor)
+                      (setf poll
+                            (bordeaux-threads:make-thread
+                             (lambda ()
+                               (handler-case
+                                   (enchiridion.supervisor:supervisor-poll-loop
+                                    supervisor)
+                                 (error () nil)))
+                             :name "enchiridion control poll")))
+                    (enchiridion.channel.cli:run-command name arguments))
+               (when poll
+                 (ignore-errors (bordeaux-threads:destroy-thread poll)))
+               (ignore-errors
+                 (enchiridion.supervisor:supervisor-stop supervisor)))))
+      (close-context context))))
+
+(declaim (ftype (function (list) t) split-options))
+
+(defun split-options (argv)
+  "Return two values: the options at the front of ARGV and what follows them.
+
+The channel flags are accepted here so that the command line the plan
+documents works. Only the CLI channel exists yet, so a flag that names another
+one is answered with one line rather than an error."
+  (let ((options '()))
+    (loop while (and argv
+                     (stringp (first argv))
+                     (> (length (first argv)) 2)
+                     (string= "--" (subseq (first argv) 0 2)))
+          do (let ((flag (subseq (first argv) 2)))
+               (if (member flag '("channel" "bind" "port") :test #'string=)
+                   (progn
+                     (push (second argv) options)
+                     (push (intern (string-upcase flag) :keyword) options)
+                     (setf argv (cddr argv)))
+                   (return (values (nreverse options) argv)))))
+    (values (nreverse options) argv)))
+
+(declaim (ftype (function (&rest t) integer) main))
+
 (defun main (&rest argv)
   "Read ARGV, everything after the script name, and run the named command.
 Return an exit status."
   (handler-case
-      (let ((command (or (first argv) "")))
-        (cond
-          ((string= command "--verify-plugin")
-           (let ((directory (second argv)))
-             (unless directory
-               (format *error-output* "--verify-plugin takes a directory.~%")
-               (finish-output *error-output*)
-               (return-from main 2))
-             (verify-plugin-directory directory)))
-          ((stringp command)
-           (if (plusp (length command))
-               (run-command command (rest argv))
-               (if (first-launch-p)
-                   (print-first-launch)
-                   (progn
-                     (format t "~&Agent directory is ready. Run `enchiridion chat`, or `enchiridion help`.~%")
-                     (finish-output)
-                     0))))
-          (t 2)))
+      (multiple-value-bind (options arguments) (split-options argv)
+        (let ((command (or (first arguments) "")))
+          (when (getf options :channel)
+            (unless (string= (getf options :channel) "cli")
+              (format *error-output*
+                      "~&enchiridion: only the cli channel is implemented; ~A arrives later.~%"
+                      (getf options :channel))
+              (finish-output *error-output*)))
+          (cond
+            ((string= command "--verify-plugin")
+             (let ((directory (second arguments)))
+               (unless directory
+                 (format *error-output* "--verify-plugin takes a directory.~%")
+                 (finish-output *error-output*)
+                 (return-from main 2))
+               (verify-plugin-directory directory)))
+            ((plusp (length command))
+             (if (supervisor-command-p command)
+                 (run-supervised-command command (rest arguments))
+                 (run-command command (rest arguments))))
+            ((first-launch-p) (print-first-launch))
+            (t
+             (format t "~&Agent directory is ready. Run `enchiridion chat`, or `enchiridion help`.~%")
+             (finish-output)
+             0))))
     (error (condition)
       (format *error-output* "~&~A~%" condition)
       ;; A command line tool that dies with no trace is a tool the operator
@@ -555,51 +639,6 @@ Return an exit status."
       (format *error-output* "~A~%" (enchiridion.compat:backtrace-string 12))
       (finish-output *error-output*)
       1)))
-
-(defparameter *commands*
-  ;; Built with LIST rather than quoted. Under a quote the reader turns #'X
-  ;; into the list (FUNCTION X), so HANDLER would hold a cons and FUNCALL
-  ;; would refuse it. The table is static either way; only the quoting lies.
-  (list (list "init" 0 0 #'command-init "Create the agent directory and seed files")
-        (list "ask" 1 nil #'command-ask "One turn, print the reply, exit")
-        (list "version" 0 0 #'command-version "Version and build provenance")
-        (list "help" 0 1 #'command-help "This list, or detail for one command"))
-  "Every command: name, minimum and maximum argument count, handler, and the
-one line that help prints beside it. NIL for the maximum means no upper
-bound.")
-
-(declaim (ftype (function (string list) integer) run-command))
-
-(defun run-command (name arguments)
-  "Call the command NAME with ARGUMENTS. Return an exit status."
-  (let ((entry (assoc name *commands* :test #'string=)))
-    (unless entry
-      (format *error-output* "There is no command called ~A.~%" name)
-      (finish-output *error-output*)
-      (return-from run-command 2))
-    (destructuring-bind (key minimum maximum handler summary) entry
-      (declare (ignore key summary))
-      (let ((count (length arguments)))
-        ;; Two comparisons and not (<= MINIMUM COUNT MAXIMUM).
-        ;;
-        ;; MAXIMUM is NIL for a command that takes any number of arguments, and
-        ;; <= on NIL is a type error about REAL. It arrives from inside MAIN,
-        ;; because the compiler inlines RUN-COMMAND into it, so the trace names
-        ;; neither the command nor the argument list and the backtrace stops at
-        ;; MAIN itself. The only symptom the operator sees is a crash on a
-        ;; command that is written down as working.
-        (unless (and (<= minimum count)
-                     (or (null maximum) (<= count maximum)))
-          ;; The range is built as a string and not written with ~[:...~;...~].
-          ;; A conditional reads one argument and its two branches then read
-          ;; different numbers of the rest, so the second ~D of the short
-          ;; branch is fed MAXIMUM, which is NIL, and the operator is told it
-          ;; got NIL arguments.
-          (format *error-output* "~A takes ~A arguments; got ~D.~%"
-                  name (argument-range minimum maximum) count)
-          (finish-output *error-output*)
-          (return-from run-command 2))
-        (funcall handler arguments)))))
 
 ;;;; First launch.
 ;;;;

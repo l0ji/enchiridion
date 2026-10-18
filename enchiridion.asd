@@ -84,14 +84,24 @@
         ((:file "loader")
          (:file "verify")
          (:file "manifest")))
+       ;; The channel protocol is what the supervisor speaks, so it loads
+       ;; first. The command table is the top of the stack: it calls the
+       ;; supervisor and one kernel function, so it loads after both. The
+       ;; alternative, forward declarations for nine signatures, is a second
+       ;; copy of those signatures and a copy is a thing that drifts.
        (:module "channel"
         :serial t
         :default-component-class "cl-source-file.cl"
         :components
-        ((:file "protocol")
-         (:file "cli")))
+        ((:file "protocol")))
        (:file "supervisor")
-       (:file "kernel"))))))
+       (:file "kernel")
+       (:module "cli"
+        :pathname "channel"
+        :serial t
+        :default-component-class "cl-source-file.cl"
+        :components
+        ((:file "cli"))))))))
 
   ;; A warning is a failure. Style warnings nobody reads are warnings nobody
   ;; fixes, and #check is the gate every commit passes through, so the gate

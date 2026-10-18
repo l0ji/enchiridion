@@ -1,5 +1,6 @@
 # Plan file, deliberately kept out of history. It is a working document.
 /PLAN.md
+research/
 
 # ASDF build output
 *.fasl
@@ -26,6 +27,12 @@
 # none of it. The nested repository ignores state.json and memory.db itself.
 /agents/
 run/
+
+# A workspace-local Nix cache. The host eval cache and fetcher cache stopped
+# accepting writes on this machine, and pointing XDG_CACHE_HOME at the
+# workspace is the one workaround that needs no permission outside it.
+/.nix-cache/
+/scratch/
 
 # Sandbox scratch. Agent-authored code is verified here before it loads.
 /tmp/enchiridion/

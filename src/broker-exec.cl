@@ -73,11 +73,17 @@ as the agent and not as the process that holds the secrets."
 (defun broker-exec-load-generation (directory generation)
   "Load a generation through the plugin loader.
 Return two values, the ok flag and the report, which is the shape
-*LOAD-GENERATION-FUNCTION* promises the broker."
+*LOAD-GENERATION-FUNCTION* promises the broker.
+
+VERIFY is NIL: a separate one-shot child already compiled and self-tested these
+files before the supervisor asked for this load. Verifying here as well would
+load every file twice in one process, and the second load redefines each
+function, which verification counts as a warning and therefore as a failure."
   (let ((result (enchiridion.plugin:load-generation
                  directory
                  :generation (or generation
-                                 (1+ (enchiridion.plugin:current-generation))))))
+                                 (1+ (enchiridion.plugin:current-generation)))
+                 :verify nil)))
     (values (enchiridion.plugin:generation-result-ok-p result)
             (enchiridion.plugin:generation-result-report result))))
 

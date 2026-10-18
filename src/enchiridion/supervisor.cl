@@ -95,8 +95,26 @@ supervisor is up, and a parse error is not an answer to that question."
 (declaim (ftype (function (t) t) status-channels))
 
 (defun status-channels (status)
-  "Return the channel rows the status file holds, or NIL."
-  (and (hash-table-p status) (gethash "channels" status)))
+  "Return the channel rows the status file holds as a list, or NIL.
+
+JZON parses a JSON array into a vector, and every reader here wants a list, so
+the coercion lives in the one accessor rather than in each caller."
+  (let ((rows (and (hash-table-p status) (gethash "channels" status))))
+    (cond
+      ((null rows) nil)
+      ((listp rows) rows)
+      ((vectorp rows) (coerce rows 'list))
+      (t nil))))
+
+(declaim (ftype (function (t) t) status-handled))
+
+(defun status-handled (status)
+  "Return how many control requests the supervisor has answered, or NIL.
+
+A counter and not a timestamp: the poll loop rewrites the status file every
+second to stay fresh, so a changed timestamp says nothing about whether a
+particular request was handled."
+  (and (hash-table-p status) (gethash "handled" status)))
 
 (declaim (ftype (function (t) t) status-bootstrap))
 
@@ -156,14 +174,14 @@ supervisor is up the answer is NIL and the caller says so and exits non-zero."
   (let ((before (read-status run)))
     (unless (status-fresh-p before)
       (return-from request-control nil))
-    (let ((previous (or (status-updated before) 0))
+    (let ((previous (or (status-handled before) 0))
           (path (queue-control line :run run)))
       (declare (ignore path))
       (let ((deadline (+ (get-internal-real-time)
                          (* wait internal-time-units-per-second))))
         (loop
           (let ((status (read-status run)))
-            (when (and status (> (or (status-updated status) 0) previous))
+            (when (and status (> (or (status-handled status) 0) previous))
               (return status)))
           (when (> (get-internal-real-time) deadline)
             (return nil))
@@ -189,6 +207,7 @@ supervisor is up the answer is NIL and the caller says so and exits non-zero."
   (heartbeat-p nil :type boolean)
   (bootstrap-line "" :type string)
   (report "" :type string)
+  (handled 0 :type integer)
   (reload-function nil :type t)
   (started 0 :type integer))
 
@@ -244,10 +263,14 @@ written, because the file is world readable."
     (setf (gethash "generation" table) (supervisor-generation supervisor))
     (setf (gethash "bootstrap" table) (supervisor-bootstrap-line supervisor))
     (setf (gethash "report" table) (supervisor-report supervisor))
+    (setf (gethash "handled" table) (supervisor-handled supervisor))
     (setf (gethash "root" table) (supervisor-directory supervisor))
     (setf (gethash "config" table) (enchiridion:config-digest (supervisor-config supervisor)))
     (setf (gethash "channels" table)
-          (mapcar #'channel-row (supervisor-channels supervisor)))
+          ;; A vector and not a list: an empty list writes as JSON false, and
+          ;; a reader that expects a list of channels would then have to treat
+          ;; false and [] as the same thing.
+          (coerce (mapcar #'channel-row (supervisor-channels supervisor)) 'vector))
     (write-json-file (status-file (supervisor-run-directory supervisor)) table)))
 
 ;;;; Channels on their own threads.
@@ -407,23 +430,31 @@ arrives with the sleep agent; until then `run` records the request."
 (declaim (ftype (function (supervisor t) t) apply-reload-result))
 
 (defun apply-reload-result (supervisor result)
-  "Record RESULT's generation on SUPERVISOR when it loaded, and return RESULT.
+  "Record the generation in RESULT on SUPERVISOR when it loaded, and return
+RESULT. RESULT is a plist of :OK-P, :GENERATION and :REPORT.
 
-A failed generation changes nothing: the last good code keeps serving, and the
+A plist rather than the loader's own struct, because the reload hook may be a
+broker round trip in another process and a struct does not cross a socket. A
+failed generation changes nothing: the last good code keeps serving, and the
 report goes back to whoever asked. That is the whole promise of the loader."
-  (when (and result (enchiridion.plugin:generation-result-ok-p result))
-    (setf (supervisor-generation supervisor)
-          (enchiridion.plugin:generation-result-generation result)))
+  (when (and (consp result) (getf result :ok-p))
+    (setf (supervisor-generation supervisor) (getf result :generation)))
   result)
 
 (declaim (ftype (function (supervisor) t) default-reload))
 
 (defun default-reload (supervisor)
-  "Load a new generation in this process. Tests use this; a daemon passes its
-own RELOAD-FUNCTION so the supervisor never loads agent code itself."
-  (enchiridion.plugin:load-generation
-   (supervisor-directory supervisor)
-   :generation (1+ (supervisor-generation supervisor))))
+  "Load a new generation in this process and return a plist of :OK-P,
+:GENERATION and :REPORT.
+
+Tests use this; a daemon passes its own RELOAD-FUNCTION so the supervisor
+never loads agent code itself."
+  (let ((result (enchiridion.plugin:load-generation
+                 (supervisor-directory supervisor)
+                 :generation (1+ (supervisor-generation supervisor)))))
+    (list :ok-p (enchiridion.plugin:generation-result-ok-p result)
+          :generation (enchiridion.plugin:generation-result-generation result)
+          :report (enchiridion.plugin:generation-result-report result))))
 
 (declaim (ftype (function (supervisor) t) supervisor-reload))
 
@@ -444,11 +475,9 @@ own RELOAD-FUNCTION so the supervisor never loads agent code itself."
     (cond
       ((string= verb "reload")
        (let ((result (supervisor-reload supervisor)))
-         (if (enchiridion.plugin:generation-result-ok-p result)
-             (format nil "reload done, generation ~D."
-                     (enchiridion.plugin:generation-result-generation result))
-             (format nil "reload refused: ~A"
-                     (enchiridion.plugin:generation-result-report result)))))
+         (if (getf result :ok-p)
+             (format nil "reload done, generation ~D." (getf result :generation))
+             (format nil "reload refused: ~A" (getf result :report)))))
       ((string= verb "channels") (handle-channels supervisor (rest parts)))
       ((string= verb "heartbeat") (handle-heartbeat supervisor (rest parts)))
       (t (format nil "unknown control request: ~A" line)))))
@@ -462,6 +491,7 @@ The last report is written into the status file, which is how a shell command
 that only appended a line learns what happened."
   (let ((lines (consume-control-lines (supervisor-run-directory supervisor))))
     (dolist (line lines)
+      (incf (supervisor-handled supervisor))
       (let ((report (handle-control supervisor line)))
         (when report
           (setf (supervisor-report supervisor) report)

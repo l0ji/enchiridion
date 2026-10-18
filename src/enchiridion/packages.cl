@@ -279,7 +279,8 @@ into. The agent loop never learns which channel a turn arrived on."))
            #:command-context-store #:command-context-agent
            #:command-context-session #:command-context-broker
            #:command-context-generation #:command-context-supervisor
-           #:command-context-channel #:repl-evaluate)
+           #:command-context-channel #:command-context-respond
+           #:command-context-cancel #:repl-evaluate)
   (:documentation
    "The REPL and the shared command table that also backs the shell
 interface, so the two surfaces cannot drift."))
@@ -306,14 +307,15 @@ reactions are all out, so the allowlist is the whole authorisation story."))
    #:supervisor-agent #:supervisor-session #:supervisor-broker
    #:supervisor-run-directory
    #:supervisor-generation #:supervisor-channels #:supervisor-running-p
-   #:supervisor-heartbeat-p #:supervisor-poll-control #:supervisor-write-status
+   #:supervisor-heartbeat-p #:supervisor-poll-control #:supervisor-poll-loop
+   #:supervisor-write-status
    #:supervisor-reload #:find-channel
    ;; The two files that let a one-shot shell command talk to a process that is
    ;; already up. A file, not a socket, so tail and grep work on it.
    #:control-file #:status-file #:read-status #:status-fresh-p #:request-control
    #:queue-control
    #:status-generation #:status-channels #:status-bootstrap #:status-pid
-   #:status-updated #:status-report)
+   #:status-updated #:status-report #:status-handled)
   (:documentation
    "The process that owns the channels, and the two run/ files it exchanges with
 the shell. It is the only writer of run/enchiridion.status, which is what lets

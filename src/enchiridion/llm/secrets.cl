@@ -39,6 +39,25 @@ and nowhere else.")
   "Name to a one word note saying where the value came from, so that
 `enchiridion secrets` can print names and sources without printing a value.")
 
+(defparameter *secrets-file-read*
+  nil
+  "The pathname the loader opened, or NIL when it opened none.
+
+Remembered rather than resolved again, because the container copy is unlinked
+the moment its values are in memory: by the time an operator asks where the
+secrets came from, that file is gone, and a second resolution answers with the
+host fallback instead and calls it absent. The one process that can name the
+file is the one that opened it.")
+
+(defparameter *secrets-file-mode-read*
+  nil
+  "The mode *SECRETS-FILE-READ* had when the loader opened it, or NIL when the
+loader opened no file.
+
+Remembered for the same reason the path is, and a mode read back later is not
+the same answer: the file may be unlinked by then, and the question the line
+answers is what the permissions were at the moment its values were read.")
+
 (defparameter *minimum-secret-length*
   8
   "A loaded value shorter than this is not scrubbed by the literal filter.
@@ -117,6 +136,30 @@ prints, with the source and never the value."
                collect name)
         #'string<))
 
+(declaim (ftype (function () (or null pathname)) secrets-file-read))
+
+(defun secrets-file-read ()
+  "Return the secret file the loader opened, or NIL when it opened none.
+
+A report about that file cannot be a fresh lookup of a file that was never
+there. The container copy is unlinked once its values are in memory, so a lookup
+after the load finds the host fallback and calls it absent while the file that
+was actually read goes unnamed. This accessor is the memory that lets the line
+whose whole job is to make guarantee 6 visible name the file it is about."
+  *secrets-file-read*)
+
+(declaim (ftype (function () (or null (integer 0 #o777))) secrets-file-mode-read))
+
+(defun secrets-file-mode-read ()
+  "Return the permission bits *SECRETS-FILE-READ* had when the loader opened it,
+or NIL when the loader opened no file.
+
+Reading the mode again rather than remembering it answers NIL after the unlink,
+which is the same answer as a file that never existed. The mode that matters is
+the one the file had while its values were being read, and only this process
+was there to see it."
+  *secrets-file-mode-read*)
+
 (defun sealed-p ()
   "Return T when the scrubber is sealed."
   (declare (special *sealed*))
@@ -137,15 +180,92 @@ prints, with the source and never the value."
 else."
   (clrhash *loaded-secrets*)
   (clrhash *loaded-sources*)
-  (setf *pattern* nil
+  (setf *secrets-file-read* nil
+        *secrets-file-mode-read* nil
+        *pattern* nil
         *scanner* nil
         *pattern-stamp* nil)
   nil)
+
+;;;; Credential names.
+;;;;
+;;;; The supervisor loads the secrets and then has to take the names back out of
+;;;; its own environment, or every child it starts inherits the values. Which
+;;;; names is a decision this file owns, because this file is the one that knows
+;;;; what a credential is called. It is a decision about names only: no value is
+;;;; read here, so nothing can leak through a mistake in the predicate.
+
+(defparameter +credential-name-tokens+
+  '("_API_KEY" "_APIKEY" "_TOKEN" "_SECRET" "_PASSWORD" "_PASSWD" "_PRIVATE_KEY")
+  "Name fragments that make an environment variable a credential whatever its
+value looks like. Matching anywhere in the name and not only at the end is
+deliberate: the deployed tooling spells credentials like AWS_SECRET_ACCESS_KEY
+and GITHUB_TOKEN, and in the first the credential word is not the last segment.
+The leading underscore is what keeps ordinary prose out, so PASSWORD_ROUNDS is
+not swept because no underscore delimits the fragment at the front, while
+MAX_TOKEN_SIZE is swept because it names a token segment. That last one is the
+cost of catching a credential whose name does not end in the credential word,
+and the cost is one variable the child process did not need.")
+
+(defparameter +credential-variable-names+
+  '("OPENAI_API_KEY" "OPENCODE_API_KEY" "ANTHROPIC_API_KEY"
+    "FLUXER_BOT_TOKEN" "ENCHIRIDION_HTTP_TOKEN")
+  "The names the shipped configuration reads, listed outright even though every
+one of them already matches a token above. This list is the belt to that
+braces: if a token is ever edited out of +CREDENTIAL-NAME-TOKENS+, the names
+this build actually uses still leave the environment, and the coverage of the
+shipped configuration is a thing a reader can see rather than a thing a reader
+has to derive.")
+
+(declaim (ftype (function (t) boolean) credential-variable-p))
+
+(defun credential-variable-p (name)
+  "Return T when NAME is the name of an environment variable that holds a
+credential, and NIL when it is not. The comparison is case-insensitive:
+environment variables are conventionally upper case, an operator's .env is
+written however the operator writes it, and a name that is credential shaped is
+credential shaped in any case.
+
+The NIL cases matter as much as the T ones. PATH, HOME, TERM, LANG, TMPDIR,
+USER, LOGNAME, and SBCL_HOME are what the child process needs to run at all;
+CL_SOURCE_REGISTRY, ENCHIRIDION_SOURCE, ENCHIRIDION_SBCL, the LD_ and DYLD_
+loader paths, and every XDG_ name point at files the child still has to find.
+A predicate that swept those would stop the agent instead of protecting it, so
+it errs on the side of the exact name and never on the side of a prefix:
+ENCHIRIDION_HTTP_TOKEN is a credential and ENCHIRIDION_SOURCE is not, and no
+rule about ENCHIRIDION_ tells the two apart.
+
+A non string, and the empty string, are NIL. The environment reader hands over
+strings, and a name that is not a string is a caller's mistake rather than a
+credential."
+  (and (stringp name)
+       (plusp (length name))
+       (let ((wanted (string-upcase name)))
+         (not (null (or (member wanted +credential-variable-names+
+                                :test #'string=)
+                        (some (lambda (token) (search token wanted))
+                              +credential-name-tokens+)
+                        (search "AUTHORIZATION" wanted)))))))
 
 ;;;; Loading.
 ;;;;
 ;;;; One place reads a secret. Everything else calls scrub, so there is one
 ;;;; thing to audit.
+
+(defparameter +container-secrets-path+
+  #p"/run/secrets/.env"
+  "Where a container keeps its secret file: a tmpfs mount, never a layer of the
+image, holding the operator's .env for exactly as long as it takes the
+supervisor to read it. DISCARD-SECRETS-FILE unlinks exactly this path and
+refuses every other, so the operator's checkout .env cannot be deleted by a
+mistake at a call site.
+
+A DEFPARAMETER and not a DEFCONSTANT, which is the one place in this file where
+the choice is load bearing. The test suite has to point this at a scratch file,
+because a nix build sandbox has no /run/secrets it may write, and SBCL folds a
+DEFCONSTANT reference into the compiled code: a binding around the call would be
+silently ignored, the refusal branch would be the only branch ever exercised,
+and the delete branch would ship untested.")
 
 (defun host-secrets-file (directory)
   "Return the .env path inside DIRECTORY. DIRECTORY is a directory pathname
@@ -154,7 +274,7 @@ sibling of the code, never the code itself."
   (merge-pathnames ".env" (uiop:ensure-directory-pathname directory)))
 
 (defun secrets-file (&key (directories (list #p"./"))
-                            (container #p"/run/secrets/.env"))
+                            (container +container-secrets-path+))
   "Return the secret file to read. The container tmpfs wins when it exists,
 because the host .env is never copied in at its own path: the run script puts
 it at /run/secrets/.env and the supervisor deletes it once loaded.
@@ -163,13 +283,88 @@ DIRECTORIES is tried in order for a host .env, which is how `enchiridion ask`
 finds the operator's file when the binary lives in a store path. The first
 directory is the fallback when no file exists, so the caller can still tell
 the operator which path it would have read. CONTAINER is nil in tests, so the
-host lookup is not at the mercy of a /run/secrets that happens to exist."
+host lookup is not at the mercy of a /run/secrets that happens to exist; its
+default is +CONTAINER-SECRETS-PATH+, read at call time, which is the other half
+of why that name is a variable and not a constant."
   (or (and container (probe-file container))
       (loop for directory in directories
             for path = (host-secrets-file directory)
             when (probe-file path)
               return path)
       (host-secrets-file (or (first directories) #p"./"))))
+
+(declaim (ftype (function () pathname) operator-secrets-file))
+
+(defun operator-secrets-file ()
+  "Return the .env the operator means, resolved the one way for every caller.
+
+The current directory comes first, because that is where the operator stands
+and where a checkout keeps .env, and `nix run` executes a script in the store
+while the operator stands in the checkout. The source root comes second,
+because the installed copy is the other place the file can live and the store
+path has no checkout above it.
+
+A NIL root is dropped rather than left in the list. PROJECT-ROOT answers NIL
+outside a checkout, HOST-SECRETS-FILE takes a directory, and NIL is not one:
+`uiop:ensure-directory-pathname` signals on it, so leaving it in the list turns
+the case of no .env anywhere into a type error in the one command that exists to
+report where the file would have been.
+
+This is the one place that decides which .env the operator means. The loader in
+src/main.cl and the `secrets` command both call it, so the file that is read
+and the file that is reported cannot drift into two different files."
+  (the pathname
+       (secrets-file :directories (remove nil
+                                          (list (uiop:getcwd)
+                                                (enchiridion:project-root))))))
+
+(declaim (ftype (function (t) boolean) secret-file-mode-ok-p))
+
+(defun secret-file-mode-ok-p (path)
+  "Return T when the secret file at PATH is one a supervisor may read.
+
+The whole rule is one bit: NIL when the world read bit is set, T otherwise. An
+absent file passes, because a missing file is not a leak: the loader complains
+about the file it could not find on its own, in its own words. A mode that
+cannot be read passes, which is what a build without stat reports.
+
+The group bit is the deliberate part. The check exists because a secret file
+readable by the world is a file that every uid in the container can read, and
+the world read bit is the only bit that says so. Group readability is how a
+normal deployment shares a file with a service account, refusing it would break
+those deployments, and it would not close the other direction: the supervisor
+already runs as the owner. So NIL is reserved for one condition and no other,
+(logand mode #o004) not zero, and the docstring says so rather than leaving a
+reader to infer it."
+  (let ((mode (enchiridion.compat:file-mode path)))
+    (or (null mode)
+        (zerop (logand mode #o004)))))
+
+(declaim (ftype (function (t) boolean) discard-secrets-file))
+
+(defun discard-secrets-file (path)
+  "Unlink PATH and return T, but only when PATH is +CONTAINER-SECRETS-PATH+;
+return NIL and leave the file alone for every other path.
+
+The container copy exists so the supervisor can read it once. Section 5.5 of
+the plan promises that it does not exist at steady state, and the promise is
+kept by unlinking it as soon as its values are in memory, so that no process
+that later gains access to the container finds the rest of the operator's .env
+sitting on a tmpfs.
+
+The operator's checkout .env is NEVER deleted. It is the file the operator
+edits, it is not the container copy, and it is exactly the file a quiet delete
+would destroy. The comparison against the container path is what stops that,
+which is why this function takes a path and decides for itself instead of
+deleting whatever its caller passes.
+
+A read-only bind mount refuses the unlink, and a read-only mount is a normal
+deployment rather than a fault. The caller has to print something either way,
+so this answers NIL and lets the caller choose the words instead of signalling
+a condition the caller would only catch in order to print anyway."
+  (when (and path
+             (ignore-errors (uiop:pathname-equal path +container-secrets-path+)))
+    (ignore-errors (delete-file path) t)))
 
 (defun register-secret (name value &optional (source :argument))
   "Hold VALUE under NAME, noting SOURCE. An empty or non string value is
@@ -231,6 +426,14 @@ afterwards, which is the step that stops the broker inheriting them."
     (with-open-file (stream path :direction :input
                               :external-format :utf-8
                               :if-does-not-exist :error)
+      ;; The stream is open, so the file exists, and this is the only moment at
+      ;; which it can be named and measured. The caller may unlink it the
+      ;; instant this returns, which is exactly what the supervisor does with
+      ;; the container copy, and after that a resolution of the path finds
+      ;; whatever is next in the search order rather than the file that was
+      ;; read.
+      (setf *secrets-file-read* (pathname path)
+            *secrets-file-mode-read* (enchiridion.compat:file-mode path))
       (load-secrets-from stream)))
   (dolist (name names)
     (let ((value (uiop:getenv name)))

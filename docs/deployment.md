@@ -118,32 +118,82 @@ at its host path, and the entrypoint logs a warning when its ownership is not
 `600:0`. The two routes and their trade-offs are in [The .env
 file](#the-env-file) below.
 
-`load-configured-secrets` reads every configured name through `load-secrets`,
-and the loader holds each pair in memory. It then unsets those names from its own
-process environment. A name that survives in the environment is a name a child
-process would inherit.
+`load-configured-secrets` resolves the file through `operator-secrets-file`,
+which is the one function that decides which `.env` the operator means. The
+loader and the `secrets` command both call it, so the file that is read and the
+file that is reported cannot become two different files. It then works in this
+order: refuse a world-readable file, read every configured name plus every
+provider key name, unset what it read, and unlink the container copy.
 
-Nothing in this code deletes `/run/secrets/.env`. The only `delete-file` calls
-under `src/` remove the broker socket in `tools/broker.cl` and a temporary
-capture in `compat.cl`. The entrypoint does not delete the file either. A
-docstring in `llm/secrets.cl` says the supervisor deletes the file once loaded,
-and no code performs that delete. The file therefore stays in the tmpfs for the
-life of the container.
+The mode gate fails closed. A file with `(logand mode #o004)` set is a
+configuration error that names the path and the mode, and the process exits 2:
+
+```text
+Configuration is wrong at SECRETS.
+/run/secrets/.env is mode #o644 and every uid can read it.
+Run chmod 600 /run/secrets/.env.
+```
+
+Mode 600 is what this page and the image ask for, but the file cannot keep that
+contract on its own: an operator's umask writes what it likes and a `cp`
+preserves what it was given. A group-readable file passes, because a group-shared
+file is a normal deployment and the world read bit is the one that admits uid
+1000. A missing file passes too, and the loader reports that on its own terms.
+
+The unset sweep covers the configured names and every credential-shaped variable
+in the environment, so an exported credential the configuration never heard of
+goes with them. The predicate that decides which names those are never selects
+`PATH`, `HOME`, `TERM`, `SBCL_HOME`, `CL_SOURCE_REGISTRY`, the loader paths, or
+an `XDG_` name, so the process keeps everything it needs to run.
+
+`discard-secrets-file` unlinks `/run/secrets/.env` once its values are in memory,
+which is guarantee 6 of section 5.5: without it the file outlives the read by the
+life of the container. It refuses every path but `/run/secrets/.env`, so the
+operator's checkout `.env` is never deleted. A read-only bind mount refuses the
+unlink, which is a route this page supports, so the supervisor prints one scrubbed
+warning line and carries on rather than stopping:
+
+```text
+enchiridion: could not unlink /run/secrets/.env; the secrets file is still on disk.
+```
 
 ## proc and hidepid
 
-The sandbox must not read the supervisor's memory. A readable `/proc` lets uid
-1000 read the cmdline, the file descriptors, and the memory maps of the
+The sandbox must not read the supervisor's process. A readable `/proc` lets uid
+1000 read the cmdline, the working directory, and the memory maps of the
 supervisor. The supervisor holds the secrets, so that read is the whole risk.
 
+Docker has no proc mount type, so the capability comes from the run line and the
+entrypoint does the remount:
+
 ```sh
---cap-add SYS_ADMIN          # then: mount -o remount,hidepid=2 /proc
+--cap-add SYS_ADMIN          # the entrypoint remounts /proc with hidepid
 ```
 
-Docker has no proc mount type, so the run line adds the capability and the
-remount is the operator's next step. The entrypoint does not do the remount, and
-it does not pretend to. The isolation test fails when uid 1000 can read
-`/proc/1/environ`, so the check covers this guarantee with or without hidepid.
+`ENCHIRIDION_HIDEPID` selects the level and defaults to 2. After the tmpfs check,
+the entrypoint remounts `/proc` with that level. When the remount fails,
+`ENCHIRIDION_REQUIRE_HIDEPID` decides what happens: `1` exits 1 before the
+supervisor starts, anything else logs one warning line and serves on.
+`ENCHIRIDION_HIDEPID=0` skips the remount without a warning. Compose sets the
+requirement, so the Compose deployment keeps the guarantee; the full run line
+below adds `-e ENCHIRIDION_REQUIRE_HIDEPID=1` to match it.
+
+`SYS_ADMIN` is a broad capability, wider than a `/proc` remount needs, and
+Docker offers nothing narrower that can reach `mount`. The trade is one of two:
+
+- Keep `--cap-add SYS_ADMIN` and `ENCHIRIDION_REQUIRE_HIDEPID=1`. The
+  supervisor's container then holds a capability that a container escape could
+  use, and in exchange uid 1000 cannot read the supervisor's process view.
+- Drop both flags. The entrypoint warns that `/proc` could not be remounted and
+  serves on. Every other guarantee below still holds, and the isolation script's
+  checks of the secret file, the environment, and the missing file still pass.
+  The proc guarantee is the one that is gone.
+
+The isolation test reads `/proc/1/environ` as uid 1000. That file belongs to the
+root supervisor with mode 0400, so the read is denied whether or not hidepid is
+mounted: the check is a regression guard, not proof that the remount happened.
+What hidepid adds is the rest of the supervisor's process view, the cmdline and
+the working directory among it, and only hidepid removes those.
 
 ## The volumes
 
@@ -195,12 +245,14 @@ The script reads seven guarantees. Tests 1 to 4 and 7 live in this script. Test
 | 6    | `/run/secrets/.env` is gone at steady state            |
 | 7    | No `.env` copy exists anywhere else                    |
 
-Test 6 does not detect the leftover file in practice. The file arrives as root
-with mode 600 inside a directory with mode 700, so uid 1000 cannot stat it and
-the absent phase reads the check as passed. The uid 0 view checks the supervisor
-environment and not the file. Nothing deletes `/run/secrets/.env`, so it stays
-for the life of the container, and the agent still cannot read it. The present
-phase is the one that proves the two permissions.
+Test 6 used to be blind. The file arrived as root with mode 600 inside a
+directory with mode 700, so uid 1000 could not stat it, and the absent phase read
+the check as passed whether the file was there or not. The supervisor now unlinks
+`/run/secrets/.env` after the load, so on the tmpfs routes the file really is
+gone and test 6 checks a fact. The read-only bind mount is still invisible to it:
+the unlink fails with the warning above, the file stays because a mount is not a
+directory entry that can be removed, and uid 1000 cannot stat `/run/secrets`
+either way.
 
 Test 7 runs `find` from two roots, because `-xdev` stops at a filesystem
 boundary and the state volume is one boundary:
@@ -212,15 +264,17 @@ find "$STATE_DIR" -path /run/secrets -prune -o -name .env -print
 
 As uid 0 the script checks the supervisor instead. It requires pid 1 to be the
 supervisor and requires `/proc/1/environ` to be readable as root. It then checks
-that no configured secret name survives in that environment. The names come from
-the shipped configuration:
+the shipped names, and then every credential-shaped name, using the same
+vocabulary `credential-variable-p` uses. The second check is the one that does
+not have to keep up with a list:
 
 ```text
-OPENCODE_API_KEY OPENAI_API_KEY FLUXER_BOT_TOKEN ENCHIRIDION_HTTP_TOKEN
+OPENCODE_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY FLUXER_BOT_TOKEN ENCHIRIDION_HTTP_TOKEN
 ```
 
-A `config.cl` that renames one of those names must add the new name to
-`SECRET_NAMES`, or the hole this test closes opens again.
+A `config.cl` that renames one of the shipped names, or exports a credential of
+its own, is caught by shape rather than by a list somebody has to remember to
+edit. The closing line names the phase that ran, so a log says which checks ran.
 
 ## The run flags for serve
 
@@ -244,7 +298,7 @@ refuses the combination before a socket opens, and the process exits 2 with one
 line. The refusal exists so that a bad flag is one line and an exit status. The
 alternative is a channel that dies and restarts every second.
 
-The full run line, with the tmpfs and the state volume:
+The full run line, with the tmpfs, the capability, and the state volume:
 
 ```sh
 docker build -t enchiridion:0.1.0 -f docker/Dockerfile .
@@ -252,15 +306,18 @@ docker build -t enchiridion:0.1.0 -f docker/Dockerfile .
 docker run -d --name enchiridion \
   -p 8787:8787 \
   --tmpfs /run/secrets:mode=0700 \
+  --cap-add SYS_ADMIN \
+  -e ENCHIRIDION_REQUIRE_HIDEPID=1 \
   -v enchiridion-state:/var/lib/enchiridion \
   enchiridion:0.1.0 \
   serve --channel http --bind 0.0.0.0 --port 8787
 ```
 
 That bind answers the network, so `/run/secrets/.env` must hold
-`ENCHIRIDION_HTTP_TOKEN`. The `-p` flag publishes the webhook port. Add
-`--cap-add SYS_ADMIN` and remount `/proc` with `hidepid=2` when the operator
-wants the proc guarantee.
+`ENCHIRIDION_HTTP_TOKEN`. The `-p` flag publishes the webhook port. The
+capability and the environment entry are the pair that makes the entrypoint's
+`/proc` remount mandatory; drop both to run without `SYS_ADMIN` and lose the proc
+guarantee. [proc and hidepid](#proc-and-hidepid) covers the trade.
 
 ## Compose
 
@@ -271,6 +328,11 @@ run line stays the alternative when Compose is not installed. It needs Compose
 | File          | What it does                                                                             |
 | ------------- | ---------------------------------------------------------------------------------------- |
 | `compose.yml` | The server. `restart: unless-stopped`, the port on every interface, and the named volume |
+
+`compose.yml` also adds `cap_add: [SYS_ADMIN]` and sets
+`ENCHIRIDION_REQUIRE_HIDEPID=1`, so the entrypoint's `/proc` remount is mandatory
+on that route. To run Compose without the capability, drop both of those lines;
+see [proc and hidepid](#proc-and-hidepid) for what that costs.
 
 Compose builds the image from the same Dockerfile. There is no registry, so
 `docker compose pull` has nothing to fetch:
@@ -295,16 +357,17 @@ checkout without the file is not a configuration error. Compose reads the same
 file for interpolation, which is where `ENCHIRIDION_IMAGE` and
 `ENCHIRIDION_PORT` go.
 
-| Name                                   | Needed because                                                                                                          |
-| -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `ENCHIRIDION_HTTP_TOKEN`               | A bind other than loopback makes `check-http-policy` refuse the combination, and the process exits 2 without this token |
-| `OPENAI_API_KEY` or `OPENCODE_API_KEY` | The model call. The loader picks the provider from the key it finds                                                     |
-| `FLUXER_BOT_TOKEN`                     | Only for `--channel fluxer`                                                                                             |
-| `ENCHIRIDION_IMAGE`                    | Optional. Defaults to `enchiridion:0.1.0`                                                                               |
-| `ENCHIRIDION_PORT`                     | Optional. Defaults to 8787                                                                                              |
+| Name                                                         | Needed because                                                                                                                                                                                              |
+| ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ENCHIRIDION_HTTP_TOKEN`                                     | A bind other than loopback makes `check-http-policy` refuse the combination, and the process exits 2 without this token                                                                                     |
+| `OPENAI_API_KEY`, `OPENCODE_API_KEY`, or `ANTHROPIC_API_KEY` | The model call. The loader reads every provider key name, and the provider is the configured one, else the one the base URL names, else the first key present of OpenAI, OpenCode, Anthropic, in that order |
+| `FLUXER_BOT_TOKEN`                                           | Only for `--channel fluxer`                                                                                                                                                                                 |
+| `ENCHIRIDION_IMAGE`                                          | Optional. Defaults to `enchiridion:0.1.0`                                                                                                                                                                   |
+| `ENCHIRIDION_PORT`                                           | Optional. Defaults to 8787                                                                                                                                                                                  |
 
-`env_file` puts the values in the container environment. The loader reads the
-configured names, holds the values in memory, and unsets each name from its own
+`env_file` puts the values in the container environment. The loader refuses a
+world-readable file before it reads a value; reads the configured names and the
+provider key names; holds the values in memory; and unsets each name from its own
 environment, so a child the supervisor starts inherits nothing. The names stay
 in the container environment for the life of the container, because Docker fixes
 that environment at start. `docker inspect` and `docker exec` still see the
@@ -317,11 +380,17 @@ check:
 ```sh
 docker run -d --name enchiridion \
   --tmpfs /run/secrets:mode=0700 \
+  --cap-add SYS_ADMIN \
+  -e ENCHIRIDION_REQUIRE_HIDEPID=1 \
   -v "$PWD/.env":/run/secrets/.env:ro \
   -v enchiridion-state:/var/lib/enchiridion \
   enchiridion:0.1.0 \
   serve --channel http --bind 127.0.0.1 --port 8787
 ```
+
+The host file must be mode 600, or group-readable, for that route too: a
+read-only mount does not change the mode, and the loader refuses a world-readable
+file before it reads a value.
 
 Do not add both routes. `env_file` wins the same names into the environment and
 the tmpfs file changes nothing then.
@@ -336,11 +405,23 @@ docker cp .env enchiridion:/run/secrets/.env
 ```
 
 The copy route runs after the container starts, so the first moments have no
-secret, and it leaves the file in the tmpfs, because no code deletes it. The
-bind mount at the start is the better route of the two: the file is there before
-the first turn, and the secret stays out of the environment. Its one cost is
-that the file is a mount and cannot be unlinked, so test 6 above stays blind to
-it either way.
+secret, and the running supervisor has already read the file it started with.
+The copy waits in the tmpfs until the next process loads secrets, which unlinks
+it then.
+
+`docker cp` into a path that a tmpfs covers does not always land in the mount:
+Docker 28.0.1 accepts the copy, exits 0, and leaves `/run/secrets` empty. Check
+after the copy, and write the file through the container when it is empty:
+
+```sh
+docker exec enchiridion ls -A /run/secrets
+docker exec -i enchiridion sh -c 'cat > /run/secrets/.env && chmod 600 /run/secrets/.env' < .env
+```
+
+The bind mount at the start is the better route of the two: the file is there
+before the first turn, and the secret stays out of the environment. Its one cost
+is that the file is a mount and cannot be unlinked, so the supervisor warns and
+test 6 above stays blind to it either way.
 
 ### State, logs, and stop
 

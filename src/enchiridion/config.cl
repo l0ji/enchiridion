@@ -97,7 +97,15 @@ store path. The model defaults match the shipped adapter defaults."
     (:model-primary "deepseek-v4.1-flash")
     (:model-cheap "deepseek-v4.1-flash")
     (:model-sleep "deepseek-v4.1-flash")
-    (:api-key-env "OPENAI_API_KEY")
+    ;; NIL and not a variable name: the provider table in the LLM module names
+    ;; the key variable for the provider that was selected, and a name shipped
+    ;; here would pin every install to OpenAI's. NIL means the provider decides.
+    (:api-key-env nil)
+    ;; The Messages API requires a max_tokens field on every request and has no
+    ;; default of its own; the OpenAI-shaped wire ignores the key entirely. The
+    ;; value bounds one reply, and it is not derived from the budget, which
+    ;; bounds what a day may spend.
+    (:max-tokens 4096)
 
     :channels
     (:cli (:enabled t))

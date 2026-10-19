@@ -55,7 +55,12 @@
         :components
         ((:file "secrets")
          (:file "protocol")
-         (:file "openai")))
+         (:file "openai")
+         ;; The Messages API backend. It loads after openai because it reuses
+         ;; the shared JSON helpers and the retry loop defined there, and
+         ;; because a name it defines must not collide with one already in the
+         ;; package.
+         (:file "anthropic")))
        (:module "memory"
         :serial t
         :default-component-class "cl-source-file.cl"

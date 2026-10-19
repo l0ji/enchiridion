@@ -79,7 +79,9 @@
 
 (defun completion-total-tokens (completion)
   "Return the tokens COMPLETION was billed for in total. A cache read is not
-added twice: it is already part of the prompt the provider counted."
+added twice: it is already part of the prompt the provider counted, and every
+backend stores the input count provider-normalised, with cache reads and cache
+writes folded in, so this sum means the same thing on either wire."
   (+ (completion-input-tokens completion)
      (completion-output-tokens completion)))
 

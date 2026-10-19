@@ -2,19 +2,23 @@
 # entrypoint.sh --- Container entry point.
 #
 # The two isolation flags the security model depends on belong on the run
-# command line rather than here, because only the runtime can honour them:
+# command line rather than here, because only the runtime can supply them:
 #
 #   --tmpfs /run/secrets:mode=0700
-#   --cap-add SYS_ADMIN          # then: mount -o remount,hidepid=2 /proc
+#   --cap-add SYS_ADMIN          # this script then remounts /proc with hidepid
 #
 # A bind mount for /run/secrets defeats the isolation. So does /proc without
-# hidepid: it lets the sandbox read the supervisor's cmdline, file descriptors
-# and memory maps. Docker has no proc mount type, so the run line adds the
-# capability and the remount is the operator's next step, which is why this
-# script does not pretend to do it.
+# hidepid: it lets the sandbox read the supervisor's cmdline, cwd, and memory
+# maps. Docker has no proc mount type, so the capability comes from the run line
+# and the remount happens below. The remount fails on a kernel that does not
+# offer the proc hidepid option and on a /proc that cannot be remounted;
+# ENCHIRIDION_REQUIRE_HIDEPID decides whether that is fatal. The hardened
+# deployment sets it, because a supervisor whose process view uid 1000 can read
+# is a supervisor whose secrets are one /proc read away.
 #
-# What this script does is set up the two users and hand over. It never writes
-# a secret anywhere a later process could find it, and it never prints one.
+# What else this script does is set up the two users and hand over. It never
+# writes a secret anywhere a later process could find it, and it never prints
+# one.
 
 set -eu
 
@@ -42,6 +46,25 @@ grep -q " $SECRETS_DIR " /proc/mounts 2>/dev/null || {
 }
 
 chmod 700 "$SECRETS_DIR"
+
+# hidepid is the half of the proc guarantee that only the runtime can supply.
+# Docker mounts /proc itself, so the remount needs SYS_ADMIN on the run line.
+# The default is 2, which hides every other user's processes; 0 is the opt-out
+# and skips the remount without a word. A failure here is fatal only when the
+# operator asks for it: a Docker Desktop kernel and a nested container both
+# refuse this remount, and refusing to start there would make the image
+# unusable rather than safe.
+HIDEPID=${ENCHIRIDION_HIDEPID:-2}
+if [ "$HIDEPID" != "0" ]; then
+  if mount -o "remount,hidepid=$HIDEPID" /proc 2>/dev/null; then
+    log "/proc remounted with hidepid=$HIDEPID"
+  elif [ "${ENCHIRIDION_REQUIRE_HIDEPID:-0}" = "1" ]; then
+    fail "cannot remount /proc with hidepid=$HIDEPID;" \
+         "add --cap-add SYS_ADMIN, or set ENCHIRIDION_HIDEPID=0 to opt out"
+  else
+    log "could not remount /proc with hidepid=$HIDEPID; uid 1000 can see the supervisor's process"
+  fi
+fi
 
 # The secret file is optional here. The operator supplies it as a read-only
 # bind mount at /run/secrets/.env, or copies it in after start, or puts the

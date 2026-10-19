@@ -61,15 +61,16 @@ interval, the heartbeat flag, and the agent uid.
 
 ## The `:llm` section
 
-| Key              | Type              | Default                 | Effect                                                                       |
-| ---------------- | ----------------- | ----------------------- | ---------------------------------------------------------------------------- |
-| `:provider`      | keyword or string | `:openai`               | Select the provider. The code recognizes only `:openai` and `:opencode`.     |
-| `:backend`       | keyword           | `:openai`               | Select the wire protocol. Only `:openai` has an implementation.              |
-| `:base-url`      | string or `nil`   | `nil`                   | Set the endpoint. The backend adds a trailing slash when the value has none. |
-| `:model-primary` | string            | `"deepseek-v4.1-flash"` | Set the model for reasoning turns.                                           |
-| `:model-cheap`   | string            | `"deepseek-v4.1-flash"` | Set the model for memory digests and compaction.                             |
-| `:model-sleep`   | string            | `"deepseek-v4.1-flash"` | Set the model for the sleep agent.                                           |
-| `:api-key-env`   | string            | `"OPENAI_API_KEY"`      | Name the variable that holds the API key.                                    |
+| Key              | Type              | Default                 | Effect                                                                             |
+| ---------------- | ----------------- | ----------------------- | ---------------------------------------------------------------------------------- |
+| `:provider`      | keyword or string | `:openai`               | Select the provider. The code recognizes `:openai`, `:opencode`, and `:anthropic`. |
+| `:backend`       | keyword           | `:openai`               | Select the wire protocol: `:openai` or `:anthropic`.                               |
+| `:base-url`      | string or `nil`   | `nil`                   | Set the endpoint. The backend adds a trailing slash when the value has none.       |
+| `:model-primary` | string            | `"deepseek-v4.1-flash"` | Set the model for reasoning turns.                                                 |
+| `:model-cheap`   | string            | `"deepseek-v4.1-flash"` | Set the model for memory digests and compaction.                                   |
+| `:model-sleep`   | string            | `"deepseek-v4.1-flash"` | Set the model for the sleep agent.                                                 |
+| `:api-key-env`   | string or `nil`   | `nil`                   | Name the variable that holds the API key. `nil` means the provider table decides.  |
+| `:max-tokens`    | integer           | `4096`                  | Cap one reply on the Messages API. The OpenAI-shaped wire ignores this key.        |
 
 Each model tier starts equal to the cheap model. The key to raise for a
 stronger turn is `:model-primary`.
@@ -78,30 +79,42 @@ stronger turn is `:model-primary`.
 
 `detect-provider` reads the keys in this order:
 
-1. `:provider`, when the value is `:openai` or `:opencode`.
-2. A recognized `:base-url`. The text `opencode.ai` selects `:opencode`. The
-   text `api.openai.com` selects `:openai`.
+1. `:provider`, when the value is `:openai`, `:opencode`, or `:anthropic`.
+2. A recognized `:base-url`. The text `opencode.ai` selects `:opencode`. The text
+   `api.anthropic.com` selects `:anthropic`. The text `api.openai.com` selects
+   `:openai`.
 3. An `OPENAI_API_KEY` in the environment or in `.env`.
 4. An `OPENCODE_API_KEY` in the environment or in `.env`.
-5. Otherwise `:openai`. OpenAI wins a tie, because OpenAI is the default.
+5. An `ANTHROPIC_API_KEY` in the environment or in `.env`.
+6. Otherwise `:openai`. OpenAI wins a tie, because OpenAI is the default.
 
 An unrecognized `:provider` value falls through to step 2. A local
 OpenAI-compatible server matches no host in step 2, so the `:base-url` still
 works and the key variable comes from the later steps.
 
-`default-api-key-env` returns `:api-key-env` when the file sets that key.
-Without it, the provider decides: `OPENAI_API_KEY` or `OPENCODE_API_KEY`.
+`default-api-key-env` returns `:api-key-env` when the file sets that key. Without
+it, the provider decides: `OPENAI_API_KEY`, `OPENCODE_API_KEY`, or
+`ANTHROPIC_API_KEY`. `provider-key-names` returns all three names plus the
+configured one, and `main.cl` loads all of them, so a key for a provider that was
+not selected still reaches the scrubber.
 
 ### Backend selection
 
-`resolve-backend` reads `:backend`, `:base-url`, `:model-primary`, and
-`:api-key-env`. An explicit `:base-url` or `:model-primary` wins over the
-provider default.
+`resolve-backend` reads `:backend`, `:base-url`, `:model-primary`,
+`:api-key-env`, and `:max-tokens`. An explicit `:base-url` or `:model-primary`
+wins over the provider default.
 
-Only the `:openai` backend exists. The template names `:anthropic` and
-`:litellm` as future protocols, and the current code refuses both. Any value
-other than `:openai` stops the command with a configuration error at
-`:backend`, and the error names the value.
+Two backends exist. `:openai` is the chat completions shape, and it covers
+OpenAI, OpenCode Go, and a local server. `:anthropic` is the Messages API, whose
+`max_tokens` field is required and whose prompt cache is marked with
+`cache_control` breakpoints. `:backend :anthropic` selects the Anthropic request
+shape and the `:anthropic` provider row together, so an OpenAI key in the
+environment cannot pair the Anthropic endpoint with a chat completions request.
+`:provider :anthropic` with no `:backend` does the same.
+
+Any other value stops the command with a configuration error at `:backend`, and
+the error names the value. `:max-tokens` caps one Anthropic reply; it is not
+derived from the budget, which caps what a day may spend.
 
 ## The `:channels` section
 
@@ -210,6 +223,7 @@ is the only copy of the format.
 | `ENCHIRIDION_SBCL`       | Set the SBCL binary the wrapper installed.                   |
 | `OPENAI_API_KEY`         | Hold the OpenAI key, when the file names this variable.      |
 | `OPENCODE_API_KEY`       | Hold the OpenCode Go key, when the file names this variable. |
+| `ANTHROPIC_API_KEY`      | Hold the Anthropic key, when the file names this variable.   |
 | `ENCHIRIDION_HTTP_TOKEN` | Hold the webhook bearer token by default.                    |
 | `FLUXER_BOT_TOKEN`       | Hold the Fluxer bot token by default.                        |
 
@@ -219,15 +233,19 @@ The program reads the secret file in this order:
 2. `<current directory>/.env`.
 3. `<project root>/.env`.
 
-Then the loader reads every name the configuration names, and the program
-removes each name from its own environment. A child process inherits nothing.
-The value stays in memory for the life of the process.
+Then the loader reads every name the configuration names and every provider key
+variable `provider-key-names` returns, and the program removes each name from its
+own environment. A child process inherits nothing. The value stays in memory for
+the life of the process.
 
 The scrubber replaces a loaded value with `[redacted]` in every text path. It
 also replaces known key shapes, such as a `Bearer` token or an `sk-` key. The
 literal filter ignores a value shorter than eight characters. A short value
-would redact most of the transcript. `secrets` prints the loaded names and
-their sources. It never prints a value.
+would redact most of the transcript. `secrets` prints the loaded names, their
+sources, the resolved file, its mode, and whether the file is still present; it
+never prints a value. A world-readable `.env` stops the supervisor at start up,
+and the container copy at `/run/secrets/.env` is unlinked once the values are in
+memory; a checkout `.env` is never deleted.
 
 A literal `:token` in the `:http` entry is the one secret-shaped value the
 file can hold. The template allows it for a loopback bind and for tests. The

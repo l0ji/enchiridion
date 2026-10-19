@@ -391,6 +391,32 @@ implementation leaves the file with whatever the umask gave it."
   (declare (ignore path mode))
   nil)
 
+(declaim (ftype (function (t) (or null (integer 0 #o777))) file-mode))
+
+#+sbcl
+(defun file-mode (path)
+  "Return the nine permission bits of PATH as an integer, or NIL when PATH does
+not exist.
+
+SB-POSIX STAT signals for a file that is not there instead of answering, and
+every caller here asks a question with two answers: may this file be read, and
+is it still there. Catching the condition here keeps the answer NIL and saves
+each caller from writing the same handler. The mask drops the file type bits,
+which sit above the permission bits, because a caller compares the result
+against #o600 or #o004 and a type bit would make every comparison lie."
+  (let ((info (ignore-errors (sb-posix:stat path))))
+    (when info
+      (logand (sb-posix:stat-mode info) #o777))))
+
+#-sbcl
+(defun file-mode (path)
+  "Return the permission bits of PATH, which is always NIL here: there is no
+portable spelling of stat. The secret file check reads NIL as a mode it cannot
+refuse on, which is the same answer it gives for a file that is absent, so no
+implementation other than SBCL loses a check it was able to make."
+  (declare (ignore path))
+  nil)
+
 ;;;; Backtraces.
 ;;;;
 ;;;; A long running server without a trace on crash is a server the operator

@@ -2,8 +2,9 @@
 ;;;;
 ;;;; One adapter covers OpenCode Go, OpenAI, and anything that speaks the chat
 ;;;; completions shape, which is what the config's :BACKEND :OPENAI means.
-;;;; Anthropic's cache_control is a different wire shape and gets its own file
-;;;; when it gets written.
+;;;; Anthropic's Messages API is a different wire shape, with a top level
+;;;; system field and tool_use and tool_result content blocks, and it has a
+;;;; file of its own: anthropic.cl, which loads after this one.
 ;;;;
 ;;;; The request and the response are separated from the transport on purpose:
 ;;;; COMPLETION-REQUEST and PARSE-COMPLETION are pure functions over text and
@@ -24,6 +25,13 @@
 ;;;; methods at the top.
 
 (in-package #:enchiridion.llm)
+
+;; ANTHROPIC-BACKEND is defined in anthropic.cl, which loads after this file,
+;; and RESOLVE-BACKEND below calls it: a forward reference across files needs a
+;; declaration or the compiler warns, which this tree makes fatal. A bare
+;; FUNCTION proclamation carries no lambda list, so it is not a second copy of
+;; the signature. BROKER-CALL in enchiridion.tools.broker uses the same idiom.
+(declaim (ftype function anthropic-backend))
 
 ;;;; JSON.
 ;;;;
@@ -157,6 +165,21 @@ every request so that it can route a conversation and keep its prompt cache
 warm. A backend generates one when it is built and reuses it for every turn."
   (format nil "~32,'0X" (random (expt 2 128))))
 
+(declaim (ftype (function (string) string) ensure-trailing-slash))
+
+(defun ensure-trailing-slash (url)
+  "Return URL ending in a slash, adding one when it lacks it.
+
+Every path in this file is appended to a base URL, so a missing slash silently
+turns /v1 into a host named v1 and the request fails with a name error instead
+of a useful message. Both backend constructors need the same rule, and one
+function for it means the rule cannot be right in the OpenAI client and wrong
+in the Anthropic one."
+  (if (and (plusp (length url))
+           (char= (char url (1- (length url))) #\/))
+      url
+      (concatenate 'string url "/")))
+
 (defun openai-backend (&key (base-url "https://api.openai.com/v1/")
                              api-key
                              (model nil)
@@ -169,10 +192,7 @@ BASE-URL gains a trailing slash when it lacks one, because every path is
 appended to it and a missing slash silently turns /v1 into a host named v1.
 SESSION-ID is generated when it is absent; one backend is one conversation."
   (%make-connection
-   :base-url (if (and (plusp (length base-url))
-                      (char= (char base-url (1- (length base-url))) #\/))
-                 base-url
-                 (concatenate 'string base-url "/"))
+   :base-url (ensure-trailing-slash base-url)
    :api-key (or api-key "")
    :model (or model (primary-model))
    :session-id (or session-id (new-session-id))
@@ -381,35 +401,41 @@ read and the one place it is formatted are not two different places."
   "The base delay in seconds for a retry. Attempt N waits N times this. Bound
 to 0 in tests so a retry test does not spend six seconds asleep.")
 
-(defun send-completion (connection messages model &key tools)
-  "Return the COMPLETION for MESSAGES from CONNECTION using MODEL.
+(declaim (ftype (function (function string string string string integer string
+                                    (integer 0 *))
+                          string)
+                post-with-retries))
+
+(defun post-with-retries (transport base-url path body api-key timeout extra
+                          retries)
+  "POST BODY to BASE-URL plus PATH with TRANSPORT, repeating a retryable status.
+
+TRANSPORT is HTTP-POST or ANTHROPIC-HTTP-POST, and it is called with the six
+request arguments between it and RETRIES. The last of those six is the one
+field each wire carries outside the body and outside the common headers: the
+OpenCode session key for the chat completions wire, and the anthropic-version
+header for the Messages API. Both transports take exactly six so that this one
+loop, and the retry policy written in it, cannot drift between providers.
 
 429 and 5xx are repeated with a growing gap, because they are the two the same
-request is worth sending again. Everything else in the 4xx range is reported
-at once: a wrong key or a wrong model does not become right by being
-repeated.
+request is worth sending again. 529 is Anthropic's overloaded status and 504
+is its gateway timeout; both are above 500 and are covered by the same test.
+Everything else in the 4xx range is reported at once: a wrong key or a wrong
+model does not become right by being repeated.
 
 There is no loop inside the handler. The handler returns after it sleeps, the
 body of the outer loop ends, and the outer loop runs again. An inner (loop)
 would be a new infinite loop and a 429 would hang the process instead of
 retrying the request."
-  (let ((body (completion-request model messages :tools tools))
-        (attempt 0))
+  (let ((attempt 0))
     (loop
       (handler-case
-          (return (parse-completion
-                   (parse-json (funcall *http-post-function*
-                                        (openai-connection-base-url connection)
-                                        "chat/completions"
-                                        body
-                                        (openai-connection-api-key connection)
-                                        (openai-connection-timeout connection)
-                                        (openai-connection-session-id connection)))))
+          (return (funcall transport base-url path body api-key timeout extra))
         (dexador.error:http-request-failed (failure)
           (let ((status (dexador.error:response-status failure)))
             (if (and (integerp status)
                      (or (= status 429) (>= status 500))
-                     (< attempt (openai-connection-retries connection)))
+                     (< attempt retries))
                 (progn (incf attempt)
                        (sleep (* *retry-delay* attempt)))
                 (error 'enchiridion.errors:transport-error
@@ -419,6 +445,24 @@ retrying the request."
                                        (1+ attempt)
                                        (provider-error-message
                                         (dexador.error:response-body failure)))))))))))
+
+(defun send-completion (connection messages model &key tools)
+  "Return the COMPLETION for MESSAGES from CONNECTION using MODEL.
+
+The reply is parsed after POST-WITH-RETRIES returns, not inside it: a 200 that
+carries something PARSE-JSON cannot read is not a transport failure and is not
+retried, and the retry loop stays a loop over one HTTP call."
+  (let ((body (completion-request model messages :tools tools)))
+    (parse-completion
+     (parse-json
+      (post-with-retries *http-post-function*
+                         (openai-connection-base-url connection)
+                         "chat/completions"
+                         body
+                         (openai-connection-api-key connection)
+                         (openai-connection-timeout connection)
+                         (openai-connection-session-id connection)
+                         (openai-connection-retries connection))))))
 
 ;;;; The operations.
 ;;;;
@@ -458,10 +502,14 @@ signature change the moment tools arrive."
 
 ;;;; Providers.
 ;;;;
-;;;; The wire protocol is :OPENAI for both providers. The provider chooses the
-;;;; endpoint, the default reasoning model, and the name of the key variable.
+;;;; A provider row carries three facts: the endpoint, the default model, and
+;;;; the name of the key variable. OpenAI and OpenCode Go speak the same chat
+;;;; completions shape, so for them the row is the whole difference. Anthropic
+;;;; speaks the Messages API, so its row is read by RESOLVE-BACKEND's
+;;;; :ANTHROPIC clause, which chooses the request shape and the row together.
+;;;;
 ;;;; OpenAI is the default. A key that the environment or .env supplies selects
-;;;; the other provider. An explicit :PROVIDER or a recognized :BASE-URL in
+;;;; another provider. An explicit :PROVIDER or a recognized :BASE-URL in
 ;;;; config.cl wins over both.
 
 (defparameter +provider-defaults+
@@ -472,9 +520,17 @@ signature change the moment tools arrive."
     :opencode
     (:base-url "https://opencode.ai/zen/go/v1"
      :model "deepseek-v4.1-flash"
-     :api-key-env "OPENCODE_API_KEY"))
+     :api-key-env "OPENCODE_API_KEY")
+    :anthropic
+    (:base-url "https://api.anthropic.com/"
+     :model "claude-sonnet-5-5"
+     :api-key-env "ANTHROPIC_API_KEY"))
   "Provider name to the endpoint, default model, and key variable it uses.
-Both speak the OpenAI chat completions shape; only these three facts differ.")
+:OPENAI and :OPENCODE speak the same chat completions shape, so these three
+facts are the whole difference between them. :ANTHROPIC speaks the Messages
+API: its row is read by RESOLVE-BACKEND's :ANTHROPIC clause, which selects the
+endpoint, the key variable, and the request shape together, because the
+Anthropic endpoint is meaningless to a chat completions request.")
 
 (declaim (ftype (function (t) list) provider-properties))
 
@@ -486,21 +542,22 @@ Both speak the OpenAI chat completions shape; only these three facts differ.")
 (declaim (ftype (function (t) (or null keyword)) normalize-provider))
 
 (defun normalize-provider (name)
-  "Return NAME as :OPENAI or :OPENCODE, or NIL when it is neither."
+  "Return NAME as :OPENAI, :OPENCODE or :ANTHROPIC, or NIL when it is none."
   (when name
     (let ((keyword (intern (string-upcase (string name)) :keyword)))
-      (when (member keyword '(:openai :opencode))
+      (when (member keyword '(:openai :opencode :anthropic))
         keyword))))
 
 (declaim (ftype (function (t) (or null keyword)) provider-from-base-url))
 
 (defun provider-from-base-url (url)
-  "Return the provider URL names, or NIL for a server that is neither.
-A local OpenAI-compatible server is neither, and its config still works: the
-base URL is used as written and the key variable comes from detection."
+  "Return the provider URL names, or NIL for a server that is none of them.
+A local OpenAI-compatible server matches nothing, and its config still works:
+the base URL is used as written and the key variable comes from detection."
   (when (stringp url)
     (cond
       ((search "opencode.ai" url) :opencode)
+      ((search "api.anthropic.com" url) :anthropic)
       ((search "api.openai.com" url) :openai)
       (t nil))))
 
@@ -517,12 +574,17 @@ the same way an exported variable does."
 
 (defun detect-provider (&optional config)
   "Return the provider CONFIG asks for, or the one the keys select.
-The order is explicit config, a recognized base URL, an OpenAI key, an
-OpenCode key, then OpenAI. OpenAI wins a tie because it is the default."
+
+The order is explicit config, a recognized base URL, an OpenAI key, an OpenCode
+key, an Anthropic key, then OpenAI. OpenAI wins a tie because it is the default:
+a machine that holds two provider keys has to have its choice written down, and
+the alternative is a provider that changes when an unrelated variable is
+exported."
   (or (normalize-provider (enchiridion:config-value config :provider))
       (provider-from-base-url (enchiridion:config-value config :base-url))
       (and (provider-key-present-p "OPENAI_API_KEY") :openai)
       (and (provider-key-present-p "OPENCODE_API_KEY") :opencode)
+      (and (provider-key-present-p "ANTHROPIC_API_KEY") :anthropic)
       :openai))
 
 (declaim (ftype (function (&optional t) string) default-api-key-env))
@@ -532,6 +594,33 @@ OpenCode key, then OpenAI. OpenAI wins a tie because it is the default."
 An explicit :API-KEY-ENV in config wins; otherwise the provider decides."
   (or (enchiridion:config-value config :api-key-env)
       (getf (provider-properties (detect-provider config)) :api-key-env)))
+
+(declaim (ftype (function (&optional t) list) provider-key-names))
+
+(defun provider-key-names (&optional config)
+  "Return every variable name that can hold a provider's API key.
+
+The list is the :API-KEY-ENV of every row in +PROVIDER-DEFAULTS+, in table
+order, followed by the :API-KEY-ENV the operator configured. It is the whole
+list and not only the selected provider's name because a key in another
+provider's variable is still a secret in this process: the loader has to read
+it before `enchiridion secrets` can list it, and the scrubber has to know the
+name before it can recognise the value.
+
+CONFIG is a configuration plist; NIL means the active configuration, which is
+the answer ENCHIRIDION:CONFIG gives, and an empty list means no configuration
+at all. The operator's own name is included even when it matches no known
+provider, because their file is the authority on what their key variable is
+called."
+  (let ((names '()))
+    (flet ((note (name)
+             (when (and (stringp name) (plusp (length name)))
+               (pushnew name names :test #'string=))))
+      (loop for cell on +provider-defaults+ by #'cddr
+            do (note (getf (second cell) :api-key-env)))
+      (note (enchiridion:config-value (or config (enchiridion:config))
+                                      :api-key-env)))
+    (nreverse names)))
 
 ;;;; Resolution.
 
@@ -545,9 +634,15 @@ An explicit :API-KEY-ENV in config wins; otherwise the provider decides."
   "Return the BACKEND that CONFIG asks for.
 
 CONFIG is a plist as config.cl holds it. An explicit :BASE-URL, :MODEL-PRIMARY,
-or :API-KEY-ENV wins. When one is absent, DETECT-PROVIDER chooses between
-OpenAI and OpenCode Go from the config, a recognized base URL, or the keys the
-environment and .env supplied.
+or :API-KEY-ENV wins. When one is absent, DETECT-PROVIDER chooses the provider
+from the config, a recognized base URL, or the keys the environment and .env
+supplied.
+
+:BACKEND chooses the wire protocol, and the provider row is chosen to match it:
+:ANTHROPIC gets the Anthropic row even when an OpenAI or OpenCode key is the
+one that is present, and :PROVIDER :ANTHROPIC without a :BACKEND selects the
+Anthropic protocol as well, because a row and a request shape have to agree
+before the endpoint means anything.
 
 CASE and not ECASE. ECASE is the better construct here in principle, because it
 refuses to run if a backend is added without a clause here, but SBCL 2.5.4
@@ -559,9 +654,12 @@ shape for the same reason.
 The T clause exists so that a typo in a config key is named rather than
 reported as a missing function."
   (let* ((config (or config '()))
-         (provider (detect-provider config))
+         (detected (detect-provider config))
+         (backend (or (enchiridion:config-value config :backend)
+                      (and (eq detected :anthropic) :anthropic)
+                      :openai))
+         (provider (if (eq backend :anthropic) :anthropic detected))
          (properties (provider-properties provider))
-         (backend (enchiridion:config-value config :backend :openai))
          (url (or base-url
                   (enchiridion:config-value config :base-url)
                   (getf properties :base-url)))
@@ -572,10 +670,21 @@ reported as a missing function."
       (:openai (openai-backend :base-url url
                                :api-key key
                                :model model))
+      (:anthropic (anthropic-backend
+                   :base-url url
+                   :api-key key
+                   :model model
+                   ;; MAX-TOKENS is required on this wire, and the connection
+                   ;; default is 4096. It is read from the config and not
+                   ;; derived from :BUDGET: the budget is how much the day may
+                   ;; spend, and a per-request cap invented from it would be a
+                   ;; limit the operator never chose.
+                   :max-tokens (or (enchiridion:config-value config :max-tokens)
+                                   4096)))
       (t
        (error 'enchiridion.errors:configuration-error
               :key :backend
-              :detail (format nil "No backend for ~S. Only :OPENAI is written."
+              :detail (format nil "No backend for ~S. Only :OPENAI and :ANTHROPIC are written."
                               backend))))))
 
 (defun backend-api-key (config backend)
@@ -588,3 +697,4 @@ the provider detection already saw the registered keys there."
   (let ((variable (default-api-key-env config)))
     (or (enchiridion.llm.secrets:secret-value variable)
         (enchiridion.compat:environment-value variable))))
+

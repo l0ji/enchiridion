@@ -917,14 +917,39 @@ and the operator has to be able to see which is which."
 (declaim (ftype (function (list) integer) cmd-secrets))
 
 (defun cmd-secrets (arguments)
-  "List the loaded secret names and their sources, never their values."
+  "List the loaded secret names and their sources, never their values. Then
+report the secrets file, its mode, and whether it is still there. When this
+process loaded a file, the line reports the file it opened and the mode it had
+at the time, remembered rather than resolved again: the container copy is
+unlinked once its values are in memory, and a second resolution would name the
+host fallback instead. That report is guarantee 6 of section 5.5 made visible."
   (declare (ignore arguments))
   (let ((names (enchiridion.llm.secrets:secret-names)))
     (if names
         (dolist (name names)
           (say "~A from ~(~A~)" name (enchiridion.llm.secrets:secret-source name)))
-        (say "no secrets are loaded."))
-    0))
+        (say "no secrets are loaded.")))
+  (let ((read (enchiridion.llm.secrets:secrets-file-read)))
+    (if read
+        ;; The file was opened, so it is the file this line is about, and it
+        ;; may already be gone: `discarded` is the container steady state, and
+        ;; it means the supervisor unlinked the copy as promised.
+        (let ((mode (enchiridion.llm.secrets:secrets-file-mode-read)))
+          (say "secrets file ~A mode ~A ~:[discarded~;present~]"
+               read
+               (if mode (format nil "#o~O" mode) "unknown")
+               (probe-file read)))
+        ;; No file was read, so there is nothing to remember and the line
+        ;; answers where the loader would have looked.
+        (let* ((path (enchiridion.llm.secrets:operator-secrets-file))
+               (present (probe-file path))
+               (resolved (or present path))
+               (mode (enchiridion.compat:file-mode resolved)))
+          (say "secrets file ~A mode ~A ~:[absent~;present~]"
+               resolved
+               (if mode (format nil "#o~O" mode) "unknown")
+               present))))
+  0)
 
 (declaim (ftype (function (list) integer) cmd-version))
 

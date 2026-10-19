@@ -23,6 +23,7 @@ Quicklisp. The Docker image uses Quicklisp, because it has no Nix.
 
 ```sh
 nix develop                      # development shell
+nix develop .#full               # the heavy shell, with the Docker tooling
 nix run .#check                  # compile every file
 nix run .#test                   # run the test suite
 nix run .#enchiridion -- help    # print the command list
@@ -30,13 +31,17 @@ nix run .#enchiridion -- help    # print the command list
 
 | Command                         | What it does                                                               |
 | ------------------------------- | -------------------------------------------------------------------------- |
-| `nix develop`                   | Start the development shell with SBCL, SQLite, sly, nixfmt, and git.       |
+| `nix develop`                   | Start the development shell with SBCL, SQLite, slynk, nixfmt, and git.     |
+| `nix develop .#full`            | Default shell plus the C toolchain, full git, colima, and clang-tools.     |
 | `nix run .#check`               | Compile the systems and the two entry scripts. A warning fails the build.  |
 | `nix run .#test`                | Run the test systems `enchiridion-tests` and `enchiridion-tests/property`. |
 | `nix run .#enchiridion -- help` | Run the program with the `help` command.                                   |
 | `nix run .#enchiridion`         | Run the program with no command. This is the first launch.                 |
 | `nix run .`                     | Run the same program through the `default` app.                            |
 | `docker compose build`          | Build the container image from `docker/Dockerfile`.                        |
+
+Use `nix develop .#full` for the container workflow and for compiling a new
+C-backed Lisp dependency by hand.
 
 `.#check` is the gate. It compiles every system file, then `src/main.cl` and
 `src/broker-exec.cl` on their own. A compiler warning becomes an error, so a

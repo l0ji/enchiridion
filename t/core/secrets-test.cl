@@ -5,6 +5,13 @@
 ;;;; request, or an outbound message does not survive it. Every path in the
 ;;;; plan is here, because the one that is missing is the one that leaks.
 ;;;;
+;;;; The last three tests stand in for guarantee 6 of section 5.5 instead: the
+;;;; container copy of the secret file is refused when the world can read it,
+;;;; it is unlinked once the supervisor has read it, and the operator's
+;;;; checkout .env is never the file that gets unlinked. A file on disk is the
+;;;; one thing the scrubber cannot save the operator from, so the file check is
+;;;; tested here beside it.
+;;;;
 ;;;; The fake keys are obviously fake. The scrubber must not care.
 
 (defpackage #:enchiridion-secrets-test
@@ -17,6 +24,36 @@
 (defparameter +fake-key+
   "sk-live-0000000000000000NOTREAL0000000000"
   "A value that is the right shape and worth nothing.")
+
+(defmacro with-scratch-directory ((name &key (prefix "enchiridion-secrets-test-"))
+                                  &body body)
+  "Bind NAME to a fresh temporary directory, run BODY, then remove it.
+
+Scratch lives under *DEFAULT-PATHNAME-DEFAULTS* and not under TMPDIR, for the
+reason testing.md gives: a nix build sandbox has no writable /tmp. That matters
+more here than anywhere else, because these tests write a file and then set its
+mode, and a mode is not worth reading on a filesystem that refused the write."
+  `(let ((,name (uiop:ensure-directory-pathname
+                  (merge-pathnames
+                   (format nil "~A~D" ,prefix (random most-positive-fixnum))
+                   (uiop:ensure-directory-pathname *default-pathname-defaults*)))))
+     (unwind-protect
+          (progn ,@body)
+       (uiop:delete-directory-tree ,name
+                                   :validate t
+                                   :if-does-not-exist :ignore))))
+
+(declaim (ftype (function (t t) t) write-fixture))
+
+(defun write-fixture (path text)
+  "Write TEXT to PATH, creating every parent directory, and return PATH."
+  (ensure-directories-exist path)
+  (with-open-file (stream path :direction :output
+                               :if-exists :supersede
+                               :if-does-not-exist :create
+                               :external-format :utf-8)
+    (write-string text stream))
+  path)
 
 (deftest a-loaded-secret-never-survives-a-scrub ()
   (enchiridion.llm.secrets:clear-secrets)
@@ -251,3 +288,104 @@
     (ng (search "later-value-not-yet-loaded"
                 (enchiridion.llm.secrets:scrub "later-value-not-yet-loaded"))))
   (enchiridion.llm.secrets:clear-secrets))
+
+(deftest a-secret-file-the-world-can-read-is-refused ()
+  ;; Guarantee 6 of section 5.5 says the container copy is gone at steady state.
+  ;; This test is the other half: it is gone, and while it is there the world
+  ;; cannot read it.
+  (with-scratch-directory (scratch)
+    (let ((path (merge-pathnames "secrets.env" scratch)))
+      (testing "an absent file is not a leak"
+        (ng (probe-file path))
+        (ok (enchiridion.llm.secrets:secret-file-mode-ok-p path)))
+      (write-fixture path "OPENCODE_API_KEY=not-a-real-value")
+      (testing "the mode the operator is told to use passes"
+        (enchiridion.compat:set-file-mode path #o600)
+        (ok (eql #o600 (enchiridion.compat:file-mode path)))
+        (ok (enchiridion.llm.secrets:secret-file-mode-ok-p path)))
+      (testing "a group readable file passes, because only the world bit leaks"
+        (enchiridion.compat:set-file-mode path #o640)
+        (ok (enchiridion.llm.secrets:secret-file-mode-ok-p path)))
+      (testing "a world readable file is refused"
+        (enchiridion.compat:set-file-mode path #o644)
+        (ng (enchiridion.llm.secrets:secret-file-mode-ok-p path)))
+      (testing "the world execute bit is not the world read bit"
+        (enchiridion.compat:set-file-mode path #o601)
+        (ok (enchiridion.llm.secrets:secret-file-mode-ok-p path))))))
+
+(deftest only-the-container-copy-may-be-unlinked ()
+  ;; The refusal is the test that matters. The operator's checkout .env is the
+  ;; file a quiet delete would destroy, and this function is the only thing in
+  ;; the tree allowed to unlink a secret file at all.
+  (with-scratch-directory (scratch)
+    (let* ((container (merge-pathnames "run/secrets/.env" scratch))
+           (checkout (merge-pathnames ".env" scratch)))
+      (write-fixture container "OPENCODE_API_KEY=not-a-real-value")
+      (write-fixture checkout "OPENCODE_API_KEY=not-a-real-value")
+      (testing "a path that is not the container path is refused and stays"
+        (ng (enchiridion.llm.secrets:discard-secrets-file checkout))
+        (ok (probe-file checkout)))
+      (testing "the container path is the one path that goes"
+        ;; The container path is moved into the scratch directory for the length
+        ;; of this form. A nix build sandbox has no /run/secrets to write to, so
+        ;; a test that used the deployed path would pass by never running the
+        ;; delete at all, and the branch that ships would be the branch that is
+        ;; never exercised here.
+        (let ((enchiridion.llm.secrets:+container-secrets-path+ container))
+          (ok (enchiridion.llm.secrets:discard-secrets-file container)))
+        (ng (probe-file container))))))
+
+(deftest credential-shaped-names-are-recognised-and-plain-names-are-not ()
+  (testing "the names the shipped configuration reads"
+    (dolist (name '("OPENAI_API_KEY" "OPENCODE_API_KEY" "ANTHROPIC_API_KEY"
+                    "FLUXER_BOT_TOKEN" "ENCHIRIDION_HTTP_TOKEN"))
+      (testing name
+        (ok (enchiridion.llm.secrets:credential-variable-p name)))))
+  (testing "the names the operator's own tooling brings"
+    (dolist (name '("GITHUB_TOKEN" "AWS_SECRET_ACCESS_KEY" "MY_PASSWORD"
+                    "SOME_PASSWD" "DEPLOY_PRIVATE_KEY" "SERVICE_APIKEY"
+                    "HTTP_AUTHORIZATION" "github_token" "aws_secret_access_key"))
+      (testing name
+        (ok (enchiridion.llm.secrets:credential-variable-p name)))))
+  (testing "the names the child process cannot lose"
+    (dolist (name '("PATH" "HOME" "PWD" "SHELL" "TERM" "LANG" "LC_ALL" "TMPDIR"
+                    "USER" "LOGNAME" "SBCL_HOME" "CL_SOURCE_REGISTRY"
+                    "ENCHIRIDION_SOURCE" "ENCHIRIDION_SBCL" "LD_LIBRARY_PATH"
+                    "DYLD_LIBRARY_PATH" "DYLD_FALLBACK_LIBRARY_PATH"
+                    "XDG_CACHE_HOME" "XDG_CONFIG_HOME" "XDG_DATA_HOME"
+                    "XDG_STATE_HOME" "XDG_RUNTIME_DIR"))
+      (testing name
+        (ng (enchiridion.llm.secrets:credential-variable-p name)))))
+  (testing "a name that is not a string, and the empty name, are not credentials"
+    (ng (enchiridion.llm.secrets:credential-variable-p nil))
+    (ng (enchiridion.llm.secrets:credential-variable-p ""))
+    (ng (enchiridion.llm.secrets:credential-variable-p :OPENCODE_API_KEY))))
+
+(deftest the-file-the-loader-opened-is-remembered-after-it-is-gone ()
+  ;; The container copy is unlinked the moment its values are in memory. This is
+  ;; what lets the `secrets` line name that file afterwards instead of resolving
+  ;; the path a second time, finding the host fallback, and calling it absent
+  ;; while listing names that plainly came from somewhere.
+  (with-scratch-directory (scratch)
+    (let ((path (merge-pathnames "secrets.env" scratch)))
+      (enchiridion.llm.secrets:clear-secrets)
+      (testing "nothing is remembered before a file is read"
+        (ng (enchiridion.llm.secrets:secrets-file-read))
+        (ng (enchiridion.llm.secrets:secrets-file-mode-read)))
+      (write-fixture path "OPENCODE_API_KEY=not-a-real-value")
+      (enchiridion.compat:set-file-mode path #o600)
+      (enchiridion.llm.secrets:load-secrets :path path)
+      (testing "the loader names the file it opened and the mode it had"
+        (ok (uiop:pathname-equal path
+                                 (enchiridion.llm.secrets:secrets-file-read)))
+        (ok (eql #o600 (enchiridion.llm.secrets:secrets-file-mode-read))))
+      (delete-file path)
+      (testing "and both survive the file they describe"
+        (ng (probe-file path))
+        (ok (uiop:pathname-equal path
+                                 (enchiridion.llm.secrets:secrets-file-read)))
+        (ok (eql #o600 (enchiridion.llm.secrets:secrets-file-mode-read))))
+      (testing "clear-secrets forgets the file with the values"
+        (enchiridion.llm.secrets:clear-secrets)
+        (ng (enchiridion.llm.secrets:secrets-file-read))
+        (ng (enchiridion.llm.secrets:secrets-file-mode-read))))))

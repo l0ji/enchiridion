@@ -15,13 +15,16 @@
   '(:llm
     ;;; This template uses OpenCode Go. Without config.cl, a key in
     ;;; OPENAI_API_KEY selects OpenAI, a key in OPENCODE_API_KEY selects
-    ;;; OpenCode Go, and OpenAI is the fallback. :provider makes the choice
-    ;;; explicit and wins over both the environment and the base URL.
+    ;;; OpenCode Go, a key in ANTHROPIC_API_KEY selects the Messages API, and
+    ;;; OpenAI is the fallback. :provider makes the choice explicit and wins
+    ;;; over both the environment and the base URL.
     (:provider :opencode)
 
     ;;; Which backend protocol to speak. :openai covers OpenCode Go, OpenAI,
     ;;; and any local OpenAI-compatible server. :anthropic covers the Messages
-    ;;; API with cache_control. :litellm starts a supervised LiteLLM process.
+    ;;; API, with tool_use blocks and cache_control breakpoints, and selects
+    ;;; the :anthropic provider row with it. :litellm starts a supervised
+    ;;; LiteLLM process.
     (:backend :openai)
 
     ;;; Base URL. Omit for the provider default.
@@ -37,8 +40,13 @@
     (:model-sleep   "deepseek-v4.1-flash")
 
     ;;; Name of the variable in .env that holds the key. The file holds the
-    ;;; name, never the value.
+    ;;; name, never the value. Omit it and the selected provider names the
+    ;;; variable: OPENAI_API_KEY, OPENCODE_API_KEY, or ANTHROPIC_API_KEY.
     (:api-key-env "OPENCODE_API_KEY")
+
+    ;;; The Messages API requires a max_tokens field on every request and has
+    ;;; no default of its own. The OpenAI-shaped wire ignores this key.
+    (:max-tokens 4096)
 
    ;;; Channels are a subcategory. Every entry has the same shape, with
    ;;; :enabled, and only the keys that channel understands. The CLI channel

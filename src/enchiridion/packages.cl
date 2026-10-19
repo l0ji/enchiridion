@@ -42,7 +42,7 @@ because a file in the repository is a file that ends up in a store path."))
    #:process-id #:process-kill
    #:script-arguments #:exit-with #:backtrace-string
    #:encode-utf8 #:decode-utf8 #:run-program-capture #:temp-directory
-   #:set-file-mode #:with-interrupt-handler #:signal-interactive-interrupt
+   #:set-file-mode #:file-mode #:with-interrupt-handler #:signal-interactive-interrupt
    #:install-shutdown-signals #:shutdown-interrupt-p #:signal-shutdown-interrupt)
   (:documentation
    "The only file in the tree that contains implementation extensions.
@@ -94,21 +94,30 @@ recover from a string."))
    #:completion-input-tokens #:completion-output-tokens
    #:completion-cache-read-tokens #:completion-cache-write-tokens
    #:completion-total-tokens
-   ;; Backends.
-   #:openai-backend #:resolve-backend
+   ;; Backends. Each wire shape is selected by RESOLVE-BACKEND, and the two
+   ;; protocols live in files of their own so neither can quietly grow the
+   ;; other's fields.
+   #:openai-backend #:anthropic-backend #:resolve-backend
    ;; The two halves of the OpenAI wire format, exported so they can be tested
    ;; without a network. They are pure functions over text and data, which is
    ;; the only reason the format is testable at all. PARSE-JSON goes with them
    ;; because it is the JSON door: one place decides what a parsed object is.
    #:completion-request #:parse-completion #:parse-json #:stringify
+   ;; The two halves of the Anthropic wire format, exported for the same
+   ;; reason. ANTHROPIC-PARSE-COMPLETION takes the reply text rather than a
+   ;; parsed object, because it has to tell an empty array from an absent
+   ;; field and has to keep a tool input an object.
+   #:anthropic-completion-request #:anthropic-parse-completion
    ;; Tiers. The models are primary-model, cheap-model and sleep-model rather
    ;; than the bare words, because a function named SLEEP in a package that
    ;; uses CL is a package lock error.
    #:*model-primary* #:*model-cheap* #:*model-sleep*
    #:tier #:model-for-tier #:primary-model #:cheap-model #:sleep-model
    ;; Provider selection and the variable that holds the key for the active
-   ;; provider. Main uses the second one before it builds the backend.
-   #:detect-provider #:default-api-key-env)
+   ;; provider. Main uses the second one before it builds the backend, and it
+   ;; unions PROVIDER-KEY-NAMES into the names the loader reads, so a key for a
+   ;; provider that is not selected still reaches the scrubber.
+   #:detect-provider #:default-api-key-env #:provider-key-names)
   (:documentation
    "LLM backends, the request and result shapes they share, and the three
 model tiers. The kernel never branches on which backend is in use."))
@@ -126,10 +135,27 @@ model tiers. The kernel never branches on which backend is in use."))
    #:*loaded-sources*
    #:*sealed*
    #:+redaction-marker+
+   ;; The container path and the three operations over it. The supervisor reads
+   ;; the file, checks its mode, and unlinks it once the values are in memory,
+   ;; so the path is shared rather than written out at each call site; and the
+   ;; environment sweep needs the predicate that says which variable names are
+   ;; credential-shaped.
+   #:+container-secrets-path+
    #:load-secrets #:load-secrets-from #:register-secret #:clear-secrets
    #:secret-names #:secret-value #:secret-source #:secret-present-p
+   #:secret-file-mode-ok-p #:discard-secrets-file
    #:scrub #:scrub-object #:scrub-tree #:sealed-p #:seal #:unseal
-   #:scrubber #:pattern #:secrets-file #:role-name-p #:parse-env-line)
+   #:scrubber #:pattern #:secrets-file #:role-name-p #:credential-variable-p
+   ;; The one resolution of "which .env does the operator mean". The loader in
+   ;; src/main.cl and the `secrets` command both call it, so the file that is
+   ;; read and the file that is reported cannot become two different files.
+   #:operator-secrets-file
+   ;; What the loader actually read, and the mode it had then. A report about a
+   ;; file that was deliberately unlinked cannot be a fresh lookup of a file
+   ;; that was never there, and these two are what the `secrets` command reads
+   ;; instead when the container copy has already been discarded.
+   #:secrets-file-read #:secrets-file-mode-read
+   #:parse-env-line)
   (:documentation
    "Loads .env into memory and scrubs every loaded value and every known shape
 out of text on its way to a model, a transcript, or Fluxer. This is the

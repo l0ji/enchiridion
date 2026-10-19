@@ -33,6 +33,10 @@
      (:file "compat-test")
      (:file "config-test")
      (:file "llm-test")
+     ;; The Anthropic wire format. It is a separate file because it is a
+     ;; separate wire shape; it loads right after the OpenAI one for the same
+     ;; reason the backends do.
+     (:file "anthropic-test")
      (:file "blocks-test")
      (:file "store-test")
      (:file "tiers-test")

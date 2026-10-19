@@ -18,7 +18,6 @@
   (:use #:cl)
   (:import-from
    #:uiop
-   #:getcwd
    #:getenv
    #:pathname-directory-pathname)
   (:export
@@ -187,12 +186,12 @@ broker runs as uid 1000 and SQLite cannot lock a file its user cannot write."
 (declaim (ftype (function () pathname) secrets-path))
 
 (defun secrets-path ()
-  "Return the .env path to read. The container tmpfs wins, then the current
-directory, then the source root. The checkout keeps .env beside the code, and
-`nix run` executes a script in the store while the operator stands in the
-checkout, so the current directory is the one that can see the host file."
-  (enchiridion.llm.secrets:secrets-file
-   :directories (list (getcwd) (enchiridion:project-root))))
+  "Return the .env path to read. The container tmpfs wins, then the operator's
+directory, then the source root. OPERATOR-SECRETS-FILE owns that order, so this
+function and the `secrets` command report the same file; the two call sites
+only spelled the order out once, and a second copy here is how they would come
+to disagree about which file was loaded."
+  (enchiridion.llm.secrets:operator-secrets-file))
 
 (declaim (ftype (function (&optional t) string) load-configured-secrets))
 
@@ -204,25 +203,84 @@ The key comes from the loader rather than from getenv so that there is one
 path to a secret. .env is read here, held in memory by the loader, and not
 written anywhere; the process is short lived and nothing is logged.
 
+A file the world can read is refused before one pair is read. Mode 600 is the
+documented contract in docs/deployment.md, and it is a contract the file cannot
+keep on its own: an operator's umask writes what it likes and a cp preserves
+what it was given. The check is here, after the file is resolved and before the
+loader opens it, and it fails closed with the path and the mode in the message.
+A group-readable file passes, because a group-shared file is a normal
+deployment; the world read bit is the one that admits uid 1000, which is the
+whole point of the split.
+
 Every name the configuration mentions is read, not only the LLM key: a Fluxer
 bot token and a webhook token are secrets too, and a token that never reaches
 the loader is a token the scrubber does not know and the shape filter cannot
-recognise. Loading them here is also what lets `enchiridion secrets` list them
-by name and source without ever printing a value.
+recognise. The provider key names are read as well, whatever provider this
+process ends up choosing, because a key for the provider it did not choose is
+still a key in this process. Loading them here is also what lets `enchiridion
+secrets` list them by name and source without ever printing a value.
 
 The names are then removed from this process's environment, which is the step
 PLAN.md section 5.2 promises: a child inherits nothing and a later read of
-/proc finds nothing. The value stays in memory for the life of the process."
+/proc finds nothing. The configured names are not the whole story, because an
+operator can export a credential this configuration never heard of, so every
+credential-shaped variable in the environment goes as well. The predicate that
+decides which names those are never selects PATH, HOME, TERM, SBCL_HOME,
+CL_SOURCE_REGISTRY, LD_LIBRARY_PATH, the DYLD_ paths, or an XDG_ name, so the
+process keeps everything it needs to run. The value stays in memory for the
+life of the process.
+
+The container copy of the file is unlinked once its values are in memory, which
+is guarantee 6 of section 5.5: without it the file outlives the read by the
+life of the container. The operator's checkout .env is never touched, because
+DISCARD-SECRETS-FILE refuses every path but /run/secrets/.env and this call site
+cannot overrule it. A read-only bind mount refuses the unlink, and that is a
+deployment docs/deployment.md supports, so the failure is one warning line on
+the error stream and not a stopped supervisor."
   (let* ((config (or config (load-config)))
          (path (secrets-path))
-         (names (enchiridion:configured-secret-names config)))
+         (present (probe-file path))
+         (configured (enchiridion:configured-secret-names config))
+         (names (append configured
+                        (enchiridion.llm:provider-key-names config))))
+    ;; The gate comes before the load. A check after it would be a report on a
+    ;; leak rather than a refusal of one, and the file is the input, so the
+    ;; check is on the input.
+    (when (and present
+               (not (enchiridion.llm.secrets:secret-file-mode-ok-p path)))
+      (error 'enchiridion.errors:configuration-error
+             :key :secrets
+             :detail (format nil "~A is mode #o~O and every uid can read it.~
+                                  ~%Run chmod 600 ~A."
+                             path
+                             (enchiridion.compat:file-mode path)
+                             path)))
     ;; Load .env before choosing the provider. A key in the file is a key the
     ;; provider detection can see, and the file is not the process environment.
     (enchiridion.llm.secrets:load-secrets
-     :path (and (probe-file path) path)
+     :path (and present path)
      :names names)
     (dolist (name names)
       (enchiridion.compat:unset-environment-variable name))
+    (dolist (entry (enchiridion.compat:environment))
+      (let ((name (car entry)))
+        (when (enchiridion.llm.secrets:credential-variable-p name)
+          (enchiridion.compat:unset-environment-variable name))))
+    (let ((discarded (enchiridion.llm.secrets:discard-secrets-file path)))
+      ;; A declined discard is the host case and needs no words. A failure on
+      ;; the container copy leaves the file exactly where the discard was meant
+      ;; to remove it, and the operator is owed one line about it. The message
+      ;; goes through the scrubber like every other outbound string, so a
+      ;; mistake here cannot print a value.
+      (when (and (not discarded)
+                 (probe-file path)
+                 (uiop:pathname-equal
+                  path enchiridion.llm.secrets:+container-secrets-path+))
+        (format *error-output* "~&enchiridion: ~A~%"
+                (enchiridion.llm.secrets:scrub
+                 (format nil "could not unlink ~A; the secrets file is still on disk."
+                         path)))
+        (finish-output *error-output*)))
     (let ((value (enchiridion.llm.secrets:secret-value
                   (enchiridion.llm:default-api-key-env config))))
       (if (and value (plusp (length value))) value ""))))

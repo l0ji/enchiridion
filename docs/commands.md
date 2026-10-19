@@ -88,7 +88,7 @@ A call outside the argument range prints that line and returns 2.
 | `usage`     | none                                             | The token ledger by model, by channel, and by day.                            | 0, or 1 without a store                   |
 | `budget`    | none                                             | The tick cap, the day cap, and the spend against each cap.                    | 0                                         |
 | `tasks`     | 0 or more: `list [STATUS]`, `add TEXT`, `rm ID`  | The task rows, or one line about the change.                                  | 0, 1 without a store, or 2 for a bad call |
-| `secrets`   | none                                             | Each loaded secret name and its source.                                       | 0                                         |
+| `secrets`   | none                                             | Each secret name and its source, then the file path, mode, and presence.      | 0                                         |
 | `version`   | none                                             | `enchiridion 0.1.0`, the source root, the branch, and the head.               | 0                                         |
 | `help`      | 0 or 1: `NAME`                                   | Every command with a summary, or the detail for one command.                  | 0, or 2 for an unknown name               |
 | `bootstrap` | 0 or 1: `status`, `run`, `reset`                 | The bootstrap state, the remaining steps, or a reset line.                    | 0, or 2 for another action                |
@@ -295,6 +295,25 @@ prints one line that says so. It returns 0.
 Prints `NAME from SOURCE` for each loaded secret. The source is `env`, `file`,
 or `argument`. It never prints a value. With nothing loaded it prints
 `no secrets are loaded.` It returns 0.
+
+Then it prints one more line about the file the secrets came from:
+
+```text
+secrets file /run/secrets/.env mode #o600 discarded
+```
+
+The line names the path, its permission bits in octal, and whether the file is
+still there. When this process loaded a file, the path is that file and the mode
+is the mode it had at the moment its values were read; both are remembered by the
+loader rather than looked up again, because the supervisor unlinks the container
+copy once its values are in memory. The last word is then `present` or
+`discarded`; `discarded` is the steady state in a container, and it is what
+guarantee 6 of the plan promises. When this process loaded no file, the path is
+the one the loader would have tried and the last word is `present` or `absent`.
+`unknown` stands in for the mode when there is none to report. A lone `no secrets
+are loaded.` still keeps the file line, because an operator running with no
+secrets at all is exactly the operator who needs to see which file the program
+looked for. The line carries no value.
 
 ### `help`
 

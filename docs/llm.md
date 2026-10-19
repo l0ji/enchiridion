@@ -1,11 +1,14 @@
 # Models and secrets
 
 The kernel calls one generic function, `complete`, and reads a `completion`. It
-never asks which backend answered. One backend exists now, the OpenAI-compatible
-client, and it serves OpenAI, OpenCode Go, and a local server with the same wire
-shape. Three model tiers decide which model a piece of work uses. A separate
-module loads every secret into memory. It scrubs each loaded value, and each known
-key shape, out of text before that text reaches a model or a channel.
+never asks which backend answered. Two backends exist. The OpenAI-compatible
+client serves OpenAI, OpenCode Go, and a local server with the same wire shape.
+The Anthropic client speaks the Messages API, which puts instructions in a top
+level field, represents a tool result as a user content block, and marks the
+cached prefix with breakpoints. Three model tiers decide which model a piece of
+work uses. A separate module loads every secret into memory. It scrubs each
+loaded value, and each known key shape, out of text before that text reaches a
+model or a channel.
 
 ## The provider protocol
 
@@ -31,18 +34,23 @@ arguments and the tool layer validates them.
 
 A `completion` holds the reply text, the tool calls, the model that answered, the
 stop reason, and four token counts. `completion-total-tokens` adds input and
-output only. A cache read is already part of the prompt count, so the function
-does not add it twice.
+output only. A cache read is already part of the prompt count, and every backend
+stores the input count provider-normalised with the cache counts folded in, so the
+function does not add either one twice.
 
 ## Backends
 
-`:openai` is the only backend with an implementation. `resolve-backend` accepts
-`:backend :openai` and signals `configuration-error` with `:key :backend` for
-any other value. `config.example.cl` names `:anthropic` and `:litellm` in
-comments, but no code implements either one, so a config that selects one does
-not start.
+`resolve-backend` accepts `:backend :openai` and `:backend :anthropic`. It signals
+`configuration-error` with `:key :backend` for any other value.
+`config.example.cl` names `:litellm` in comments, but no code implements it, so a
+config that selects it does not start.
 
-`openai-backend` builds the connection.
+| Backend      | Wire shape              | Default endpoint prefix      |
+| ------------ | ----------------------- | ---------------------------- |
+| `:openai`    | chat completions        | `https://api.openai.com/v1/` |
+| `:anthropic` | the Messages API        | `https://api.anthropic.com/` |
+
+`openai-backend` builds the OpenAI connection.
 
 | Keyword       | Default                      | Effect                                                                       |
 | ------------- | ---------------------------- | ---------------------------------------------------------------------------- |
@@ -56,31 +64,62 @@ not start.
 `new-session-id` returns 32 hexadecimal characters. One connection reuses one
 session id for every turn. `model-capabilities` reports `:tools` true, `:streaming`
 true, `:cache` true, and `:cache-breakpoints` nil. Nothing sends a cache
-breakpoint yet, and the backend reports the capability as absent rather than as
-present and ignored.
+breakpoint on this wire, and the backend reports the capability as absent rather
+than as present and ignored.
+
+`anthropic-backend` builds the Messages connection.
+
+| Keyword       | Default                      | Effect                                                                    |
+| ------------- | ---------------------------- | ------------------------------------------------------------------------- |
+| `:base-url`   | `https://api.anthropic.com/` | the endpoint prefix, with a trailing slash added when it is absent        |
+| `:api-key`    | `""`                         | the `x-api-key` header value                                              |
+| `:model`      | `*model-primary*`            | the default model for the connection                                      |
+| `:max-tokens` | 4096                         | `max_tokens`, which the API requires on every request                     |
+| `:cache-p`    | true                         | place the two cache breakpoints                                           |
+| `:cache-ttl`  | nil                          | a breakpoint lifetime, `"5m"` or `"1h"`; nil takes the provider's default |
+| `:timeout`    | 60                           | the read timeout and the connect timeout in seconds                       |
+| `:retries`    | 2                            | extra attempts that a 429 or a 5xx earns                                  |
+
+`model-capabilities` reports `:tools` true, `:streaming` true, `:cache` true, and
+`:cache-breakpoints` true, because this backend really does place breakpoints.
+There is no session id, because the Messages API has no routing header.
 
 ## Providers
 
-Two providers speak the OpenAI shape. The plist `+provider-defaults+` holds the
-three facts that differ.
+Three providers are known. The plist `+provider-defaults+` holds the three facts
+that differ between them.
 
-| Provider    | Base URL                        | Default model         | Key variable       |
-| ----------- | ------------------------------- | --------------------- | ------------------ |
-| `:openai`   | `https://api.openai.com/v1/`    | `gpt-5.6-luna`        | `OPENAI_API_KEY`   |
-| `:opencode` | `https://opencode.ai/zen/go/v1` | `deepseek-v4.1-flash` | `OPENCODE_API_KEY` |
+| Provider     | Base URL                        | Default model         | Key variable        |
+| ------------ | ------------------------------- | --------------------- | ------------------- |
+| `:openai`    | `https://api.openai.com/v1/`    | `gpt-5.6-luna`        | `OPENAI_API_KEY`    |
+| `:opencode`  | `https://opencode.ai/zen/go/v1` | `deepseek-v4.1-flash` | `OPENCODE_API_KEY`  |
+| `:anthropic` | `https://api.anthropic.com/`    | `claude-sonnet-5-5`   | `ANTHROPIC_API_KEY` |
+
+`:openai` and `:opencode` speak the same chat completions shape, so for them the
+row is the whole difference. `:anthropic` speaks the Messages API, and its row is
+only ever read together with that request shape: `:backend :anthropic` selects
+both, and `:provider :anthropic` with no `:backend` selects both as well, so the
+Anthropic endpoint can never be paired with a chat completions request.
 
 `detect-provider` picks one in this order. It reads an explicit `:provider`, then
 a base URL that `provider-from-base-url` recognizes. It then reads a present
-`OPENAI_API_KEY`, a present `OPENCODE_API_KEY`, and finally `:openai`. OpenAI wins
-a tie, because it is the default. `provider-from-base-url` matches `opencode.ai`
-and `api.openai.com`. A local server matches neither, and its config still works:
+`OPENAI_API_KEY`, a present `OPENCODE_API_KEY`, a present `ANTHROPIC_API_KEY`, and
+finally `:openai`. OpenAI wins a tie, because it is the default, and a machine
+that holds two provider keys has to have its choice written down.
+`provider-from-base-url` matches `opencode.ai`, `api.anthropic.com`, and
+`api.openai.com`. A local server matches none of them, and its config still works:
 the base URL is used as written.
 
 `default-api-key-env` returns the variable name for the active provider, unless
 config.cl sets `:api-key-env`. `backend-api-key` reads the value from the secret
 loader first and from the process environment second. The loader runs before
-provider detection, so a key in `.env` selects a provider the same way an
-exported variable does.
+provider detection, so a key in `.env` selects a provider the same way an exported
+variable does.
+
+`provider-key-names` returns every provider's key variable plus the configured
+`:api-key-env`, and `main.cl` unions that list into the names the loader reads. A
+key for a provider that was not selected is still a secret in the process, and the
+scrubber has to know the name before it can recognize the value.
 
 `resolve-backend` lets an explicit `:base-url`, `:model-primary`, or
 `:api-key-env` win over the provider defaults. The kernel calls `complete` with a
@@ -141,20 +180,85 @@ object into a plist with keyword keys, an array into a list, and JSON null into
 nil. `provider-error-message` reads the provider's own error text, and it answers
 one short line when the reply is not JSON at all.
 
+### The Messages API
+
+`anthropic-completion-request` builds the body for the Messages API. The object
+holds `model`, `max_tokens` (required by the API), and `messages`. The mapping is
+not the OpenAI one.
+
+- A system message is hoisted to a top level `system` array and never appears in
+  `messages`. Several system messages become one text block, concatenated in
+  order.
+- A tool message becomes a USER message whose content holds a `tool_result` block
+  with `tool_use_id`. Consecutive tool messages merge into one user message, in
+  order, and a text message that follows the results joins that same message after
+  them, because a `tool_result` block has to come first in its message.
+- An assistant message carries its text and then a `tool_use` block per call. The
+  input is a JSON object: the stored argument text is read with
+  `com.inuoe.jzon:parse`, which keeps objects as hash tables, and not with
+  `parse-json`, which turns them into plists that jzon writes back as arrays. An
+  empty or absent argument string becomes an empty object.
+- Tools are flat `name`, `description`, `input_schema` objects. The registry's
+  `parameters` key is renamed, and `tool_choice` `{"type": "auto"}` is added only
+  when there are tools.
+- `cache_control` `{"type": "ephemeral"}` goes on the last system block and the
+  last tool definition, which is at most two of the four breakpoints the API
+  allows, and never on the incoming user message. `:cache-ttl` adds a `ttl` field.
+
+A field the request does not need is absent and never nil: the JSON writer turns
+nil into `false`, and an empty `messages` array has to be `[]` rather than
+`false`.
+
+`anthropic-parse-completion` reads the reply text itself with
+`com.inuoe.jzon:parse`, because `parse-json` cannot tell an empty content array
+from an absent field and would collapse a tool input into a plist. It
+concatenates every text block into `completion-text`, turns each `tool_use` block
+into a tool call whose arguments are the input written back as JSON text, maps the
+stop reason, and folds the usage.
+
+| Completion slot      | Source field                                            |
+| -------------------- | ------------------------------------------------------- |
+| `input-tokens`       | `usage.input_tokens` plus both cache counts (see below) |
+| `output-tokens`      | `usage.output_tokens`                                   |
+| `cache-read-tokens`  | `usage.cache_read_input_tokens`                         |
+| `cache-write-tokens` | `usage.cache_creation_input_tokens`                     |
+
+Anthropic's `input_tokens` excludes the cache reads and the cache writes, so all
+three are added for `input-tokens` while the two cache slots are still filled. A
+reply with no content field at all signals `backend-error` with `:backend
+"anthropic"`. An empty content array is legal and becomes an empty completion,
+because a model may end a turn without saying anything. The stop reasons map as
+`end_turn` and `stop_sequence` to `stop`, `max_tokens` to `length`, and `tool_use`
+to `tool_calls`; anything else passes through as it came.
+
 ## Transport and retries
 
-`http-post` sends one POST to `base-url` plus `chat/completions`. It uses bearer
-authentication, a JSON content type, the user agent `enchiridion/0.1.0`, and the
-`x-opencode-session` header. OpenCode Go needs that header as its routing key and
-its prompt cache key, and a generic server ignores it. The special
-`*http-post-function*` holds the transport, so a test can replace it without a
-network.
+Two transports and one retry loop.
 
-`send-completion` builds the body once and calls the transport. It repeats a 429
-and any 5xx, up to `retries` extra attempts, and it waits `*retry-delay*` seconds
-times the attempt number. `*retry-delay*` is 2. Any other 4xx becomes a
-`transport-error` at once, with `:status` and the provider's own error text. A
-wrong key or a wrong model does not become right by a second send.
+| Backend             | Transport              | Path and headers                                                                       |
+| ------------------- | ---------------------- | -------------------------------------------------------------------------------------- |
+| `:openai`           | `http-post`            | `base-url` plus `chat/completions`, bearer authentication, `x-opencode-session`        |
+| `:anthropic`        | `anthropic-http-post`  | `base-url` plus `v1/messages`, `x-api-key`, `anthropic-version` `2023-06-01`           |
+
+`http-post` uses bearer authentication, a JSON content type, the user agent
+`enchiridion/0.1.0`, and the `x-opencode-session` header. OpenCode Go needs that
+header as its routing key and its prompt cache key, and a generic server ignores
+it. `anthropic-http-post` sends `content-type`, `x-api-key`, the required
+`anthropic-version`, and the same user agent. `x-api-key` is what every documented
+example sends; `Authorization: Bearer` is accepted today and deliberately unused,
+so the key stays out of the header proxies log, and no `x-opencode-session` goes
+with it. The specials `*http-post-function*` and
+`*anthropic-http-post-function*` hold the two transports, so a test can replace
+either one without a network.
+
+`post-with-retries` is the one retry loop. Both senders call it with their
+transport, and both transports take six arguments, so the two providers cannot
+drift apart in what they repeat. It repeats a 429 and any status at or above 500,
+up to `retries` extra attempts, and it waits `*retry-delay*` seconds times the
+attempt number. `*retry-delay*` is 2, and a test binds it to 0. The 5xx rule
+covers Anthropic's 500, 504, and 529. Any other 4xx becomes a `transport-error` at
+once, with `:status` and the provider's own error text. A wrong key or a wrong
+model does not become right by a second send.
 
 ## Token accounting
 

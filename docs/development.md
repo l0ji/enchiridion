@@ -41,6 +41,44 @@ SBCL as the bootstrap compiler. Every Lisp dependency comes from nixpkgs, built
 with that SBCL, and the gate loads the store fasls instead of compiling the
 dependencies itself.
 
+### Closure sizes
+
+Measured with `nix path-info -rSh` on `aarch64-darwin`:
+
+| Target                                | Closure |
+| ------------------------------------- | ------- |
+| `packages.aarch64-darwin.enchiridion` | 222 MB  |
+| `devShells.aarch64-darwin.default`    | 407 MB  |
+| `devShells.aarch64-darwin.full`       | 3.0 GB  |
+
+The package figure is SBCL and the Lisp libraries. Two parts of the Darwin
+figure are easy to reintroduce, so the composition is recorded here:
+
+- SBCL's own closure is 144 MB, down from 431 MB. nixpkgs substitutes
+  `${posixUtils}/bin/env` into SBCL's sources, and on Darwin `posixUtils` is
+  `darwin.shell_cmds`, whose closure reaches `libxo`, `gettext` and 267 MB of
+  `bootstrap-tools`. The flake rewrites that path to `coreutils` in
+  `sbclPatchPhase`, so neither `shell_cmds` nor `bootstrap-tools` appears
+  anywhere in the package closure. The rewrite is silent when it misses: if a
+  future nixpkgs renames `sbclPatchPhase`, the override becomes a no-op and the
+  reference returns, so the check that catches it is
+  `nix path-info -r .#packages.<system>.enchiridion | grep -cE
+  'shell_cmds|bootstrap-tools'`, which must be 0.
+- The default shell is 407 MB, down from 3.2 GB, because it uses `mkShellNoCC`
+  and `gitMinimal`. `mkShell` propagates `stdenv-darwin` (1.3 GB), and `pkgs.git`
+  pulls `python3`, which pulls the same toolchain; together they are 1.6 GB the
+  default shell never uses. Nix builds the C dependencies, so the toolchain is
+  only needed when someone compiles a new C-backed Lisp dependency by hand. The
+  rule is explicit: `default` is the lean shell, with no C toolchain and no git
+  python extras; `nix develop .#full` is the complete shell, with `pkgs.mkShell`,
+  full `pkgs.git`, colima, and clang-tools.
+
+The Linux closures need a Linux builder; they are not measured here.
+
+`$out/lib` holds `src/` and `enchiridion.asd` only, 2.1 MB. `t/`, `docs/`,
+`docker/`, `compose.yml`, `flake.nix`, `README.md`, and `LICENSE` are not
+runtime inputs and do not ship.
+
 ### Generated and ignored paths
 
 These live beside the source. `.gitignore` excludes all of them:
@@ -82,7 +120,7 @@ reads as `enchiridion.llm:complete` and the reader knows where it lives.
 1. `packages` and `compat`. The package definitions come before every file that
    uses them, and `compat` is the only file with implementation extensions.
 2. `config`, `git`, `errors`.
-3. `llm`: `secrets`, `protocol`, `openai`.
+3. `llm`: `secrets`, `protocol`, `openai`, `anthropic`.
 4. `memory`: `blocks`, `store`, `tiers`, `seed`, `state`.
 5. `tools`: `schema`, `registry`, `pipe`, `broker`, then the builtins `file`,
    `shell`, `search`, `blockops`, `meta`, `web`, `register`.

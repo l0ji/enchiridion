@@ -81,7 +81,11 @@
 
 (deftest every-credential-name-the-config-mentions-is-collected ()
   (testing "the shipped names, so an unconfigured harness still loads them"
-    (ok (equal '("OPENAI_API_KEY" "FLUXER_BOT_TOKEN" "ENCHIRIDION_HTTP_TOKEN")
+    ;; The shipped config names no LLM key variable: the provider table in the
+    ;; LLM module decides that name, and main.cl unions provider-key-names in
+    ;; before it loads anything. The two channel tokens are still shipped here,
+    ;; because no provider table can supply them.
+    (ok (equal '("FLUXER_BOT_TOKEN" "ENCHIRIDION_HTTP_TOKEN")
                (enchiridion:configured-secret-names (enchiridion:default-config)))))
   (testing "a configured name wins and the channels are still read"
     (let ((config '(:llm (:api-key-env "MY_LLM_KEY")

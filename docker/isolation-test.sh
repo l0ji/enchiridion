@@ -27,14 +27,33 @@ set -eu
 PHASE=${ISOLATION_PHASE:-all}
 STATE_DIR=${ENCHIRIDION_HOME:-/var/lib/enchiridion}
 
-# The names the shipped configuration reads: the model key, the Fluxer bot
-# token, and the webhook token. A config.cl that renames one has to add the
-# new name here too, or the hole this closes opens again.
-SECRET_NAMES="OPENCODE_API_KEY OPENAI_API_KEY FLUXER_BOT_TOKEN ENCHIRIDION_HTTP_TOKEN"
+# The names the shipped configuration reads: the model keys, the Fluxer bot
+# token, and the webhook token. A config.cl that renames one has to add the new
+# name here too, or the hole this closes opens again. The shape check below is
+# the one that catches a name nobody listed.
+SECRET_NAMES="OPENCODE_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY \
+FLUXER_BOT_TOKEN ENCHIRIDION_HTTP_TOKEN"
 
 fail() {
   echo "FAIL: $*" >&2
   exit 1
+}
+
+# A credential-shaped NAME, by the same vocabulary
+# ENCHIRIDION.LLM.SECRETS:CREDENTIAL-VARIABLE-P uses: a token anywhere in the
+# name, or AUTHORIZATION anywhere. It is a substring match and not a suffix
+# match, because AWS_SECRET_ACCESS_KEY is a credential whose credential word is
+# not the last segment. Shell case globs are case-sensitive, so the name is
+# folded to upper case first, the way the predicate folds it.
+credential_shaped_name() {
+  case "$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')" in
+    *_API_KEY*|*_APIKEY*|*_TOKEN*|*_SECRET*|*_PASSWORD*|*_PASSWD*|*_PRIVATE_KEY*|*AUTHORIZATION*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 # The supervisor's own environment. The loader reads every configured name and
@@ -52,7 +71,19 @@ if [ "$(id -u)" -eq 0 ]; then
       fail "$name is still in the supervisor environment"
     fi
   done
-  echo "isolation: supervisor environment holds no secret name (uid $(id -u))"
+  # The list above has to keep up with config.cl. The shape check does not: it
+  # catches a credential the configuration never named, which is exactly the
+  # name that would otherwise survive in every child this process starts.
+  while IFS= read -r entry; do
+    name=${entry%%=*}
+    [ -n "$name" ] || continue
+    if credential_shaped_name "$name"; then
+      fail "$name is credential shaped and is still in the supervisor environment"
+    fi
+  done <<EOF
+$supervisor_env
+EOF
+  echo "isolation: phase $PHASE passed as uid $(id -u); supervisor env is clean"
   exit 0
 fi
 
@@ -76,12 +107,21 @@ if [ -r /proc/1/environ ]; then
   fail "/proc/1/environ is readable; hidepid is not active"
 fi
 
-# 4: the broker environment has none of the secret names or values.
+# 4: the broker environment holds no secret name or credential-shaped name.
 for name in $SECRET_NAMES; do
   if env | grep -q "^${name}="; then
     fail "$name is in the agent environment"
   fi
 done
+while IFS= read -r entry; do
+  name=${entry%%=*}
+  [ -n "$name" ] || continue
+  if credential_shaped_name "$name"; then
+    fail "$name is credential shaped and is in the agent environment"
+  fi
+done <<EOF
+$(env)
+EOF
 
 # 6 and 7: after the supervisor reads it, the file is gone and no copy is
 # anywhere else. A PRESENT phase skips these two because the file must exist
@@ -105,4 +145,4 @@ case "$PHASE" in
     ;;
 esac
 
-echo "isolation: all checks passed as uid $(id -u)"
+echo "isolation: phase $PHASE passed as uid $(id -u)"

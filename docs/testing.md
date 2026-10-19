@@ -14,7 +14,7 @@ warning into an error, and both run through the rove bridge in
 | `enchiridion-tests`          | `t/core/*.cl`     | `enchiridion`, `rove`                |
 | `enchiridion-tests/property` | `t/property/*.cl` | `enchiridion-tests`, `cl-quickcheck` |
 
-`t/enchiridion-tests.asd` names every file. The core module lists 25 files and
+`t/enchiridion-tests.asd` names every file. The core module lists 26 files and
 the property module lists 2. Both modules are `:serial t`, so the load order
 is the order in the file.
 
@@ -130,6 +130,7 @@ reader error at load time.
 | `compat-test`     | The implementation extensions in `compat.cl`.            |
 | `config-test`     | The sectioned and flat configuration readers.            |
 | `llm-test`        | Protocol shapes, the OpenAI wire format, backend choice. |
+| `anthropic-test`  | The Messages API wire format and provider choice.        |
 | `blocks-test`     | Block limits, the write scan, prompt stability.          |
 | `store-test`      | SQLite, FTS5, sessions, memories, and the ledger.        |
 | `tiers-test`      | L0, L1, L2, and the two miss rule.                       |
@@ -147,7 +148,7 @@ reader error at load time.
 | `supervisor-test` | The control file, the status file, and channels.         |
 | `tool-loop-test`  | The model asks, the kernel runs, the model answers.      |
 | `seed-test`       | The seed files, the first launch, and bootstrap.         |
-| `secrets-test`    | The scrubber on every path a secret can take.            |
+| `secrets-test`    | The scrubber and the file-mode, discard, and name rules. |
 | `http-test`       | The webhook routes, the token, and the limits.           |
 | `fluxer-test`     | The Fluxer direct-message rules.                         |
 | `sleep-test`      | The heartbeat, the sleep agent, and compaction.          |

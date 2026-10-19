@@ -107,6 +107,51 @@ store path. The model defaults match the shipped adapter defaults."
     ;; bounds what a day may spend.
     (:max-tokens 4096)
 
+    ;; The three providers this build ships a row for, so the default path
+    ;; works with no catalog cached and no network. They are configuration and
+    ;; not code on purpose: everything else this tree knows about a provider is
+    ;; generated at run time from models.dev, and a row here is exactly the
+    ;; same shape as a row the operator writes, so either can override the
+    ;; other field by field. Each row pins the endpoint, the key variable and
+    ;; the default model the shipped documentation promises.
+    (:providers
+     ((:id :openai
+       :name "OpenAI"
+       :profile :openai
+       :base-url "https://api.openai.com/v1/"
+       :api-key-env "OPENAI_API_KEY"
+       :model "gpt-5.6-luna")
+      (:id :opencode
+       :name "OpenCode Go"
+       :profile :openai
+       :base-url "https://opencode.ai/zen/go/v1"
+       :api-key-env "OPENCODE_API_KEY"
+       :model "deepseek-v4.1-flash")
+      (:id :anthropic
+       :name "Anthropic"
+       :profile :anthropic
+       :base-url "https://api.anthropic.com/"
+       :api-key-env "ANTHROPIC_API_KEY"
+       :model "claude-sonnet-5-5")))
+
+    ;; The runtime catalog. :providers-url is models.dev and not a mirror, and
+    ;; the two TTLs are a day: a provider's endpoint does not move hourly, and
+    ;; a model list is a snapshot rather than an inventory.
+    (:providers-url "https://models.dev/api.json")
+    (:providers-ttl-seconds 86400)
+    (:models-ttl-seconds 86400)
+    ;; T means no network at start up at all: no catalog fetch, no model list.
+    ;; An explicit `enchiridion providers refresh` still works, because the
+    ;; operator asked for it.
+    (:offline nil)
+
+    ;; Cloud placement. Bedrock reads :region, Vertex reads :project and
+    ;; :location; the environment variables of the same meaning win when these
+    ;; are NIL.
+    (:region nil)
+    (:project nil)
+    (:location nil)
+
     :channels
     (:cli (:enabled t))
     (:http (:enabled nil) (:bind "127.0.0.1") (:port 8787) (:token nil)

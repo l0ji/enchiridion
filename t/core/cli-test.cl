@@ -16,8 +16,8 @@
 (defparameter +plan-commands+
   '("init" "ask" "check" "skills" "tools" "blocks" "persona" "operator" "world"
     "memory" "sessions" "journey" "undo" "usage" "budget" "tasks" "secrets"
-    "version" "help" "bootstrap" "health" "reload" "channels" "heartbeat" "chat"
-    "serve")
+    "providers" "version" "help" "bootstrap" "health" "reload" "channels"
+    "heartbeat" "chat" "serve")
   "PLAN.md section 10's commands in table order. BOOTSTRAP arrived with the
 integration step, after CHANNEL-WORK wrote the other twenty-five.")
 

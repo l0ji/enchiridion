@@ -26,6 +26,12 @@
    #:agent-directory #:run-directory #:load-config #:config-digest
    #:control-path #:status-path #:project-root
    #:sectioned-config-p #:config-section #:config-value #:config-section-value
+   ;; CONFIG-LOOKUP is the reader that answers from the active configuration
+   ;; first and the shipped defaults second, which is what the provider table
+   ;; wants: a config.cl that names two keys must not blank out the other
+   ;; twenty. It is exported because the LLM module reads provider defaults
+   ;; through it.
+   #:config-lookup
    #:configured-secret-names #:config-memory-db)
   (:documentation
    "Configuration. Paths and behaviour only; a secret never comes from here,
@@ -90,10 +96,40 @@ recover from a string."))
    #:message-tool-calls
    #:tool-call #:tool-call-id #:tool-call-name #:tool-call-arguments
    #:completion #:completion-text #:completion-tool-calls
-   #:completion-model #:completion-stop-reason
+   #:completion-model #:completion-stop-reason #:completion-reasoning-text
    #:completion-input-tokens #:completion-output-tokens
    #:completion-cache-read-tokens #:completion-cache-write-tokens
    #:completion-total-tokens
+   ;; The adapter registry and the provider record it speaks. A handler
+   ;; registers itself under an id; the provider table resolves an id to the
+   ;; handler and hands it a PROVIDER. Nothing here names a vendor, which is
+   ;; what keeps a Bedrock or a Vertex file from reaching into the core.
+   #:api-handler #:find-api-handler #:register-api-handler
+   #:registered-api-handlers #:provider-supported-p
+   #:provider #:provider-id #:provider-name #:provider-api #:provider-profile
+   #:provider-base-url #:provider-key #:provider-env #:provider-model
+   #:provider-default-model #:provider-cached-models #:provider-headers
+   #:provider-query-params #:provider-options #:provider-doc #:provider-source
+   #:provider-option
+   #:model-info #:model-info-id #:model-info-name #:model-info-tool-call-p
+   #:model-info-reasoning-p #:model-info-context #:model-info-output
+   #:model-info-cost-input #:model-info-cost-output
+   #:model-info-cost-cache-read #:model-info-cost-cache-write
+   ;; The declarative quirks. A DIALECT is data, so a new provider is usually a
+   ;; profile entry and not a function.
+   #:dialect #:dialect-field #:dialect-profile #:dialect-profile-p
+   #:make-dialect-for
+   ;; Auth: the simple schemes are here, the signed ones register themselves.
+   #:auth-apply #:auth-headers #:auth-query-params
+   #:register-auth-signer #:find-auth-signer
+   ;; The transport, so a handler and a test can build a request.
+   #:http-request #:make-http-request #:http-request-url #:http-request-body
+   #:http-request-headers #:http-request-timeout
+   #:http-post #:http-get #:post-with-retries #:merge-headers
+   #:ensure-trailing-slash #:new-session-id #:provider-error-message
+   ;; The runtime catalog and the provider table that consumes it.
+   #:read-catalog-file #:refresh-catalog #:catalog-providers
+   #:provider-models #:resolve-provider #:list-providers #:provider-from-base-url
    ;; Backends. Each wire shape is selected by RESOLVE-BACKEND, and the two
    ;; protocols live in files of their own so neither can quietly grow the
    ;; other's fields.

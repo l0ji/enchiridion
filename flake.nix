@@ -73,7 +73,7 @@
         "cl-dbi" "dbd-sqlite3" "dexador" "cl-jschema" "com_dot_inuoe_dot_jzon"
         "hunchentoot" "websocket-driver-client" "chanl" "cl-ppcre" "cl-base64"
         "alexandria" "usocket" "bordeaux-threads" "trivial-backtrace" "rove"
-        "cl-quickcheck"
+        "cl-quickcheck" "ironclad"
       ];
       lispClosure = pkgs:
         let

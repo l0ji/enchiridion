@@ -17,6 +17,30 @@
 
 (in-package #:enchiridion-llm-test)
 
+(defmacro with-shipped-providers (&body body)
+  "Run BODY with no provider key in the environment and no cached catalog.
+
+These tests are about which key selects which provider and which model a
+shipped row names. The gate can run on a machine that has ANTHROPIC_API_KEY
+exported, and a cached run/providers.json changes step five of detection, so
+without this wrapper the suite reports on the shell that started it. The
+previous values are always put back."
+  (let ((names '("OPENAI_API_KEY" "OPENCODE_API_KEY" "ANTHROPIC_API_KEY")))
+    `(let ((previous (loop for name in ',names
+                           collect (cons name (enchiridion.compat:environment-value name))))
+           (enchiridion.llm::*catalog* nil)
+           (enchiridion.llm::*catalog-path* #p"/nonexistent/enchiridion-providers.json"))
+       (unwind-protect
+            (progn
+              (dolist (name ',names)
+                (enchiridion.compat:unset-environment-variable name))
+              ,@body)
+         (dolist (pair previous)
+           (if (cdr pair)
+               (enchiridion.compat:set-environment-variable (car pair) (cdr pair))
+               (enchiridion.compat:unset-environment-variable (car pair))))))))
+
+
 ;;;; Messages.
 
 (deftest a-message-carries-a-role-and-a-body ()
@@ -287,11 +311,12 @@
 (deftest the-default-provider-is-openai ()
   ;; No config and no provider key means OpenAI. The key name follows the
   ;; provider, so a missing key is reported as OPENAI_API_KEY.
-  (enchiridion.llm.secrets:clear-secrets)
-  (let ((backend (enchiridion.llm:resolve-backend :api-key "k")))
-    (ok (search "api.openai.com" (enchiridion.llm:backend-name backend)))
-    (ok (string= "gpt-5.6-luna"
-                 (enchiridion.llm::openai-connection-model backend)))))
+  (with-shipped-providers
+    (enchiridion.llm.secrets:clear-secrets)
+    (let ((backend (enchiridion.llm:resolve-backend :api-key "k")))
+      (ok (search "api.openai.com" (enchiridion.llm:backend-name backend)))
+      (ok (string= "gpt-5.6-luna"
+                   (enchiridion.llm::openai-connection-model backend))))))
 
 (deftest an-openai-key-selects-openai ()
   (enchiridion.llm.secrets:clear-secrets)
@@ -369,8 +394,8 @@
   (let* ((calls 0)
         (enchiridion.llm::*retry-delay* 0)
         (enchiridion.llm::*http-post-function*
-          (lambda (base-url path body key timeout session-id)
-            (declare (ignore base-url path body key timeout session-id))
+          (lambda (request)
+            (declare (ignore request))
             (incf calls)
             (if (< calls 3)
                 (error 'dexador.error:http-request-failed
@@ -393,8 +418,8 @@
   (let* ((calls 0)
         (enchiridion.llm::*retry-delay* 0)
         (enchiridion.llm::*http-post-function*
-          (lambda (base-url path body key timeout session-id)
-            (declare (ignore base-url path body key timeout session-id))
+          (lambda (request)
+            (declare (ignore request))
             (incf calls)
             (error 'dexador.error:http-request-failed
                    :status 401

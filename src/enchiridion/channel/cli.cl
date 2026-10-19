@@ -951,6 +951,161 @@ host fallback instead. That report is guarantee 6 of section 5.5 made visible."
                present))))
   0)
 
+;;;; Providers.
+;;;;
+;;;; The provider table lives in the LLM module and knows about models.dev,
+;;;; config.cl and the secret store. This file only prints what it is told, so
+;;;; the catalog can change shape without a change here.
+;;;;
+;;;; The three functions below are forward referenced so the file compiles
+;;;; whatever order the LLM module lands in: a DECLAIM (FTYPE FUNCTION ...)
+;;;; carries no lambda list, which is the same idiom BROKER-CALL uses.
+
+(declaim (ftype function enchiridion.llm:list-providers))
+(declaim (ftype function enchiridion.llm:provider-models))
+(declaim (ftype function enchiridion.llm:refresh-catalog))
+(declaim (ftype function enchiridion.llm:resolve-provider))
+
+(declaim (ftype (function (t) string) provider-label))
+
+(defun provider-label (id)
+  "Return ID as one lowercase word, for matching what the operator typed."
+  (string-downcase (string id)))
+
+(declaim (ftype (function (list t) (or null list)) provider-row-for))
+
+(defun provider-row-for (rows id)
+  "Return the row in ROWS whose id is ID, or NIL.
+
+The comparison is on the printed form, because the operator types `deepseek`
+at a shell and the row may hold the keyword :DEEPSEEK or the string
+\"deepseek\"; the two name one provider everywhere else in this tree and they
+name one here."
+  (find (string-downcase (string id)) rows
+        :key (lambda (row) (provider-label (getf row :id)))
+        :test #'string=))
+
+(declaim (ftype (function (list) null) print-provider-list))
+
+(defun print-provider-list (rows)
+  "Print one line per provider: what it is, where it points, and its key."
+  (if rows
+      (dolist (row rows)
+        ;; The key variable and whether it is loaded, and never the value: the
+        ;; scrubber would catch one, and a listing must not depend on it.
+        ;; The marker follows SUPPORTED-P and not the handler id: a row can
+        ;; name a handler this build does not have, and the field that knows
+        ;; that is the one the listing computes.
+        (say "~A~@[ (~A)~] ~:[unsupported~;~A~]~@[ ~(~A~)~] ~A ~A ~:[no key~;key ~A~] (~(~A~))"
+             (getf row :id)
+             (getf row :name)
+             (getf row :supported-p)
+             (getf row :api)
+             (getf row :profile)
+             (or (getf row :base-url) "no endpoint")
+             (or (getf row :api-key-env) "no variable")
+             (when (getf row :key-present-p)
+               (getf row :api-key-env))
+             (getf row :source)))
+      (say "No providers are known. Run `~A` to load the models.dev catalog."
+           (command-label "providers"))))
+
+(declaim (ftype (function (list t) integer) print-provider-detail))
+
+(defun print-provider-detail (rows id)
+  "Print every field of one provider row, or one line when there is no such id."
+  (let ((row (provider-row-for rows id)))
+    (if (null row)
+        (progn
+          (say "There is no provider called ~A." id)
+          2)
+        (progn
+          (loop for (key value) on row by #'cddr
+                do (say "~(~A~): ~A" key
+                        (if (null value) "none" value)))
+          0))))
+
+(declaim (ftype (function (list t) integer) print-provider-models))
+
+(defun print-provider-models (configuration id)
+  "Ask provider ID which models its account can use, and print them.
+
+The list comes from the provider, not from the tree: it is what the key in
+hand can actually reach. A failure is reported as one line and returns 1,
+rather than stopping a command that only wanted to look."
+  (let* ((rows (enchiridion.llm:list-providers :config configuration))
+         (row (provider-row-for rows id)))
+    (if (null row)
+        (progn
+          (say "There is no provider called ~A." id)
+          2)
+        (let* ((config (list :provider (getf row :id)
+                             :providers (enchiridion:config-value configuration
+                                                                  :providers)
+                             :offline (enchiridion:config-value configuration
+                                                               :offline)))
+               (provider (enchiridion.llm:resolve-provider config))
+               ;; FORCE: `providers models' is the operator asking for one
+               ;; request, and it is the documented exception to :offline.
+               (models (enchiridion.llm:provider-models provider :force t)))
+          (if models
+              (progn
+                (dolist (model models)
+                  (say "~A~@[  (~A)~]~@[  context ~D~]~@[  output ~D~]"
+                       (enchiridion.llm:model-info-id model)
+                       (let ((name (enchiridion.llm:model-info-name model)))
+                         (unless (string= name (enchiridion.llm:model-info-id model))
+                           name))
+                       (enchiridion.llm:model-info-context model)
+                       (enchiridion.llm:model-info-output model)))
+                (say "~D model~:P." (length models))
+                0)
+              (progn
+                (say "~A offers no model list. Set :model-primary, or use a row with :models."
+                     id)
+                1))))))
+
+(declaim (ftype (function (list) integer) cmd-providers))
+
+(defun cmd-providers (arguments)
+  "List the providers this build knows, show one, list its models, or refresh
+the catalog.
+
+Provider knowledge is generated at run time from models.dev and cached under
+run/, so a command that only looks never writes anything: `refresh` is the one
+action that goes to the network on the operator's behalf, and `models` is the
+one that asks a provider what its account can reach."
+  (let ((action (string-downcase (or (first arguments) "list")))
+        (configuration (command-context-config (context))))
+    (cond
+      ((string= action "list")
+       (print-provider-list (enchiridion.llm:list-providers :config configuration))
+       0)
+      ((string= action "show")
+       (if (second arguments)
+           (print-provider-detail (enchiridion.llm:list-providers
+                                   :config configuration)
+                                  (second arguments))
+           (progn (say "providers show takes an ID.") 2)))
+      ((string= action "models")
+       (if (second arguments)
+           (print-provider-models configuration (second arguments))
+           (progn (say "providers models takes an ID.") 2)))
+      ((string= action "refresh")
+       (handler-case
+           (let ((catalog (enchiridion.llm:refresh-catalog)))
+             (say "provider catalog refreshed: ~D provider~:P." (length catalog))
+             0)
+         (enchiridion.errors:enchiridion-error (condition)
+           ;; One line, not a backtrace: a refresh that could not reach
+           ;; models.dev leaves the previous cache exactly where it was, and
+           ;; that is a thing to report rather than a thing to crash on.
+           (say "~A" condition)
+           1)))
+      (t
+       (say "providers takes list, show ID, models ID or refresh.")
+       2))))
+
 (declaim (ftype (function (list) integer) cmd-version))
 
 (defun cmd-version (arguments)
@@ -1141,6 +1296,7 @@ operator's view of a state machine the agent works through."
    (list "budget" 0 0 #'cmd-budget "Spend against the caps")
    (list "tasks" 0 nil #'cmd-tasks "The task queue")
    (list "secrets" 0 0 #'cmd-secrets "Names and sources, never values")
+   (list "providers" 0 2 #'cmd-providers "Provider list, one provider, its models, or a catalog refresh")
    (list "version" 0 0 #'cmd-version "Version and build provenance")
    (list "help" 0 1 #'cmd-help "Command list, or detail for one")
    (list "bootstrap" 0 1 #'cmd-bootstrap "Bootstrap state, remaining steps, or a reset")

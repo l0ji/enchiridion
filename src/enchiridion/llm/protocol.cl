@@ -66,9 +66,17 @@
 ;;;; order it asked for them. model is which model actually answered, which is
 ;;;; not always the one that was asked for. stop-reason is why it stopped: stop,
 ;;;; length, tool_calls.
+;;;;
+;;;; reasoning-text is the chain of thought some providers return beside the
+;;;; answer, in a field of its own (reasoning_content, reasoning, thinking).
+;;;; It is kept apart from text because it is not the answer: a caller that
+;;;; concatenated the two would send the model's private notes to the operator
+;;;; as its reply. Nothing in this tree persists it, and the default is the
+;;;; empty string, so a provider that does not report one is not a special case.
 
 (defstruct (completion (:constructor %make-completion))
   (:text "" :type string)
+  (:reasoning-text "" :type string)
   (:tool-calls '() :type list)
   (:model "" :type string)
   (:stop-reason "" :type string)

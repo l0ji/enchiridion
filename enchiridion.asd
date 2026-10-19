@@ -34,7 +34,12 @@
   :depends-on ("alexandria" "cl-ppcre" "dexador" "com.inuoe.jzon"
                "cl-jschema" "usocket" "bordeaux-threads"
                "hunchentoot" "websocket-driver-client"
-               "dbi" "dbd-sqlite3")
+               "dbi" "dbd-sqlite3"
+               ;; The cloud handlers sign their requests: AWS with HMAC-SHA256
+               ;; and GCP with an RS256 JWT. Ironclad is the one primitive
+               ;; source, and cl-base64 turns the JWT into the URL-safe text
+               ;; the token endpoint wants.
+               "ironclad" "cl-base64")
   :components
   ((:module "src"
     :serial t
@@ -55,12 +60,28 @@
         :components
         ((:file "secrets")
          (:file "protocol")
+         ;; Vendor-neutral plumbing. JSON and HTTP live here and not inside a
+         ;; provider file, so no adapter owns infrastructure the others need.
+         (:file "json")
+         (:file "http")
+         ;; The adapter registry and the declarative quirk profiles. Vendor
+         ;; files register themselves here; nothing above names a vendor.
+         (:file "registry")
+         (:file "dialects")
+         (:file "auth")
+         ;; The generic handlers. Each owns one wire schema that many vendors
+         ;; speak, and consults a dialect rather than branching on a provider.
          (:file "openai")
-         ;; The Messages API backend. It loads after openai because it reuses
-         ;; the shared JSON helpers and the retry loop defined there, and
-         ;; because a name it defines must not collide with one already in the
-         ;; package.
-         (:file "anthropic")))
+         (:file "anthropic")
+         ;; Vendor-only APIs, one file per vendor, each reusing a schema above
+         ;; and owning its transport, path and signing.
+         (:file "aws-sigv4")
+         (:file "bedrock")
+         (:file "gcp-oauth")
+         (:file "vertex")
+         ;; The runtime catalog and the provider table that consumes it.
+         (:file "catalog")
+         (:file "providers")))
        (:module "memory"
         :serial t
         :default-component-class "cl-source-file.cl"

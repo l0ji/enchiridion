@@ -320,14 +320,58 @@ minutes: an interval of zero is a tick loop and a string is a mistyped key."
   (let ((value (enchiridion:config-section-value config :sleep :interval-seconds 900)))
     (if (and (integerp value) (plusp value)) value 900)))
 
-(defun make-context ()
+(declaim (ftype (function (t) null) refresh-provider-knowledge))
+
+(defun refresh-provider-knowledge (config)
+  "Refresh what this process knows about providers, once, before it serves.
+
+TWO THINGS ARE REFRESHED, and only on the commands that run a turn. The
+models.dev catalog is fetched when the cached copy is missing or older than
+:PROVIDERS-TTL-SECONDS, and the selected provider's own model list is fetched
+when a key is present and its cache is stale. The list is what the account can
+actually reach, which no catalog can know, so a turn that is about to spend
+money is the right moment to learn it.
+
+INSPECTION COMMANDS DO NOT REACH HERE. `help`, `version`, `secrets', `providers
+list' and the rest build a context and never call this, so a command that only
+looks at the configuration cannot fetch models.dev or write a cache file.
+
+:OFFLINE T stops both. A failure is one warning line and never stops the
+process: a provider whose endpoint is down is still a provider whose configured
+model can be asked for, and the cache from the last successful run is still the
+best answer available."
+  (unless (enchiridion:config-value config :offline)
+    (let ((ttl (enchiridion:config-value config :providers-ttl-seconds)))
+      (when (enchiridion.llm::catalog-expired-p
+             (enchiridion.llm::catalog-path) ttl)
+        (handler-case (enchiridion.llm:refresh-catalog)
+          (enchiridion.errors:enchiridion-error (condition)
+            (format *error-output* "~&enchiridion: ~A~%" condition)
+            (finish-output *error-output*)))))
+    (handler-case
+        (let ((provider (enchiridion.llm:resolve-provider config)))
+          (enchiridion.llm:provider-models provider :refresh t))
+      (enchiridion.errors:enchiridion-error (condition)
+        (format *error-output* "~&enchiridion: ~A~%" condition)
+        (finish-output *error-output*))))
+  nil)
+
+(defun make-context (&key (refresh-models nil))
   "Build the context for one command. Start nothing and open no socket.
 
 The store is opened before the agent because the agent's prompt is compiled
-from the blocks, and two of those blocks are rows in the store."
+from the blocks, and two of those blocks are rows in the store.
+
+REFRESH-MODELS is T for the commands that run a turn (`ask`, `chat`, `serve`)
+and NIL for every other command. It is the one thing this function does that
+can open a socket, it is bounded, it honours :OFFLINE, and it is the reason the
+sentence above says no socket rather than no network."
+  (declare (ignorable refresh-models))
   (let* ((config (load-config))
          (directory (agent-directory))
          (key (load-configured-secrets config))
+         (_ (when (and refresh-models (plusp (length key)))
+              (refresh-provider-knowledge config)))
          (store (open-agent-store config))
          (backend (when (plusp (length key))
                     (enchiridion.llm:resolve-backend :config config :api-key key)))
@@ -819,8 +863,12 @@ the way the operator typed it."
 
 (defun run-command (name arguments)
   "Run NAME with ARGUMENTS through the shared command table.
-Return an exit status."
-  (let ((context (make-context)))
+Return an exit status.
+
+Only ASK refreshes the provider knowledge: it is the one command here that
+spends a turn. Every other command in this table inspects the configuration or
+the store, and an inspection must not open a socket or rewrite a cache."
+  (let ((context (make-context :refresh-models (string= name "ask"))))
     (unwind-protect
          (let* ((cancelled (list nil))
                 (enchiridion.channel.cli:*command-context*
@@ -850,7 +898,7 @@ foreground itself.
 The channels are built and handed over before the supervisor starts. It starts
 whatever is in its list, and an empty list is why `serve` used to come up with
 no channels at all."
-  (let ((context (make-context)))
+  (let ((context (make-context :refresh-models t)))
     (unwind-protect
          (progn
            (ensure-started context)

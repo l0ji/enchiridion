@@ -1,9 +1,9 @@
-;;;; anthropic.cl --- The Anthropic Messages API backend.
+;;;; anthropic.cl --- The Anthropic Messages API handler.
 ;;;;
 ;;;; A second wire shape, not a second transport. The request and the reply are
-;;;; pure functions over text and data, exactly as in openai.cl, so the whole
-;;;; format is testable without a network, a key, or a provider; the only part
-;;;; that needs any of those is one function long.
+;;;; pure functions over text and data, so the whole format is testable without
+;;;; a network, a key, or a provider; the only part that needs any of those is
+;;;; the transport, and it lives in http.cl.
 ;;;;
 ;;;; Everything that is genuinely different about this API is in the mapping:
 ;;;;
@@ -19,19 +19,17 @@
 ;;;;   * prompt caching is a cache_control breakpoint on the blocks that end
 ;;;;     the reusable prefix, not a request level flag.
 ;;;;
-;;;; The file is in dependency order, bottom to top, and it has to be. A name
-;;;; used before it is defined is not a forward declaration in Lisp: the
-;;;; compiler reads a symbol it has never seen as a variable, and the failure
-;;;; surfaces at run time as UNBOUND-VARIABLE from a function that plainly
-;;;; exists. COMPLETE is written last for that reason, after the sender and the
-;;;; parser it calls.
+;;;; The schema half of this file is shared. Anthropic's own endpoint, an
+;;;; Anthropic-shaped gateway, Amazon Bedrock's InvokeModel path and Google
+;;;; Vertex's :rawPredict path all carry this body; they differ in transport,
+;;;; path, auth and where the version string goes. Those differences live in
+;;;; bedrock.cl and vertex.cl, and both call ANTHROPIC-REQUEST-BODY and
+;;;; ANTHROPIC-PARSE-COMPLETION from here rather than copying them.
 ;;;;
 ;;;; Every name here is new to package ENCHIRIDION.LLM. OPENAI.CL already owns
-;;;; %MAKE-CONNECTION, COMPLETION-REQUEST, PARSE-COMPLETION,
-;;;; MESSAGE->REQUEST-MESSAGE, TOOL-CALL->REQUEST, TOOL-DEFINITION->REQUEST,
-;;;; PARSE-TOOL-CALLS, SEND-COMPLETION and HTTP-POST, and a second definition
-;;;; of one of those names is a redefinition warning, which this system makes
-;;;; an error rather than a note.
+;;;; OPENAI-BACKEND and the OpenAI request builders, and a second definition of
+;;;; one of those names is a redefinition warning, which this system makes an
+;;;; error rather than a note.
 
 (in-package #:enchiridion.llm)
 
@@ -60,6 +58,8 @@
   (:max-tokens 4096 :type (integer 1 *))
   (:cache-p t :type boolean)
   (:cache-ttl nil :type (or null string))
+  (:headers '() :type list)
+  (:dialect nil :type t)
   (:timeout 60 :type (integer 1 *))
   (:retries 2 :type (integer 0 *)))
 
@@ -69,6 +69,8 @@
                                 (max-tokens 4096)
                                 (cache-ttl nil)
                                 (cache-p t)
+                                (headers '())
+                                (dialect nil)
                                 (timeout 60)
                                 (retries 2))
   "Return a BACKEND that speaks the Anthropic Messages API.
@@ -92,8 +94,25 @@ declaration per keyword costs more than the annotation would catch."
    :max-tokens max-tokens
    :cache-ttl cache-ttl
    :cache-p (not (null cache-p))
+   :headers headers
+   :dialect dialect
    :timeout timeout
    :retries retries))
+
+;; DEFPARAMETER and not DEFCONSTANT, which is deliberate. SBCL evaluates a
+;; DEFCONSTANT's init form at compile time and again when the fasl loads, and
+;; two strings with the same characters are not EQL, so the second evaluation
+;; is a redefinition warning; this system makes a warning an error, and the
+;; report names a value that never changed. Nothing rebinds this.
+;;
+;; It is defined here, above the request builder, because that builder is what
+;; writes the revision into a body when the profile puts it there, and a
+;; variable used above its DEFPARAMETER is an undefined-variable warning.
+(defparameter +anthropic-version+ "2023-06-01"
+  "The anthropic-version header every Messages API request carries. The value
+is the revision of the API, not a build of it, and the service refuses a
+request that omits the header. A profile that carries the revision in the body
+names its own value instead.")
 
 ;;;; The request.
 ;;;;
@@ -285,32 +304,81 @@ breakpoints."
                      (anthropic-cache-control cache-ttl))
           collect entry)))
 
-(defun anthropic-completion-request (connection messages &key tools model)
+(defun anthropic-request-body (messages &key model tools max-tokens
+                                            (cache-p t) cache-ttl
+                                            (model-in-body-p t model-in-body-p-p)
+                                            dialect betas)
+  "Return the Messages request for MESSAGES as data.
+
+MODEL is written into the body unless MODEL-IN-BODY-P is NIL, which is what
+Amazon Bedrock and Google Vertex need: both carry the model in the URL path and
+reject a body that names it twice. DIALECT answers that question when the
+caller does not, so a profile cannot be applied and then ignored.
+
+CACHE-P and CACHE-TTL are explicit arguments rather than slots of a connection,
+because the cloud endpoints are stricter than Anthropic's own: Bedrock has no
+top level cache_control and no 1h TTL, and the caller is the one that knows
+which endpoint it is building for. A profile whose CACHE-TTL-SUPPORTED-P is NIL
+drops the TTL and keeps the breakpoint.
+
+DIALECT also decides where the revision goes. A profile with a :BODY version
+location gets anthropic_version in the body and no header; the header case is
+the caller's, because only the caller knows what the transport sends.
+BETAS is the beta feature list. A profile whose beta channel is the body gets
+it as an anthropic_beta array; the header case is written by the caller."
+  (flet ((flag (key)
+           ;; The raw slot answers a switch, and the generic wire answers T
+           ;; when there is no dialect. A T default cannot be passed to
+           ;; DIALECT-FIELD: it answers its default for a slot that holds NIL,
+           ;; and NIL is exactly what a profile writes to switch a switch off.
+           (if dialect (dialect-field dialect key nil) t)))
+    (let* ((model-in-body-p (if model-in-body-p-p
+                                model-in-body-p
+                                (flag :model-in-body-p)))
+           (cache-ttl (if (flag :cache-ttl-supported-p) cache-ttl nil))
+           (body (json-object
+                  :max_tokens (or max-tokens 4096)
+                  :messages (coerce (anthropic-request-messages messages)
+                                    'vector)))
+           (system (anthropic-system-blocks messages cache-p cache-ttl)))
+      (when (eq (dialect-field dialect :version-location :header) :body)
+        (setf (gethash "anthropic_version" body)
+              (or (dialect-field dialect :version-value nil)
+                  +anthropic-version+)))
+      (when (and betas
+                 (plusp (length betas))
+                 (eq (dialect-field dialect :beta-channel :header) :body))
+        (setf (gethash "anthropic_beta" body) (coerce betas 'vector)))
+      (when model-in-body-p
+        (setf (gethash "model" body) (or model "")))
+      (when system
+        (setf (gethash "system" body) system))
+      (when tools
+        (setf (gethash "tools" body)
+              (anthropic-tool-definitions tools cache-p cache-ttl))
+        (setf (gethash "tool_choice" body) (json-object :type "auto")))
+      body)))
+
+(defun anthropic-completion-request (connection messages &key tools model betas)
   "Return the request body for MESSAGES, as JSON text.
 
-MODEL overrides the connection's model; an absent model means the connection's
-own. The messages array is coerced to a vector even when it is empty, because
+The messages array is coerced to a vector even when it is empty, because
 STRINGIFY writes an empty list as false and the API wants [] there: the key is
 required, so omitting it is not an option.
 
 SYSTEM, TOOLS and TOOL_CHOICE are added only when there is something to say.
 An absent field is not the same fact as a present but empty one, and the
-provider refuses several of the empty spellings."
-  (let* ((cache-p (anthropic-connection-cache-p connection))
-         (cache-ttl (anthropic-connection-cache-ttl connection))
-         (body (json-object
-                :model (or model (anthropic-connection-model connection))
-                :max_tokens (anthropic-connection-max-tokens connection)
-                :messages (coerce (anthropic-request-messages messages)
-                                  'vector)))
-         (system (anthropic-system-blocks messages cache-p cache-ttl)))
-    (when system
-      (setf (gethash "system" body) system))
-    (when tools
-      (setf (gethash "tools" body)
-            (anthropic-tool-definitions tools cache-p cache-ttl))
-      (setf (gethash "tool_choice" body) (json-object :type "auto")))
-    (stringify body)))
+provider refuses several of the empty spellings. The connection's dialect is
+passed through so the body is built for the endpoint this connection talks to."
+  (stringify (anthropic-request-body
+              messages
+              :model (or model (anthropic-connection-model connection))
+              :tools tools
+              :max-tokens (anthropic-connection-max-tokens connection)
+              :cache-p (anthropic-connection-cache-p connection)
+              :cache-ttl (anthropic-connection-cache-ttl connection)
+              :dialect (anthropic-connection-dialect connection)
+              :betas betas)))
 
 ;;;; The reply.
 ;;;;
@@ -321,45 +389,6 @@ provider refuses several of the empty spellings."
 ;;;; become NIL, and a tool_use input has to stay an object so STRINGIFY can
 ;;;; write it back as one. Reading the wire's types as they are keeps both.
 
-(declaim (ftype (function (t string &optional t) t) anthropic-json-value))
-
-(defun anthropic-json-value (object key &optional default)
-  "Return KEY from OBJECT, a jzon object, or DEFAULT.
-
-Keys are compared with STRING-EQUAL and not by identity, because jzon pools
-object keys: a table just parsed holds the pooled string, and a GETHASH against
-a fresh literal of the same characters is the kind of code that works until the
-pool grows. A value that is not an object, an absent key and a JSON null all
-answer DEFAULT rather than signalling, because a provider that omits a field
-and one that sends it as null are the same fact to every caller here."
-  (if (hash-table-p object)
-      (let ((name (loop for candidate being the hash-keys of object
-                        when (string-equal (string candidate) key)
-                          return candidate)))
-        (if name (gethash name object) default))
-      default))
-
-(declaim (ftype (function (t) string) anthropic-json-string))
-
-(defun anthropic-json-string (value)
-  "Return VALUE as a string, or the empty string when it is absent or null.
-
-jzon spells JSON null as a symbol, so a field the provider sent as null
-reaches this function as something that is neither a string nor NIL, and every
-completion slot it is stored in is typed STRING."
-  (if (stringp value) value ""))
-
-(declaim (ftype (function (t) (integer 0 *)) anthropic-json-count))
-
-(defun anthropic-json-count (value)
-  "Return VALUE as a token count, and zero for anything else.
-
-A missing usage field, a null and a value that is not a whole number are all an
-unknown cost, and zero is the honest answer for an unknown cost. The completion
-slots are typed (INTEGER 0 *), so jzon's null symbol would be a type error at
-the constructor rather than the number nobody asked for."
-  (if (and (integerp value) (not (minusp value))) value 0))
-
 (declaim (ftype (function (t) string) anthropic-error-message))
 
 (defun anthropic-error-message (data)
@@ -367,12 +396,11 @@ the constructor rather than the number nobody asked for."
 
 The error is an object with a message in it, and a proxy in front of the
 provider may answer with something else entirely, so anything that is not the
-object is put through ANTHROPIC-JSON-STRING rather than assumed to be a
-string."
-  (let ((error-object (anthropic-json-value data "error")))
+object is put through JSON-STRING rather than assumed to be a string."
+  (let ((error-object (json-value data "error")))
     (if (hash-table-p error-object)
-        (anthropic-json-string (anthropic-json-value error-object "message"))
-        (anthropic-json-string error-object))))
+        (json-string (json-value error-object "message"))
+        (json-string error-object))))
 
 (declaim (ftype (function (t) string) anthropic-tool-arguments))
 
@@ -382,10 +410,15 @@ string."
 STRINGIFY writes a jzon object as an object and an empty one as {}, which is
 what the tool layer wants. An absent input and a null become {} rather than
 \"null\": a call with no arguments is a call with an empty argument object, and
-every reader downstream can index that without a special case."
-  (if (or (null input) (eq input +json-null+))
-      "{}"
-      (stringify input)))
+every reader downstream can index that without a special case.
+
+An input that arrived as a string is passed through as it is: a handful of
+Anthropic-shaped gateways emit the arguments already serialized, and parsing
+text only to re-serialize it would change nothing and could fail."
+  (cond
+    ((or (null input) (eq input +json-null+)) "{}")
+    ((stringp input) (if (plusp (length input)) input "{}"))
+    (t (stringify input))))
 
 (declaim (ftype (function (t) string) anthropic-content-text))
 
@@ -402,11 +435,29 @@ wire's request side and is passed through as it is."
     ((vectorp content)
      (format nil "~{~A~}"
              (loop for block across content
-                   for type = (anthropic-json-value block "type")
+                   for type = (json-value block "type")
                    when (and (stringp type) (string= type "text"))
-                     collect (anthropic-json-string
-                              (anthropic-json-value block "text")))))
+                     collect (json-string (json-value block "text")))))
     (t "")))
+
+(declaim (ftype (function (t) string) anthropic-reasoning-text))
+
+(defun anthropic-reasoning-text (content)
+  "Return every thinking block in CONTENT, concatenated.
+
+Extended thinking arrives as its own block type. It is not the answer and must
+not be concatenated into the reply text, but it is worth keeping apart so a
+caller that wants to show its work can. The blocks are joined like the text
+blocks, with nothing inserted between them."
+  (if (vectorp content)
+      (format nil "~{~A~}"
+              (loop for block across content
+                    for type = (json-value block "type")
+                    when (and (stringp type)
+                              (member type '("thinking" "redacted_thinking")
+                                      :test #'string=))
+                      collect (json-string (json-value block "thinking"))))
+      ""))
 
 (declaim (ftype (function (t) list) anthropic-parse-tool-calls))
 
@@ -419,15 +470,13 @@ writes a jzon object back as an object, so an input that arrived as data leaves
 as the text of exactly that data."
   (if (vectorp content)
       (loop for block across content
-            for type = (anthropic-json-value block "type")
+            for type = (json-value block "type")
             when (and (stringp type) (string= type "tool_use"))
               collect (%make-tool-call
-                       :id (anthropic-json-string
-                            (anthropic-json-value block "id"))
-                       :name (anthropic-json-string
-                              (anthropic-json-value block "name"))
+                       :id (json-string (json-value block "id"))
+                       :name (json-string (json-value block "name"))
                        :arguments (anthropic-tool-arguments
-                                   (anthropic-json-value block "input"))))
+                                   (json-value block "input"))))
       '()))
 
 (declaim (ftype (function (t) string) anthropic-stop-reason))
@@ -449,7 +498,7 @@ should have it recorded and not silently renamed."
       ((string= reason "tool_use") "tool_calls")
       (t reason))))
 
-(declaim (ftype (function (string)) anthropic-parse-completion))
+(declaim (ftype (function (string) completion) anthropic-parse-completion))
 
 (defun anthropic-parse-completion (payload)
   "Return the COMPLETION described by PAYLOAD, the reply text.
@@ -468,7 +517,7 @@ provider-normalised, so the three are added together here and the cache slots
 are still filled: the ledger keeps the split, and COMPLETION-TOTAL-TOKENS stays
 input plus output on both wires."
   (let* ((data (com.inuoe.jzon:parse payload))
-         (content (anthropic-json-value data "content")))
+         (content (json-value data "content")))
     (unless (or (vectorp content) (stringp content))
       (let ((message (anthropic-error-message data)))
         (error 'enchiridion.errors:backend-error
@@ -477,54 +526,54 @@ input plus output on both wires."
                            "The reply carried no content blocks at all."
                            (format nil "The reply carried no content blocks: ~A"
                                    message)))))
-    (let ((usage (anthropic-json-value data "usage")))
+    (let ((usage (json-value data "usage")))
       (%make-completion
        :text (anthropic-content-text content)
+       :reasoning-text (anthropic-reasoning-text content)
        :tool-calls (anthropic-parse-tool-calls content)
-       :model (anthropic-json-string (anthropic-json-value data "model"))
+       :model (json-string (json-value data "model"))
        :stop-reason (anthropic-stop-reason
-                     (anthropic-json-value data "stop_reason"))
-       :input-tokens (+ (anthropic-json-count
-                         (anthropic-json-value usage "input_tokens"))
-                        (anthropic-json-count
-                         (anthropic-json-value usage "cache_read_input_tokens"))
-                        (anthropic-json-count
-                         (anthropic-json-value usage
-                                               "cache_creation_input_tokens")))
-       :output-tokens (anthropic-json-count
-                       (anthropic-json-value usage "output_tokens"))
-       :cache-read-tokens (anthropic-json-count
-                           (anthropic-json-value usage
-                                                 "cache_read_input_tokens"))
-       :cache-write-tokens (anthropic-json-count
-                            (anthropic-json-value usage
-                                                  "cache_creation_input_tokens"))))))
+                     (json-value data "stop_reason"))
+       :input-tokens (+ (json-count (json-value usage "input_tokens"))
+                        (json-count
+                         (json-value usage "cache_read_input_tokens"))
+                        (json-count
+                         (json-value usage "cache_creation_input_tokens")))
+       :output-tokens (json-count (json-value usage "output_tokens"))
+       :cache-read-tokens (json-count
+                           (json-value usage "cache_read_input_tokens"))
+       :cache-write-tokens (json-count
+                            (json-value usage
+                                        "cache_creation_input_tokens"))))))
 
 ;;;; The transport.
 ;;;;
-;;;; dexador signals HTTP-REQUEST-FAILED on any 4xx or 5xx and returns the body
-;;;; on a 2xx, so the status is read off the condition rather than off a return
-;;;; value. RESPONSE-STATUS is that condition's reader; it is not a way to ask
-;;;; "what did the last call return".
-;;;;
 ;;;; x-api-key is what every documented Messages request sends, so it is the
-;;;; spelling this backend standardises on. Authorization: Bearer is accepted as
-;;;; well and is deliberately not used, so the key stays out of the header a
-;;;; proxy is built to log. anthropic-version is required on every request.
+;;;; spelling this backend standardises on. anthropic-version is required on
+;;;; every request to Anthropic's own endpoint. A dialect changes both facts
+;;;; for a gateway or a cloud endpoint --- a bearer token instead of the key, a
+;;;; revision in the body instead of a header, a beta list in the body --- and
+;;;; AUTH-APPLY is the one call that puts the credential wherever the profile
+;;;; says it goes.
 
-;; DEFPARAMETER and not DEFCONSTANT, which is deliberate. SBCL evaluates a
-;; DEFCONSTANT's init form at compile time and again when the fasl loads, and
-;; two strings with the same characters are not EQL, so the second evaluation
-;; is a redefinition warning; this system makes a warning an error, and the
-;; report names a value that never changed. Nothing rebinds this.
-(defparameter +anthropic-version+ "2023-06-01"
-  "The anthropic-version header every Messages API request carries. The value
-is the revision of the API, not a build of it, and the service refuses a
-request that omits the header.")
+(declaim (ftype (function (&optional list) list) anthropic-static-headers))
 
-(declaim (ftype (function (string string) list) anthropic-headers))
+(defun anthropic-static-headers (&optional extra)
+  "Return the Messages headers that are not the credential.
 
-(defun anthropic-headers (api-key version)
+The content type and the user agent are the same on every Anthropic-shaped
+endpoint, and they live here so the chat request, the model list and a cloud
+handler cannot disagree about them. EXTRA is merged last, which is what lets a
+provider replace either one."
+  (merge-headers
+   (list (cons :content-type "application/json")
+         (cons :user-agent "enchiridion/0.1.0"))
+   extra))
+
+(declaim (ftype (function (string (or null string) &optional list) list)
+                anthropic-headers))
+
+(defun anthropic-headers (api-key version &optional extra)
   "Return the headers a Messages API request carries.
 
 An alist of CONSES and not a list of two element lists: dexador walks the
@@ -535,66 +584,122 @@ a parenthesised list.
 These four headers are the whole set. There is no Authorization header and no
 x-opencode-session: the key travels in x-api-key, which every documented example
 sends, and not in the header generic proxies are built to log and forward. The
-user agent names this project rather than dexador, as a validated client does."
-  (list (cons :content-type "application/json")
-        (cons :x-api-key api-key)
-        (cons :anthropic-version version)
-        (cons :user-agent "enchiridion/0.1.0")))
+user agent names this project rather than dexador, as a validated client does.
 
-(declaim (ftype (function (string string string string integer string) string)
-                anthropic-http-post))
+VERSION NIL omits anthropic-version entirely, which is what a profile that
+carries the revision in the request body needs: Bedrock's InvokeModel path
+refuses the header, and a header with a NIL value is worse than no header."
+  (merge-headers
+   (append (anthropic-static-headers)
+           (list (cons :x-api-key api-key))
+           (when version (list (cons :anthropic-version version))))
+   extra))
 
-(defun anthropic-http-post (base-url path body api-key timeout version)
-  "POST BODY to PATH under BASE-URL and return the reply text.
+(declaim (ftype (function (t) (or null string)) anthropic-version-header-value))
 
-The argument names are dexador's, not guesses. It spells the payload :CONTENT
-and not :DATA, spells the content type as a header and not as a :CONTENT-TYPE
-argument, and spells both halves of a deadline :READ-TIMEOUT and
-:CONNECT-TIMEOUT with no :TIMEOUT at all. Passing the names that read well
-instead of the names it accepts is a style warning about unknown argument
-keywords, and a warning here is an error.
+(defun anthropic-version-header-value (dialect)
+  "Return the anthropic-version header for DIALECT, or NIL when the version
+travels in the body.
 
-No :FORCE-BINARY. A Messages reply is JSON text and dexador decodes it using
-the charset the reply names, which is the only decoding that is correct for a
-reply that is not ASCII. Forcing binary returns a vector of octets instead, and
-the first thing that touches the reply is the parser, which wants a string.
+A profile that carries the revision in the body (Bedrock, Vertex) must not send
+the header as well, and one that names a revision of its own gets that
+revision. The generic wire sends the constant this service requires."
+  (when (eq (dialect-field dialect :version-location :header) :header)
+    (or (dialect-field dialect :version-value nil) +anthropic-version+)))
 
-VERSION is a parameter and not a constant read inside this function, because
-POST-WITH-RETRIES hands both wire transports one six argument call: the last
-argument is the one field each wire carries outside the body and outside the
-common headers, and on this wire it is the anthropic-version value."
-  (dexador:request
-   (concatenate 'string base-url path)
-   :method :post
-   :headers (anthropic-headers api-key version)
-   :content body
-   :read-timeout timeout
-   :connect-timeout timeout))
+(declaim (ftype (function (t t) list) anthropic-beta-headers))
 
-;; The transport is a special so a test can replace it without a network, and
-;; so the retry path is testable at all: the retry path is about what happens
-;; between two calls and not about what a provider says.
-(defparameter *anthropic-http-post-function* #'anthropic-http-post
-  "The function SEND-ANTHROPIC-COMPLETION uses to make one HTTP request.
-Bound in tests.")
+(defun anthropic-beta-headers (dialect betas)
+  "Return the anthropic-beta header for DIALECT, or NIL.
 
-(defun send-anthropic-completion (connection messages model &key tools)
+A profile whose beta channel is the body writes the list into the request as
+anthropic_beta and gets no header at all, so this function answers NIL for it.
+Several betas travel as one comma separated header, which is the spelling the
+service documents."
+  (when (and betas
+             (plusp (length betas))
+             (eq (dialect-field dialect :beta-channel :header) :header))
+    (list (cons :anthropic-beta (format nil "~{~A~^,~}" betas)))))
+
+(declaim (ftype (function (t) t) anthropic-auth-scheme))
+
+(defun anthropic-auth-scheme (dialect)
+  "Return the credential scheme this Messages request uses.
+
+ANTHROPIC's own endpoint authenticates with x-api-key, and so does every
+Anthropic-shaped endpoint that does not say otherwise. The DIALECT struct's
+generic default is :bearer and the :anthropic profile overrides no field, so
+the scheme is read from the provider's profile when that profile names one and
+is :x-api-key otherwise. A gateway profile names :bearer, which is what turns
+x-api-key into Authorization: Bearer on the same wire."
+  (if (and dialect
+           (getf (dialect-profile-plist (dialect-profile dialect)) :auth-scheme))
+      (dialect-field dialect :auth-scheme)
+      :x-api-key))
+
+(declaim (ftype (function (t t (or null string) list http-request) http-request)
+                anthropic-authorize))
+
+(defun anthropic-authorize (dialect api-key version extra request)
+  "Return REQUEST with DIALECT's credential applied to it.
+
+VERSION is the anthropic-version header value, or NIL when the profile carries
+the revision in the body. EXTRA is the connection's own header list, which
+already carries the beta header when the profile wants one in a header.
+
+The Messages API's own wire authenticates with x-api-key, so that branch writes
+the header directly. A profile that names another scheme --- a bearer gateway,
+Amazon SigV4, Google OAuth --- goes through AUTH-APPLY, which is the only code
+that knows where a signed credential goes."
+  (let ((headers (append (anthropic-static-headers)
+                         (when version (list (cons :anthropic-version version)))
+                         (dialect-field dialect :extra-headers '())
+                         extra)))
+    (if (eq (anthropic-auth-scheme dialect) :x-api-key)
+        (progn
+          ;; ANTHROPIC-HEADERS adds the credential and the version. The version
+          ;; is already in HEADERS, and MERGE-HEADERS keeps one of each name,
+          ;; so the merge is a no-op for it and the credential lands in the
+          ;; one place this wire puts it.
+          (setf (http-request-headers request)
+                (anthropic-headers api-key version headers))
+          request)
+        (auth-apply dialect api-key request :extra headers))))
+
+(defun send-anthropic-completion (connection messages model &key tools betas)
   "Return the COMPLETION for MESSAGES from CONNECTION using MODEL.
+
+The URL is the connection's base URL and the dialect's chat path, with {model}
+replaced by MODEL. The credential is applied last, to the finished request,
+because a signed scheme has to see the body before it can sign it.
 
 The reply is parsed by ANTHROPIC-PARSE-COMPLETION, which reads the JSON itself
 rather than receiving the plist shape PARSE-JSON would produce, for the reasons
 written at that function."
-  (let ((body (anthropic-completion-request connection messages
-                                            :model model
-                                            :tools tools)))
+  (let* ((dialect (normalize-dialect-query-params
+                   (anthropic-connection-dialect connection)))
+         (version (anthropic-version-header-value dialect))
+         (extra (append (anthropic-beta-headers dialect betas)
+                        (anthropic-connection-headers connection)))
+         (body (anthropic-completion-request connection messages
+                                             :model model
+                                             :tools tools
+                                             :betas betas))
+         (request (make-http-request
+                   :url (concatenate
+                         'string
+                         (anthropic-connection-base-url connection)
+                         (dialect-path-with-model
+                          (dialect-field dialect :chat-path "v1/messages")
+                          model))
+                   :body body
+                   :timeout (anthropic-connection-timeout connection))))
     (anthropic-parse-completion
-     (post-with-retries *anthropic-http-post-function*
-                        (anthropic-connection-base-url connection)
-                        "v1/messages"
-                        body
-                        (anthropic-connection-api-key connection)
-                        (anthropic-connection-timeout connection)
-                        +anthropic-version+
+     (post-with-retries *http-post-function*
+                        (anthropic-authorize dialect
+                                             (anthropic-connection-api-key
+                                              connection)
+                                             version extra request)
                         (anthropic-connection-retries connection)))))
 
 ;;;; The operations.
@@ -633,4 +738,154 @@ max_tokens comes from the connection."
   (send-anthropic-completion connection messages
                              (or model (anthropic-connection-model connection))
                              :tools tools))
+
+;;;; The adapter.
+;;;;
+;;;; The provider table hands over an already resolved PROVIDER: endpoint, key,
+;;;; model, profile, headers and options. Everything vendor specific is either
+;;;; in the row or in the dialect, and this section is the only place that
+;;;; knows both a PROVIDER and this wire.
+
+(declaim (ftype (function (provider) t) anthropic-dialect-for))
+
+(defun anthropic-dialect-for (provider)
+  "Return the resolved dialect for PROVIDER.
+
+The provider's profile names the quirks and the row's :dialect-overrides
+replaces any single field. The row's own :query-params are appended to the
+profile's and every parameter is turned into a proper pair, because
+AUTH-APPLY is the one place that appends a query string and a second appender
+would drift from it."
+  (let ((dialect (make-dialect-for
+                  (provider-profile provider)
+                  :protocol :anthropic
+                  :overrides (provider-option provider :dialect-overrides))))
+    (setf (dialect-query-params dialect)
+          (dialect-query-param-pairs
+           (append (dialect-query-params dialect)
+                   (provider-query-params provider))))
+    dialect))
+
+(declaim (ftype (function (provider) t) build-anthropic-provider))
+
+(defun build-anthropic-provider (provider)
+  "Return the :ANTHROPIC-MESSAGES backend PROVIDER describes.
+
+MAX-TOKENS is required on this wire, so a row that names no cap gets the whole
+reply rather than an omission. CACHE-P is on unless the row turns it off: the
+two breakpoints are what make a repeated prefix cheap."
+  (anthropic-backend
+   :base-url (provider-base-url provider)
+   :api-key (provider-key provider)
+   :model (or (provider-model provider) (provider-default-model provider))
+   :max-tokens (or (provider-option provider :max-tokens) 4096)
+   :cache-ttl (provider-option provider :cache-ttl)
+   :cache-p (provider-option provider :cache-p t)
+   :headers (merge-headers (anthropic-static-headers)
+                           (provider-headers provider))
+   :dialect (anthropic-dialect-for provider)))
+
+;;;; The model list.
+
+;; The list is paginated, and a has_more that never clears is a provider bug.
+;; The cap turns it into a bounded number of requests rather than a loop that
+;; runs until the process is killed.
+(defparameter +anthropic-model-pages+ 64
+  "The most pages the model lister follows before it stops asking.")
+
+(defparameter +anthropic-model-page-size+ 1000
+  "How many models one models request asks for; the API's own maximum.")
+
+(declaim (ftype (function (string (or null string)) string)
+                anthropic-models-url))
+
+(defun anthropic-models-url (base after)
+  "Return the models URL for BASE, asking for the page that follows AFTER.
+
+AFTER is the id of the last model of the previous page, which is the cursor the
+API documents, or NIL for the first page. The page size is always asked for, so
+the endpoint does not fall back to a default this tree does not know."
+  (url-with-query base nil
+                  (append (list (cons "limit"
+                                      (princ-to-string
+                                       +anthropic-model-page-size+)))
+                          (when after (list (cons "after_id" after))))))
+
+(declaim (ftype (function (t) model-info) anthropic-model-row))
+
+(defun anthropic-model-row (entry)
+  "Return ENTRY, one model of a Messages model list, as a MODEL-INFO row.
+
+The endpoint reports an id, a display name and a creation time and little else.
+Tool calling is not a per-model fact on this wire: every model the Messages API
+serves can be given tools, so the row says so rather than leaving the catalog
+to guess."
+  (let* ((id (json-string (getf entry :id)))
+         (name (json-string (getf entry :display_name))))
+    (%make-model-info
+     :id id
+     :name (if (plusp (length name)) name id)
+     :tool-call-p t
+     :reasoning-p nil
+     :source :provider)))
+
+(declaim (ftype (function (provider) t) list-anthropic-models))
+
+(defun list-anthropic-models (provider)
+  "Return the MODEL-INFO rows the Messages endpoint reports.
+
+The list is paginated: a reply carries a page, HAS_MORE says whether another
+one exists, and AFTER_ID asks for the models that follow the last one seen. The
+cursor is the id of the last row rather than a count, because the API's
+ordering is its own and a caller that assumed the number of models it had seen
+was the offset would skip or repeat rows."
+  (let* ((dialect (anthropic-dialect-for provider))
+         (path (dialect-field dialect :models-path "v1/models"))
+         (base (concatenate 'string
+                            (ensure-trailing-slash (provider-base-url provider))
+                            path))
+         (version (anthropic-version-header-value dialect))
+         (extra (append (anthropic-beta-headers dialect nil)
+                        (merge-headers (anthropic-static-headers)
+                                       (provider-headers provider))))
+         (rows '())
+         (after nil)
+         (more t))
+    ;; Every repeated page goes through AUTH-APPLY, so a gateway's token and a
+    ;; signed request are built exactly as the chat request is. The version's
+    ;; header placement is shared with it for the same reason.
+    (loop repeat +anthropic-model-pages+
+          while more
+          do (let* ((request (anthropic-authorize
+                              dialect (provider-key provider) version extra
+                              (make-http-request
+                               :url (anthropic-models-url base after))))
+                    (payload (parse-json
+                              (funcall *http-get-function*
+                                       (http-request-url request)
+                                       :headers (http-request-headers request))))
+                    (entries (getf payload :data)))
+               (when (and (listp entries) (every #'consp entries))
+                 (dolist (entry entries)
+                   (push (anthropic-model-row entry) rows)))
+               (setf after (and (listp entries)
+                                (consp entries)
+                                (getf (car (last entries)) :id))
+                     more (and after (getf payload :has_more)))))
+    (nreverse rows)))
+
+;;;; Registration.
+;;;;
+;;;; Last form in the file, and it has to be: it names the two functions above
+;;;; with #', and a #' of a name the compiler has not seen is a warning.
+
+(register-api-handler
+ :anthropic-messages
+ :schema :anthropic
+ :build #'build-anthropic-provider
+ :list-models #'list-anthropic-models
+ :documentation
+ "The Anthropic Messages API, and every Anthropic-shaped gateway that speaks
+it: Anthropic's own endpoint, an OpenRouter-style bearer gateway, and an
+Anthropic-compatible proxy.")
 

@@ -420,11 +420,10 @@
   (let* ((calls 0)
          (paths '())
          (enchiridion.llm::*retry-delay* 0)
-         (enchiridion.llm::*anthropic-http-post-function*
-           (lambda (base-url path body key timeout version)
-             (declare (ignore base-url body key timeout version))
+         (enchiridion.llm::*http-post-function*
+           (lambda (request)
              (incf calls)
-             (push path paths)
+             (push (enchiridion.llm::http-request-url request) paths)
              (if (< calls 3)
                  (error 'dexador.error:http-request-failed
                         :status 429 :body "slow down"
@@ -438,14 +437,14 @@
       (ok (= 3 calls) "two 429 responses and one success")
       (testing "and every attempt went to the Messages endpoint"
         (ok (= 3 (length paths)))
-        (ok (every (lambda (path) (string= "v1/messages" path)) paths))))))
+        (ok (every (lambda (url) (search "v1/messages" url)) paths))))))
 
 (deftest a-529-overload-is-retried-too ()
   (let* ((calls 0)
          (enchiridion.llm::*retry-delay* 0)
-         (enchiridion.llm::*anthropic-http-post-function*
-           (lambda (base-url path body key timeout version)
-             (declare (ignore base-url path body key timeout version))
+         (enchiridion.llm::*http-post-function*
+           (lambda (request)
+             (declare (ignore request))
              (incf calls)
              (if (< calls 2)
                  (error 'dexador.error:http-request-failed
@@ -462,9 +461,9 @@
 (deftest a-401-is-reported-at-once ()
   (let* ((calls 0)
          (enchiridion.llm::*retry-delay* 0)
-         (enchiridion.llm::*anthropic-http-post-function*
-           (lambda (base-url path body key timeout version)
-             (declare (ignore base-url path body key timeout version))
+         (enchiridion.llm::*http-post-function*
+           (lambda (request)
+             (declare (ignore request))
              (incf calls)
              (error 'dexador.error:http-request-failed
                     :status 401 :body "bad key"
@@ -477,10 +476,9 @@
 
 (deftest a-complete-call-sends-the-turn-model-and-the-tools ()
   (let* ((seen nil)
-         (enchiridion.llm::*anthropic-http-post-function*
-           (lambda (base-url path body key timeout version)
-             (declare (ignore base-url path key timeout version))
-             (setf seen body)
+         (enchiridion.llm::*http-post-function*
+           (lambda (request)
+             (setf seen (enchiridion.llm::http-request-body request))
              *text-reply*))
          (completion (enchiridion.llm:complete
                       (enchiridion.llm:anthropic-backend
@@ -590,19 +588,27 @@
             (enchiridion.llm::anthropic-connection-max-tokens backend)))))
 
 (deftest every-provider-key-variable-is-named ()
-  (let ((names (enchiridion.llm:provider-key-names
-                '(:llm (:api-key-env "MY_LLM_KEY")))))
-    (ok (member "OPENAI_API_KEY" names :test #'string=))
-    (ok (member "OPENCODE_API_KEY" names :test #'string=))
-    (ok (member "ANTHROPIC_API_KEY" names :test #'string=))
-    (ok (member "MY_LLM_KEY" names :test #'string=))
-    (testing "and no name is repeated"
-      (ok (= (length names)
-             (length (remove-duplicates names :test #'string=))))))
-  (testing "the active configuration supplies the configured name"
-    (let ((enchiridion:*config* '(:llm (:api-key-env "ACTIVE_KEY"))))
-      (ok (member "ACTIVE_KEY" (enchiridion.llm:provider-key-names)
-                  :test #'string=))))
-  (testing "and the shipped configuration names no LLM key at all"
-    (ok (equal '("OPENAI_API_KEY" "OPENCODE_API_KEY" "ANTHROPIC_API_KEY")
-               (enchiridion.llm:provider-key-names '())))))
+  ;; The catalog cache is a run-time artefact: an operator who has refreshed it
+  ;; holds hundreds of provider key names, and this test is about the shipped
+  ;; configuration alone. Binding the path to somewhere that cannot exist keeps
+  ;; the assertion the same whether run/ holds a cache or not, which is the
+  ;; difference between a test and a report on the machine it ran on.
+  (let ((enchiridion.llm::*catalog* nil)
+        (enchiridion.llm::*catalog-path*
+          #p"/nonexistent/enchiridion-providers.json"))
+    (let ((names (enchiridion.llm:provider-key-names
+                  '(:llm (:api-key-env "MY_LLM_KEY")))))
+      (ok (member "OPENAI_API_KEY" names :test #'string=))
+      (ok (member "OPENCODE_API_KEY" names :test #'string=))
+      (ok (member "ANTHROPIC_API_KEY" names :test #'string=))
+      (ok (member "MY_LLM_KEY" names :test #'string=))
+      (testing "and no name is repeated"
+        (ok (= (length names)
+               (length (remove-duplicates names :test #'string=))))))
+    (testing "the active configuration supplies the configured name"
+      (let ((enchiridion:*config* '(:llm (:api-key-env "ACTIVE_KEY"))))
+        (ok (member "ACTIVE_KEY" (enchiridion.llm:provider-key-names)
+                    :test #'string=))))
+    (testing "and the shipped configuration names no LLM key at all"
+      (ok (equal '("OPENAI_API_KEY" "OPENCODE_API_KEY" "ANTHROPIC_API_KEY")
+                 (enchiridion.llm:provider-key-names '()))))))

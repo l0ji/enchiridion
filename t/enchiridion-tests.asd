@@ -37,6 +37,16 @@
      ;; separate wire shape; it loads right after the OpenAI one for the same
      ;; reason the backends do.
      (:file "anthropic-test")
+     ;; The provider layer: the quirk profiles, the runtime catalog, the
+     ;; provider table, and the vendor-only handlers. One file each, in the
+     ;; order the modules they test load.
+     (:file "dialect-test")
+     (:file "catalog-test")
+     (:file "provider-test")
+     (:file "aws-sigv4-test")
+     (:file "bedrock-test")
+     (:file "gcp-oauth-test")
+     (:file "vertex-test")
      (:file "blocks-test")
      (:file "store-test")
      (:file "tiers-test")

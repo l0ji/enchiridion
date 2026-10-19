@@ -1,42 +1,16 @@
-# Deploy the enchiridion image with Compose. Docker builds the image from
-# docker/Dockerfile, so there is no registry to pull from:
-#
-#   docker compose build
-#   docker compose up -d
-#
-# docs/deployment.md gives the full procedure.
-
 name: enchiridion
 
 services:
   enchiridion:
-    # Built from docker/Dockerfile. `docker compose up --build` rebuilds it,
-    # and `docker compose build` builds it alone.
     image: ${ENCHIRIDION_IMAGE:-enchiridion:0.1.0}
     build:
       context: .
       dockerfile: docker/Dockerfile
-
     container_name: enchiridion
     restart: unless-stopped
-
-    # .env holds ENCHIRIDION_HTTP_TOKEN, the model key (OPENAI_API_KEY,
-    # OPENCODE_API_KEY, or ANTHROPIC_API_KEY), and FLUXER_BOT_TOKEN for the
-    # Fluxer channel. The file is optional. A non-loopback bind without a token
-    # exits 2. Compose also reads .env for ENCHIRIDION_IMAGE and
-    # ENCHIRIDION_PORT.
-    #
-    # env_file puts the values in the container environment, and it is kept
-    # because a checkout with no .env must still start. The supervisor now
-    # refuses to start at all when the file it reads is world readable, and it
-    # unsets these names in its own process, but Docker fixes the container
-    # environment at start, so `docker exec` still sees them. The tmpfs route in
-    # docs/deployment.md, a read-only mount at /run/secrets/.env with this key
-    # removed, is the only route that satisfies the isolation script.
     env_file:
       - path: .env
         required: false
-
     command:
       - serve
       - --channel
@@ -45,43 +19,20 @@ services:
       - 0.0.0.0
       - --port
       - "8787"
-
     ports:
       - "${ENCHIRIDION_PORT:-8787}:8787"
-
-    # The tmpfs is necessary. The entrypoint reads /proc/mounts and exits 1
-    # when /run/secrets is not a mount, and the supervisor unlinks
-    # /run/secrets/.env once it has read it. This service still uses env_file as
-    # the fallback; the read-only bind mount from docs/deployment.md, with the
-    # env_file key removed, is the routing the isolation script passes on.
     tmpfs:
       - /run/secrets:mode=0700
-
     volumes:
       - enchiridion-state:/var/lib/enchiridion
-
-    # Docker sends SIGTERM and waits 30 seconds before SIGKILL. The handler
-    # stops the supervisor and its channels, then closes the context.
     stop_grace_period: 30s
-
-    # Cap the logs, so a long deployment does not fill the disk.
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
-
-    # hidepid stops uid 1000 reading the supervisor's process view. Docker
-    # mounts /proc itself, so the entrypoint needs SYS_ADMIN to remount it, and
-    # ENCHIRIDION_REQUIRE_HIDEPID makes that remount mandatory: the process
-    # exits 1 rather than serve with /proc readable. SYS_ADMIN is a broad
-    # capability, wider than a remount needs, and Docker has no narrower one
-    # that can reach mount. To run without it, drop both the cap_add and the
-    # environment entry below; the entrypoint then warns and serves on, with the
-    # proc guarantee gone.
     cap_add:
       - SYS_ADMIN
-
     environment:
       ENCHIRIDION_REQUIRE_HIDEPID: "1"
 

@@ -28,10 +28,6 @@ docker compose build                   # build the image from docker/Dockerfile
 docker compose up -d                   # start the supervisor
 ```
 
-`docker build -t enchiridion:0.1.0 -f docker/Dockerfile .` builds the same image
-on its own.
-[Deployment](docs/deployment.md) gives the full procedure.
-
 ## Documentation
 
 - [Documentation index](docs/index.md)

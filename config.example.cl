@@ -48,6 +48,78 @@
     ;;; no default of its own. The OpenAI-shaped wire ignores this key.
     (:max-tokens 4096)
 
+    ;;; The runtime catalog. Provider knowledge is generated from models.dev at
+    ;;; run time and cached under run/; nothing about a provider is committed
+    ;;; to the tree apart from the three rows this build ships for :openai,
+    ;;; :opencode and :anthropic, which are configuration defaults. The
+    ;;; commands that run a turn (ask, chat, serve) refresh the cache at
+    ;;; context build, once per process, when the cached index is missing or
+    ;;; older than the TTL, and a provider's model list when a key is present
+    ;;; and its cache is stale; an inspection command never fetches. The TTLs,
+    ;;; :offline, :headers, :query-params and :profile apply to whichever
+    ;;; provider is selected. `enchiridion providers refresh` and
+    ;;; `enchiridion providers models ID` do it by hand. :offline t stops the
+    ;;; start-up fetching, the model list included; those two explicit commands
+    ;;; still run.
+    (:providers-url "https://models.dev/api.json")
+    (:providers-ttl-seconds 86400)   ; the provider index
+    (:models-ttl-seconds 86400)      ; one provider's model list
+    (:offline nil)
+
+    ;;; Cloud placement. Bedrock reads :region; Vertex reads :project and
+    ;;; :location. The environment variables of the same meaning (AWS_REGION,
+    ;;; GOOGLE_VERTEX_PROJECT, GOOGLE_VERTEX_LOCATION) win when these are nil.
+    (:region nil)
+    (:project nil)
+    (:location nil)
+
+    ;;; Providers you define or override. A row is the same shape as the rows
+    ;;; this build ships for :openai, :opencode and :anthropic, so any field
+    ;;; can be overridden one at a time. A row whose :id matches a models.dev
+    ;;; provider overrides that provider; a new :id adds one.
+    ;;;
+    ;;; :api names the wire. :openai-chat covers OpenAI, OpenCode Go, Azure,
+    ;;; OpenRouter, Groq and the long tail; :anthropic-messages covers the
+    ;;; Messages API; :bedrock-invoke and :bedrock-messages cover Amazon
+    ;;; Bedrock; :vertex-anthropic covers Claude on Google Vertex. :profile
+    ;;; names the quirks to apply, and an individual quirk may be overridden
+    ;;; directly (:auth-scheme, :auth-header, :chat-path, :models-path,
+    ;;; :max-tokens-field, :system-role, :reasoning-field). A header may be
+    ;;; written ("Name" "value") or ("Name" . "value"); both reach the wire
+    ;;; identically.
+    ;;;
+    ;;; (:providers
+    ;;;  ((:id my-llm :name "My LLM" :api :openai-chat :profile :openai
+    ;;;    :base-url "https://llm.internal/v1/"
+    ;;;    :api-key-env "MY_LLM_KEY"
+    ;;;    :headers (("X-Tenant" "acme"))
+    ;;;    :models ("m-1" "m-2"))
+    ;;;   ;; Override only what differs from the catalog row.
+    ;;;   (:id deepseek :api-key-env "DEEPSEEK_KEY")
+    ;;;   ;; Azure, which needs the api-key header and a deployment path.
+    ;;;   (:id azure :api :openai-chat :profile :azure
+    ;;;    :base-url "https://myresource.openai.azure.com/")
+    ;;;   ;; Claude on Amazon Bedrock. AWS_BEARER_TOKEN_BEDROCK selects bearer
+    ;;;   ;; auth; AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY select SigV4.
+    ;;;   (:id amazon-bedrock :api :bedrock-invoke :profile :bedrock-invoke
+    ;;;    :region "us-east-1")
+    ;;;   ;; Claude on Google Vertex, with a service-account JSON in
+    ;;;   ;; GOOGLE_APPLICATION_CREDENTIALS or a token in
+    ;;;   ;; GOOGLE_VERTEX_ACCESS_TOKEN.
+    ;;;   (:id google-vertex-anthropic :api :vertex-anthropic
+    ;;;    :profile :vertex :project "my-project" :location "us-east5")))
+
+    ;;; The generic custom provider: no preset at all, everything from the
+    ;;; :llm keys above, and one of the two API routes reused. Set
+    ;;; (:provider :custom) and name the route with :backend.
+    ;;;
+    ;;; (:provider :custom)
+    ;;; (:backend :anthropic)                 ; or :openai
+    ;;; (:base-url "https://proxy.internal/")
+    ;;; (:api-key-env "PROXY_KEY")
+    ;;; (:headers (("X-Route" "team-a")))
+    ;;; (:model-primary "claude-sonnet-5-5")
+
    ;;; Channels are a subcategory. Every entry has the same shape, with
    ;;; :enabled, and only the keys that channel understands. The CLI channel
    ;;; is the control plane and starts whenever a terminal is attached.

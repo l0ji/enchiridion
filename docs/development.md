@@ -79,6 +79,26 @@ The Linux closures need a Linux builder; they are not measured here.
 `docker/`, `compose.yml`, `flake.nix`, `README.md`, and `LICENSE` are not
 runtime inputs and do not ship.
 
+## The runtime provider catalog
+
+No provider or model data is committed to this tree, apart from the three rows
+in `config.cl` (`:openai`, `:opencode`, `:anthropic`) that ship as configuration
+defaults, so the default path works with no catalog and no network.
+`src/enchiridion/llm/catalog.cl` fetches
+[models.dev](https://models.dev/api.json) at run time and caches the trimmed
+index under `run/providers.json` and the model metadata under
+`run/provider-models.json`, and each provider's own model list is cached under
+`run/models/<provider>.json`. All of them live under `run/`, which `.gitignore`
+and the flake source filter already exclude, so a refresh can never put provider
+data into the store. `enchiridion providers refresh` runs the fetch by hand;
+`ENCHIRIDION_PROVIDERS_PATH` points the write at another path, which is how the
+cache is inspected without touching an operator's run directory.
+
+The cloud handlers sign their requests, so the system depends on `ironclad`
+(HMAC-SHA256 for AWS Signature V4, RS256 for the Vertex service-account JWT) and
+`cl-base64` for the URL-safe encoding. Both are in `lispPackageNames` in
+`flake.nix`.
+
 ### Generated and ignored paths
 
 These live beside the source. `.gitignore` excludes all of them:
@@ -88,7 +108,7 @@ These live beside the source. `.gitignore` excludes all of them:
 | `config.cl`                          | Your configuration. The tracked template is `config.example.cl` |
 | `.env`                               | Secret values, mode 600                                         |
 | `agents/`                            | The agent directory, written on first launch                    |
-| `run/`                               | The control file and the status file of a running supervisor    |
+| `run/`                               | The control file and the status file of a running supervisor, and the provider caches `providers.json`, `provider-models.json`, and `models/<provider>.json` |
 | `PLAN.md`                            | The design record. It holds rationale, not instructions         |
 | `research/`, `enchiridion-property/` | Local working directories                                       |
 

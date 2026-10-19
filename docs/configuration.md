@@ -63,54 +63,140 @@ interval, the heartbeat flag, and the agent uid.
 
 | Key              | Type              | Default                 | Effect                                                                             |
 | ---------------- | ----------------- | ----------------------- | ---------------------------------------------------------------------------------- |
-| `:provider`      | keyword or string | `:openai`               | Select the provider. The code recognizes `:openai`, `:opencode`, and `:anthropic`. |
-| `:backend`       | keyword           | `:openai`               | Select the wire protocol: `:openai` or `:anthropic`.                               |
+| `:provider`      | keyword or string | `:openai`               | Select a provider. Any shipped, catalog or `:providers` id, or `:custom`. A value that names nothing is a configuration error, not a fallback. |
+| `:backend`       | keyword           | `:openai`               | Override the wire protocol: `:openai` or `:anthropic`.                             |
 | `:base-url`      | string or `nil`   | `nil`                   | Set the endpoint. The backend adds a trailing slash when the value has none.       |
 | `:model-primary` | string            | `"deepseek-v4.1-flash"` | Set the model for reasoning turns.                                                 |
 | `:model-cheap`   | string            | `"deepseek-v4.1-flash"` | Set the model for memory digests and compaction.                                   |
 | `:model-sleep`   | string            | `"deepseek-v4.1-flash"` | Set the model for the sleep agent.                                                 |
-| `:api-key-env`   | string or `nil`   | `nil`                   | Name the variable that holds the API key. `nil` means the provider table decides.  |
+| `:api-key-env`   | string or `nil`   | `nil`                   | Name the variable that holds the API key. `nil` means the provider row decides.     |
 | `:max-tokens`    | integer           | `4096`                  | Cap one reply on the Messages API. The OpenAI-shaped wire ignores this key.        |
+| `:providers`     | list of rows      | three shipped rows      | Define or override providers by id. See below.                                     |
+| `:providers-url` | string            | `https://models.dev/api.json` | Where the runtime provider catalog is fetched from.                          |
+| `:providers-ttl-seconds` | integer   | `86400`                 | How long the cached provider index stays fresh. It is compared at start up against the cache's age. |
+| `:models-ttl-seconds`    | integer   | `86400`                 | How long one provider's cached model list stays fresh.                             |
+| `:offline`       | boolean           | `nil`                   | `t` stops every start-up fetch, the model list included. `providers refresh` and `providers models ID` still run when asked. |
+| `:region`        | string or `nil`   | `nil`                   | Bedrock region; `AWS_REGION` or `AWS_DEFAULT_REGION` is used when this is nil.      |
+| `:project`       | string or `nil`   | `nil`                   | Vertex project; `GOOGLE_VERTEX_PROJECT` is used when this is nil.                  |
+| `:location`      | string or `nil`   | `nil`                   | Vertex location; `GOOGLE_VERTEX_LOCATION` is used when this is nil.                |
+| `:headers`       | alist             | `nil`                   | Extra request headers for the selected provider.                                   |
+| `:query-params`  | alist             | `nil`                   | Extra query parameters for the selected provider.                                  |
+| `:profile`       | keyword           | `nil`                   | Force a quirk profile for the selected provider.                                   |
 
 Each model tier starts equal to the cheap model. The key to raise for a
 stronger turn is `:model-primary`.
+
+The keys `:providers-ttl-seconds`, `:models-ttl-seconds`, `:offline`,
+`:headers`, `:query-params` and `:profile` are not specific to
+`:provider :custom`: each one works for whichever provider is selected.
+`:headers`, `:query-params` and `:profile` are merged into the selected
+provider's row, and a value written in the row wins over the top-level one.
+
+### Provider rows
+
+Provider knowledge is generated at run time from models.dev and cached under
+`run/`; nothing about a provider is committed to the tree except the three rows
+in `config.cl` (`:openai`, `:opencode`, `:anthropic`), which ship as
+configuration defaults so the default path needs no catalog and no network. A
+row defines or overrides one provider, and a row has the same shape wherever it
+is written, so the three shipped rows and an operator's row cannot drift apart.
+
+```lisp
+(:provider :my-llm)
+(:providers
+ ((:id my-llm :name "My LLM" :api :openai-chat :profile :openai
+   :base-url "https://llm.internal/v1/"
+   :api-key-env "MY_LLM_KEY"
+   :headers (("X-Tenant" "acme"))
+   :models ("m-1" "m-2"))
+  ;; Override the catalog's row for a provider it knows.
+  (:id deepseek :api-key-env "DEEPSEEK_KEY")
+  ;; Amazon Bedrock and Google Vertex.
+  (:id amazon-bedrock :api :bedrock-invoke :profile :bedrock-invoke
+   :region "us-east-1")
+  (:id google-vertex-anthropic :api :vertex-anthropic :profile :vertex
+   :project "my-project" :location "us-east5")))
+```
+
+| Row key        | Type              | Effect                                                                    |
+| -------------- | ----------------- | ------------------------------------------------------------------------- |
+| `:id`          | keyword or string | The provider id. Required.                                                |
+| `:name`        | string            | Display name.                                                             |
+| `:api`         | keyword           | The handler: `:openai-chat`, `:anthropic-messages`, `:bedrock-invoke`, `:bedrock-messages`, `:vertex-anthropic`. |
+| `:profile`     | keyword           | The quirk profile. See [Models and secrets](llm.md).                       |
+| `:base-url`    | string            | The endpoint.                                                             |
+| `:api-key-env` | string or list    | The variable name, or names, that hold the credential.                    |
+| `:model`       | string            | The default model for this provider.                                      |
+| `:models`      | list of strings   | A static model list, when the endpoint cannot be asked.                   |
+| `:headers`, `:query-params` | alist  | Extra headers and query parameters. A header may be written `("Name" "value")` or `("Name" . "value")`; both reach the wire identically. |
+| `:region`, `:project`, `:location` | string | Cloud placement for Bedrock and Vertex.                            |
+
+An individual quirk may also be overridden directly on the row: `:auth-scheme`,
+`:auth-header`, `:chat-path`, `:models-path`, `:max-tokens-field`,
+`:system-role`, `:reasoning-field`.
+
+`:provider :custom` is the generic case: a provider with no preset at all, built
+from the top-level `:llm` keys (`:backend`, `:base-url`, `:api-key-env`,
+`:headers`, `:query-params`, `:model-*`). `:base-url` is required.
 
 ### Provider selection
 
 `detect-provider` reads the keys in this order:
 
-1. `:provider`, when the value is `:openai`, `:opencode`, or `:anthropic`.
-2. A recognized `:base-url`. The text `opencode.ai` selects `:opencode`. The text
-   `api.anthropic.com` selects `:anthropic`. The text `api.openai.com` selects
-   `:openai`.
+1. An explicit `:provider`. A value that names nothing is a configuration error:
+   it says to run `providers refresh` or to add a `:providers` row. It does not
+   fall through to base-URL detection.
+2. A recognized `:base-url`. `opencode.ai`, `api.anthropic.com` and
+   `api.openai.com` are matched first; then any provider in the cached catalog
+   whose `api` host matches.
 3. An `OPENAI_API_KEY` in the environment or in `.env`.
-4. An `OPENCODE_API_KEY` in the environment or in `.env`.
-5. An `ANTHROPIC_API_KEY` in the environment or in `.env`.
+4. An `OPENCODE_API_KEY`, then an `ANTHROPIC_API_KEY`.
+5. Exactly one provider in the cached catalog whose `env` variable is present.
 6. Otherwise `:openai`. OpenAI wins a tie, because OpenAI is the default.
 
-An unrecognized `:provider` value falls through to step 2. A local
-OpenAI-compatible server matches no host in step 2, so the `:base-url` still
-works and the key variable comes from the later steps.
+A local OpenAI-compatible server matches none of the hosts in step 2, so its
+`:base-url` is used as written and the key variable comes from the later steps.
+An explicit `:provider` that names nothing never reaches step 2: it stops the
+command with that error.
 
-`default-api-key-env` returns `:api-key-env` when the file sets that key. Without
-it, the provider decides: `OPENAI_API_KEY`, `OPENCODE_API_KEY`, or
-`ANTHROPIC_API_KEY`. `provider-key-names` returns all three names plus the
-configured one, and `main.cl` loads all of them, so a key for a provider that was
-not selected still reaches the scrubber.
+`default-api-key-env` returns `:api-key-env` when the file sets that key.
+Without it, the provider row decides. `provider-key-names` returns the
+configured name, every shipped and configured row's variables, the selected
+provider's variables, and the cached providers' credential-shaped variables; it
+deliberately leaves out names such as `AWS_ACCESS_KEY_ID` unless that provider
+is the one selected, because a name in this list is read from `.env` and then
+removed from the process environment.
+
+### The runtime catalog
+
+Provider knowledge comes from [models.dev](https://models.dev) at run time and
+is cached under `run/`, never in the tree apart from the three rows in
+`config.cl` that ship as configuration defaults. `enchiridion providers refresh`
+fetches and rewrites the cache by hand. The commands that run a turn (`ask`,
+`chat`, `serve`) also refresh it at context build, once per process: the cached
+provider index when it is missing or older than `:providers-ttl-seconds`, and
+the selected provider's model list when a key is present and its cache is older
+than `:models-ttl-seconds`. Inspection commands (`help`, `version`, `secrets`,
+`providers list`, `tools`, …) never fetch and never write a cache.
+`:providers-url` changes the source. `:offline t` stops every start-up fetch,
+the model list included, while `providers refresh` and `providers models ID`
+still run because the operator asked for them. Every failure is one warning
+line: a turn still runs on the shipped rows and the configured models.
 
 ### Backend selection
 
 `resolve-backend` reads `:backend`, `:base-url`, `:model-primary`,
-`:api-key-env`, and `:max-tokens`. An explicit `:base-url` or `:model-primary`
-wins over the provider default.
+`:api-key-env`, and `:max-tokens`, then asks the provider row for its handler.
+An explicit `:base-url` or `:model-primary` wins over the row.
 
-Two backends exist. `:openai` is the chat completions shape, and it covers
-OpenAI, OpenCode Go, and a local server. `:anthropic` is the Messages API, whose
-`max_tokens` field is required and whose prompt cache is marked with
-`cache_control` breakpoints. `:backend :anthropic` selects the Anthropic request
-shape and the `:anthropic` provider row together, so an OpenAI key in the
-environment cannot pair the Anthropic endpoint with a chat completions request.
-`:provider :anthropic` with no `:backend` does the same.
+Two handlers cover every vendor that speaks one of the two shared schemas: the
+chat-completions handler (`:openai`) and the Messages handler (`:anthropic`).
+Two more cover APIs only one cloud offers: `:bedrock-invoke` and
+`:bedrock-messages` for Amazon Bedrock, and `:vertex-anthropic` for Claude on
+Google Vertex. `:backend :anthropic` selects the Anthropic request shape and the
+`:anthropic` row together, so an OpenAI key in the environment cannot pair the
+Anthropic endpoint with a chat-completions request. `:provider :anthropic` with
+no `:backend` does the same.
 
 Any other value stops the command with a configuration error at `:backend`, and
 the error names the value. `:max-tokens` caps one Anthropic reply; it is not

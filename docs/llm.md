@@ -1,14 +1,15 @@
 # Models and secrets
 
 The kernel calls one generic function, `complete`, and reads a `completion`. It
-never asks which backend answered. Two backends exist. The OpenAI-compatible
-client serves OpenAI, OpenCode Go, and a local server with the same wire shape.
-The Anthropic client speaks the Messages API, which puts instructions in a top
-level field, represents a tool result as a user content block, and marks the
-cached prefix with breakpoints. Three model tiers decide which model a piece of
-work uses. A separate module loads every secret into memory. It scrubs each
-loaded value, and each known key shape, out of text before that text reaches a
-model or a channel.
+never asks which backend answered. Two generic handlers exist, each owning one
+wire schema that many vendors speak: the OpenAI chat-completions handler serves
+OpenAI, OpenCode Go, Azure, OpenRouter, Groq and the long tail; the Anthropic
+Messages handler serves Anthropic's own endpoint and the Anthropic-shaped
+gateways. Two vendor-only handlers speak APIs only one cloud offers: Amazon
+Bedrock's InvokeModel path and Google Vertex's `:rawPredict` path. Three model
+tiers decide which model a piece of work uses. A separate module loads every
+secret into memory. It scrubs each loaded value, and each known key shape, out
+of text before that text reaches a model or a channel.
 
 ## The provider protocol
 
@@ -38,56 +39,180 @@ output only. A cache read is already part of the prompt count, and every backend
 stores the input count provider-normalised with the cache counts folded in, so the
 function does not add either one twice.
 
-## Backends
+## Handlers and the adapter registry
 
-`resolve-backend` accepts `:backend :openai` and `:backend :anthropic`. It signals
-`configuration-error` with `:key :backend` for any other value.
-`config.example.cl` names `:litellm` in comments, but no code implements it, so a
-config that selects it does not start.
+A provider names a **handler**, and a handler is one wire schema. The registry
+lives in `src/enchiridion/llm/registry.cl`; each handler file registers itself
+as it loads, so nothing in the core names a vendor.
 
-| Backend      | Wire shape              | Default endpoint prefix      |
-| ------------ | ----------------------- | ---------------------------- |
-| `:openai`    | chat completions        | `https://api.openai.com/v1/` |
-| `:anthropic` | the Messages API        | `https://api.anthropic.com/` |
+| Handler             | File           | Schema      | Used by                                                        |
+| ------------------- | -------------- | ----------- | -------------------------------------------------------------- |
+| `:openai-chat`      | `openai.cl`    | `:openai`   | OpenAI, OpenCode Go, Azure, OpenRouter, Groq, local servers, … |
+| `:anthropic-messages` | `anthropic.cl` | `:anthropic` | Anthropic's endpoint and Anthropic-shaped gateways          |
+| `:bedrock-invoke`   | `bedrock.cl`   | `:anthropic` | Amazon Bedrock's `/model/{id}/invoke` path                    |
+| `:bedrock-messages` | `bedrock.cl`   | `:anthropic` | Amazon Bedrock's native `/anthropic/v1/messages` endpoint     |
+| `:vertex-anthropic` | `vertex.cl`    | `:anthropic` | Claude on Google Vertex, `:rawPredict`                        |
 
-`openai-backend` builds the OpenAI connection.
+Bedrock and Vertex reuse the Messages request and reply builders from
+`anthropic.cl` and own only their transport, path, auth and version placement.
 
-| Keyword       | Default                      | Effect                                                                       |
-| ------------- | ---------------------------- | ---------------------------------------------------------------------------- |
-| `:base-url`   | `https://api.openai.com/v1/` | the endpoint prefix, and the builder adds a trailing slash when it is absent |
-| `:api-key`    | `""`                         | the bearer token                                                             |
-| `:model`      | `*model-primary*`            | the default model for the connection                                         |
-| `:session-id` | a new 32 character id        | the routing and prompt cache key                                             |
-| `:timeout`    | 60                           | the read timeout and the connect timeout in seconds                          |
-| `:retries`    | 2                            | extra attempts that a 429 or a 5xx earns                                     |
+`resolve-backend` picks a handler from the selected provider and calls its
+builder. An unsupported provider is a `configuration-error` that names the
+provider, its models.dev `npm` package, and the fix (`:api` plus `:base-url`
+in a `:providers` row). `:backend` still overrides the route by hand;
+`:backend :anthropic` with no `:provider` selects the Anthropic row, and any
+other value is a `configuration-error` at `:backend`.
 
-`new-session-id` returns 32 hexadecimal characters. One connection reuses one
-session id for every turn. `model-capabilities` reports `:tools` true, `:streaming`
-true, `:cache` true, and `:cache-breakpoints` nil. Nothing sends a cache
-breakpoint on this wire, and the backend reports the capability as absent rather
-than as present and ignored.
+| Keyword       | Wire shape        | Default endpoint prefix      |
+| ------------- | ----------------- | ---------------------------- |
+| `:openai`     | chat completions  | `https://api.openai.com/v1/` |
+| `:anthropic`  | the Messages API  | `https://api.anthropic.com/` |
 
-`anthropic-backend` builds the Messages connection.
+## The runtime catalog
 
-| Keyword       | Default                      | Effect                                                                    |
-| ------------- | ---------------------------- | ------------------------------------------------------------------------- |
-| `:base-url`   | `https://api.anthropic.com/` | the endpoint prefix, with a trailing slash added when it is absent        |
-| `:api-key`    | `""`                         | the `x-api-key` header value                                              |
-| `:model`      | `*model-primary*`            | the default model for the connection                                      |
-| `:max-tokens` | 4096                         | `max_tokens`, which the API requires on every request                     |
-| `:cache-p`    | true                         | place the two cache breakpoints                                           |
-| `:cache-ttl`  | nil                          | a breakpoint lifetime, `"5m"` or `"1h"`; nil takes the provider's default |
-| `:timeout`    | 60                           | the read timeout and the connect timeout in seconds                       |
-| `:retries`    | 2                            | extra attempts that a 429 or a 5xx earns                                  |
+Provider knowledge is **not committed to the tree**, with one exception: the
+three rows in `config.cl` (`:openai`, `:opencode`, `:anthropic`) ship as
+configuration defaults, so the default path works with no catalog and no
+network. Everything else about a provider is generated at run time from
+[models.dev](https://models.dev):
 
-`model-capabilities` reports `:tools` true, `:streaming` true, `:cache` true, and
-`:cache-breakpoints` true, because this backend really does place breakpoints.
-There is no session id, because the Messages API has no routing header.
+- `enchiridion providers refresh` fetches `https://models.dev/api.json`
+  (`:providers-url`), trims it to the provider index, and writes
+  `run/providers.json`. The trim keeps each provider's `id`, `name`, `npm`,
+  `env`, `api` and `doc`, maps `npm` to a protocol, and computes a default
+  model. The trim decides the protocol only; the provider table in
+  `src/enchiridion/llm/providers.cl` (`+npm-adapters+`) maps that protocol, and
+  a provider id, to the handler that speaks it.
+- The trim's default-model rule: among the provider's models that support tool
+  calling, the newest `release_date` wins, tied by the smallest id; otherwise
+  the newest model overall; otherwise the smallest id.
+- The cache lives under `run/`, which git ignores and the Nix source filter
+  excludes. No fetched provider data ever enters the store.
+- A missing or corrupt cache is not an error. The three shipped rows in
+  `config.cl` (`:openai`, `:opencode`, `:anthropic`) still work, and anything
+  else reports that `providers refresh` has not run.
+- `${ENV_VAR}` inside a models.dev `api` value is expanded from the loaded
+  secret table, which is how providers whose endpoint contains an account id
+  (Cloudflare Workers AI, Snowflake Cortex) work without a special case.
+- Azure is reachable from the catalog: `@ai-sdk/azure` maps to the default
+  endpoint `https://${AZURE_RESOURCE_NAME}.openai.azure.com/`, with
+  `${AZURE_RESOURCE_NAME}` expanded from the loaded secret table. When that
+  variable is absent the row has no endpoint, and the error says to set
+  `:base-url`.
+- `:providers-ttl-seconds` (default 86400) is live: it is compared at start up
+  to decide when the cached provider index is stale. The commands that run a
+  turn (`ask`, `chat`, `serve`) refresh at context build, once per process: the
+  catalog when the cached copy is missing or older than the TTL, and the
+  selected provider's own model list when a key is present and its cache is
+  stale. Inspection commands (`help`, `version`, `secrets`, `providers list`,
+  `tools`, …) never fetch and never write a cache. `:offline t` stops all of
+  that, the model list included. The two exceptions are the operator's own act
+  and still run: `enchiridion providers refresh` and `enchiridion providers
+  models ID`.
+
+## Provider rows
+
+A row is the unit of configuration. The three shipped rows are configuration
+defaults in `config.cl`, and an operator row of the same shape overrides them
+field by field. A row whose `:id` matches a models.dev provider overrides that
+provider; a new `:id` adds one.
+
+```lisp
+(:providers
+ ((:id my-llm :name "My LLM" :api :openai-chat :profile :openai
+   :base-url "https://llm.internal/v1/"
+   :api-key-env "MY_LLM_KEY"
+   :headers (("X-Tenant" "acme"))
+   :models ("m-1" "m-2"))
+  (:id deepseek :api-key-env "DEEPSEEK_KEY")
+  (:id amazon-bedrock :api :bedrock-invoke :profile :bedrock-invoke
+   :region "us-east-1")))
+```
+
+| Row key           | Effect                                                                    |
+| ----------------- | ------------------------------------------------------------------------- |
+| `:id`             | The provider id, required                                                 |
+| `:name`           | Display name                                                              |
+| `:api`            | The handler id                                                            |
+| `:profile`        | The quirk profile to apply                                                |
+| `:base-url`       | The endpoint                                                              |
+| `:api-key-env`    | One variable name, or a list (Bedrock needs several)                      |
+| `:model`          | The default model for this provider                                       |
+| `:models`         | A static model list, when the endpoint cannot be asked                    |
+| `:headers`, `:query-params` | Extra request headers and query parameters                      |
+| `:region`, `:project`, `:location` | Cloud placement for Bedrock and Vertex                     |
+
+Any dialect field may be overridden directly on the row: `:auth-scheme`,
+`:auth-header`, `:chat-path`, `:models-path`, `:max-tokens-field`,
+`:system-role`, `:reasoning-field`. That is what makes a one-off endpoint a
+configuration line rather than a patch.
+
+A header may be written either as `("Name" "value")` or as
+`("Name" . "value")`; both reach the wire identically.
+
+`:provider :custom` is the generic case: a row with no preset at all, built
+entirely from the top-level `:llm` keys (`:backend`, `:base-url`,
+`:api-key-env`, `:headers`, `:model-*`). `:base-url` is required.
+
+The top-level `:providers-ttl-seconds`, `:models-ttl-seconds`, `:offline`,
+`:headers`, `:query-params` and `:profile` keys are not specific to `:custom`:
+each one works for whichever provider is selected. `:headers`, `:query-params`
+and `:profile` are merged into the selected provider's row, and a value written
+in the row wins over the top-level one.
+
+## Quirk profiles
+
+Every "OpenAI-compatible" vendor is compatible with a different subset. Those
+differences are data, in `src/enchiridion/llm/dialects.cl`, and a provider picks
+a profile rather than a branch.
+
+| Profile                | What it encodes                                                                 |
+| ---------------------- | -------------------------------------------------------------------------------- |
+| `:openai`              | The generic wire                                                                 |
+| `:openai-local`        | No credential header, no `tool_choice` (Ollama, LM Studio, llama.cpp)             |
+| `:ollama`              | As above, and models are listed at `api/tags`                                     |
+| `:azure`               | `api-key` header, deployment in the path, `api-version` query, `max_completion_tokens`, the `developer` role |
+| `:openrouter`          | Attribution header, `reasoning`, cache write tokens in `prompt_tokens_details`    |
+| `:deepseek`            | `reasoning_content`, cache hits in `prompt_cache_hit_tokens`                      |
+| `:google-openai`       | Bearer on `/v1beta/openai/`, no `tool_choice`, no `parallel_tool_calls`           |
+| `:qwen`                | No `parallel_tool_calls`, `enable_thinking` in the body                           |
+| `:zai`                 | `thinking` in the body, `reasoning_content` in the reply                          |
+| `:groq`                | Drops `stream_options` and `parallel_tool_calls`, which it rejects                |
+| `:cloudflare-gateway`  | `cf-aig-authorization` alongside the upstream key                                 |
+| `:anthropic`           | Anthropic's own endpoint, unchanged                                               |
+| `:anthropic-gateway`   | A bearer token instead of `x-api-key`                                             |
+| `:bedrock-invoke`      | `anthropic_version` in the body, betas in `anthropic_beta`, no 1h cache TTL       |
+| `:bedrock-messages`    | The native Messages path under `bedrock-mantle`                                   |
+| `:vertex`              | `anthropic_version` in the body, no model in the body, model in the URL           |
+
+A dialect also decides where the chain of thought is read from. It is stored
+apart, in `completion-reasoning-text`, and never concatenated into the reply:
+reasoning is not the answer.
+
+## Model lists
+
+A model list is asked of the provider that holds the account, not of the repo:
+
+| Handler                | Endpoint                                                        |
+| ---------------------- | --------------------------------------------------------------- |
+| `:openai-chat`         | `GET {base-url}{models-path}` (`data[].id`; `api/tags` on Ollama) |
+| `:anthropic-messages`  | `GET {base-url}v1/models`, paginated with `limit`/`after_id`      |
+| `:bedrock-invoke`, `:bedrock-messages` | `ListFoundationModels` on the Bedrock control plane |
+| `:vertex-anthropic`    | Not offered by Google; the catalog list is used                  |
+
+The list is cached at `run/models/<provider>.json` with a fetch time and obeys
+`:models-ttl-seconds`. The commands that run a turn (`ask`, `chat`, `serve`)
+refresh it at context build, once per process, when a key is present and the
+cache is stale; an inspection command never fetches, and `:offline t` stops the
+refresh along with the rest of start-up fetching. `enchiridion providers models
+ID` refreshes it by hand, which is the operator's own act, so it still runs
+under `:offline t`. A failure is one warning line and the cached or configured
+model; a turn is never stopped by a model list.
 
 ## Providers
 
-Three providers are known. The plist `+provider-defaults+` holds the three facts
-that differ between them.
+The three shipped rows, the catalog's rows and the operator's rows are merged in
+that order, field by field.
 
 | Provider     | Base URL                        | Default model         | Key variable        |
 | ------------ | ------------------------------- | --------------------- | ------------------- |
@@ -95,35 +220,31 @@ that differ between them.
 | `:opencode`  | `https://opencode.ai/zen/go/v1` | `deepseek-v4.1-flash` | `OPENCODE_API_KEY`  |
 | `:anthropic` | `https://api.anthropic.com/`    | `claude-sonnet-5-5`   | `ANTHROPIC_API_KEY` |
 
-`:openai` and `:opencode` speak the same chat completions shape, so for them the
-row is the whole difference. `:anthropic` speaks the Messages API, and its row is
-only ever read together with that request shape: `:backend :anthropic` selects
-both, and `:provider :anthropic` with no `:backend` selects both as well, so the
-Anthropic endpoint can never be paired with a chat completions request.
+`detect-provider` picks one in this order:
 
-`detect-provider` picks one in this order. It reads an explicit `:provider`, then
-a base URL that `provider-from-base-url` recognizes. It then reads a present
-`OPENAI_API_KEY`, a present `OPENCODE_API_KEY`, a present `ANTHROPIC_API_KEY`, and
-finally `:openai`. OpenAI wins a tie, because it is the default, and a machine
-that holds two provider keys has to have its choice written down.
-`provider-from-base-url` matches `opencode.ai`, `api.anthropic.com`, and
-`api.openai.com`. A local server matches none of them, and its config still works:
-the base URL is used as written.
+1. An explicit `:provider`. If it names a provider that nothing knows, that is a
+   configuration error: the message says to run `providers refresh` or to add a
+   `:providers` row. It does not fall through to base-URL detection.
+2. A `:base-url` that names a known host: `opencode.ai`, `api.anthropic.com`,
+   `api.openai.com`, then any cached catalog provider's `api` host.
+3. A present `OPENAI_API_KEY`, then `OPENCODE_API_KEY`, then
+   `ANTHROPIC_API_KEY`.
+4. Exactly one cached provider whose `env` name is present.
+5. Otherwise `:openai`, because it is the default.
 
-`default-api-key-env` returns the variable name for the active provider, unless
-config.cl sets `:api-key-env`. `backend-api-key` reads the value from the secret
-loader first and from the process environment second. The loader runs before
-provider detection, so a key in `.env` selects a provider the same way an exported
-variable does.
+`default-api-key-env` returns `:api-key-env` when the file sets it, and
+otherwise the selected provider's first environment variable.
 
-`provider-key-names` returns every provider's key variable plus the configured
-`:api-key-env`, and `main.cl` unions that list into the names the loader reads. A
-key for a provider that was not selected is still a secret in the process, and the
-scrubber has to know the name before it can recognize the value.
+`provider-key-names` returns the configured `:api-key-env`, every shipped and
+configured row's variables, the selected provider's full variable list, and the
+cached providers' variable names that are credential shaped. It deliberately
+does **not** return `AWS_ACCESS_KEY_ID`, `GOOGLE_APPLICATION_CREDENTIALS` or
+`CLOUDFLARE_ACCOUNT_ID` unless that provider is the one selected, because a name
+in this list is read from `.env` and then removed from the process environment.
 
-`resolve-backend` lets an explicit `:base-url`, `:model-primary`, or
-`:api-key-env` win over the provider defaults. The kernel calls `complete` with a
-model name, and it never reads the provider.
+`resolve-backend` lets an explicit `:base-url` or `:model-primary` win over the
+provider row. The kernel calls `complete` with a model name, and it never reads
+the provider.
 
 ## Model tiers
 
@@ -233,32 +354,56 @@ to `tool_calls`; anything else passes through as it came.
 
 ## Transport and retries
 
-Two transports and one retry loop.
+One transport and one retry loop.
 
-| Backend             | Transport              | Path and headers                                                                       |
-| ------------------- | ---------------------- | -------------------------------------------------------------------------------------- |
-| `:openai`           | `http-post`            | `base-url` plus `chat/completions`, bearer authentication, `x-opencode-session`        |
-| `:anthropic`        | `anthropic-http-post`  | `base-url` plus `v1/messages`, `x-api-key`, `anthropic-version` `2023-06-01`           |
+A request is a value: a URL, a body, a header list, and a timeout
+(`http-request` in `src/enchiridion/llm/http.cl`). A handler builds one, applies
+its credential with `auth-apply`, and hands it to `post-with-retries`. There is
+no second loop to drift from, and no per-vendor transport.
 
-`http-post` uses bearer authentication, a JSON content type, the user agent
-`enchiridion/0.1.0`, and the `x-opencode-session` header. OpenCode Go needs that
+| Handler                | Path                         | Credential                                        |
+| ---------------------- | ---------------------------- | ------------------------------------------------- |
+| `:openai-chat`         | `{base-url}{chat-path}`      | `Authorization: Bearer`, or the profile's header   |
+| `:anthropic-messages`  | `{base-url}{chat-path}`      | `x-api-key` and `anthropic-version`, or Bearer     |
+| `:bedrock-invoke`      | `{base-url}model/{id}/invoke`| `AWS_BEARER_TOKEN_BEDROCK`, or SigV4               |
+| `:bedrock-messages`    | `{base-url}anthropic/v1/messages` | the same, signed for service `bedrock-mantle` |
+| `:vertex-anthropic`    | `{base-url}.../{model}:rawPredict` | `Authorization: Bearer` from GCP OAuth       |
+
+The chat-completions handler sends a JSON content type, the user agent
+`enchiridion/0.1.0`, and the `x-opencode-session` header; OpenCode Go needs that
 header as its routing key and its prompt cache key, and a generic server ignores
-it. `anthropic-http-post` sends `content-type`, `x-api-key`, the required
-`anthropic-version`, and the same user agent. `x-api-key` is what every documented
-example sends; `Authorization: Bearer` is accepted today and deliberately unused,
-so the key stays out of the header proxies log, and no `x-opencode-session` goes
-with it. The specials `*http-post-function*` and
-`*anthropic-http-post-function*` hold the two transports, so a test can replace
-either one without a network.
+it. The Messages handler sends `x-api-key` and the required `anthropic-version`,
+because that is what every documented example sends; a gateway profile replaces
+both through the same merge. `*http-post-function*` and `*http-get-function*`
+hold the transport and the one GET, so a test can replace either without a
+network.
 
-`post-with-retries` is the one retry loop. Both senders call it with their
-transport, and both transports take six arguments, so the two providers cannot
-drift apart in what they repeat. It repeats a 429 and any status at or above 500,
-up to `retries` extra attempts, and it waits `*retry-delay*` seconds times the
-attempt number. `*retry-delay*` is 2, and a test binds it to 0. The 5xx rule
-covers Anthropic's 500, 504, and 529. Any other 4xx becomes a `transport-error` at
-once, with `:status` and the provider's own error text. A wrong key or a wrong
-model does not become right by a second send.
+`post-with-retries` repeats a 429 and any status at or above 500, up to `retries`
+extra attempts, and waits `*retry-delay*` seconds times the attempt number.
+`*retry-delay*` is 2, and a test binds it to 0. The 5xx rule covers Anthropic's
+500, 504, and 529. Any other 4xx becomes a `transport-error` at once, with
+`:status` and the provider's own error text. A wrong key or a wrong model does
+not become right by a second send.
+
+## Signing
+
+Two handlers cannot use a static header, because their credential signs the
+request:
+
+- **Amazon Bedrock.** `AWS_BEARER_TOKEN_BEDROCK` selects a bearer token; the
+  absence of it selects AWS Signature Version 4 from `aws-sigv4.cl`, which signs
+  with `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and an optional
+  `AWS_SESSION_TOKEN` for the region in `:region`, `AWS_REGION` or
+  `AWS_DEFAULT_REGION`. The signer registers itself under `:aws-sigv4`, and the
+  file ships AWS's published test vectors as fixtures.
+- **Google Vertex.** `vertex.cl` asks `gcp-oauth.cl` for a bearer token: an
+  `GOOGLE_VERTEX_ACCESS_TOKEN` or `GCLOUD_ACCESS_TOKEN` when one is set,
+  otherwise an RS256 JWT built from the service account at
+  `GOOGLE_APPLICATION_CREDENTIALS` and exchanged at Google's token endpoint. The
+  token is cached in memory until it expires. `gcloud` is never required.
+
+Both signers are functions in the `*auth-signers*` table, so nothing in the core
+knows that AWS or Google exists.
 
 ## Token accounting
 

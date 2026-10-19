@@ -131,6 +131,13 @@ reader error at load time.
 | `config-test`     | The sectioned and flat configuration readers.            |
 | `llm-test`        | Protocol shapes, the OpenAI wire format, backend choice. |
 | `anthropic-test`  | The Messages API wire format and provider choice.        |
+| `dialect-test`    | The quirk profiles: auth, paths, body fields, reasoning. |
+| `catalog-test`    | The models.dev catalog: trim, default model, cache.      |
+| `provider-test`   | Provider rows, overlays, detection, model lists.        |
+| `aws-sigv4-test`  | AWS Signature V4 against the published test vectors.    |
+| `bedrock-test`    | Bedrock InvokeModel, the native Messages path, listing. |
+| `gcp-oauth-test`  | The service-account JWT and the token cache.            |
+| `vertex-test`     | Vertex `:rawPredict`: path, body version, OAuth.        |
 | `blocks-test`     | Block limits, the write scan, prompt stability.          |
 | `store-test`      | SQLite, FTS5, sessions, memories, and the ledger.        |
 | `tiers-test`      | L0, L1, L2, and the two miss rule.                       |

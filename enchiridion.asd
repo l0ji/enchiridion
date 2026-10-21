@@ -12,11 +12,11 @@
 ;;;; asdf::*default-component-class* is not in ASDF/INTERFACE in this version.
 
 (defsystem "enchiridion"
-  :description "An autonomous agent harness written in Common Lisp"
+  :description "An autonomous agent harness with a strange memory model"
   :author "penny <penny@hexmani.ac>"
   :license "0BSD"
   :version "0.1.0"
-  :homepage "https://github.com/penny/enchiridion"
+  :homepage "https://tangled.org/hexmani.ac/enchiridion"
 
   ;; Deterministic load order. Packages before the files that use them,
   ;; conditions before the code that signals them.

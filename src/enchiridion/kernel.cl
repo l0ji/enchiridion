@@ -60,7 +60,7 @@ identical bytes, or the prefix cache is dead."
 (defun block-text-from (directory name)
   "Return the text of NAME under DIRECTORY, or the seed template when the file
 is absent or unreadable. An unreadable seed file falls back rather than
-stops the agent from starting; the plan requires that."
+stopping the agent from starting."
   (let ((path (and directory (merge-pathnames name directory))))
     (if (and path (probe-file path))
         (handler-case (uiop:read-file-string path :external-format :utf-8)

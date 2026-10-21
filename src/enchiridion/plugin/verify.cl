@@ -47,9 +47,9 @@
   "Compile and load PATH, and return two values: whether it was clean, and the
 list of warnings it produced.
 
-The policy is (safety 3) (debug 3), which is the profile the plan fixes for
-plugin verification and the broker. A warning is collected and muffled, so it
-is reported once by the code that owns the decision instead of printed twice."
+The policy is (safety 3) (debug 3), which is the profile plugin verification
+and the broker share. A warning is collected and muffled, so it is reported
+once by the code that owns the decision instead of printed twice."
   (let ((warnings '()))
     (handler-case
         (progn

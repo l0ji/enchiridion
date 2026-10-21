@@ -31,7 +31,7 @@
 ;;
 ;; The value is INTERNed rather than left as whatever LISP-IMPLEMENTATION-TYPE
 ;; returned, because that is not the same answer on every SBCL: it is the
-;; string "SBCL" on 2.5.4 and a keyword on older ones. Comparing the raw value
+;; string "SBCL" on this SBCL and a keyword on older ones. Comparing the raw value
 ;; against :sbcl silently answers nil on a perfectly good SBCL, and every
 ;; feature check that depends on it answers nil too. The call is written out
 ;; rather than hidden in a helper because DEF-CONSTANT evaluates it while the
@@ -103,7 +103,7 @@ an absent name proves nothing about the writer."
 (defun unset-environment-variable (name)
   "Remove environment variable NAME from this process and return T.
 
-PLAN.md section 5.2: the supervisor reads its secrets once, holds the values
+The supervisor reads its secrets once, holds the values
 in memory, and then removes them from its own environment, so a child cannot
 inherit a key and a later /proc read finds nothing. SB-POSIX:UNSETENV reports
 no status and a name that was never set is not an error, so T is the honest
@@ -123,7 +123,7 @@ answer to the only question that is left: the name is gone from this process."
 (defun environment ()
   "Return the environment as an alist of strings.
 
-SB-EXT:POSIX-ENVIRON hands back a list of \"NAME=VALUE\" strings on SBCL 2.5.4,
+SB-EXT:POSIX-ENVIRON hands back a list of \"NAME=VALUE\" strings on this SBCL,
 and a list of pairs on older ones. Which of the two arrives is an SBCL
 implementation detail, and the supervisor builds the broker's whole environment
 from this list, so the shape is fixed here rather than left to be discovered
@@ -172,8 +172,8 @@ the longer name and translates."
   "Run PROGRAM and return its standard output as a string. The exit status is
 the second value: an integer, or NIL when the child was killed by a signal.
 
-The output goes to a string stream, and not to the keyword :STRING. On SBCL
-2.5.4 :STRING is a pathname, not a request to hand back a string, so asking
+The output goes to a string stream, and not to the keyword :STRING. On this
+SBCL, :STRING is a pathname, not a request to hand back a string, so asking
 for it fails at run time with an invalid option error. A string stream says
 what is meant and works on every SBCL.
 

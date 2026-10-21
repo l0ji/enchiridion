@@ -4,9 +4,8 @@
 ;;;; repository. Author writes a new tool or skill file. Undo reverts the last
 ;;;; commit, and it asks for confirmation because a revert is a real change.
 ;;;;
-;;;; Reload records a request. The supervisor consumes it in the plugin
-;;;; milestone, after the loader can verify a generation. The tool does not
-;;;; pretend the code is already loaded.
+;;;; Reload records a request. The supervisor consumes it after the loader can
+;;;; verify a generation. The tool does not pretend the code is already loaded.
 
 (in-package #:enchiridion.tools.builtin)
 

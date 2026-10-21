@@ -1,9 +1,9 @@
 ;;;; seed-property.cl --- Property tests over the seed templates.
 ;;;;
-;;;; Property 2 of the plan: a block value under its limit survives a write
-;;;; and a read with its text intact. The seed files are the first block
-;;;; values this system ever holds, so the property is checked on them here,
-;;;; where a round trip failure costs one turn instead of a personality.
+;;;; A block value under its limit survives a write and a read with its text
+;;;; intact. The seed files are the first block values this system ever holds,
+;;;; so the property is checked on them here, where a round trip failure costs
+;;;; one turn instead of a personality.
 
 (defpackage #:enchiridion-seed-property
   (:use #:cl)
@@ -64,7 +64,7 @@ and a random suffix is added so that two cases never collide."
           (delete-file path))))))
 
 (deftest text-under-the-limit-keeps-its-text ()
-  ;; Property 2, applied to the shapes a block can actually hold. A block
+  ;; The shapes a block can actually hold. A block
   ;; that gains or loses a character on the way to disk is a personality that
   ;; drifts by one character a night.
   (dolist (contents (list ""
@@ -110,8 +110,8 @@ and a random suffix is added so that two cases never collide."
                                   :if-does-not-exist :ignore))))
 
 (deftest bootstrap-completeness-is-exactly-every-step-done ()
-  ;; Property 7 of the plan: the bootstrap is complete when every step is
-  ;; done, and at no other time. The done set is generated rather than written
+  ;; The bootstrap is complete when every step is done, and at no other time.
+  ;; The done set is generated rather than written
   ;; out, because the interesting case is a step missing from the middle, and
   ;; a hand-written fixture almost never has one.
   (let ((root (scratch-root))

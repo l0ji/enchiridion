@@ -3,8 +3,7 @@
 ;;;; Every test here runs with no network, no key, and no provider. The request
 ;;;; and the reply are pure functions over text and data, and they are the
 ;;;; parts that decide whether a turn works at all. The one function that
-;;;; touches a socket is four lines long and is covered by the live call the
-;;;; milestone exists to make.
+;;;; touches a socket is four lines long and is covered by the live call.
 ;;;;
 ;;;; The fixtures are shaped like real replies, including the fields that are
 ;;;; optional and the ones that only one provider sends, because those are
@@ -265,7 +264,7 @@ previous values are always put back."
                          :base-url "https://example.test/v1/" :api-key "k"))))))
 
 (deftest something-that-is-not-a-backend-is-not-a-backend ()
-  ;; Stands in for satisfies, which SBCL 2.5.4 has no defprotocol to provide.
+  ;; Stands in for satisfies, which SBCL has no defprotocol to provide.
   (ng (enchiridion.llm:backendp 42))
   (ng (enchiridion.llm:backendp nil)))
 

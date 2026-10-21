@@ -764,7 +764,7 @@ Anthropic protocol as well, because a row and a request shape have to agree
 before the endpoint means anything.
 
 CASE and not ECASE. ECASE is the better construct here in principle, because it
-refuses to run if a backend is added without a clause here, but SBCL 2.5.4
+refuses to run if a backend is added without a clause here, but SBCL
 gives ECASE no default clause: a clause headed by T is a clause about the
 symbol T, so an unknown backend comes back as CASE-FAILURE listing (:OPENAI T)
 rather than as the configuration error the operator needs.

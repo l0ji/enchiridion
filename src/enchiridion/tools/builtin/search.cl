@@ -1,6 +1,6 @@
 ;;;; search.cl --- Full text search over what the agent said and remembered.
 ;;;;
-;;;; The store arrived in milestone 4, so this tool now answers from SQLite:
+;;;; The store backs this tool, so it answers from SQLite:
 ;;;; the raw turns and the raw memories, with FTS5 doing the matching and no
 ;;;; model call in the path. Nothing is summarised, because a summary costs
 ;;;; tokens and can be wrong about the one line that mattered.

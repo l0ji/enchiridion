@@ -922,7 +922,7 @@ report the secrets file, its mode, and whether it is still there. When this
 process loaded a file, the line reports the file it opened and the mode it had
 at the time, remembered rather than resolved again: the container copy is
 unlinked once its values are in memory, and a second resolution would name the
-host fallback instead. That report is guarantee 6 of section 5.5 made visible."
+host fallback instead. That report makes the container copy's absence visible."
   (declare (ignore arguments))
   (let ((names (enchiridion.llm.secrets:secret-names)))
     (if names

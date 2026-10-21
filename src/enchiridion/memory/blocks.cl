@@ -18,7 +18,7 @@
 
 (defparameter *default-block-limits*
   '(:persona 1200 :operator 800 :world 1500 :session 400 :ledger 250 :bootstrap 300)
-  "Character limits per block, as the plan fixes them. Raising a limit raises
+  "Character limits per block. Raising a limit raises
 the fixed token cost of every prompt, which is why they live in one place.
 The bootstrap block holds the status line, so it is small on purpose: it is
 resident in every prompt until the first steps are done.")
@@ -124,8 +124,8 @@ checked."
 (declaim (ftype (function (block) (integer 0 *)) block-bytes))
 
 (defun block-bytes (block)
-  "Return the character count of BLOCK. The name follows the plan's accessor;
-the unit is characters, which is what the limits count."
+  "Return the character count of BLOCK. The unit is characters, which is what
+the limits count."
   (length (block-text block)))
 
 (declaim (ftype (function (block) boolean) block-full-p))
@@ -181,7 +181,7 @@ has one."
 
 (defun block-summary (blocks)
   "Return one line per block with its character count and limit. This is the
-capacity line the plan puts in the prompt, so the agent knows before it writes."
+capacity line in the prompt, so the agent knows before it writes."
   (with-output-to-string (stream)
     (dolist (block blocks)
       (format stream "~(~A~) ~D/~D~%"

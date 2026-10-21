@@ -177,8 +177,8 @@ size test, and it costs one read of sixteen bytes."
       ts INTEGER NOT NULL)"
    "CREATE INDEX IF NOT EXISTS usage_ts ON usage(ts)"
 
-   ;; The task queue. The CLI adds and removes, and the sleep agent drains it
-   ;; in milestone 10. Both go through the store, so a task survives a restart
+   ;; The task queue. The CLI adds and removes, and the sleep agent drains it.
+   ;; Both go through the store, so a task survives a restart
    ;; that a list in memory would not.
    "CREATE TABLE IF NOT EXISTS tasks (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -188,7 +188,7 @@ size test, and it costs one read of sixteen bytes."
    "CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status, id)")
   "Every table this store creates, one statement per element. Each is IF NOT
 EXISTS, so opening a store is safe on every start and needs no migration for
-the shape this milestone defines.")
+the shape this schema defines.")
 
 (defparameter +store-tables+
   '("turns_fts" "turns" "memories_fts" "memories" "blocks" "usage" "tasks")

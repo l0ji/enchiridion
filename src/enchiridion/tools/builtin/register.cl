@@ -7,7 +7,7 @@
 (in-package #:enchiridion.tools.builtin)
 
 (defun register-builtin-tools ()
-  "Register every built-in tool in this milestone. Idempotent."
+  "Register every built-in tool. Idempotent."
   (+ (register-file-tools)
      (register-shell-tools)
      (register-search-tools)

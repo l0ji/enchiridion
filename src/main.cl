@@ -220,23 +220,23 @@ process ends up choosing, because a key for the provider it did not choose is
 still a key in this process. Loading them here is also what lets `enchiridion
 secrets` list them by name and source without ever printing a value.
 
-The names are then removed from this process's environment, which is the step
-PLAN.md section 5.2 promises: a child inherits nothing and a later read of
-/proc finds nothing. The configured names are not the whole story, because an
-operator can export a credential this configuration never heard of, so every
-credential-shaped variable in the environment goes as well. The predicate that
+The names are then removed from this process's environment: a child inherits
+nothing and a later read of /proc finds nothing. The configured names are
+not the whole story, because an operator can export a credential this
+configuration never heard of, so every credential-shaped variable in the
+environment goes as well. The predicate that
 decides which names those are never selects PATH, HOME, TERM, SBCL_HOME,
 CL_SOURCE_REGISTRY, LD_LIBRARY_PATH, the DYLD_ paths, or an XDG_ name, so the
 process keeps everything it needs to run. The value stays in memory for the
 life of the process.
 
-The container copy of the file is unlinked once its values are in memory, which
-is guarantee 6 of section 5.5: without it the file outlives the read by the
-life of the container. The operator's checkout .env is never touched, because
-DISCARD-SECRETS-FILE refuses every path but /run/secrets/.env and this call site
-cannot overrule it. A read-only bind mount refuses the unlink, and that is a
-deployment docs/deployment.md supports, so the failure is one warning line on
-the error stream and not a stopped supervisor."
+The container copy of the file is unlinked once its values are in memory:
+without it the file outlives the read by the life of the container. The
+operator's checkout .env is never touched, because DISCARD-SECRETS-FILE
+refuses every path but /run/secrets/.env and this call site cannot overrule
+it. A read-only bind mount refuses the unlink, and that is a deployment
+docs/deployment.md supports, so the failure is one warning line on the error
+stream and not a stopped supervisor."
   (let* ((config (or config (load-config)))
          (path (secrets-path))
          (present (probe-file path))
@@ -1017,10 +1017,10 @@ the operator has had a chance to edit the seed files."
                (verify-plugin-directory directory)))
             ((plusp (length command))
              (if (supervisor-command-p command)
-                 ;; The flags come before the command, which is what the plan
-                 ;; prints. They are also read after it, because `serve
-                 ;; --channel http` is what a person types and silently serving
-                 ;; with no channels is worse than accepting both spellings.
+                 ;; The flags come before the command. They are also read after
+                 ;; it, because `serve --channel http` is what a person types
+                 ;; and silently serving with no channels is worse than
+                 ;; accepting both spellings.
                  (multiple-value-bind (later rest-arguments) (split-options (rest arguments))
                    (let ((all (append options later))
                          (later-problem nil))
@@ -1032,8 +1032,8 @@ the operator has had a chance to edit the seed files."
                      (run-supervised-command command rest-arguments all)))
                  (run-command command (rest arguments))))
             ((first-launch-p) (print-first-launch))
-            ;; The plan prints `enchiridion --channel http --bind 127.0.0.1
-            ;; --port 8787` with no subcommand, so a channel flag with no
+            ;; `enchiridion --channel http --bind 127.0.0.1 --port 8787` is a
+            ;; whole invocation with no subcommand, so a channel flag with no
             ;; command is a request to serve.
             (options (run-supervised-command "serve" '() options))
             (t

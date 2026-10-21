@@ -19,7 +19,7 @@
 ;; read as a slot named DOCUMENTATION instead of as a note about the struct.
 ;; So each slot's meaning is a comment here. Every slot has a type and a
 ;; default, so an empty message is a valid one and a caller fills only what it
-;; knows. The field names match PLAN.md section 16.3 and the field order there.
+;; knows.
 (defstruct msg
   (:id "" :type string)          ; the channel's own id for this message
   (:channel :cli :type keyword)  ; where it came from
@@ -54,8 +54,8 @@ two channels cannot mint the same id.")
 (defun normalize (&rest arguments)
   "Return a MSG built from ARGUMENTS.
 
-ARGUMENTS is either a plist, as (normalize '(:author \"penny\")), or keyword
-arguments, as (normalize :author \"penny\"). Both spellings reach the same
+ARGUMENTS is either a plist, as (normalize '(:author \"sama\")), or keyword
+arguments, as (normalize :author \"sama\"). Both spellings reach the same
 slots.
 
 A missing or empty id is minted from the counter as cli-1, the channel name and

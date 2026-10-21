@@ -1,9 +1,9 @@
 ;;;; cli-test.cl --- The shared command table and the REPL.
 ;;;;
 ;;;; The command table is data, so most of these tests read it rather than run
-;;;; it: the plan fixes the names and the argument ranges, and a row that
-;;;; drifts is caught here. The rest prove the two behaviours a caller depends
-;;;; on: arity is checked before dispatch, and a command that needs a
+;;;; it: the names and the argument ranges are part of the contract, and a row
+;;;; that drifts is caught here. The rest prove the two behaviours a caller
+;;;; depends on: arity is checked before dispatch, and a command that needs a
 ;;;; supervisor says so and returns 1 instead of signalling.
 
 (defpackage #:enchiridion-cli-test
@@ -18,8 +18,7 @@
     "memory" "sessions" "journey" "undo" "usage" "budget" "tasks" "secrets"
     "providers" "version" "help" "bootstrap" "health" "reload" "channels"
     "heartbeat" "chat" "serve")
-  "PLAN.md section 10's commands in table order. BOOTSTRAP arrived with the
-integration step, after CHANNEL-WORK wrote the other twenty-five.")
+  "The commands in table order.")
 
 (defmacro with-empty-context (&body body)
   "Run BODY with a fresh command context that holds nothing live."

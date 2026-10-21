@@ -84,7 +84,7 @@
 
 (deftest the-implementation-is-named ()
   ;; A keyword, not whatever LISP-IMPLEMENTATION-TYPE returned. It is the
-  ;; string "SBCL" on SBCL 2.5.4, and a test that compares the raw value passes
+  ;; string "SBCL" on this SBCL, and a test that compares the raw value passes
   ;; on an older SBCL and fails on this one for a reason that has nothing to do
   ;; with the code under test.
   (ok (member enchiridion.compat:+implementation+

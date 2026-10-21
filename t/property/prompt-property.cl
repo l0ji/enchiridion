@@ -1,9 +1,9 @@
 ;;;; prompt-property.cl --- The frozen prompt has to be byte stable.
 ;;;;
-;;;; Property 4 of the plan: compiling the prompt twice from the same blocks
-;;;; yields identical bytes. That is the one property that makes the prefix
-;;;; cache work. A silent break here costs money on every turn, so it is
-;;;; checked over many generated block values rather than one fixture.
+;;;; Compiling the prompt twice from the same blocks yields identical bytes.
+;;;; That is the one property that makes the prefix cache work. A silent break
+;;;; here costs money on every turn, so it is checked over many generated block
+;;;; values rather than one fixture.
 ;;;;
 ;;;; A second property covers the freeze itself: a write after compilation
 ;;;; changes the block and leaves the compiled prompt alone.

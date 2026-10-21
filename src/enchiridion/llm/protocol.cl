@@ -131,9 +131,8 @@ default, and the default is the point: the sleep agent has no deadline.")
 Unknown names become :PRIMARY rather than signalling. A typo in a config key
 should cost a cheap turn on a strong model, not stop the agent from starting,
 and a tier is never a security decision."
-  ;; One key per clause. SBCL 2.6.9 warns about a repeated CASE key, and this
-  ;; system makes every compiler warning an error, so the repetition that 2.6.8
-  ;; accepted stops the build on the newer compiler.
+  ;; One key per clause. SBCL warns about a repeated CASE key, and this system
+  ;; makes every compiler warning an error, so a repetition stops the build.
   (case (or name :primary)
     (:primary :primary)
     (:cheap :cheap)
@@ -164,18 +163,16 @@ and a tier is never a security decision."
 
 ;;;; The protocol.
 ;;;;
-;;;; Three generic functions rather than DEFPROTOCOL, and that is the one
-;;;; deliberate departure from the shape section 16.3 of the plan draws. SBCL
-;;;; 2.5.4 does not have defprotocol: the symbol is not in the CL package and
-;;;; not in SB-MOP or SB-EXT either, so (defprotocol backend ...) reads as an
-;;;; ordinary call to a function that does not exist and dies with
-;;;; UNDEFINED-FUNCTION. Writing the three generics by hand is the whole
-;;;; substitution. The names, the argument lists and every call site are the
-;;;; ones the plan fixes, so nothing above this line has to know.
+;;;; Three generic functions rather than DEFPROTOCOL. SBCL does not have
+;;;; defprotocol: the symbol is not in the CL package and not in SB-MOP or
+;;;; SB-EXT either, so (defprotocol backend ...) reads as an ordinary call to a
+;;;; function that does not exist and dies with UNDEFINED-FUNCTION. Writing the
+;;;; three generics by hand is the whole substitution, so nothing above this
+;;;; line has to know.
 ;;;;
-;;;; TOOLS and BUDGET are in the signature now and are ignored by the only
-;;;; backend written so far. They are here because adding a parameter later
-;;;; changes every DEF-METHOD at once, and the plan fixes this signature.
+;;;; The signature carries TOOLS and BUDGET, and the only backend written so
+;;;; far ignores them. They are here because adding a parameter later changes
+;;;; every DEF-METHOD at once.
 
 (defgeneric complete (this messages &key model tools budget)
   (:documentation
@@ -211,7 +208,7 @@ refuses to match a method against the wrong number of specializers.
 
 The NIL before each list is a METHOD QUALIFIER list, not an empty
 specializer list, and the NIL after each list is an ERRORP argument, not a
-third specializer. SBCL 2.5.4 spells the parameters QUALIFIERS, SPECIALIZERS
+third specializer. SBCL spells the parameters QUALIFIERS, SPECIALIZERS
 and ERRORP where ANSI spells the first two SPECIALIZERS and GENERIC-ARGS.
 Written the ANSI way, SBCL reads a list of classes as a list of qualifiers and
 answers FIND-METHOD-LENGTH-MISMATCH, which names neither the class nor the

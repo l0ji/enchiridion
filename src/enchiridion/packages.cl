@@ -87,7 +87,7 @@ recover from a string."))
   (:use #:cl)
   (:export
    ;; The protocol every backend implements. Three generic functions and the
-   ;; check that stands in for satisfies, because SBCL 2.5.4 has no
+   ;; check that stands in for satisfies, because SBCL has no
    ;; defprotocol.
    #:complete #:model-capabilities #:backend-name #:backendp
    ;; The result and message shapes.
@@ -219,16 +219,16 @@ did not think of."))
    #:state-generation #:set-state-generation
    #:bootstrap-steps #:bootstrap-handover #:reset-bootstrap
    #:bootstrap-status-line
-   ;; Blocks. Written in milestone 2.
+   ;; Blocks.
    #:block #:make-block #:block-label #:block-text #:block-limit
    #:block-file #:block-writable-p #:block-bytes #:block-full-p #:block-slack
    #:default-block-limit #:scan-block-text
    #:set-block-text #:compile-blocks #:block-summary #:block-descriptions
    #:*default-block-limits*
-   ;; The bootstrap state machine. Milestone 7.
+   ;; The bootstrap state machine.
    #:bootstrap-status #:bootstrap-complete-p #:bootstrap-remaining
    #:bootstrap-refuse-writes-p #:mark-bootstrap-step
-   ;; Tiers. Milestone 4.
+   ;; Tiers.
    #:tiered #:tiered-l0 #:tiered-l1 #:tiered-l2 #:build-tiers #:promote-tier
    #:tier-for #:tier-name #:tier-misses #:note-tier-miss #:reset-tier-misses)
   (:documentation
@@ -253,8 +253,7 @@ the three loading tiers, and the bootstrap state machine."))
    ;; The ledger, summed. The CLI prints it and the heartbeat budgets against
    ;; it, so the grouping lives in one place and the two cannot disagree.
    #:usage-summary #:usage-total-since #:usage-session-total #:recent-turns
-   ;; The task queue. The CLI writes it and the sleep agent drains it in
-   ;; milestone 10, so the storage and the command land together.
+   ;; The task queue. The CLI writes it and the sleep agent drains it.
    #:enqueue-task #:dequeue-task #:complete-task #:fail-task #:recover-tasks
    #:count-tasks #:list-tasks #:remove-task
    #:task-row #:task-row-id #:task-row-body #:task-row-status #:task-row-ts)

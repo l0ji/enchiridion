@@ -3,8 +3,8 @@
 ;;;; Secrets that reach the context window are gone. They are sent to a
 ;;;; third party API and stored in that provider's logs. That leak is what
 ;;;; actually burns operators, and it is not a permissions problem, so no
-;;;; amount of uid separation fixes it. This file is the second half of the
-;;;; answer to section 5 of the plan.
+;;;; amount of uid separation fixes it. This file scrubs a secret out of text
+;;;; before that text is stored or sent.
 ;;;;
 ;;;; Three filters:
 ;;;;
@@ -145,7 +145,8 @@ A report about that file cannot be a fresh lookup of a file that was never
 there. The container copy is unlinked once its values are in memory, so a lookup
 after the load finds the host fallback and calls it absent while the file that
 was actually read goes unnamed. This accessor is the memory that lets the line
-whose whole job is to make guarantee 6 visible name the file it is about."
+whose whole job is to report that the container copy is gone name the file it
+is about."
   *secrets-file-read*)
 
 (declaim (ftype (function () (or null (integer 0 #o777))) secrets-file-mode-read))
@@ -346,11 +347,10 @@ reader to infer it."
   "Unlink PATH and return T, but only when PATH is +CONTAINER-SECRETS-PATH+;
 return NIL and leave the file alone for every other path.
 
-The container copy exists so the supervisor can read it once. Section 5.5 of
-the plan promises that it does not exist at steady state, and the promise is
-kept by unlinking it as soon as its values are in memory, so that no process
-that later gains access to the container finds the rest of the operator's .env
-sitting on a tmpfs.
+The container copy exists so the supervisor can read it once. It is gone at
+steady state, and that invariant is kept by unlinking it as soon as its values
+are in memory, so that no process that later gains access to the container
+finds the rest of the operator's .env sitting on a tmpfs.
 
 The operator's checkout .env is NEVER deleted. It is the file the operator
 edits, it is not the container copy, and it is exactly the file a quiet delete

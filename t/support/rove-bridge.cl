@@ -2,10 +2,10 @@
 ;;;;
 ;;;; rove can run a suite by system name, and that path maps source files back
 ;;;; to the package that defined them. It assumes the extension .lisp. This
-;;;; project uses .cl, because the plan says so, so the mapping never matches,
-;;;; `system-packages` returns nothing, and the run reports success having
-;;;; executed zero tests. A green suite that ran nothing is worse than a red
-;;;; one, because it hides the next real failure.
+;;;; project uses .cl, so the mapping never matches, `system-packages` returns
+;;;; nothing, and the run reports success having executed zero tests. A green
+;;;; suite that ran nothing is worse than a red one, because it hides the next
+;;;; real failure.
 ;;;;
 ;;;; So the tests are run from what rove collected, and the count is checked.
 ;;;; A run that finds no tests fails the build.

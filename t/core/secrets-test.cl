@@ -1,11 +1,11 @@
 ;;;; secrets-test.cl --- The secret scrubber.
 ;;;;
-;;;; These tests stand in for the guarantee in section 5.4 of the plan: a
-;;;; secret that reached a tool result, a block, a journal entry, an outbound
-;;;; request, or an outbound message does not survive it. Every path in the
-;;;; plan is here, because the one that is missing is the one that leaks.
+;;;; These tests pin the invariant: a secret that reached a tool result, a
+;;;; block, a journal entry, an outbound request, or an outbound message does
+;;;; not survive the scrubber. Every path is here, because the one that is
+;;;; missing is the one that leaks.
 ;;;;
-;;;; The last three tests stand in for guarantee 6 of section 5.5 instead: the
+;;;; The last three tests cover the container-file invariant instead: the
 ;;;; container copy of the secret file is refused when the world can read it,
 ;;;; it is unlinked once the supervisor has read it, and the operator's
 ;;;; checkout .env is never the file that gets unlinked. A file on disk is the
@@ -118,8 +118,8 @@ mode, and a mode is not worth reading on a filesystem that refused the write."
       (ok (equal text (enchiridion.llm.secrets:scrub text))))))
 
 (deftest a-tool-result-is-scrubbed-before-it-enters-the-transcript ()
-  ;; Path 1 of section 5.4. The scrubber runs on the tool result, not on the
-  ;; outbound request, so a secret never reaches the transcript at all.
+  ;; The scrubber runs on the tool result, not on the outbound request, so a
+  ;; secret never reaches the transcript at all.
   (enchiridion.llm.secrets:clear-secrets)
   (enchiridion.llm.secrets:register-secret "OPENCODE_API_KEY" +fake-key+)
   (let* ((tool-result (format nil "cat /run/secrets/.env -> OPENCODE_API_KEY=~A"
@@ -177,7 +177,7 @@ mode, and a mode is not worth reading on a filesystem that refused the write."
     (ok (eql value (enchiridion.llm.secrets:scrub value)))))
 
 (deftest a-block-write-is-scrubbed ()
-  ;; Path 2 of section 5.4.
+  ;; The block-write path.
   (enchiridion.llm.secrets:clear-secrets)
   (enchiridion.llm.secrets:register-secret "OPENCODE_API_KEY" +fake-key+)
   (ng (search +fake-key+
@@ -188,7 +188,7 @@ mode, and a mode is not worth reading on a filesystem that refused the write."
   (enchiridion.llm.secrets:clear-secrets))
 
 (deftest a-journal-entry-is-scrubbed ()
-  ;; Path 4 of section 5.4.
+  ;; The journal-entry path.
   (enchiridion.llm.secrets:clear-secrets)
   (enchiridion.llm.secrets:register-secret "FLUXER_BOT_TOKEN" +fake-key+)
   (ng (search +fake-key+
@@ -290,7 +290,7 @@ mode, and a mode is not worth reading on a filesystem that refused the write."
   (enchiridion.llm.secrets:clear-secrets))
 
 (deftest a-secret-file-the-world-can-read-is-refused ()
-  ;; Guarantee 6 of section 5.5 says the container copy is gone at steady state.
+  ;; The container copy of the secret file is gone at steady state.
   ;; This test is the other half: it is gone, and while it is there the world
   ;; cannot read it.
   (with-scratch-directory (scratch)

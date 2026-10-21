@@ -36,8 +36,8 @@
   (default-model nil :type (or null string))
   ;; CACHED-MODELS and not MODELS: a slot named MODELS generates the accessor
   ;; PROVIDER-MODELS, and the provider table exports a function of that name
-  ;; which lists the models a live account can use. On SBCL 2.6.9 the collision
-  ;; is a redefinition warning, and in this tree a warning is an error.
+  ;; which lists the models a live account can use. The collision is a
+  ;; redefinition warning, and in this tree a warning is an error.
   (cached-models '() :type list)
   (headers '() :type list)
   (query-params '() :type list)

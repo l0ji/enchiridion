@@ -513,7 +513,7 @@ retried, and the retry loop stays a loop over one HTTP call."
   :tools             tool calling is available
   :streaming         a stream can be requested, and is not used here
 
-:CACHE-BREAKPOINTS is nil because nothing in this milestone sends one. It is
+:CACHE-BREAKPOINTS is nil because no request sends one. It is
 reported as absent rather than as present-and-ignored so that nothing above
 has to guess whether the feature is real."
   (declare (ignore connection))

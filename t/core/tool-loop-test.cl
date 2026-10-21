@@ -167,10 +167,10 @@
                  (getf (getf tool-call :function) :arguments)))))
 
 (deftest a-turn-that-edits-soul-md-lands-in-the-agent-repository ()
-  ;; Definition of done, PLAN section 16.11: the agent edits SOUL.md after
-  ;; bootstrap hands over, and the change lands in git. The backend is
-  ;; scripted, so what this proves is the harness chain - kernel, tool, file,
-  ;; commit - and not a model's willingness to cooperate.
+  ;; The agent edits SOUL.md after bootstrap hands over, and the change lands
+  ;; in git. The backend is scripted, so what this proves is the harness
+  ;; chain - kernel, tool, file, commit - and not a model's willingness to
+  ;; cooperate.
   ;;
   ;; The commit itself needs an identity, and the build sandbox has no global
   ;; git configuration, so *COMMIT-ENVIRONMENT* carries the test one. In
@@ -189,8 +189,14 @@
              (enchiridion.memory:mark-bootstrap-step directory (1+ step)))
            (enchiridion.tools:clear-registry)
            (enchiridion.tools.builtin:register-builtin-tools)
-           (let* ((arguments (format nil "{\"action\":\"patch\",\"label\":\"soul\",\"old\":\"This file is a placeholder.\",\"new\":\"Written by the agent itself.\",\"directory\":~S}"
-                                     (namestring directory)))
+           (let* ((soul (merge-pathnames "SOUL.md" directory))
+                  ;; The heading, read from the template, not a sentence from it.
+                  ;; A template rewrite must not break this test.
+                  (heading (first (uiop:split-string
+                                   (uiop:read-file-string soul)
+                                   :separator '(#\Newline))))
+                  (arguments (format nil "{\"action\":\"patch\",\"label\":\"soul\",\"old\":~S,\"new\":\"Written by the agent itself.\",\"directory\":~S}"
+                                     heading (namestring directory)))
                   (backend (make-scripted-backend
                             :replies (list (completion
                                             "" :tool-calls

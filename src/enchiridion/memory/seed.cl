@@ -24,200 +24,203 @@
 (defparameter +guide+
   "# Guide
 
-This directory belongs to one agent. The Markdown files in it are the agent's
-memory, and they are in git, so its development is a diff you can read.
+This directory holds one agent. The Markdown files in it are the agent's
+identity, its instructions, and its memory. The directory is a git repository of
+its own, nested inside the enchiridion checkout, so every change to the agent is
+a commit that can be read and reverted.
 
 ## The five files
 
-| File | Who writes it | What it holds |
+| File | Written by | Contents |
 | --- | --- | --- |
-| `SOUL.md` | you, then the agent | identity, voice, values |
-| `OPERATOR.md` | you, then the agent | who it works for, what you prefer |
-| `WORLD.md` | you, then the agent | the environment: paths, conventions, lessons |
-| `BOOTSTRAP.md` | you | the first steps, worked through once |
-| `GUIDE.md` | you | this file |
+| `SOUL.md` | the operator, then the agent | identity, voice, and values |
+| `OPERATOR.md` | the operator, then the agent | who it works for, and how |
+| `WORLD.md` | the operator, then the agent | the environment: paths, commands, conventions |
+| `BOOTSTRAP.md` | the operator | the first steps, worked through once |
+| `GUIDE.md` | the operator | this file |
 
-Before bootstrap hands over, the agent cannot edit the first three. After it,
-the sleep-time agent owns all three. That is deliberate: you get a guided
-start, and then an agent with a personality of its own.
+Until bootstrap hands over, the agent cannot edit the first three files. After
+handover, the sleep-time agent maintains all three.
 
-## Do this first
+## The first run
 
-1. Rewrite `SOUL.md`. The current text is a placeholder. Say who the agent
-   is, how it talks, and what it will not do.
-2. Rewrite `OPERATOR.md`. Who you are, how you like answers, when you want
-   to be interrupted and when you do not.
-3. Rewrite `WORLD.md`. The real paths on this machine, the real commands,
-   the real conventions. This is the file that stops it guessing.
-4. Then run `enchiridion chat`.
+1. Edit `SOUL.md`. The shipped text is a placeholder. State who the agent is,
+   how it speaks, and what it refuses.
+2. Edit `OPERATOR.md`. State who the operator is, what a good answer looks
+   like, and when the agent may act or interrupt without asking.
+3. Edit `WORLD.md`. State the real paths, the real commands, and the real
+   conventions on this machine.
+4. Run `enchiridion chat`.
 
-The agent reads these three on its first turn, asks you the questions they
-do not answer, and writes the answers back. Only then does it create its own
-first skill.
+The agent reads the three files on its first turn and asks about what they leave
+open. It writes the answers back. It creates its first skill after that.
 
-## Commands worth knowing
+## Bootstrap
 
-| Command | What it does |
+`BOOTSTRAP.md` holds the handover procedure as a numbered list. The agent works
+through one step per turn and records each step in `state.json`. Writes to
+`SOUL.md`, `OPERATOR.md`, and `WORLD.md` are refused until the last step, so the
+operator's guidance cannot be edited away before handover. When the last step is
+done, the agent archives the file as `BOOTSTRAP.done.md`.
+
+## Commands
+
+| Command | Output |
 | --- | --- |
-| `enchiridion chat` | start the REPL |
-| `enchiridion ask \"...\"` | one turn, print, exit |
-| `enchiridion serve` | run the supervisor with the channels you enabled |
+| `enchiridion chat` | a turn-by-turn session in the terminal |
+| `enchiridion ask \"...\"` | one turn, its answer, then exit |
+| `enchiridion serve` | the supervisor, with the enabled channels |
 | `enchiridion blocks` | the memory blocks with character counts |
-| `enchiridion skills` | every skill, with its tier and trigger line |
+| `enchiridion skills` | every skill, with its trigger line |
 | `enchiridion tools` | every tool, with its schema token cost |
 | `enchiridion journey` | everything the agent has learned or written |
 | `enchiridion memory \"...\"` | full text search across sessions and memories |
-| `enchiridion usage` | the token ledger, with cache columns |
-| `enchiridion undo N` | roll back the Nth change in this directory |
+| `enchiridion usage` | the token ledger, with the cache columns |
+| `enchiridion undo N` | roll back the Nth commit in this directory |
 
-Every command is also available in the REPL with a leading slash. Only
-`/stop` and `/who` are REPL only, because they act on a turn that is running
-right now.
+The REPL accepts every command with a leading slash. `/stop` and `/who` exist
+only in the REPL because they act on a turn that is running.
 
 ## What the agent cannot see
 
-Your keys are not reachable from anything the agent runs. The supervisor
-reads `.env` from a tmpfs at startup, holds the values in memory, unsets them
-from its own environment, and deletes the file. The agent's own code runs in
-a separate process under a different user, with no view of the supervisor's
-environment. That is a property of the deployment, not a setting you can turn
-off.
+The agent cannot reach the operator's keys. The supervisor reads `.env` from a
+tmpfs at startup, holds the values in memory, removes them from its own
+environment, and deletes the file. Agent code runs in a separate process under a
+different user and has no view of the supervisor's environment. This is a
+property of the deployment and not a setting.
 
-## Reverting
+## History
 
-This directory is its own git repository, nested inside the enchiridion
-checkout. Every change the agent makes here is a commit signed with your key,
-so its history is separate from the source tree's history and you can read it
-without reading the harness.
+This directory is its own git repository. Every change the agent makes is a
+commit signed with the operator's key, so its history is separate from the
+source tree.
 
     git -C agents/default log
     git -C agents/default diff
     git -C agents/default show HEAD
     enchiridion undo 3
 
-Personality evolution is a diff, not a mystery. Read it if you want to.
+## Changing the agent
+
+The sleep-time agent rewrites the three files it owns as it learns. Read the
+diff to see what changed, and revert the commit to undo it.
 "
   "The operator walkthrough.")
 
 (defparameter +soul+
   "# Soul
 
-This file is a placeholder. Replace it before the agent's first run.
+The shipped text in this file is a placeholder. Replace it before the agent's
+first run.
 
 ## Who it is
 
-Name it. A short paragraph is enough. An agent with no name in its own
-identity drifts into the most generic possible assistant, because that is what
-the median of the training data sounds like.
+Give the agent a name and a short description. A name in the identity makes the
+answers specific to this agent.
 
-## How it talks
+## How it speaks
 
-Short or long. Does it use headers. Does it say when it is unsure, or does it
-guess. Does it show its working, or does it answer.
-
-Be concrete here. \"Be concise\" means nothing. \"Under six lines unless asked
-for more\" is a rule it can follow.
+State the answer length, whether it uses headings, and whether it shows its
+work. Give a limit with a number: \"under six lines unless the question needs
+more\" is a rule the agent can follow, and \"be concise\" is not.
 
 ## What it will not do
 
-The list that matters most. Things it should refuse even when a message asks
-politely. If it will not send mail without asking, write that down, because
-nothing else in the system will stop it.
+List the refusals. Nothing else in the system stops the agent from a network
+call that was asked for politely, so the refusals belong here.
 
-## What it is trying to get better at
+## What it is trying to improve
 
-Two or three things. This is what the sleep-time agent rewrites when it has
-a turn and nothing else.
+Two or three goals. The sleep-time agent rewrites this section when it has a
+turn and nothing else.
 "
   "Identity, voice, and values.")
 
 (defparameter +operator+
   "# Operator
 
-This file is a placeholder. Replace it before the agent's first run.
+The shipped text in this file is a placeholder. Replace it before the agent's
+first run.
 
-## Who you are
+## Who the operator is
 
-What you work on, what you are building, what you already know. An agent that
-knows your domain stops explaining it back to you.
+What the operator works on, what they are building, and what they already know.
+State the domain so the agent does not explain it back.
 
-## What you want from it
+## What a good answer looks like
 
-The shape of a good answer. Detail level, tone, how much to ask before acting,
-how much to just do.
+Detail level, tone, how much to ask before acting, and how much to do without
+asking.
 
-## When it may act without asking
+## When the agent may act alone
 
-This is the important one. Reading files: fine. Writing files under this
-directory: fine. Anything that reaches the network, anything that costs
-money, anything that touches something outside this directory: ask first.
+State the boundary. Reading files and writing under this directory are usually
+allowed. A network call, a cost, or a change outside this directory usually
+needs a question first.
 
-## When it may interrupt you
+## When the agent may interrupt
 
-And when it should queue its question and keep working. Both directions are
-worth writing down, because the default is always the same and the default is
-usually wrong.
+State both directions: what is worth an interruption, and what waits for the
+next turn. State it, because a missing rule leaves the agent to guess.
 
 ## Standing constraints
 
-Deadlines, budgets, the things it must not spend time on.
+Deadlines, budgets, and the work the agent must not spend time on.
 "
   "Who it works for.")
 
 (defparameter +world+
   "# World
 
-This file is a placeholder. Replace it before the agent's first run.
+The shipped text in this file is a placeholder. Replace it before the agent's
+first run.
 
-This is the file that stops it guessing. Every fact here is one it would
-otherwise have to spend a turn discovering.
+The agent reads this file to avoid rediscovering the machine. State only facts
+that are true here.
 
 ## Where things are
 
-Real absolute paths. The source tree, the agent directory, the database, the
-control file. Not placeholders.
+Absolute paths: the source tree, the agent directory, the database, and the
+control file.
 
-## How things are run
+## How things run
 
-The commands that actually work on this machine. The container flags. The port
-numbers. The name of the environment variable that holds the key, never the
-key.
+The commands that work on this machine, the container flags, the port numbers,
+and the name of the environment variable that holds a key. Never the key.
 
 ## Conventions
 
-Indentation, naming, where tests live, what a commit message looks like here.
-The shape of the work it will be doing.
+Indentation, naming, where tests live, the commit message format, and the shape
+of the work.
 
-## What has already been learned
+## Lessons
 
-Lessons that cost a turn to discover. The sleep-time agent appends here. Keep
-entries short and dated, and delete the ones that have stopped being true.
+Facts that cost a turn to find. The sleep-time agent appends here. Keep entries
+short and dated, and delete the ones that stopped being true.
 "
   "The environment it lives in.")
 
 (defparameter +bootstrap+
   "# Bootstrap
 
-The first steps. Work through them in order, one turn each, and mark each one
-done in `state.json` as you finish it.
+The first steps. Work through them in order, one turn each, and record each step
+as done in `state.json`.
 
 1. Read `SOUL.md`, `OPERATOR.md`, and `WORLD.md`.
 2. List, in one message, every question those three files do not answer.
-3. Wait for the answers. Do not guess at a fact you were not given.
+3. Wait for the answers. Do not guess at a fact that was not given.
 4. Write the answers into the three files.
-5. Create one first skill under `skills/`, and use it once in this same
-   session.
+5. Create one skill under `skills/`, and use it once in this session.
 6. Write one memory, and read it back with the memory tool.
-7. Mark each step above done in `state.json`.
-8. When every step is done, archive this file to `BOOTSTRAP.done.md` and tell
-   the operator the handover is complete.
+7. Record each step above as done in `state.json`.
+8. When every step is done, archive this file as `BOOTSTRAP.done.md` and report
+   the handover to the operator.
 
-Until the last step, writes to `SOUL.md`, `OPERATOR.md`, and `WORLD.md` are
-refused. That is not a bug. The operator's guidance cannot be edited away in
-the first minutes of your life.
+Writes to `SOUL.md`, `OPERATOR.md`, and `WORLD.md` are refused until the last
+step. The operator's guidance cannot be edited away before handover.
 
-After handover this file is read-only history and the sleep-time agent owns
-all three of the others.
+After handover this file is read-only history, and the sleep-time agent owns the
+three identity files.
 "
   "The first steps.")
 
@@ -343,9 +346,8 @@ calls one with no arguments.\"
     ("skills/example-welcome.cl"  :kind :lisp     :contents +example-skill+ :description "example skill")
     ("tools/example-echo.cl"      :kind :lisp     :contents +example-tool+ :description "example tool")
     ("state.json"                 :kind :json     :contents +initial-state+ :description "runtime state"))
-  "Every file init writes: its name, what kind of file it is, its contents,
-and the one line the first launch prints beside it. In that order, so the
-listing reads top to bottom.")
+  "Every file init writes: its name, its kind, its contents, and the one line
+the first launch prints beside it.")
 
 (defparameter *seed-subdirectories* '("skills" "tools")
   "Directories init creates before it writes anything into them.")

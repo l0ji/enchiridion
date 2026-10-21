@@ -1,114 +1,222 @@
 # Memory
 
-Memory holds what the agent knows across turns. The kernel reads five blocks when
-it builds an agent, compiles them into one prompt, and freezes that prompt for the
-session. The store keeps the transcript, the memories, the two harness blocks, the
-token ledger, and the task queue in one SQLite file. The heartbeat rewrites the
-session block from recent turns, so the prompt does not grow with the transcript.
+Memory is what the agent carries from one turn to the next.
+Five named blocks are compiled into one prompt when the agent is built, and that prompt stays frozen for the session.
+A SQLite store holds the transcript, memories, harness blocks, ledger, and task queue, and SQLite full-text search (FTS5) indexes the text without a model call.
+The heartbeat rewrites the session block from recent turns, so the prompt does not grow with the transcript.
+
+## The memory model
+
+A block is one named piece of memory with a character limit and a writer.
+Three blocks are backed by Markdown files, so personality change is a git diff, and two are store rows written by the harness.
+
+| Label        | Limit | Backing        | Writer                                        |
+| ------------ | ----- | -------------- | --------------------------------------------- |
+| `:persona`   | 1200  | `SOUL.md`      | The sleep agent, after the bootstrap handover |
+| `:operator`  | 800   | `OPERATOR.md`  | The sleep agent, after the bootstrap handover |
+| `:world`     | 1500  | `WORLD.md`     | The sleep agent, after the bootstrap handover |
+| `:session`   | 400   | A `blocks` row | The heartbeat and compaction                  |
+| `:ledger`    | 250   | A `blocks` row | The heartbeat                                 |
+| `:bootstrap` | 300   | None           | No block is built                             |
+
+`*default-block-limits*` holds the six limits, and `default-block-limit` returns 1200 for a label the list does not name.
+The limits count characters, and the configuration's `:memory :block-limits` key is not read, so a limit change is a source change.
+
+The kernel builds five blocks in `blocks-from-directory`.
+It reads the three Markdown files and falls back to the seed template, and it reads `:session` and `:ledger` from the store.
+The first three are not writable for the operator's agent, and the two store blocks are writable.
+
+`make-agent` compiles the blocks once into a frozen prompt, and every turn sends that prompt.
+A later write changes the block and its file, not the bytes already sent.
+The next prompt gets the text on disk when the next agent is built, and the sleep agent is built fresh on every tick.
+
+`compile-blocks` prints one capacity line per block, then each block as `## label (n/limit characters)` with its text.
+`estimate-tokens` counts one token per four characters for the ledger only.
 
 ## Blocks
 
-A block is one named piece of memory. `make-block` builds one, scans its text, and
-takes the limit from `*default-block-limits*`. The kernel builds five blocks for an
-agent directory.
+A block has five fields: `label` (keyword), `text` (string), `limit` (integer), `file` (pathname or `nil`), and `writable-p` (boolean).
+The defaults are `:persona`, `""`, 1200, `nil`, and true, and `writable-p` says whether this agent may replace the text.
 
-| Label       | File           | Limit | Writer                      |
-| ----------- | -------------- | ----- | --------------------------- |
-| `:persona`  | `SOUL.md`      | 1200  | sleep agent, after handover |
-| `:operator` | `OPERATOR.md`  | 800   | sleep agent, after handover |
-| `:world`    | `WORLD.md`     | 1500  | sleep agent, after handover |
-| `:session`  | a `blocks` row | 400   | heartbeat                   |
-| `:ledger`   | a `blocks` row | 250   | heartbeat                   |
+`make-block` scans the text, takes the limit from `*default-block-limits*` when the caller passes none, and keeps the file when one is given.
 
-`*default-block-limits*` is a plist of six labels. It also holds `:bootstrap` with
-300 characters. `default-block-limit` returns the plist value for a label, or 1200
-for a label the plist does not name.
+`set-block-text` replaces the text of a writable block and refuses four cases.
 
-The limits count characters, not bytes. `block-bytes` returns the character count
-of a block. `block-full-p` answers true when the count reaches the limit, and
-`block-slack` returns the room that is left.
+| Refusal        | Condition                                              | Report                                                                          |
+| -------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------- |
+| Frozen block   | `writable-p` is false                                  | `Block <label> is frozen for this session.`                                     |
+| Duplicate text | The text equals the current text                       | `Configuration is wrong at BLOCK.` and `Block <label> already holds that text.` |
+| Scanned text   | An invisible character or an injection pattern appears | `Configuration is wrong at BLOCK.` and a line naming the block                  |
+| Over the limit | The text is longer than the limit                      | `Block <label> is at <limit> characters and needs <wanted>, so <n> must go.`    |
 
-`set-block-text` replaces the text of a writable block. It refuses four things:
+A `block-frozen` condition carries the label, and a `block-overflow` condition carries the label as `:label`, the limit as `:current`, and the attempted length as `:wanted`.
+The file is written last, so a refused write leaves both the block and the file unchanged.
 
-- a frozen block, with `block-frozen` and the block label
-- text that repeats the current text, with `configuration-error`
-- text with an invisible character or an injection pattern, with `configuration-error`
-- text longer than the limit, with `block-overflow`, the limit as `:current`, and the
-  attempted length as `:wanted`
+`block-bytes` counts characters, `block-full-p` is true at the limit, `block-slack` is the room left, and `block-descriptions` returns label, count, limit, slack, writability, and file.
 
-The file write comes last, and only when the block has a file. `block-summary`
-prints one capacity line per block. `compile-blocks` prints that summary and then
-each block as `## label (n/limit characters)`.
+Every write passes `scan-block-text`, which refuses invisible code points in `U+200B` to `U+200F`, `U+202A` to `U+202E`, `U+2060` to `U+2064`, and `U+2066` to `U+2069`.
+It also refuses `U+E0000` to `U+E007F` and the single points `U+FEFF`, `U+00AD`, `U+061C`, and `U+180E`.
+Those are zero-width spaces and directional marks, bidirectional overrides, the word joiner, and invisible operators.
+The rest are directional isolates, tag characters, the byte order mark, the soft hyphen, the Arabic letter mark, and the Mongolian vowel separator.
+The patterns are compiled once, with case folding, in `+injection-scanners+`.
 
-The kernel builds the five blocks in `blocks-from-directory`. It reads
-`:persona`, `:operator`, and `:world` from their Markdown files, and it falls back
-to the seed template when a file is absent. Those three blocks are not writable
-for the operator's agent. The `:session` and `:ledger` blocks come from the store,
-and the heartbeat writes them.
+```text
+ignore\s+(?:all\s+)?(?:the\s+)?(?:previous|prior|above)\s+instructions
+disregard\s+(?:all\s+)?(?:the\s+)?(?:previous|prior|above)\s+instructions
+reveal\s+(?:your\s+)?(?:system\s+)?prompt
+print\s+(?:your\s+)?(?:system\s+)?prompt
+repeat\s+(?:your\s+)?(?:system\s+)?prompt
+you\s+are\s+now\s+(?:a|an|the)\b
+exfiltrate
+send\s+(?:the\s+)?(?:secret|token|key|password)\s+to
+```
 
-## The write scan
-
-A write reaches a block only after `scan-block-text` passes. The scan refuses
-invisible Unicode: zero width spaces, bidi overrides, the word joiner, the byte
-order mark, the soft hyphen, and the tag character range. `invisible-character-p`
-is the test.
-
-The scan also refuses eight patterns in `+injection-patterns+`. They name attempts
-to ignore instructions, to disregard instructions, to reveal the system prompt,
-to print it, and to repeat it. They also name the opening `you are now`, the word
-`exfiltrate`, and a request to send a secret. `+injection-scanners+` holds the
-compiled form, built once with `create-scanner` in case-insensitive mode.
-
-A hit signals `configuration-error` with `:key :block` and a line that names the
-block. The list stays short on purpose, so an operator can read every pattern and
-disagree with it. A false positive costs one refused write.
+A hit signals a `configuration-error` with `:key :block` and a detail that reads `Block <label> contains invisible Unicode.` or `Block <label> contains a prompt injection or exfiltration pattern.`
 
 ## Seed files
 
 `init-agent` creates an agent directory and writes every seed file that is absent.
-It creates `skills/` and `tools/` first. `write-if-absent` returns `:created`,
-`:kept`, or `:failed`, and it never overwrites a file. A rerun of init therefore
-completes a half finished setup and reports what was already there.
+It creates the `skills/` and `tools/` directories first, then writes the templates in this order.
 
-`*seed-templates*` holds eight files, in this order.
+| File                        | Kind     | Contents                 |
+| --------------------------- | -------- | ------------------------ |
+| `GUIDE.md`                  | markdown | The operator walkthrough |
+| `SOUL.md`                   | markdown | Identity                 |
+| `OPERATOR.md`               | markdown | Who the agent works for  |
+| `WORLD.md`                  | markdown | The environment          |
+| `BOOTSTRAP.md`              | markdown | The first steps          |
+| `skills/example-welcome.cl` | lisp     | An example skill         |
+| `tools/example-echo.cl`     | lisp     | An example tool          |
+| `state.json`                | json     | The runtime state        |
 
-| File                        | Kind     | Description          |
-| --------------------------- | -------- | -------------------- |
-| `GUIDE.md`                  | markdown | operator walkthrough |
-| `SOUL.md`                   | markdown | identity             |
-| `OPERATOR.md`               | markdown | who it works for     |
-| `WORLD.md`                  | markdown | the environment      |
-| `BOOTSTRAP.md`              | markdown | first steps          |
-| `skills/example-welcome.cl` | lisp     | example skill        |
-| `tools/example-echo.cl`     | lisp     | example tool         |
-| `state.json`                | json     | runtime state        |
+`write-if-absent` never overwrites and answers `:created`, `:kept`, or `:failed` with the condition when a write fails.
+A rerun against a populated directory completes a half finished setup and reports what was already there.
+`seed-template`, `seed-description`, and `seed-kind` read one row each.
+`seed-file-names` returns the eight relative names, and `agent-seeded-p` answers whether a directory holds at least one seed file.
 
-The templates live as Lisp string constants in `seed.cl`, so init needs no file
-lookup. `seed-template`, `seed-description`, and `seed-kind` read one row each.
-`seed-file-names` returns the eight relative names. `agent-seeded-p` answers
-whether a directory holds at least one seed file.
+After the files are on disk and no write failed, `ensure-agent-repository` makes the directory a nested git repository and commits it.
+A host without git keeps the files and skips the commit.
 
-`init-agent` returns an `init-result` with `directory`, `created`, `existing`,
-`problems`, and `existed-p`. A write that fails lands in `problems` with its
-condition rather than stopping the run. `init-status-line` prints one line for the
-first launch. After the files arrive, `ensure-agent-repository` makes the directory
-a nested git repository and commits it.
+`init-agent` returns an `init-result` with the directory, the files created, the files kept, and the problems.
+It also holds a flag that says whether the directory already held a seed file, and `init-status-line` renders one line.
+
+```text
+No agent directory found. Creating /home/operator/agents/default/.
+Agent directory /home/operator/agents/default/ already has 5 of 8 seed files.
+```
+
+Run init by hand to repair a partial directory.
+
+```sh
+enchiridion init
+```
+
+The command prints the status line, a `created` line per file written, a `kept` line per file kept, and a `problem` line per failure.
+It exits 1 on any problem and 0 otherwise.
+The no-command first launch runs the same code and stops, so the operator can edit the three identity files.
+[Getting started](getting-started.md) covers that run.
+
+## The bootstrap
+
+`BOOTSTRAP.md` is a numbered list.
+`bootstrap-steps` returns each `(number . text)` in file order, and continuation lines are prose.
+
+The steps live in `state.json` under a bootstrap record.
+The record holds `step` (integer, initial 0), `done` (sorted array of step numbers, initial `[]`), and `complete` (boolean, initial false).
+
+While `BOOTSTRAP.md` exists and steps remain, `bootstrap-refuse-writes-p` is true, so the sleep agent skips its pass.
+The block tool signals `bootstrap-pending` for a seed-backed label without changing the file.
+The report reads `Block <label> is the operator's until bootstrap hands over.`
+
+`mark-bootstrap-step` keeps `done` sorted and duplicate free, sets `step` to the number done, writes the state, and runs the handover when the last step lands.
+No shipped tool calls it, so the turn surface cannot complete the bootstrap.
+
+The handover renames `BOOTSTRAP.md` to `BOOTSTRAP.done.md`, sets `complete` true, writes the state, and commits the directory.
+A missing `BOOTSTRAP.md` still marks the state complete.
+The report is one line: the archive sentence and the commit report, which reads `The agent repository was not committed.` when the commit fails.
+
+```text
+Bootstrap complete; BOOTSTRAP.md is now BOOTSTRAP.done.md. Commit 3f2a91c recorded the change.
+Bootstrap complete; there was no BOOTSTRAP.md to archive. Nothing changed, so there was nothing to commit.
+```
+
+`reset-bootstrap` restores `BOOTSTRAP.done.md` as `BOOTSTRAP.md` only when `BOOTSTRAP.md` is absent, clears the record, and writes the state.
+A live `BOOTSTRAP.md` is never overwritten.
+
+`bootstrap-status` returns `(:step N :done (N...) :total M :complete BOOL :remaining ((N . TEXT)...))`, and `bootstrap-status-line` renders one of:
+
+```text
+Bootstrap step 3 of 8: Wait for the answers. Do not guess at a fact that was not given.
+Bootstrap complete: 8 of 8 steps done.
+Bootstrap complete.
+```
+
+`bootstrap-step-summary` cuts a step to 60 characters for that line and replaces a newline with a space.
+The `bootstrap` command shows the line, the remaining steps, or resets the record, and [Commands](commands.md) documents its arguments.
+
+## state.json
+
+The agent directory holds one JSON file with `schema` (integer, initial 1), `generation` (integer, initial 0), and `bootstrap` (the record above).
+
+`read-state` never signals.
+A missing, empty, or malformed file becomes `default-state`, and `normalize-state` and `normalize-bootstrap` fill absent or mistyped fields, so a hand-edited file costs a fresh start.
+
+`write-state` writes `state.json.new` and renames it, so a crash leaves the old state or the new one.
+`ensure-state` accepts a state object or a directory.
+`state-generation` and `set-state-generation` read and write the counter.
+The setter takes a state object in memory or a directory it reads, changes, and writes back.
+
+The generation seeds the plugin generation at startup.
+No shipped code calls the setter, so the value stays at what the seed wrote unless a caller writes it.
+The supervisor's status file carries a separate generation, and [Plugins and self-modification](plugins.md) documents the loader.
+
+## Loading tiers
+
+One body has three forms: L0 answers whether the text matters, L1 answers what shape the body has, and L2 is the whole body.
+A caller starts at L0 and pulls a higher tier only after an index read has missed twice.
+
+| Form | Limit            | Derivation                                                   |
+| ---- | ---------------- | ------------------------------------------------------------ |
+| L0   | 400 characters   | The first paragraph, cut at a word boundary inside the limit |
+| L1   | 8000 characters  | The body cut at the last line break inside the limit         |
+| L2   | No derived limit | The whole body                                               |
+
+The limits are `+l0-chars+`, `+l1-chars+`, and the miss rule is `+misses-before-promotion+`, which is 2.
+A `tiered` value holds the name, the three forms, the tier in use, and the miss count.
+`tier-name` and `tier-misses` read the name and the count.
+A body with no line break inside the L1 limit is cut at the limit, so the result always fits the budget.
+
+`build-tiers` derives L1 and L0 from L2 when the caller passes neither, and a written abstract is passed as L0.
+
+```lisp
+(enchiridion.memory:tier-for
+ (enchiridion.memory:build-tiers "world" "# World
+The machine runs Debian."))
+```
+
+`tier-for` returns one named form and defaults to the tier in use, and `note-tier-miss` counts one index read that came back empty.
+`promote-tier` moves up after `+misses-before-promotion+` (2) misses and clears the count.
+At L2 it clears and returns `:l2`, and `reset-tier-misses` clears without moving.
+
+The derivation is mechanical, and no shipped code calls it: `build-tiers` runs from the test suite only, so no live prompt reads a tier.
 
 ## The store
 
-The store is one SQLite file. `default-store-path` puts it at `memory.db` under
-`agents/default/` in `ENCHIRIDION_HOME`, or under the current directory when that
-variable is unset. `*store-path*` overrides both. The `:db` key in the `:memory`
-section of config.cl names the file.
+The store is one SQLite file.
+`default-store-path` puts `memory.db` under `agents/default/` in `ENCHIRIDION_HOME`, or under the current directory, and the `:db` key or `*store-path*` overrides that path.
 
-`open-store` creates the file and the schema when they are absent, then returns a
-`store` with a path, a DBI connection, and a recursive lock. `with-store-lock` runs
-a body under that lock, because a channel thread, the control poll, and the
-heartbeat share one connection. `store-file-p` reads the sixteen byte SQLite header
-and refuses to adopt a file that is not a database. `drop-store` drops every table.
+`open-store` creates the file and schema when missing and uses a 5000 ms busy timeout.
+A file that cannot be opened signals `configuration-error` with `Cannot open the memory store <path>: <reason>`, and a failed schema signals one with `Cannot create the memory store schema in <path>: <reason>`.
+Both report `Configuration is wrong at MEMORY.`
+When root creates the file it widens the mode to `#o666`, because the broker runs as the agent user.
+Every string is scrubbed before it reaches a column, so the store holds no secret.
 
-`+schema+` holds seventeen statements. Five create a table, two create an FTS
-table, four create an index, and six create a trigger.
+`store-file-p` reads the sixteen-byte SQLite header, and a search opens a store only when that check passes.
+An empty or non-database file is therefore a leftover, and not a store.
+
+One connection serves several threads: `with-store-lock` runs a body under a recursive lock, and `exec` and `query-rows` take it themselves.
+
+The schema is seventeen statements, each `IF NOT EXISTS`, so opening a store needs no migration.
 
 | Table          | Columns                                                                                   |
 | -------------- | ----------------------------------------------------------------------------------------- |
@@ -117,178 +225,120 @@ table, four create an index, and six create a trigger.
 | `blocks`       | `name`, `body`, `ts`                                                                      |
 | `usage`        | `id`, `session`, `model`, `input`, `output`, `cache_read`, `cache_write`, `channel`, `ts` |
 | `tasks`        | `id`, `body`, `status`, `ts`                                                              |
-| `turns_fts`    | FTS5 over `turns.body`                                                                    |
-| `memories_fts` | FTS5 over `memories.name` and `memories.body`                                             |
+| `turns_fts`    | An FTS5 external content table over `turns.body`                                          |
+| `memories_fts` | An FTS5 external content table over `memories.name` and `memories.body`                   |
 
-The schema also creates four indexes: `turns_session`, `memories_name`,
-`usage_ts`, and `tasks_status`. The two FTS tables are external content tables
-over the row tables, so each body exists once. Three triggers per FTS table keep
-the index in step on insert, update, and delete. `+store-tables+` lists the seven
-tables, index table before row table, and it is also the trigger list.
+The four indexes are `turns_session`, `memories_name`, `usage_ts`, and `tasks_status`.
+The search tables are external content tables over the row tables.
+Three triggers per table keep them in step through an insert, an update, and a delete.
+`+store-tables+` lists the seven tables in drop order, and `drop-store` drops them and leaves the connection open.
+`set-session-block` and `set-ledger-block` run the injection scan and limit check, and `session-block` and `ledger-block` read the rows.
+The heartbeat writes those rows, so no agent sees them first.
+The task queue functions are `enqueue-task`, `list-tasks`, `dequeue-task`, `complete-task`, `fail-task`, `recover-tasks`, `count-tasks`, and `remove-task`.
+Their statuses and claim rule belong to [Supervisor and heartbeat](supervisor.md).
 
-Every string that reaches a column goes through `scrubbed`, which calls
-`enchiridion.llm.secrets:scrub`. The agent can read the transcript through the
-search tool, so this is the last gate before the disk.
+## Sessions and search
 
-## Store queries
+A session is a string on every turn row, so the store needs no session table.
+`fresh-session-id` returns 32 hexadecimal characters, and a session spans the smallest and largest timestamps of its turns.
 
-The turn and search functions:
+A turn row records session, role, body, model, channel, and universal time.
+The roles are `user`, `assistant`, and `tool`, and `record-turn` defaults the session to `default` and the role to `user`.
+Every round of a tool turn is stored, including tool results, and an empty assistant body is skipped.
 
-| Function          | Returns                                                           |
-| ----------------- | ----------------------------------------------------------------- |
-| `record-turn`     | one `turns` row as a `turn-row`                                   |
-| `recent-sessions` | sessions newest first, with `:id`, `:started`, `:ended`, `:turns` |
-| `session-count`   | the number of distinct sessions                                   |
-| `delete-session`  | the turns removed                                                 |
-| `search-sessions` | matches best first, as `turn-row` values                          |
-| `recent-turns`    | the newest turns, optionally not from one channel                 |
+`record-turn` returns the stored `turn-row`, and `recent-sessions` returns sessions newest first with `:id`, `:started`, `:ended`, and `:turns`.
+`session-count` counts distinct sessions, and `delete-session` removes a session's turns and returns the count.
+`search-sessions` returns matching turns best first, and `recent-turns` returns the newest turns, optionally excluding one channel.
 
-The memory, block, and ledger functions:
+`save-memory` stores one named body and returns the new row identifier.
+It refuses an empty body after the scrub with `A memory needs text.` and an exact duplicate with `Memory <name> already holds that text.`
+`list-memories` returns memories newest first, and `search-memories` matches a name or a body.
 
-| Function                              | Returns                                                             |
-| ------------------------------------- | ------------------------------------------------------------------- |
-| `save-memory`                         | the new row id, or a `configuration-error`                          |
-| `list-memories`                       | memories newest first                                               |
-| `search-memories`                     | matches best first, with `:id`, `:name`, `:body`, `:session`, `:ts` |
-| `session-block` / `set-session-block` | the `session` row                                                   |
-| `ledger-block` / `set-ledger-block`   | the `ledger` row                                                    |
-| `record-usage`                        | the new ledger row id                                               |
-| `usage-rows` / `usage-since`          | ledger rows oldest first                                            |
-| `usage-summary`                       | the ledger summed by `:model`, `:channel`, or `:day`                |
-| `usage-total-since`                   | the ledger summed from a time                                       |
-| `usage-session-total`                 | the ledger summed for one session                                   |
+A search turns each whitespace-separated term into an FTS5 quoted prefix query, so an operator character such as `+` is a literal.
+A term with no alphanumeric character is dropped.
+A query left with no terms signals `schema-error` with `The query has no searchable terms.`, and a control character signals one with `The query has a control character.`
+`search-sessions` and `search-memories` use `MATCH` with `ORDER BY rank`, and no model call runs, so recall costs no tokens and cannot invent a memory.
+The search functions and `recent-sessions` return 20 rows by default, and `recent-turns` returns 4.
 
-`set-session-block` and `set-ledger-block` call `store-checked-block`, which runs
-the injection scan and the block limit before the write. The heartbeat writes
-those two rows, so nothing else would scan them.
+The search tool in [Tools](tools.md) reads the same store and opens it only when `store-file-p` passes.
 
-The task queue functions:
+Search the transcript and the saved memories from the shell.
 
-| Function        | Returns                                      |
-| --------------- | -------------------------------------------- |
-| `enqueue-task`  | a pending `task-row`                         |
-| `list-tasks`    | tasks oldest first, or only one status       |
-| `dequeue-task`  | the oldest pending task, marked `running`    |
-| `complete-task` | true when a `running` task became `done`     |
-| `fail-task`     | true when a `running` task became `failed`   |
-| `recover-tasks` | the count of `running` tasks marked `failed` |
-| `count-tasks`   | the number of tasks, or of one status        |
-| `remove-task`   | true when a row was deleted                  |
-
-`dequeue-task` marks a task `running` rather than `done`, and the update carries
-`AND status = 'pending'`, so two claimants cannot both win. `recover-tasks` marks
-every `running` task `failed` at the start of a tick, because a task a dead
-process left behind is not in progress. Nothing requeues a failed task.
-
-`fts-query` turns each whitespace separated term into an FTS5 quoted prefix query,
-so an operator character such as `+` is a literal. The function drops a term with
-no alphanumeric character. A query with no terms at all signals `schema-error`, and
-so does a control character. `search-sessions` and `search-memories` use FTS5
-`MATCH` with `ORDER BY rank`. No model call runs in the search path, so recall
-costs no tokens and cannot invent a memory.
-
-## Loading tiers
-
-Each body of text has three forms. L0 is a one sentence abstract of at most 400
-characters (`+l0-chars+`) and answers whether the text matters. L1 is an overview
-of at most 8000 characters (`+l1-chars+`) and answers what shape the body has. L2
-is the whole body.
-
-`build-tiers` derives L1 and L0 from L2 when the caller does not pass them. L1 is
-L2 cut at the last line break inside 8000 characters. L0 is the first paragraph of
-L2, cut at a word boundary inside 400 characters. A caller with a written abstract
-passes it as L0.
-
-`tier-for` returns the text of one named tier, and defaults to the tier in use.
-`note-tier-miss` counts one index read that came back empty. `promote-tier` moves
-one tier up, and it moves only after `+misses-before-promotion+` misses, which is 2. A move clears the count. At L2 a further call clears the count and returns
-`:l2` rather than signalling. `reset-tier-misses` clears the count without a move.
-
-The derivation is mechanical: the same body always yields the same three strings.
-A tier that changed bytes mid-session would invalidate the prompt prefix cache.
-
-Limit: the tier machinery has no production caller. `build-tiers` runs from the
-test system only, so no live prompt reads a tier today.
-
-## The bootstrap state machine
-
-`state.json` holds three keys: `schema` (1), `generation` (0), and `bootstrap`.
-The bootstrap record holds `step`, `done`, and `complete`. `read-state` never
-signals: a missing, empty, or malformed file becomes `default-state`.
-`normalize-state` and `normalize-bootstrap` fill an absent or mistyped field with
-its default. A hand edited file therefore costs a fresh start, not a type error
-three functions later. `write-state` writes `state.json.new` first and renames it
-last, so a crash leaves the old state or the new one, never half of either.
-
-`bootstrap-steps` reads `BOOTSTRAP.md` and returns each numbered line as
-`(number . text)`. `bootstrap-remaining` returns the steps that `done` does not
-name. `bootstrap-complete-p` answers true when no step remains. An absent
-`BOOTSTRAP.md` has no steps, so it counts as complete. `bootstrap-status` returns
-`(:step N :done (...) :total M :complete BOOL :remaining (...))`.
-
-`mark-bootstrap-step` adds a step number, keeps the list sorted and duplicate
-free, and runs the handover when the last step lands. `bootstrap-handover` renames
-`BOOTSTRAP.md` to `BOOTSTRAP.done.md`, marks the record complete, writes the
-state, and commits the directory. `reset-bootstrap` restores `BOOTSTRAP.md` from
-the archive and clears the record.
-
-`bootstrap-refuse-writes-p` answers true while `BOOTSTRAP.md` exists and steps
-remain. The sleep agent reads that answer and skips its pass, so the three seed
-files stay the operator's during the first steps.
-`bootstrap-step-summary` cuts one step to sixty characters, and
-`bootstrap-status-line` prints the state as one line.
-
-## Digests and compaction
-
-`heartbeat` runs one tick in a fixed order. It fails every task that a dead
-process left running. It writes the ledger block and the session fallback. It runs
-the sleep agent. It then compacts the session block. Each phase has its own guard,
-so one failed phase does not stop the rest.
-
-`compact-session` builds a prompt from two parts. The first part is the previous
-session block, which is the summary so far. The second part is the last four turns
-verbatim (`+compaction-turns+`), each cut to 400 characters
-(`+recent-turn-limit+`). It runs the cheap model (`:cheap`) through a compactor
-agent. That agent holds no tools and only the `+compaction-brief+` persona,
-because a summariser needs no personality and no tools. The brief asks for plain
-prose of at most four hundred characters. The pass scrubs the answer, then
-`set-session-block` scans it and checks it against the 400 character limit before
-it lands.
-
-`compact-when-due` runs compaction when four new turns exist and the newest turn
-is past `supervisor-last-compacted-turn`. The cursor lives on the supervisor, so a
-restart rereads the last turns once. `write-session-fallback` puts one line about
-the task queue in an empty session block, and compaction overwrites it.
-
-`ledger-line` builds the ledger block as one line by construction, rather than by
-truncation. The shape is:
-
-```text
-session in N out N cache r N w N calls N · day N
+```sh
+enchiridion memory "open ports"
+enchiridion sessions
 ```
 
-## Session search and the frozen prompt
+`memory` prints the memories section and the turns section with their counts, and `sessions` prints one line per stored session with its turn count.
+[Commands](commands.md) documents both commands.
 
-The `search` tool answers from the store with scope `memory`, which is the default,
-or walks the agent files with scope `files`. A `path` argument selects the file
-walk. The store opens only when `store-file-p` is true, so a search never creates a
-database. One hit is one line, and `+search-hit-chars+` cuts a hit to 400
-characters.
+## The ledger
 
-`make-agent` compiles the five blocks into one prompt once. `compile-prompt` puts
-`+prompt-preamble+` first and then the compiled blocks. The kernel sends that
-snapshot as the system message on every turn of the session. A later block write
-lands in the block object and in its file, but it does not change the bytes of a
-compiled prompt. That rule keeps the provider prefix cache valid, and a cached
-turn costs less than a cold one.
+Every model call adds one `usage` row with the four numbers the provider reported, the session, the channel, and a universal time.
+Nothing in the row is derived, and every column is scrubbed.
 
-`estimate-tokens` returns one token per four characters of prompt text, for the
-ledger only.
+`record-usage` returns the new row identifier, and `usage-rows` returns rows oldest first, up to 1000 by default.
+`usage-since` returns rows at or after a time, and `usage-summary` returns the ledger summed by `:model`, `:channel`, or `:day`.
+`usage-total-since` and `usage-session-total` sum every column from a time and for one session.
 
-## Related
+`usage-summary` groups by model, by channel, or by day.
+A day is the local calendar day of the row's time.
+Model and channel groups are ordered by total tokens, and day groups are ordered newest first.
+A sum beyond a 64-bit integer is coerced to an integer for printing, and `:total` is input plus output.
+A summary returns at most 100 groups.
 
-- [Models and secrets](llm.md)
-- [Configuration](configuration.md)
-- [Supervisor and heartbeat](supervisor.md)
-- [Tools](tools.md)
-- [Testing](testing.md)
+Print the report from the shell.
+
+```sh
+enchiridion usage
+```
+
+The command prints three sections by model, by channel, and by day, each with input, output, cache read, cache write, and calls.
+[Commands](commands.md) documents the columns.
+
+The heartbeat writes the ledger block, one line in every prompt: `session in 1200 out 340 cache r 0 w 0 calls 4 · day 15400`.
+The line is built to fit the block limit by construction.
+The same totals bound the sleep agent through the budget windows in [Supervisor and heartbeat](supervisor.md).
+
+## Compaction
+
+The session block is the agent's summary.
+Compaction sends the previous block and the last four turns to the cheap model and stores the answer.
+
+Compaction runs when `+compaction-turns+` (4) new turns exist, sends `+recent-turn-limit+` (400 characters) of each turn, and enforces a 400-character session block.
+`+compaction-brief+` is the compactor's only persona and asks for plain prose of at most 400 characters.
+
+`compact-session` builds a message from the previous block or `(none)` and the last four turns, each cut to 400 characters.
+It runs the cheap model through a compactor agent with no tools and only the brief as its persona.
+The answer is scrubbed, and a non-empty answer is written with `set-session-block`, which scans it and enforces the 400-character limit.
+An oversized or refused answer changes nothing.
+
+`compact-when-due` runs when exactly four recent turns exist and the newest is past `last-compacted-turn`.
+The cursor lives on the supervisor, and the pass excludes the `:sleep` channel, so the summariser does not read its own output.
+
+`write-session-fallback` writes `Tick 12. 3 tasks waiting, 1 failed.` into an empty session block, and compaction overwrites it.
+
+## Troubleshooting
+
+| Symptom                                                              | Cause                                                        | Fix                                                                     |
+| -------------------------------------------------------------------- | ------------------------------------------------------------ | ----------------------------------------------------------------------- |
+| `Block <label> is at 1200 characters and needs 1280, so 80 must go.` | The new text exceeds the limit                               | Shorten the text before the write                                       |
+| `Block <label> is frozen for this session.`                          | The block object is not writable for this agent              | Write through the sleep agent, or through the block tool after handover |
+| `Block <label> is the operator's until bootstrap hands over.`        | The first steps are unfinished                               | Finish the bootstrap, or reset and complete it                          |
+| `Block <label> already holds that text.`                             | The write changes nothing                                    | Skip the write                                                          |
+| `A memory needs text.`                                               | The body was empty after the scrubber                        | Write a body with content                                               |
+| `Memory notes already holds that text.`                              | The name and body pair already exists                        | Use another name, or update the existing memory                         |
+| Search signals `The query has no searchable terms.`                  | The query held only punctuation                              | Search for words                                                        |
+| Search signals `The query has a control character.`                  | The query held a control character                           | Remove it                                                               |
+| `enchiridion memory` prints a section with no rows                   | The store has no matching rows, or the text was never stored | Search for another term, and check that the store path is right         |
+| The prompt does not show a block that was newly written              | The prompt was compiled at agent start and does not change   | Start a new process                                                     |
+| The transcript is missing entirely                                   | The store did not open, and the process said so              | Read the error line, and check the path and permissions for `memory.db` |
+| The session block is one line about the queue                        | Compaction has not run since the block was empty             | Send four more turns, or wait for the next tick                         |
+
+## See also
+
+- [Supervisor and heartbeat](supervisor.md) for the tick that writes the blocks and runs compaction.
+- [Large language model backends](llm.md) for the scrubber that cleans every string before it reaches a column.
+- [Tools](tools.md) for the search tool and the memory tool that read the store.
+- [Commands](commands.md) for `blocks`, `memory`, `sessions`, `usage`, and `bootstrap`.
+- [Plugins and self-modification](plugins.md) for the loader generation that the process starts from.

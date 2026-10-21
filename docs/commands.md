@@ -1,406 +1,600 @@
 # Commands
 
-One command table backs both the shell and the REPL. A row holds a name, a
-minimum and a maximum argument count, a handler, and a summary. A shell command
-is one program invocation that prints and exits. The REPL is the same commands
-with a live process behind them. A handler prints and returns an exit status.
+One command table backs the shell binary and the terminal read-eval-print loop (REPL).
+The chapter lists every command, its arguments, its output, and its exit status.
+It also covers the command-line flags, the REPL rules, the live-supervisor requests, and the signal behavior.
+After it, an operator can script the harness and read its answers without reading the source.
 
-## Call a command
+## How a call works
 
-```sh
-nix run .#enchiridion -- help
-nix run .#enchiridion -- ask "What is in WORLD.md?"
-nix run .#enchiridion -- usage
-```
+A table row holds five fields: a name, a minimum argument count, a maximum argument count, a handler, and a summary.
+A maximum of `nil` means any number of arguments.
 
-In the REPL, a command starts with a slash. `/help` prints every REPL command
-in that form, so the list the operator reads is the list the operator can type:
+A shell command is one program invocation.
+It starts the process, runs one handler, prints, and exits with a status.
+`chat` and `serve` keep the process alive instead.
 
-```text
-enchiridion> /help
-enchiridion> /usage
-```
+The REPL is the same table with a live process behind it.
+A line that starts with `/` is a command.
+Any other line is a turn for the agent.
 
-The REPL has three commands of its own that the shell does not: `/stop`,
-`/quit`, and `/who`. They act on the live turn, so a shell invocation cannot
-run them. `chat` and `serve` are the other way around. They are shell-only
-commands, because `chat` starts a nested REPL and `serve` starts a supervisor.
-The `/help` list leaves both off, and `/help chat` says that `chat` is a
-shell-only command and returns 2.
+The minimum and maximum are checked before the handler runs.
+An unknown name, or a call outside the range, prints one line and returns 2.
+A handler that returns no integer is treated as success.
 
-A line without a slash is a turn, and the REPL sends it to the agent. A single
-word that is a REPL command name is the exception: the REPL prints
-``Commands start with a slash: try `/NAME`.``, where NAME is the word that was
-typed, returns 0, and sends no turn. Two or more words, and a word that names
-nothing, are turns as usual.
-
-The command line reads four flags: `--channel NAME`, `--bind ADDRESS`,
-`--port NUMBER`, and `--token-env NAME`. The flags come before the command.
-For `chat` and `serve`, the flags also come after the command. The `--bind`,
-`--port`, and `--token-env` flags belong to `--channel http`.
-
-Four mistakes stop the command with one line and exit 2. The first mistake is a
-flag with no value. The second mistake is a channel that is not `cli`, `http`,
-or `fluxer`. The third mistake is a `--bind`, `--port`, or `--token-env` flag
-without `--channel http`. The fourth mistake is a port outside 1 to 65535.
+Command names match without case.
+Arguments are joined with single spaces for `ask`, for `memory`, and for `tasks add`.
+Every other command reads positional words.
 
 ## Exit statuses
 
-| Status | Meaning                                                                                                                                                              |
-| ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 0      | The command finished.                                                                                                                                                |
-| 1      | The command refused its situation, and it said why. A refused reload also returns 1. An unexpected error prints the condition and a short backtrace, then returns 1. |
-| 2      | The call was not usable: unknown name, wrong argument count, bad flag, or refused configuration.                                                                     |
+| Status | Meaning                                                                                        |
+| ------ | ---------------------------------------------------------------------------------------------- |
+| 0      | The command completed.                                                                         |
+| 1      | The command refused its situation and said why, a turn failed, or a build failed.              |
+| 2      | The call was not usable: unknown name, wrong argument count, bad flag, or refused configuration. |
+| 130    | A signal stopped the process (see [Signals](#signals)).                                         |
 
-A command that returns no integer becomes 0. `run-command` checks the argument
-count before it calls the handler. A name that is not in the table prints this
-line and returns 2:
+A handler prints its own failure line.
+A configuration error that escapes a handler prints its report and returns 2.
+Any other escaping condition prints the condition and a short backtrace, then returns 1.
+
+An unknown name prints one line and returns 2:
 
 ```text
 There is no command called NAME. Try `help`.
 ```
 
-At the REPL the same line reads
-``There is no command called NAME. Try `/help`.``
-Every message that names a command names it the way the surface does: the REPL
-adds the slash, and the shell does not. So the arity line reads `NAME takes
-ARGUMENTS; got N.` at a shell and `/NAME takes ARGUMENTS; got N.` at the REPL.
+At the REPL the suggestion names `/help`.
+A call outside the argument range prints `COMMAND takes ARGUMENTS; got N.` and returns 2.
+Every line that names a command uses the spelling of the surface in front of the operator.
 
-A call outside the argument range prints that line and returns 2.
+## Flags
+
+The command line reads four flags with values.
+`--verify-plugin` is read separately (see [Plugin verification](#plugin-verification)).
+
+| Flag              | Value                        | Effect                                                                 |
+| ----------------- | ---------------------------- | ---------------------------------------------------------------------- |
+| `--channel NAME`  | `cli`, `http`, or `fluxer`   | Start `http` or `fluxer` even when its entry disables it. `serve` builds `cli` regardless. |
+| `--bind ADDRESS`  | An address                   | Set the webhook bind address for this process.                          |
+| `--port NUMBER`   | 1 to 65535                   | Set the webhook port for this process.                                  |
+| `--token-env NAME`| A variable name              | Name the variable that holds the webhook token for this process.        |
+
+The flags configure the channels of `chat` and `serve`.
+They come before the command, and for those two commands they also come after it.
+A valid flag before another command is accepted and has no effect.
+The `--bind`, `--port`, and `--token-env` flags belong to `--channel http`.
+A flag belongs to one invocation and never writes `config.cl` (see [Configuration](configuration.md)).
+
+An invalid flag stops the process before any command runs.
+The line goes to standard error with the `enchiridion: ` prefix, and the status is 2:
+
+| Mistake                          | Line                                                                       |
+| -------------------------------- | -------------------------------------------------------------------------- |
+| A flag with no value             | `The --channel flag needs a value.`                                        |
+| A channel that does not exist    | `There is no channel called NAME. The channels are cli, http and fluxer.`  |
+| A webhook flag without `--channel http` | `The --bind, --port and --token-env flags belong to --channel http.` |
+| A port outside the range         | `The port must be a number between 1 and 65535, not VALUE.`                |
+
+A value that starts with `--` is read as the next flag, so `--bind --port 8787` reports that `--bind` needs a value.
+A flag that is not one of the four reaches the table as a command name or as an argument.
+`enchiridion --wat x` prints the unknown-command line and returns 2.
+
+On a seeded agent directory, channel flags with no command serve.
+Before the first launch, they write the seed files instead.
 
 ## The command table
 
-| Command     | Arguments                                        | What it prints                                                                | Exit                                      |
-| ----------- | ------------------------------------------------ | ----------------------------------------------------------------------------- | ----------------------------------------- |
-| `init`      | 0 or 1                                           | The status line, then each created and kept file, then each problem.          | 0, or 1 with a problem                    |
-| `ask`       | 1 or more                                        | The reply on standard output, the token line on standard error.               | 0, or 1 on failure                        |
-| `check`     | none                                             | The output of `nix run .#check`.                                              | 0, or 1 when the build fails              |
-| `skills`    | 0 to 2: `list`, `show NUMBER`                    | A numbered skill list with trigger lines, or one skill file.                  | 0, 1, or 2                                |
-| `tools`     | 0 to 2: `list`, `show NAME`                      | Every tool with its schema token cost, or one tool schema as JSON.            | 0, 1, or 2                                |
-| `blocks`    | 0 to 2: `show`, `edit NUMBER`                    | Each block with its character count and limit, or the path of one block file. | 0, 1, or 2                                |
-| `persona`   | 0 or 1: `show`, `edit`                           | The text of `SOUL.md`, or its path.                                           | 0, or 2 for another action                |
-| `operator`  | 0 or 1: `show`, `edit`                           | The text of `OPERATOR.md`, or its path.                                       | 0, or 2                                   |
-| `world`     | 0 or 1: `show`, `edit`                           | The text of `WORLD.md`, or its path.                                          | 0, or 2                                   |
-| `memory`    | 1 or more                                        | Matching memories and stored turns, with two counts.                          | 0, or 1 without a store                   |
-| `sessions`  | none                                             | Each stored session with its turn count, then the session count.              | 0, or 1 without a store                   |
-| `journey`   | 0 to 2: `list`, `show REV`, `edit REV`, `rm REV` | The history, one revision, or the result of a revert.                         | 0, 1, or 2                                |
-| `undo`      | exactly 1: `NUMBER`                              | `reverted REV.` or `could not revert REV.`                                    | 0, 1, or 2                                |
-| `usage`     | none                                             | The token ledger by model, by channel, and by day.                            | 0, or 1 without a store                   |
-| `budget`    | none                                             | The tick cap, the day cap, and the spend against each cap.                    | 0                                         |
-| `tasks`     | 0 or more: `list [STATUS]`, `add TEXT`, `rm ID`  | The task rows, or one line about the change.                                  | 0, 1 without a store, or 2 for a bad call |
-| `secrets`   | none                                             | Each secret name and its source, then the file path, mode, and presence.      | 0                                         |
-| `providers` | 0 to 2: `list`, `show ID`, `models ID`, `refresh` | Each provider with its id, display name, handler, profile, endpoint, key-variable name, and whether a key is loaded, marked `unsupported` when this build does not implement its handler; one provider in full; the models that provider's account can use; or a catalog refresh. | 0, 1 on a failed fetch, or 2 for a bad call |
-| `version`   | none                                             | `enchiridion 0.1.0`, the source root, the branch, and the head.               | 0                                         |
-| `help`      | 0 or 1: `NAME`                                   | Every command with a summary, or the detail for one command.                  | 0, or 2 for an unknown name               |
-| `bootstrap` | 0 or 1: `status`, `run`, `reset`                 | The bootstrap state, the remaining steps, or a reset line.                    | 0, or 2 for another action                |
-| `health`    | none                                             | The supervisor pid, generation, heartbeat, and channels.                      | 0, or 1 with no supervisor                |
-| `reload`    | none                                             | The supervisor report, then the generation.                                   | 0, or 1 when refused or absent            |
-| `channels`  | 0 to 2: `list`, `enable NAME`, `disable NAME`    | The channel report from the supervisor.                                       | 0, or 1 with no supervisor                |
-| `heartbeat` | 0 or 1: `on`, `off`, `run`                       | The supervisor report.                                                        | 0, or 1 with no supervisor                |
-| `chat`      | none                                             | The REPL.                                                                     | 0 when the REPL ends                      |
-| `serve`     | none                                             | Channel reports and heartbeat reports as they happen.                         | 0 when the process stops                  |
+| Command     | Arguments                                            | Summary                                             | Exit        |
+| ----------- | ---------------------------------------------------- | --------------------------------------------------- | ----------- |
+| `init`      | 0 or 1                                               | Create the agent directory and seed files           | 0 or 1      |
+| `ask`       | 1 or more                                            | One turn in a short-lived session                   | 0 or 1      |
+| `check`     | none                                                 | Compile the tree under safety 3                     | 0 or 1      |
+| `skills`    | 0 to 2: `list`, `show NUMBER`                        | List or show skills                                 | 0, 1, or 2  |
+| `tools`     | 0 to 2: `list`, `show NAME`                          | List or show tools                                  | 0, 1, or 2  |
+| `blocks`    | 0 to 2: `show`, `edit NUMBER`                        | Blocks with character counts and capacity           | 0, 1, or 2  |
+| `persona`   | 0 or 1: `show`, `edit`                               | Show or point at `SOUL.md`                          | 0 or 2      |
+| `operator`  | 0 or 1: `show`, `edit`                               | Show or point at `OPERATOR.md`                      | 0 or 2      |
+| `world`     | 0 or 1: `show`, `edit`                               | Show or point at `WORLD.md`                         | 0 or 2      |
+| `memory`    | 1 or more                                            | Search sessions and memories                        | 0 or 1      |
+| `sessions`  | none                                                 | Stored sessions with turn counts                    | 0 or 1      |
+| `journey`   | 0 to 2: `list`, `show REV`, `edit REV`, `rm REV`     | Everything the agent has learned or written         | 0 or 2      |
+| `undo`      | exactly 1                                            | Roll back the nth change in the agent directory     | 0, 1, or 2  |
+| `usage`     | none                                                 | Token ledger by model, channel, and day             | 0 or 1      |
+| `budget`    | none                                                 | Spend against the caps                              | 0           |
+| `tasks`     | 0 or more: `list [STATUS]`, `add TEXT`, `rm ID`      | The task queue                                      | 0, 1, or 2  |
+| `secrets`   | none                                                 | Names and sources, never values                     | 0           |
+| `providers` | 0 to 2: `list`, `show ID`, `models ID`, `refresh`    | Provider list, one provider, its models, or a refresh | 0, 1, or 2 |
+| `version`   | none                                                 | Version and build provenance                        | 0           |
+| `help`      | 0 or 1                                               | Command list, or detail for one                     | 0 or 2      |
+| `bootstrap` | 0 or 1: `status`, `run`, `reset`                     | Bootstrap state, remaining steps, or a reset        | 0 or 2      |
+| `health`    | none                                                 | Read the running supervisor's status                | 0 or 1      |
+| `reload`    | none                                                 | Ask a running supervisor to reload its code         | 0 or 1      |
+| `channels`  | 0 to 2: `list`, `enable NAME`, `disable NAME`        | List, enable, or disable a channel                  | 0, 1, or 2  |
+| `heartbeat` | 0 or 1: `on`, `off`, `run`                           | Turn the heartbeat on or off, or run one tick       | 0, 1, or 2  |
+| `chat`      | none                                                 | Start the REPL                                      | 0, 1, or 130 |
+| `serve`     | none                                                 | Start the supervisor and its channels               | 1 or 130    |
 
-A command with an optional argument uses the default when the argument is
-absent. The defaults are `list` for `skills`, `tools`, `journey`, and `tasks`.
-They are `show` for `blocks`, `persona`, `operator`, and `world`. They are
-`status` for `bootstrap`, `on` for `heartbeat`, and `list` for `channels`.
+Every row also returns 2 for a wrong argument count.
+The exit column names what the handler can return after the count check.
 
-## Commands that need a live process
+An absent action argument takes the default.
+The defaults are `list` for `skills`, `tools`, `channels`, `journey`, and `tasks`.
+They are `show` for `blocks`, `persona`, `operator`, and `world`.
+They are `status` for `bootstrap`, and `on` for `heartbeat`.
 
-| Command                                | What it needs                                                         | Without it                                                               |
-| -------------------------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| `reload`, `channels`, `heartbeat`      | A supervisor and its control file. The request waits up to 5 seconds. | `NAME: no supervisor is running, so nothing was asked.` Exit 1.          |
-| `health`                               | A fresh status file. The file stays fresh for 10 seconds.             | `no supervisor is running.` Exit 1.                                      |
-| `serve`                                | A supervisor in the command context.                                  | `serve needs a supervisor in the command context.` Exit 1.               |
-| `memory`, `sessions`, `usage`, `tasks` | An open memory store.                                                 | `NAME needs the memory store, and none is open in this process.` Exit 1. |
-| `ask`                                  | A backend and an API key.                                             | `No API key. Put NAME in .env or the environment.` Exit 1.               |
+## Session and build commands
 
-`chat` and `serve` own a supervisor. The configuration and the flags decide
-which channels the supervisor starts. Every other command runs in a short-lived
-process and starts no channel.
+A shell call has the form:
 
-## Starting and talking
+```sh
+nix run .#enchiridion -- COMMAND ARGS
+```
 
-### `init`
+### init
 
-Creates the agent directory and the seed files. The handler ignores any
-argument. It writes each absent file, and it keeps each present file. Then it
-prints the status line, then `created NAME`, `kept NAME`, or `problem NAME` for
-every entry. A problem returns 1.
+`init` writes every absent seed file and keeps every present one.
+An argument is accepted and ignored.
+It prints the status line and one line per file, prefixed `  created `, `  kept    `, or `  problem `.
+A problem prints `  problem (NAME . CONDITION)` and returns 1.
+The first launch does the same work (see [Getting started](getting-started.md#perform-the-first-launch)).
 
-### `chat`
+### ask
 
-Starts the REPL in the foreground and returns when the operator quits. The
-process also starts a supervisor, and it polls the control file on a thread. A
-`reload` typed at the REPL therefore reaches the supervisor that answers. The
-terminal channel is not a supervised channel under `chat`.
+`ask` joins its arguments with single spaces and runs one turn in a short-lived session.
+It needs a backend and a provider key.
+The reply goes to standard output, scrubbed.
+The token line goes to standard error as `<model>  in <input>  out <output>`, with `  cached <N>` and `  wrote <N>` appended when the provider reports cache tokens.
+The model field is the answering model, or the configured primary model when the provider reports none.
+A completed turn returns 0, and a failed or cancelled turn returns 1.
+Without a key it prints `Configuration is wrong at API-KEY.` and `No API key. Put OPENAI_API_KEY in .env or the environment.` and returns 1.
+`ask` is the only one-shot command that refreshes provider knowledge when `:offline` is nil.
 
-### `ask`
+### check
 
-Joins the arguments with single spaces and runs one turn. That join is why an
-unquoted question still reads the way the operator typed it. The reply goes to
-standard output, scrubbed. The token line goes to standard error. The exit
-status is the status of the turn.
+`check` runs `nix --option eval-cache false run .#check` in the current directory with a one hour timeout.
+It prints the combined output, returns 0 on success, and returns 1 on a failed build or a missing `nix`.
 
-### `serve`
+### chat
 
-Starts the supervisor and polls the control file until the process stops. The
-poll loop rewrites the status file on every pass. That rewrite keeps the file
-fresh for a shell command in another process. `serve` builds the `cli` channel
-only for this command. Without a terminal, that channel returns at once. The
-supervisor waits one second, then starts it again, for as long as the process
-runs, so the line repeats about once per second.
+`chat` starts the REPL in the foreground.
+It builds a supervisor, starts it, and polls the control file on a thread, so a `reload` typed at the REPL reaches a supervisor that answers.
+The terminal channel is not supervised under `chat`.
+The exit status is 0 when `/quit` or an end of input ends the session, 130 on a signal, and 1 when the supervisor fails to start.
+Agent code that fails to load prints a warning and does not stop the session.
+It is a shell-only command.
 
-## The agent directory
+### serve
 
-### `journey`
+`serve` starts the supervisor and polls the control file in the foreground.
+The `cli` channel is built for this command, and `http` and `fluxer` are built when the configuration enables them or a `--channel` flag names them.
+The command runs until a signal stops it and then returns 130, and a startup error returns 1.
+It is a shell-only command.
+The `cli` channel needs a terminal: without one it prints `enchiridion: stdin is not a terminal, so the cli channel stays down.` and the supervisor restarts it after one second, so the line repeats.
 
-| Action     | What it prints                                                          |
-| ---------- | ----------------------------------------------------------------------- |
-| `list`     | Up to 20 revisions as `REV SUBJECT`. With no history, one line says so. |
-| `show REV` | The revision text. Without a revision, exit 2.                          |
-| `edit REV` | The directory path and a line that names the revision to edit by hand.  |
-| `rm REV`   | The output of the revert.                                               |
+## Inspection commands
 
-A revision is a 1-based position in the log, or a hash.
+### help
 
-### `undo`
+`help` prints the command list, or the detail for one command.
 
-Reverts the change that `NUMBER` names. It prints `reverted REV.` and returns
-0, or `could not revert REV.` and returns 1. A missing number returns 2.
+```text
+ask -- One turn in a short lived session
+  arguments: at least 1 argument
+```
 
-### `persona`, `operator`, `world`
+The arity text is `no arguments`, `at least N arguments`, `exactly N arguments`, or `N to M arguments`.
+At the REPL the list labels every command with its slash, appends `/stop`, `/quit`, and `/who`, and leaves out `chat` and `serve`.
+`/help chat` prints `chat is a shell-only command, so the REPL does not have it.` and returns 2.
+An unknown name returns 2.
 
-Each command shows one seed file. `show` prints the file text. `edit` prints the
-file path for the operator to open. Any other action returns 2. The files are
-`SOUL.md`, `OPERATOR.md`, and `WORLD.md`.
+### version
 
-### `blocks`
+`version` prints `enchiridion 0.1.0`, then `source` with the project root, and `branch` and `head` when Git answers.
 
-`show` prints one line per block: the label, the character count, the limit,
-and the file path. The labels are `soul`, `persona`, `operator`, and `world`.
-The first two both use `SOUL.md`, so the listing shows that file two times.
+```text
+enchiridion 0.1.0
+source /path/to/enchiridion
+```
 
-`edit NUMBER` prints the path of one block file and returns 0. A missing number
-returns 2. A number past the end returns 1.
-
-### `bootstrap`
-
-| Action   | What it prints                                                    |
-| -------- | ----------------------------------------------------------------- |
-| `status` | The one line bootstrap state.                                     |
-| `run`    | The remaining steps, or one line that says bootstrap is complete. |
-| `reset`  | `bootstrap reset to its first step.`                              |
-
-Any other action returns 2. The agent marks a step done with the meta tool, and
-not from this command.
-
-## The memory store
-
-The store commands need an open store. The program opens the configured store
-at start up. A store that will not open prints one line on standard error, and
-the command then refuses with exit 1.
-
-### `memory`
-
-Searches stored memories and stored turns for the joined arguments. It prints
-`memories: N`, then one block per row as `  KEY: VALUE`, then `turns: N`, then
-the turns. It returns 0.
-
-### `sessions`
-
-Prints `ID N turns` for each stored session, then `N sessions in the store.`
+The packaged wrapper sets `ENCHIRIDION_SOURCE` to the installed tree, so `source` names that tree under `nix run`.
+With no root above the current directory it prints `no checkout was found above this directory.`
 It returns 0.
 
-### `usage`
+### secrets
 
-Prints three grouped sections: by model, by channel, and by day. Each section
-holds one line per group with the columns `input`, `output`, `cache read`,
-`cache write`, and `calls`. An empty ledger prints `  the ledger is empty.`
+`secrets` prints each loaded name with its source, never a value, then one line about the secret file.
 
-### `tasks`
+```text
+OPENAI_API_KEY from file
+secrets file /path/to/enchiridion/.env mode #o600 present
+```
 
-| Action        | What it prints                                                                               |
-| ------------- | -------------------------------------------------------------------------------------------- |
-| `list`        | One row per task as `ID (status) body`.                                                      |
-| `list STATUS` | The rows with that status. The four statuses are `pending`, `running`, `done`, and `failed`. |
-| `add TEXT`    | `task ID queued.`                                                                            |
-| `rm ID`       | `task ID removed.`, or `there is no task ID.` Both return 0.                                 |
+The source is `file`, `env`, or `argument`, and `argument` comes from a literal `:token` in `:http`.
+With nothing loaded it prints `no secrets are loaded.` and still reports the file line.
+A file the loader opened reports `present` or `discarded`, and `discarded` is the steady state in a container.
+When no file was read, the line names the path the loader would have tried and reports `present` or `absent`.
+The mode reads `unknown` when there is no file mode to report.
+It returns 0.
 
-A bad status word returns 2. `add` with no text returns 2. `rm` without an id
-returns 2.
+### budget
 
-### `budget`
+`budget` prints the caps and the spend against each window.
 
-Prints the tick cap and the day cap from the `:budget` section. A live agent
-adds two lines: `tick spent out:` and `day spent out:`. Each line shows whether
-that window is spent. It returns 0.
+```text
+tick cap: 4000
+day cap:  400000
+tick spent out: NIL
+day spent out:  NIL
+```
+
+The caps come from the `:budget` section, and `T` on a spent line means the window is exhausted.
+It returns 0.
+
+### providers
+
+`providers list` prints one line per provider with the id, display name, handler, profile, endpoint, key variable, key presence, and row source.
+A handler this build does not implement is marked `unsupported`.
+`providers show ID` prints every field of one row with `none` for an empty value, and an unknown id returns 2.
+`providers models ID` asks the provider which models its account can reach and prints the id, display name, context size, and output size per model, then `<N> model(s).`
+A missing ID prints `providers show takes an ID.` or `providers models takes an ID.` and returns 2.
+A provider with no model list prints `<ID> offers no model list. Set :model-primary, or use a row with :models.` and returns 1.
+`providers refresh` fetches the catalog and prints `provider catalog refreshed: <N> provider(s).`, and a failed fetch returns 1.
+`models` and `refresh` reach the network even when `:offline` is t.
+A bad action prints `providers takes list, show ID, models ID or refresh.` and returns 2.
+
+## Agent directory commands
+
+### skills
+
+`skills` lists the Lisp files directly under `skills/` in the agent directory, or shows one with `show NUMBER`.
+`list` prints one numbered line per skill:
+
+```text
+1. example-welcome.cl -- welcome, hello, introduce yourself
+```
+
+The trigger line follows the file name when the file declares a `+trigger+` string.
+With no files it prints `no skills yet.`
+A non-numeric argument prints `expected the number of an entry.` and returns 2, a number past the end prints `there is no entry N.` and returns 1, and a bad action prints `skills takes list or show NUMBER.` and returns 2.
+A listing reads the trigger line without evaluating the file, and a file that does not read still appears.
+
+### tools
+
+`tools list` prints `NAME TOKENS tokens - DESCRIPTION` for every registered tool, where the count is the schema cost, or `no tools are registered in this process.`
+`tools show NAME` prints the schema as one line of JavaScript Object Notation (JSON).
+A missing name prints `tools show needs a tool name.` and returns 2, an unknown name prints `There is no tool called NAME.` and returns 1, and a bad action prints `tools takes list or show NAME.` and returns 2.
+The built-in tools are registered for every command, and tools from the agent directory load when a turn runs (`ask`, `chat`, `serve`) (see [Plugins and self-modification](plugins.md)).
+
+### blocks
+
+`blocks` prints one line per block: label, character count, limit, and file.
+
+```text
+soul 758/1200 /path/to/home/agents/default/SOUL.md
+persona 758/1200 /path/to/home/agents/default/SOUL.md
+```
+
+`soul` and `persona` both use `SOUL.md`.
+The limit comes from the memory module, not from `:block-limits` in `config.cl` (see [Configuration](configuration.md)).
+`edit NUMBER` prints the path of one block file.
+A missing or non-numeric number prints `blocks edit needs the number of a block.` and returns 2, a number past the end prints `there is no block N.` and returns 1, and a bad action prints `blocks takes show or edit NUMBER.` and returns 2.
+
+### persona, operator, and world
+
+`persona`, `operator`, and `world` show or point at `SOUL.md`, `OPERATOR.md`, and `WORLD.md`.
+`show` prints the file text, and `edit` prints the absolute path.
+A bad action prints `NAME takes show or edit.` and returns 2.
+
+### bootstrap
+
+`bootstrap` reads and resets the bootstrap state.
+`status` prints one line: `Bootstrap step N of M: <summary>` while steps remain, `Bootstrap complete.` when `BOOTSTRAP.md` is absent, or `Bootstrap complete: N of N steps done.` when the file is present and every step is done.
+`run` prints `bootstrap has N steps left:` and the remaining steps, or `bootstrap is complete; the agent owns the seed files.`
+`reset` restores `BOOTSTRAP.md` from `BOOTSTRAP.done.md` when the live file is absent, clears the record, and prints `bootstrap reset to its first step.`
+A bad action prints `bootstrap takes status, run or reset.` and returns 2.
+No shipped tool marks a step done, so the handover does not occur through the turn surface (see [Memory](memory.md)).
+
+### journey
+
+`journey list` prints up to 20 commits as `REV SUBJECT`, or `the agent directory has no history yet.`
+A revision argument is a 1-based position in the log or a revision string.
+`show REV` prints the revision text, `edit REV` prints `edit <directory> by hand; the change is <revision>.`, and `rm REV` reverts the revision and prints the Git output.
+A missing revision prints `journey show needs a revision or a number.` (or the matching line for `edit` and `rm`) and returns 2.
+A bad action prints `journey takes list, show, edit or rm.` and returns 2.
+A Git failure is ignored, so a failed revert still returns 0.
+
+### undo
+
+`undo N` rolls back one change in the agent directory and resolves the argument like a `journey` revision.
+It prints `reverted REV.` and returns 0, prints `could not revert REV.` and returns 1 when Git refuses, and prints `undo needs the number of a change.` and returns 2 when no log entry matches.
+
+## Memory and ledger commands
+
+The store commands need an open memory store.
+The program opens the configured store at start up.
+A store that cannot be opened prints one warning on standard error and does not stop the command.
+The store command then refuses with exit 1:
+
+```text
+enchiridion: not keeping a transcript: Configuration is wrong at MEMORY.
+COMMAND needs the memory store, and none is open in this process.
+```
+
+### memory
+
+`memory` searches stored memories and stored turns for the joined arguments.
+The output has two sections:
+
+```text
+memories: 0
+turns: 0
+```
+
+Each row prints as `  KEY: VALUE`.
+A search that fails prints no rows for that section.
+The exit status is 0 with a store and 1 without one.
+
+### sessions
+
+`sessions` lists stored sessions with their turn counts.
+
+```text
+ID 4 turns
+3 sessions in the store.
+```
+
+The exit status is 0 with a store and 1 without one.
+
+### usage
+
+`usage` prints the token ledger in three grouped sections.
+
+```text
+by model
+  the ledger is empty.
+by channel
+  the ledger is empty.
+by day
+  the ledger is empty.
+```
+
+A non-empty section has a header row with the columns `input`, `output`, `cache read`, `cache write`, and `calls`, then one row per group.
+The grouping uses one query per section, so the report is the same for the shell and the webhook.
+The exit status is 0 with a store and 1 without one.
+
+### tasks
+
+`tasks` reads, adds, and removes work for the sleep-time agent.
+Options are `list [STATUS]`, `add TEXT`, and `rm ID`.
+`list` prints `ID (status) body` for each task.
+An empty queue prints `no tasks.`
+A status word filters the list, and the four statuses are `pending`, `running`, `done`, and `failed`.
+Any other status word prints `tasks list takes pending, running, done or failed.` and returns 2.
+
+`add` joins the remaining arguments and prints `task ID queued.`
+A missing text prints `tasks add needs the text of the task.` and returns 2.
+
+`rm` prints `task ID removed.` or `there is no task ID.`
+Both results return 0.
+A missing or non-numeric id prints `tasks rm needs the id of a task.` and returns 2.
+
+A bad action prints `tasks takes list, add or rm.` and returns 2.
 
 ## The live supervisor
 
-### `health`
+Three commands reach a running supervisor through the control file (see [Supervisor and heartbeat](supervisor.md)).
+`reload`, `channels`, and `heartbeat` append one request line to `run/enchiridion.control`.
+The supervisor polls that file once per second and writes its answer into `run/enchiridion.status`.
+The command waits up to five seconds for the answer.
 
-Reads the status file and reports whether a supervisor answers. It prints
-`supervisor pid PID, generation G.`, then the last report, then a heartbeat
-line, then one line per channel. The heartbeat line shows `on` or `off`, the
-tick count, the last tick time, and the last tick report. A tick that is still
-running adds the seconds since the tick started. With no fresh status file it
-prints `no supervisor is running.` and returns 1.
-
-### `reload`
-
-Asks the supervisor to verify and load the agent code again. The request goes
-to the control file, and the answer comes back in the status file. It prints
-the report, then `generation N.` A refused generation keeps the last good code
-and returns 1.
-
-### `channels`
-
-| Action         | What it prints                          |
-| -------------- | --------------------------------------- |
-| `list`         | Each supervised channel with its state. |
-| `enable NAME`  | `NAME is up.` or `NAME is already up.`  |
-| `disable NAME` | `NAME is down.`                         |
-
-A name that no channel matches prints `channel NAME is not implemented yet.`
-The request still returns 0. Any other action returns 2.
-
-### `heartbeat`
-
-| Action | What it prints                                               |
-| ------ | ------------------------------------------------------------ |
-| `on`   | `heartbeat on.`                                              |
-| `off`  | `heartbeat off.`                                             |
-| `run`  | A line that says the supervisor takes the tick or queues it. |
-
-`off` stops the schedule and not the operator, so `run` still asks for a tick.
-A process with no sleep agent attached answers with a refusal line, and the
-command still returns 0.
-
-## The installation
-
-### `check`
-
-Runs `nix --option eval-cache false run .#check` with a one hour timeout. It
-prints the combined output of the build. It returns 0 when the build passes,
-and 1 when the build fails or when `nix` is absent.
-
-### `version`
-
-Prints `enchiridion 0.1.0`. Then it finds the project root and prints `source`,
-`branch`, and `head` when it can. With no checkout above the directory, it
-prints one line that says so. It returns 0.
-
-### `secrets`
-
-Prints `NAME from SOURCE` for each loaded secret. The source is `env`, `file`,
-or `argument`. It never prints a value. With nothing loaded it prints
-`no secrets are loaded.` It returns 0.
-
-Then it prints one more line about the file the secrets came from:
+A status file counts as live for ten seconds and only while its `running` flag is true.
+Without a live supervisor, the command prints one line and returns 1 without writing a request:
 
 ```text
-secrets file /run/secrets/.env mode #o600 discarded
+reload: no supervisor is running, so nothing was asked.
 ```
 
-The line names the path, its permission bits in octal, and whether the file is
-still there. When this process loaded a file, the path is that file and the mode
-is the mode it had at the moment its values were read; both are remembered by the
-loader rather than looked up again, because the supervisor unlinks the container
-copy once its values are in memory. The last word is then `present` or
-`discarded`; `discarded` is the steady state in a container, and it is what
-guarantee 6 of the plan promises. When this process loaded no file, the path is
-the one the loader would have tried and the last word is `present` or `absent`.
-`unknown` stands in for the mode when there is none to report. A lone `no secrets
-are loaded.` still keeps the file line, because an operator running with no
-secrets at all is exactly the operator who needs to see which file the program
-looked for. The line carries no value.
+The line names the command first.
+`health` reads the status file only and does not send a request.
 
-### `help`
+### health
 
-Without an argument it prints every command name and summary, one row each.
-With a name it prints `NAME -- SUMMARY` and `  arguments: ARITY`. The arity
-text reads `no arguments`, `at least N arguments`, `exactly N arguments`, or
-`N to M arguments`. An unknown name returns 2.
+`health` reports the supervisor state.
 
-At the REPL the command name is printed as `/NAME`, the three REPL-only
-commands are appended to the list, `chat` and `serve` are left out, and the
-bare name and the slash form both resolve. In the REPL, `/help chat` and
-`/help serve` print one line that says the command is shell-only and return 2.
-At a shell, `enchiridion help chat` prints the detail as usual.
+```text
+supervisor pid 12345, generation 2.
+reload done, generation 2.
+heartbeat on, 7 ticks, last at 4001409114
+channel cli stopped
+channel http live
+```
 
-### `skills`
+The first line holds the pid and the generation.
+The next line is the last control report, when one exists.
+The heartbeat line holds the schedule state, the tick count, and the universal time of the last tick.
+A non-empty tick report is appended after a colon.
+A tick that is still running adds one line: `  a tick has been running for N second(s).`
+A channel line is `channel NAME STATE`.
 
-`list` prints every skill file with a number and its trigger line. A skill with
-no trigger shows only its name. `show NUMBER` prints the file text. A missing
-number returns 2, and a number past the end returns 1.
+Without a live supervisor the command prints `no supervisor is running.` and returns 1.
+With a live supervisor it returns 0.
 
-### `tools`
+### reload
 
-`list` prints every registered tool as `NAME TOKENS tokens - DESCRIPTION`,
-where the token count is the cost of the schema. `show NAME` prints the schema
-as JSON. A missing name returns 2, and an unknown tool returns 1.
+`reload` asks the supervisor to verify and load the agent code again.
+
+```text
+reload done, generation 2.
+generation 2.
+```
+
+The first line is the supervisor report.
+The second line is the generation the status file now names.
+A refused generation keeps the last good code serving and returns 1:
+
+```text
+reload refused: broken self-test returned NIL
+```
+
+A supervisor that answers returns 0 on a successful reload.
+A command with no supervisor returns 1.
+
+### channels
+
+`channels` lists, enables, or disables a supervised channel.
+Options are `list`, `enable NAME`, and `disable NAME`.
+
+```text
+cli stopped, http live
+generation 1.
+```
+
+`list` prints every supervised channel with its state, separated by commas.
+`enable NAME` prints `NAME is up.` or `NAME is already up.`
+`disable NAME` prints `NAME is down.`
+
+A name that matches no channel prints `channel NAME is not implemented yet.`
+The request is still answered, so the command returns 0.
+Only the channels the supervisor built can start.
+The process builds an `http` or `fluxer` channel when the configuration enables it or a `--channel` flag names it.
+A channel disabled at startup therefore has no object to start.
+
+A missing name produces the supervisor report `which channel?` and returns 0.
+A bad action prints `channels takes list, enable NAME or disable NAME.` and returns 2.
+
+### heartbeat
+
+`heartbeat` turns the sleep schedule on or off, or asks for one tick.
+Options are `on`, `off`, and `run`, and `on` is the default.
+`on` prints `heartbeat on.`
+`off` prints `heartbeat off.`
+A process with no sleep agent attached answers `heartbeat on, but no sleep agent is attached to this process.` to `on`, and returns 0.
+
+`run` asks for one tick and answers at once.
+The report is `heartbeat tick requested; the answer lands in the status file.`
+A request during a tick answers `a tick is running; one more is queued and the answer lands in the status file.`
+With no sleep agent attached it answers `no sleep agent is attached to this process.`
+
+`off` stops the schedule and not the operator, so `run` still forces a tick.
+A bad action prints `heartbeat takes on, off or run.` and returns 2.
+The command returns 0 when the supervisor answers and 1 when none answers.
 
 ## The REPL
 
-The prompt is `enchiridion> `. A line that starts with `/` is a command, and
-the rest of the line is the argument list. The REPL folds the command name to
-lower case.
+`chat` starts the REPL.
+The prompt is `enchiridion> `.
 
-| Line    | What it does                                                                                                                                                       |
-| ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `/help` | Prints the command list in its slash form, with the REPL-only commands and without `chat` and `serve`.                                                              |
-| `/stop` | Asks the turn in flight to stop. It prints `cancellation requested.` and returns 0. Without a cancel function it prints `there is no turn to stop.` and returns 1. |
-| `/quit` | Leaves the session. `run-repl` returns `:quit`.                                                                                                                    |
-| `/who`  | Prints the attached channel and the supervisor state, then returns 0.                                                                                              |
+| Line     | Behavior                                                                                                    |
+| -------- | ----------------------------------------------------------------------------------------------------------- |
+| `/help`  | Print the command list in slash form, with the REPL-only commands and without `chat` and `serve`.            |
+| `/stop`  | Ask the turn in flight to stop. Print `cancellation requested.` and return 0, or `there is no turn to stop.` and return 1. |
+| `/quit`  | Leave the session.                                                                                          |
+| `/who`   | Print the attached channel and the supervisor state, then return 0.                                          |
+| other `/NAME ARGS` | Run the command table row NAME.                                                                  |
+| any other line | Send the line to the agent as one turn.                                                              |
 
-`stop`, `quit`, and `who` are REPL-only, because they act on the live turn. The
-other commands are the table above, and the REPL calls the same handler the
-shell calls. A REPL-only name needs the slash. A lone word that names a REPL
-command, `quit` and `help` among them, prints
-``Commands start with a slash: try `/NAME`.``, where NAME is the word that was
-typed, and does not reach the agent. `chat` and `serve` are shell-only, so a
-lone `chat` is an ordinary turn.
+An empty line does nothing.
+An end of input leaves the loop.
+A slash command that fails prints its line and the loop continues.
+The REPL ignores every command status except the request to quit.
 
-An empty line does nothing. A line that names no command prints the
-unknown-command line, and the REPL reads the next one. `run-repl` ignores the
-status of every command except `/quit`. An end of input leaves the loop, and
-`run-repl` returns `:eof`.
+A line with no slash is a turn, with one exception.
+A single word that names a REPL command prints:
 
-Ctrl-C does not leave the session. It aborts the line being typed, or the turn
-being answered, prints `interrupted.`, and the prompt comes back. `/stop` is the
-cooperative version of the same request: it asks the turn in flight to stop and
-lets it report the cancellation.
-
-Ctrl-C, SIGTERM, and SIGHUP share one handler at the top level: the throw
-unwinds through every open context, so a `serve` process stops its channels and
-writes its last status, a chat process stops its supervisor, and the exit status
-is 130. That is why `docker stop` and a closed terminal end the container
-cleanly rather than in the middle of a write. The REPL is the one difference: it
-answers SIGINT itself, by aborting the line, and declines SIGTERM and SIGHUP, so
-those two leave the session instead of interrupting it.
-
-There is no `exit` command. A shell call with the name `exit` prints the
-unknown-command line and returns 2. Use `/quit` or an end of input.
-
-## The `--verify-plugin` flag
-
-```sh
-nix run .#enchiridion -- --verify-plugin agents/default/
+```text
+Commands start with a slash: try `/help`.
 ```
 
-The flag takes one directory. It verifies the directory in a child process at
-uid 1000, and it prints the report. It returns 0 when the directory verifies, 1
-when the verification fails, and 2 when the directory argument is absent. The
-program reads the flag before the command table, so the flag is not a command
-row. See [Plugins and self-modification](plugins.md).
+The command name appears in the message, lowercased, and the REPL sends no turn.
+Two or more words are always a turn.
 
-## Related
+`/who` prints the channel and the supervisor state:
 
-- [Getting started](getting-started.md)
-- [Configuration](configuration.md)
-- [Supervisor and heartbeat](supervisor.md)
-- [Channels](channels.md)
-- [Memory](memory.md)
-- [Tools](tools.md)
-- [Plugins and self-modification](plugins.md)
+```text
+channel cli is attached to this command context.
+supervisor generation 1
+```
+
+The generation line prints only while a supervisor answers.
+With no live supervisor it prints `no supervisor is running.`
+
+`/quit` and an end of input leave an ordinary session.
+A signal also ends the process (see [Signals](#signals)).
+There is no `exit` command.
+A shell call with the name `exit` prints the unknown-command line and returns 2.
+
+Ctrl-C does not leave the session.
+It aborts the line being read or the turn being answered, prints `interrupted.`, and returns to the prompt.
+`/stop` is the cooperative form of the same request for a running turn.
+
+## Signals
+
+One handler at the top level answers Ctrl-C, SIGTERM, and SIGHUP.
+It prints one line to standard error and returns 130:
+
+```text
+enchiridion: interrupted.
+```
+
+The throw unwinds through every cleanup form.
+`serve` stops its channels and writes a last status file.
+`chat` stops its supervisor.
+`ask` closes its context and store.
+A closed terminal and `docker stop` therefore stop the process cleanly (see [Deployment](deployment.md)).
+
+The REPL is the one difference.
+It answers Ctrl-C itself, by aborting the line or the turn, and declines SIGTERM and SIGHUP.
+Those two leave the session and reach the top level, which returns 130.
+
+## Plugin verification
+
+`--verify-plugin` verifies a directory of agent files and exits.
+The flag takes one directory.
+It is read before the command table, so it is not a command row.
+A missing directory prints `--verify-plugin takes a directory.` and returns 2.
+
+Verification runs in a separate child process, so a file that kills the compiler cannot take the running generation with it.
+The child drops to a user identifier (uid) of 1000 before it reads one agent file when the parent runs as root.
+It compiles and loads every Lisp file under `skills/` and `tools/`, collects every warning, and runs every plugin self-test.
+The report goes to standard output.
+
+```text
+2 files compiled, 2 self-tests ran
+```
+
+A failure prints the reason lines and returns 1:
+
+```text
+broken self-test returned NIL
+warned.cl: IGNORE declaration for an unknown variable: Y
+```
+
+Success returns 0, and a compile error, a warning, and a self-test that returns `nil` are all failures.
+
+The child is selected by `ENCHIRIDION_SBCL`.
+Without the variable the harness tries `sbcl`, and a source run must set the variable and give the child a writable compiled-file cache.
+The packaged wrapper sets the variable.
+[Plugins and self-modification](plugins.md) covers verification and the generation.
+
+## Troubleshooting
+
+| Symptom                                                              | Cause                                                                 | Fix                                                                  |
+| -------------------------------------------------------------------- | --------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `There is no command called NAME.`                                   | The name is not in the table, or a flag reached the table as a name    | Run `help`, and put flags before the command                         |
+| `COMMAND takes ARGUMENTS; got N.`                                    | The call is outside the row's argument range                          | Run `help COMMAND` for the range                                     |
+| `COMMAND needs the memory store, and none is open in this process.`  | The store did not open                                                | Set `:memory :db` to a writable path (see [Configuration](configuration.md)) |
+| `COMMAND: no supervisor is running, so nothing was asked.`           | No live supervisor answers the control file                           | Start `serve` in another terminal                                    |
+| `channel NAME is not implemented yet.`                               | The supervisor did not build that channel                             | Enable the channel in the configuration, or pass `--channel NAME`    |
+| `The broker did not start before the timeout.`                       | The child Lisp is missing, or its cache directory is not writable     | Run from `nix develop`, and set `ENCHIRIDION_SBCL` to the SBCL path  |
+| `--verify-plugin` reports a failure                                  | An agent file warns, fails to compile, or fails its self-test         | Correct the file, then verify again                                  |
+| `enchiridion: stdin is not a terminal, so the cli channel stays down.`| `serve` supervises the terminal channel without a terminal            | Run `serve` in a terminal, or use another channel                    |
+
+## See also
+
+- [Getting started](getting-started.md): the first launch and the first session.
+- [Configuration](configuration.md): the keys the commands read and the flag precedence.
+- [Supervisor and heartbeat](supervisor.md): the control file, the status file, and the tick.
+- [Channels](channels.md): the terminal, webhook, and Fluxer channels.
+- [Plugins and self-modification](plugins.md): generations, verification, and the broker.

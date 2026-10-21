@@ -1,49 +1,45 @@
 # enchiridion
 
-an autonomous agent harness with a strange memory model
+enchiridion is an autonomous agent harness with a strange memory model
+
+## Requirements
+
+- UNIX box
+- Nix, Docker or SBCL knowledge for any other way
 
 ## Build and test
 
 ```sh
-nix run .#check                 # compile
-nix run .#test                  # run the test suite
-nix run .#enchiridion -- help   # list the commands
+nix develop         # devshell
+nix run .#check     # compile with SBCL
+nix run .#test      # run test suite
 ```
 
 ## Run
 
+To create an agent, run the program without any arguments and then modify the agent's files if needed.
+
 ### Nix
 
 ```sh
-nix run .#enchiridion                  # write the agent files on the first launch
-nix run .#enchiridion -- chat          # the terminal REPL
-nix run .#enchiridion -- ask "..."     # ask a question
-nix run .#enchiridion -- serve         # start the agent supervisor
+nix run .#enchiridion                  # create agent
+nix run .#enchiridion -- chat          # start a quick chat
+nix run .#enchiridion -- ask "..."     # ask something
+nix run .#enchiridion -- serve         # start the supervisor and its channels
+nix run .#enchiridion -- help          # more commands
 ```
 
 ### Docker
 
 ```sh
-docker compose build                   # build the image from docker/Dockerfile
-docker compose up -d                   # start the supervisor
+docker compose build
+docker compose up -d
 ```
 
 ## Documentation
 
-- [Documentation index](docs/index.md)
-- [Getting started](docs/getting-started.md)
-- [Configuration](docs/configuration.md)
-- [Commands](docs/commands.md)
-- [Channels](docs/channels.md)
-- [Supervisor and heartbeat](docs/supervisor.md)
-- [Memory](docs/memory.md)
-- [Models and secrets](docs/llm.md)
-- [Tools](docs/tools.md)
-- [Plugins and self-modification](docs/plugins.md)
-- [Deployment](docs/deployment.md)
-- [Testing](docs/testing.md)
-- [Development](docs/development.md)
+Start with [the getting started page](docs/getting-started.md) or the [documentation index](docs/index.md).
 
 ## License
 
-0BSD
+BSD Zero Clause License

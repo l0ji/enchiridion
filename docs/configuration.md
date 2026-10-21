@@ -1,29 +1,46 @@
 # Configuration
 
-enchiridion reads one configuration file, `config.cl`. The file holds paths and
-behavior only. It never holds a secret value. The tracked template
-`config.example.cl` shows the format, and the operator copies that template to
-`config.cl`. The program loads the file at start up and makes the value active
-for the life of the process. When `config.cl` is absent, the program starts on
-the defaults and needs no file at all.
+The harness reads one Lisp file for paths and behavior, and the environment for credentials.
+The chapter gives the location and shape of that file and every section and key with its default.
+It also gives the provider rows and the order in which the file, the environment, and a command-line flag decide a value.
+After it, an operator can select a provider, enable channels, and cap unattended spend without writing a secret value.
 
-## Where the program reads the file
+## The configuration model
 
-The reader tries two places, in order:
+The file is `config.cl`.
+The harness loads it with the Lisp `load` function before any command runs, so treat the file as code.
+The load defines `enchiridion.user::*enchiridion-config*`, and that value becomes the active configuration for the life of the process.
+An absent file, or a file that binds no variable, is not an error: the harness starts on the shipped defaults.
+
+The file holds paths and behavior only.
+A secret value belongs in `.env` or the process environment, and the file names the variable that holds it.
+
+`config-lookup` asks the active configuration first and the shipped defaults second, key by key.
+`config-value` reads the active configuration only, so a sectioned file that omits a key does not inherit the shipped value.
+A file that names two keys does not blank out the others.
+
+`config.cl` is gitignored, and the tracked `config.example.cl` is the template and the only committed copy of the format.
+
+## Locate the file
+
+The reader tries two paths, in order:
 
 1. `<current directory>/config.cl`
 2. `<project root>/config.cl`
 
-The current directory wins, because a checkout keeps `config.cl` beside the
-code. Without `ENCHIRIDION_SOURCE`, the project root is the nearest directory
-above the current one that holds `enchiridion.asd`.
+The project root is `ENCHIRIDION_SOURCE`, or the nearest directory at or above the current one that holds `enchiridion.asd`.
 
-`read-config` loads the file with the Lisp `load` function. Then it reads the
-variable `enchiridion.user:*enchiridion-config*`. The file must set that
-variable in the package `enchiridion.user`. An absent file, or a file that
-binds no variable, means the defaults. That case is not an error.
+Create the file from the template:
 
-A small file that names two keys:
+```sh
+cp config.example.cl config.cl
+```
+
+A file with a read error stops startup before any command runs.
+
+## Shape
+
+A sectioned configuration is a list of section keywords and `(key value)` entries until the next section keyword.
 
 ```lisp
 (in-package #:enchiridion.user)
@@ -32,317 +49,283 @@ A small file that names two keys:
   '(:llm
     (:provider :opencode)
     (:model-primary "deepseek-v4.1-flash")
-    (:api-key-env "OPENCODE_API_KEY")
-
     :channels
-    (:http (:enabled t))
-    (:fluxer (:enabled nil))))
+    (:http (:enabled nil) (:port 8787))))
 ```
 
-## The two shapes
+| Section     | Holds                                                              |
+| ----------- | ------------------------------------------------------------------ |
+| `:llm`      | Provider selection, model tiers, catalog settings, cloud placement |
+| `:channels` | One entry per channel                                              |
+| `:budget`   | Token caps for unattended work                                     |
+| `:sandbox`  | Agent user id and `/proc` hiding                                   |
+| `:memory`   | Memory store path and block limits                                 |
+| `:sleep`    | Sleep-time agent switch and interval                               |
 
-The reader accepts two shapes:
+A flat property list is also accepted, and the sectioned shape wins when both could match.
+Two readers exist: `config-value` reads the `:llm` section then a flat list, and `config-section-value` reads one named section.
 
-- The sectioned shape from `config.example.cl`. A section keyword comes first,
-  then a list of `(key value)` entries.
-- A flat property list. The tests and a small file use that shape.
+A key that belongs outside `:llm` and is read through `config-value` returns the given default in silence.
+Write every key in the section that owns it.
 
-The sectioned shape wins when both shapes could match. The top-level sections
-are `:llm`, `:channels`, `:budget`, `:sandbox`, `:memory`, and `:sleep`.
+Unknown keys are ignored, and values are not type-checked at load.
+A reader that needs a number falls back to its default or refuses the value when it uses it.
 
-Two readers exist, and the two are not interchangeable:
+## The :llm section
 
-- `config-value` reads the `:llm` section, then a flat list.
-- `config-section-value` reads one named section.
+| Key                                                        | Type                                    | Default                         | Meaning                                                                                                               |
+| ---------------------------------------------------------- | --------------------------------------- | ------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `:provider`                                                | keyword or string                       | `:openai`                       | Provider id to select, or `:custom`. A name that resolves to nothing is a configuration error.                        |
+| `:backend`                                                 | keyword                                 | `:openai`                       | Wire protocol and matching provider row. `:openai`, `:anthropic`, or a registered adapter id.                         |
+| `:base-url`                                                | string or `nil`                         | `nil`                           | Endpoint override. `nil` takes the provider row's endpoint.                                                           |
+| `:model-primary`                                           | string                                  | `"deepseek-v4.1-flash"`         | Model for reasoning turns.                                                                                            |
+| `:model-cheap`                                             | string                                  | `"deepseek-v4.1-flash"`         | Model for memory digests and compaction.                                                                              |
+| `:model-sleep`                                             | string                                  | `"deepseek-v4.1-flash"`         | Model for the sleep-time agent.                                                                                       |
+| `:api-key-env`                                             | string or `nil`                         | `nil`                           | Variable that holds the provider key. `nil` lets the provider row decide.                                             |
+| `:max-tokens`                                              | integer                                 | `4096`                          | Reply cap for one request. The dialect names the field.                                                               |
+| `:providers`                                               | list of rows                            | three shipped rows              | Define or override providers by id.                                                                                   |
+| `:models`                                                  | list of strings                         | `nil`                           | Static model list for `:provider :custom`.                                                                            |
+| `:providers-url`                                           | string                                  | `"https://models.dev/api.json"` | Source of the runtime provider catalog.                                                                               |
+| `:providers-ttl-seconds`                                   | integer                                 | `86400`                         | Age at which the cached provider index is stale.                                                                      |
+| `:models-ttl-seconds`                                      | integer                                 | `86400`                         | Age at which one provider's cached model list is stale.                                                               |
+| `:offline`                                                 | boolean                                 | `nil`                           | `t` stops the start-up catalog and model-list fetches. Explicit `providers refresh` and `providers models` still run. |
+| `:region`                                                  | string or `nil`                         | `nil`                           | Amazon Bedrock region.                                                                                                |
+| `:project`                                                 | string or `nil`                         | `nil`                           | Google Vertex project.                                                                                                |
+| `:location`                                                | string or `nil`                         | `nil`                           | Google Vertex location.                                                                                               |
+| `:headers`                                                 | list of pairs or `nil`                  | `nil`                           | Extra request headers for the selected provider.                                                                      |
+| `:query-params`                                            | list of pairs or `nil`                  | `nil`                           | Extra query parameters for the selected provider.                                                                     |
+| `:profile`                                                 | keyword or `nil`                        | `nil`                           | Quirk profile for the selected provider.                                                                              |
+| `:cache-p`, `:cache-ttl`, `:betas`, `:timeout`, `:retries` | boolean, string, list, integer, integer | `nil`                           | Per-provider request options. `nil` takes the handler default.                                                        |
 
-A key outside `:llm` that goes through `config-value` returns the default in
-silence. The program uses `config-section-value` for the budget caps, the sleep
-interval, the heartbeat flag, and the agent uid.
-
-## The `:llm` section
-
-| Key              | Type              | Default                 | Effect                                                                             |
-| ---------------- | ----------------- | ----------------------- | ---------------------------------------------------------------------------------- |
-| `:provider`      | keyword or string | `:openai`               | Select a provider. Any shipped, catalog or `:providers` id, or `:custom`. A value that names nothing is a configuration error, not a fallback. |
-| `:backend`       | keyword           | `:openai`               | Override the wire protocol: `:openai` or `:anthropic`.                             |
-| `:base-url`      | string or `nil`   | `nil`                   | Set the endpoint. The backend adds a trailing slash when the value has none.       |
-| `:model-primary` | string            | `"deepseek-v4.1-flash"` | Set the model for reasoning turns.                                                 |
-| `:model-cheap`   | string            | `"deepseek-v4.1-flash"` | Set the model for memory digests and compaction.                                   |
-| `:model-sleep`   | string            | `"deepseek-v4.1-flash"` | Set the model for the sleep agent.                                                 |
-| `:api-key-env`   | string or `nil`   | `nil`                   | Name the variable that holds the API key. `nil` means the provider row decides.     |
-| `:max-tokens`    | integer           | `4096`                  | Cap one reply on the Messages API. The OpenAI-shaped wire ignores this key.        |
-| `:providers`     | list of rows      | three shipped rows      | Define or override providers by id. See below.                                     |
-| `:providers-url` | string            | `https://models.dev/api.json` | Where the runtime provider catalog is fetched from.                          |
-| `:providers-ttl-seconds` | integer   | `86400`                 | How long the cached provider index stays fresh. It is compared at start up against the cache's age. |
-| `:models-ttl-seconds`    | integer   | `86400`                 | How long one provider's cached model list stays fresh.                             |
-| `:offline`       | boolean           | `nil`                   | `t` stops every start-up fetch, the model list included. `providers refresh` and `providers models ID` still run when asked. |
-| `:region`        | string or `nil`   | `nil`                   | Bedrock region; `AWS_REGION` or `AWS_DEFAULT_REGION` is used when this is nil.      |
-| `:project`       | string or `nil`   | `nil`                   | Vertex project; `GOOGLE_VERTEX_PROJECT` is used when this is nil.                  |
-| `:location`      | string or `nil`   | `nil`                   | Vertex location; `GOOGLE_VERTEX_LOCATION` is used when this is nil.                |
-| `:headers`       | alist             | `nil`                   | Extra request headers for the selected provider.                                   |
-| `:query-params`  | alist             | `nil`                   | Extra query parameters for the selected provider.                                  |
-| `:profile`       | keyword           | `nil`                   | Force a quirk profile for the selected provider.                                   |
-
-Each model tier starts equal to the cheap model. The key to raise for a
-stronger turn is `:model-primary`.
-
-The keys `:providers-ttl-seconds`, `:models-ttl-seconds`, `:offline`,
-`:headers`, `:query-params` and `:profile` are not specific to
-`:provider :custom`: each one works for whichever provider is selected.
-`:headers`, `:query-params` and `:profile` are merged into the selected
-provider's row, and a value written in the row wins over the top-level one.
+`:headers`, `:query-params`, and `:profile` apply to whichever provider is selected.
+A value written in the row wins over the top-level value.
+A header may be written `("Name" "value")` or `("Name" . "value")`, and both reach the wire identically.
 
 ### Provider rows
 
-Provider knowledge is generated at run time from models.dev and cached under
-`run/`; nothing about a provider is committed to the tree except the three rows
-in `config.cl` (`:openai`, `:opencode`, `:anthropic`), which ship as
-configuration defaults so the default path needs no catalog and no network. A
-row defines or overrides one provider, and a row has the same shape wherever it
-is written, so the three shipped rows and an operator's row cannot drift apart.
+A row defines or overrides one provider.
+A shipped row, a catalog row, and an operator row all use this shape.
 
-```lisp
-(:provider :my-llm)
-(:providers
- ((:id my-llm :name "My LLM" :api :openai-chat :profile :openai
-   :base-url "https://llm.internal/v1/"
-   :api-key-env "MY_LLM_KEY"
-   :headers (("X-Tenant" "acme"))
-   :models ("m-1" "m-2"))
-  ;; Override the catalog's row for a provider it knows.
-  (:id deepseek :api-key-env "DEEPSEEK_KEY")
-  ;; Amazon Bedrock and Google Vertex.
-  (:id amazon-bedrock :api :bedrock-invoke :profile :bedrock-invoke
-   :region "us-east-1")
-  (:id google-vertex-anthropic :api :vertex-anthropic :profile :vertex
-   :project "my-project" :location "us-east5")))
-```
+| Row key                                                                                          | Type              | Meaning                                                                                                                 |
+| ------------------------------------------------------------------------------------------------ | ----------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `:id`                                                                                            | keyword or string | Provider identifier. Required.                                                                                          |
+| `:name`                                                                                          | string            | Display name.                                                                                                           |
+| `:api`                                                                                           | keyword           | Wire handler, as `:openai-chat`, `:anthropic-messages`, `:bedrock-invoke`, `:bedrock-messages`, or `:vertex-anthropic`. |
+| `:profile`                                                                                       | keyword           | Quirk profile.                                                                                                          |
+| `:base-url`                                                                                      | string            | Endpoint.                                                                                                               |
+| `:api-key-env`                                                                                   | string or list    | Variable name, or names, that hold the credential.                                                                      |
+| `:model`, `:default-model`                                                                       | string            | The provider model and its fallback.                                                                                    |
+| `:models`                                                                                        | list of strings   | Static model list for an endpoint that cannot be asked.                                                                 |
+| `:headers`, `:query-params`                                                                      | list of pairs     | Extra headers and query parameters.                                                                                     |
+| `:region`, `:project`, `:location`                                                               | string            | Cloud placement for Bedrock and Vertex.                                                                                 |
+| `:max-tokens`, `:models-ttl-seconds`, `:cache-p`, `:cache-ttl`, `:betas`, `:timeout`, `:retries` | mixed             | Per-provider request options; `llm.md` lists them.                                                                      |
 
-| Row key        | Type              | Effect                                                                    |
-| -------------- | ----------------- | ------------------------------------------------------------------------- |
-| `:id`          | keyword or string | The provider id. Required.                                                |
-| `:name`        | string            | Display name.                                                             |
-| `:api`         | keyword           | The handler: `:openai-chat`, `:anthropic-messages`, `:bedrock-invoke`, `:bedrock-messages`, `:vertex-anthropic`. |
-| `:profile`     | keyword           | The quirk profile. See [Models and secrets](llm.md).                       |
-| `:base-url`    | string            | The endpoint.                                                             |
-| `:api-key-env` | string or list    | The variable name, or names, that hold the credential.                    |
-| `:model`       | string            | The default model for this provider.                                      |
-| `:models`      | list of strings   | A static model list, when the endpoint cannot be asked.                   |
-| `:headers`, `:query-params` | alist  | Extra headers and query parameters. A header may be written `("Name" "value")` or `("Name" . "value")`; both reach the wire identically. |
-| `:region`, `:project`, `:location` | string | Cloud placement for Bedrock and Vertex.                            |
+An individual quirk may be overridden on the row with `:auth-scheme`, `:auth-header`, `:chat-path`, `:models-path`, `:max-tokens-field`, `:system-role`, or `:reasoning-field`.
+[Large language model backends](llm.md) lists the handlers, the profiles, and the quirks.
 
-An individual quirk may also be overridden directly on the row: `:auth-scheme`,
-`:auth-header`, `:chat-path`, `:models-path`, `:max-tokens-field`,
-`:system-role`, `:reasoning-field`.
+An operator row overrides the shipped row and the catalog row field by field, and a new `:id` adds one.
+A row without `:id` is a configuration error, because a row that names no provider overrides nothing.
+`config.example.cl` carries a full `:providers` example.
 
-`:provider :custom` is the generic case: a provider with no preset at all, built
-from the top-level `:llm` keys (`:backend`, `:base-url`, `:api-key-env`,
-`:headers`, `:query-params`, `:model-*`). `:base-url` is required.
+`:provider :custom` builds a row from the top-level `:llm` keys with no preset and no catalog entry.
+`:base-url` is required for `:custom`.
+
+### Shipped providers
+
+Three rows ship as configuration defaults, so the default path works with no catalog cached and no network.
+
+| Id           | Name        | Profile      | Base URL                        | Default model         | Key variable        |
+| ------------ | ----------- | ------------ | ------------------------------- | --------------------- | ------------------- |
+| `:openai`    | OpenAI      | `:openai`    | `https://api.openai.com/v1/`    | `gpt-5.6-luna`        | `OPENAI_API_KEY`    |
+| `:opencode`  | OpenCode Go | `:openai`    | `https://opencode.ai/zen/go/v1` | `deepseek-v4.1-flash` | `OPENCODE_API_KEY`  |
+| `:anthropic` | Anthropic   | `:anthropic` | `https://api.anthropic.com/`    | `claude-sonnet-5-5`   | `ANTHROPIC_API_KEY` |
+
+Provider knowledge beyond those rows comes from the runtime catalog, generated from `https://models.dev/api.json` and cached under `run/` (see [Large language model backends](llm.md)).
 
 ### Provider selection
 
-`detect-provider` reads the keys in this order:
+An explicit `:provider` wins.
+Without one, detection uses a recognized `:base-url` host, then the key variables `OPENAI_API_KEY`, `OPENCODE_API_KEY`, `ANTHROPIC_API_KEY`, the one cached provider whose variable is present, then OpenAI.
+The shipped default is `:provider :openai`, so a process with no `config.cl` always uses OpenAI.
+Two exported keys need an explicit `:provider` or `:base-url`.
+[Large language model backends](llm.md) lists the complete order.
 
-1. An explicit `:provider`. A value that names nothing is a configuration error:
-   it says to run `providers refresh` or to add a `:providers` row. It does not
-   fall through to base-URL detection.
-2. A recognized `:base-url`. `opencode.ai`, `api.anthropic.com` and
-   `api.openai.com` are matched first; then any provider in the cached catalog
-   whose `api` host matches.
-3. An `OPENAI_API_KEY` in the environment or in `.env`.
-4. An `OPENCODE_API_KEY`, then an `ANTHROPIC_API_KEY`.
-5. Exactly one provider in the cached catalog whose `env` variable is present.
-6. Otherwise `:openai`. OpenAI wins a tie, because OpenAI is the default.
+An explicit `:provider` that names nothing is a configuration error, and the error names `enchiridion providers refresh` and a row under `:providers`.
 
-A local OpenAI-compatible server matches none of the hosts in step 2, so its
-`:base-url` is used as written and the key variable comes from the later steps.
-An explicit `:provider` that names nothing never reaches step 2: it stops the
-command with that error.
+An explicit `:api-key-env` names the variable for the selected provider, and without it the provider row names the variable (see [Secrets and .env](#secrets-and-env)).
 
-`default-api-key-env` returns `:api-key-env` when the file sets that key.
-Without it, the provider row decides. `provider-key-names` returns the
-configured name, every shipped and configured row's variables, the selected
-provider's variables, and the cached providers' credential-shaped variables; it
-deliberately leaves out names such as `AWS_ACCESS_KEY_ID` unless that provider
-is the one selected, because a name in this list is read from `.env` and then
-removed from the process environment.
+## The :channels section
 
-### The runtime catalog
+Every channel has one entry under `:channels`, and the entry merges over the shipped entry key by key.
+An entry holds `(key value)` pairs, an explicit `nil` wins, and a channel with no entry is disabled.
 
-Provider knowledge comes from [models.dev](https://models.dev) at run time and
-is cached under `run/`, never in the tree apart from the three rows in
-`config.cl` that ship as configuration defaults. `enchiridion providers refresh`
-fetches and rewrites the cache by hand. The commands that run a turn (`ask`,
-`chat`, `serve`) also refresh it at context build, once per process: the cached
-provider index when it is missing or older than `:providers-ttl-seconds`, and
-the selected provider's model list when a key is present and its cache is older
-than `:models-ttl-seconds`. Inspection commands (`help`, `version`, `secrets`,
-`providers list`, `tools`, …) never fetch and never write a cache.
-`:providers-url` changes the source. `:offline t` stops every start-up fetch,
-the model list included, while `providers refresh` and `providers models ID`
-still run because the operator asked for them. Every failure is one warning
-line: a turn still runs on the shipped rows and the configured models.
+### The :cli entry
 
-### Backend selection
+| Key        | Type    | Default | Meaning                                                                                     |
+| ---------- | ------- | ------- | ------------------------------------------------------------------------------------------- |
+| `:enabled` | boolean | `t`     | Enabled state that the status file reports. `serve` builds the terminal channel regardless. |
 
-`resolve-backend` reads `:backend`, `:base-url`, `:model-primary`,
-`:api-key-env`, and `:max-tokens`, then asks the provider row for its handler.
-An explicit `:base-url` or `:model-primary` wins over the row.
+`serve` supervises the terminal channel, which runs the interactive session when a terminal is attached.
+A process with no terminal keeps it down and prints one line (see [Channels](channels.md)).
 
-Two handlers cover every vendor that speaks one of the two shared schemas: the
-chat-completions handler (`:openai`) and the Messages handler (`:anthropic`).
-Two more cover APIs only one cloud offers: `:bedrock-invoke` and
-`:bedrock-messages` for Amazon Bedrock, and `:vertex-anthropic` for Claude on
-Google Vertex. `:backend :anthropic` selects the Anthropic request shape and the
-`:anthropic` row together, so an OpenAI key in the environment cannot pair the
-Anthropic endpoint with a chat-completions request. `:provider :anthropic` with
-no `:backend` does the same.
+### The :http entry
 
-Any other value stops the command with a configuration error at `:backend`, and
-the error names the value. `:max-tokens` caps one Anthropic reply; it is not
-derived from the budget, which caps what a day may spend.
+| Key               | Type            | Default                    | Meaning                                                  |
+| ----------------- | --------------- | -------------------------- | -------------------------------------------------------- |
+| `:enabled`        | boolean         | `nil`                      | Start the webhook.                                       |
+| `:bind`           | string          | `"127.0.0.1"`              | Bind address.                                            |
+| `:port`           | integer         | `8787`                     | Port.                                                    |
+| `:token`          | string or `nil` | `nil`                      | Literal bearer token, for a loopback bind and for tests. |
+| `:token-env`      | string          | `"ENCHIRIDION_HTTP_TOKEN"` | Variable that holds the bearer token.                    |
+| `:max-body-bytes` | integer         | `65536`                    | Request body bytes the webhook reads.                    |
 
-## The `:channels` section
+A bind address other than loopback requires a token, and the harness refuses to start without one.
+The literal `:token` is the one secret-shaped value the file can hold, and the harness registers it with the scrubber.
 
-Each channel has one entry under `:channels`. An entry holds `(key value)`
-pairs, and only the keys that channel understands belong in it.
+### The :fluxer entry
 
-`channel-config` merges the operator entry over the shipped entry, key by key.
-An entry with only `:enabled` keeps the default bind address and port. An
-explicit `nil` is a value and wins. A channel with no entry is disabled.
+| Key              | Type            | Default              | Meaning                                  |
+| ---------------- | --------------- | -------------------- | ---------------------------------------- |
+| `:enabled`       | boolean         | `nil`                | Start the Fluxer gateway channel.        |
+| `:allowed-users` | list of strings | `nil`                | User ids that may send a direct message. |
+| `:token-env`     | string          | `"FLUXER_BOT_TOKEN"` | Variable that holds the bot token.       |
 
-### `:cli`
+The channel is deny by default, and an empty or absent allowlist admits nobody (see [Channels](channels.md)).
 
-| Key        | Type    | Default | Effect                                                  |
-| ---------- | ------- | ------- | ------------------------------------------------------- |
-| `:enabled` | boolean | `t`     | Start the terminal channel. Only `serve` supervises it. |
+## The :budget section
 
-### `:http`
+| Key                    | Type    | Default  | Meaning                           |
+| ---------------------- | ------- | -------- | --------------------------------- |
+| `:max-tokens-per-tick` | integer | `4000`   | Token cap for one heartbeat tick. |
+| `:max-tokens-per-day`  | integer | `400000` | Token cap for one day.            |
 
-| Key               | Type            | Default                    | Effect                                                                         |
-| ----------------- | --------------- | -------------------------- | ------------------------------------------------------------------------------ |
-| `:enabled`        | boolean         | `nil`                      | Start the webhook.                                                             |
-| `:bind`           | string          | `"127.0.0.1"`              | Set the bind address.                                                          |
-| `:port`           | integer         | `8787`                     | Set the port.                                                                  |
-| `:token-env`      | string          | `"ENCHIRIDION_HTTP_TOKEN"` | Name the variable that holds the bearer token.                                 |
-| `:token`          | string or `nil` | `nil`                      | Set a literal bearer token. The program registers the value with the scrubber. |
-| `:max-body-bytes` | integer         | `65536`                    | Set the number of request body bytes the webhook reads.                        |
+The heartbeat starts no new phase once the spend reaches a cap, and a phase under way finishes.
+A sectioned file that omits a budget key leaves that cap unset.
+An unset cap is no cap, not a shipped default, because the reader takes the value it finds.
+Write both keys when the file has a `:budget` section (see [Supervisor and heartbeat](supervisor.md)).
 
-A bind address other than loopback needs a token. The process refuses to start
-without one. That check runs before the supervisor starts, so a bad flag costs
-one line and an exit status.
+## The :sandbox section
 
-The routes, the methods, and the reply shape live in [Channels](channels.md).
+| Key             | Type    | Default | Meaning                                              |
+| --------------- | ------- | ------- | ---------------------------------------------------- |
+| `:agent-uid`    | integer | `1000`  | User identifier (uid) for agent code and the broker. |
+| `:proc-hidepid` | integer | `2`     | Declared `/proc` hidepid value. No code reads it.    |
 
-### `:fluxer`
+The supervisor runs as root in the container deployment and holds the secrets.
+The broker and agent code drop to `:agent-uid`, which the harness passes to both the broker and plugin verification.
+No Lisp path reads `:proc-hidepid`, and the container entry point reads `ENCHIRIDION_HIDEPID` instead (see [Deployment](deployment.md)).
 
-| Key              | Type            | Default              | Effect                                           |
-| ---------------- | --------------- | -------------------- | ------------------------------------------------ |
-| `:enabled`       | boolean         | `nil`                | Start the Fluxer gateway channel.                |
-| `:allowed-users` | list of strings | `nil`                | Set the user ids that may send a direct message. |
-| `:token-env`     | string          | `"FLUXER_BOT_TOKEN"` | Name the variable that holds the bot token.      |
+## The :memory section
 
-Deny by default: an empty or absent allowlist means nobody may talk to the
-agent.
+| Key             | Type                              | Default                                                                        | Meaning                                                           |
+| --------------- | --------------------------------- | ------------------------------------------------------------------------------ | ----------------------------------------------------------------- |
+| `:db`           | string or `nil`                   | `nil`                                                                          | SQLite store path. `nil` selects `agents/default/memory.db`.      |
+| `:block-limits` | property list of label to integer | `:persona 1200`, `:operator 800`, `:world 1500`, `:session 400`, `:ledger 250` | Declared character limit for each memory block. No code reads it. |
 
-## The `:budget` section
+The store path can also be a pathname object, and the container deployment sets an absolute path on the state volume.
+No code reads the configured `:block-limits` value.
+The effective limits come from `*default-block-limits*` in the memory module, which also holds `:bootstrap` with a limit of 300.
+Raising a limit raises the fixed token cost of every prompt (see [Memory](memory.md)).
 
-| Key                    | Type    | Default  | Effect                                       |
-| ---------------------- | ------- | -------- | -------------------------------------------- |
-| `:max-tokens-per-tick` | integer | `4000`   | Cap the tokens one heartbeat tick may spend. |
-| `:max-tokens-per-day`  | integer | `400000` | Cap the tokens one day may spend.            |
+## The :sleep section
 
-The heartbeat starts no new phase when the spend reaches a cap. A phase
-already under way finishes. The program reads both keys with
-`config-section-value` and gives them to the agent at start up.
-
-## The `:sandbox` section
-
-| Key             | Type    | Default | Effect                                                                       |
-| --------------- | ------- | ------- | ---------------------------------------------------------------------------- |
-| `:agent-uid`    | integer | `1000`  | Set the uid for the broker and for agent code. The supervisor runs as uid 0. |
-| `:proc-hidepid` | integer | `2`     | Record the hidepid value for `/proc`.                                        |
-
-The harness reads `:agent-uid` and passes the value to the broker. The harness
-does not read `:proc-hidepid` and does not mount `/proc`. The deployment
-supplies that mount. See [Deployment](deployment.md).
-
-## The `:memory` section
-
-| Key             | Type                      | Default   | Effect                                                                             |
-| --------------- | ------------------------- | --------- | ---------------------------------------------------------------------------------- |
-| `:db`           | string or `nil`           | `nil`     | Set the SQLite store path. A `nil` value selects the store beside the agent files. |
-| `:block-limits` | plist of label to integer | see below | Record the character limit for each memory block.                                  |
-
-The default `:block-limits` plist holds `:persona 1200`, `:operator 800`,
-`:world 1500`, `:session 400`, and `:ledger 250`.
-
-The harness reads `:db` with `config-memory-db`. The block limits come from
-`*default-block-limits*` in the memory module, and no code reads the
-configured `:block-limits` value. The shipped limits match the values above.
-The shipped table also holds `:bootstrap 300`, a label with no configured
-entry. Raising a limit raises the fixed token cost of every prompt. See
-[Memory](memory.md).
-
-## The `:sleep` section
-
-| Key                 | Type    | Default | Effect                                            |
+| Key                 | Type    | Default | Meaning                                           |
 | ------------------- | ------- | ------- | ------------------------------------------------- |
 | `:enabled`          | boolean | `t`     | Start the heartbeat schedule with the supervisor. |
-| `:interval-seconds` | integer | `900`   | Set the seconds between sleep ticks.              |
+| `:interval-seconds` | integer | `900`   | Seconds between sleep ticks.                      |
 
-The supervisor reads `:enabled` as its heartbeat flag. `heartbeat-interval`
-reads `:interval-seconds`. A value that is not a positive whole number becomes
-900, because an interval of zero is a tick loop.
+The supervisor takes `:enabled` as its heartbeat flag.
+A value of `:interval-seconds` that is not a positive integer becomes 900 (see [Supervisor and heartbeat](supervisor.md)).
 
-## The environment and `.env`
+## Environment variables
 
-The `.env` file holds secret values. The configuration file holds the names of
-the variables instead. That rule keeps a secret out of a file that a person
-copies between hosts. The repository ignores `config.cl`. The tracked template
-is the only copy of the format.
+| Variable                     | Meaning                                                                                       |
+| ---------------------------- | --------------------------------------------------------------------------------------------- |
+| `ENCHIRIDION_HOME`           | Home root for `agents/default/` and `run/`. Defaults to the current directory.                |
+| `ENCHIRIDION_SOURCE`         | Project root for the second `config.cl` path and for `.env`.                                  |
+| `ENCHIRIDION_SBCL`           | Lisp implementation for the broker and for plugin verification. The packaged wrapper sets it. |
+| `ENCHIRIDION_PROVIDERS_PATH` | Path of the provider catalog cache, instead of `run/providers.json`.                          |
+| `OPENAI_API_KEY`             | OpenAI credential, unless `:api-key-env` names another variable.                              |
+| `OPENCODE_API_KEY`           | OpenCode Go credential.                                                                       |
+| `ANTHROPIC_API_KEY`          | Anthropic credential.                                                                         |
+| `ENCHIRIDION_HTTP_TOKEN`     | Webhook bearer token, unless the `:http` entry names another variable.                        |
+| `FLUXER_BOT_TOKEN`           | Fluxer bot token, unless the `:fluxer` entry names another variable.                          |
 
-| Variable                 | Effect                                                       |
-| ------------------------ | ------------------------------------------------------------ |
-| `ENCHIRIDION_HOME`       | Set the home root for the agent directory and `run/`.        |
-| `ENCHIRIDION_SOURCE`     | Set the project root for a copy with no checkout above it.   |
-| `ENCHIRIDION_SBCL`       | Set the SBCL binary the wrapper installed.                   |
-| `OPENAI_API_KEY`         | Hold the OpenAI key, when the file names this variable.      |
-| `OPENCODE_API_KEY`       | Hold the OpenCode Go key, when the file names this variable. |
-| `ANTHROPIC_API_KEY`      | Hold the Anthropic key, when the file names this variable.   |
-| `ENCHIRIDION_HTTP_TOKEN` | Hold the webhook bearer token by default.                    |
-| `FLUXER_BOT_TOKEN`       | Hold the Fluxer bot token by default.                        |
+A credential variable is removed from the process environment after the loader reads it.
 
-The program reads the secret file in this order:
+## Secrets and .env
 
-1. `/run/secrets/.env`, the container location.
-2. `<current directory>/.env`.
-3. `<project root>/.env`.
+The rule is one sentence: the file names the variable and the environment holds the value.
+A secret written into `config.cl` is a secret in a file that people copy between hosts.
 
-Then the loader reads every name the configuration names and every provider key
-variable `provider-key-names` returns, and the program removes each name from its
-own environment. A child process inherits nothing. The value stays in memory for
-the life of the process.
+The loader reads the first secret file that exists, in this order, and reports `<current directory>/.env` when none does:
 
-The scrubber replaces a loaded value with `[redacted]` in every text path. It
-also replaces known key shapes, such as a `Bearer` token or an `sk-` key. The
-literal filter ignores a value shorter than eight characters. A short value
-would redact most of the transcript. `secrets` prints the loaded names, their
-sources, the resolved file, its mode, and whether the file is still present; it
-never prints a value. A world-readable `.env` stops the supervisor at start up,
-and the container copy at `/run/secrets/.env` is unlinked once the values are in
-memory; a checkout `.env` is never deleted.
+1. `/run/secrets/.env`, the container location
+2. `<current directory>/.env`
+3. `<project root>/.env`
 
-A literal `:token` in the `:http` entry is the one secret-shaped value the
-file can hold. The template allows it for a loopback bind and for tests. The
-program registers that value with the scrubber.
+Before it reads one pair, the loader checks the mode, and a file with the world read bit set is refused with exit status 2:
 
-## Related
+```text
+Configuration is wrong at SECRETS.
+/path/to/checkout/.env is mode #o644 and every uid can read it.
+Run chmod 600 /path/to/checkout/.env.
+```
 
-- [Getting started](getting-started.md)
-- [Commands](commands.md)
-- [Models and secrets](llm.md)
-- [Channels](channels.md)
-- [Supervisor and heartbeat](supervisor.md)
-- [Memory](memory.md)
-- [Deployment](deployment.md)
+Use mode 600.
+A group-readable file passes, and so do an absent file and a mode that cannot be read.
+
+- The `.env` format is one `NAME=VALUE` pair per line.
+- A line that starts with `#` or `;`, a blank line, a line without `=`, and an empty name or value are skipped.
+- A leading `export ` is accepted, and matching single or double quotes around the value are removed.
+
+The loader reads every pair, then every variable name the configuration mentions and every provider key name from the process environment.
+
+After the load, the process removes every loaded name and every credential-shaped variable from its own environment.
+A child process inherits nothing, and a later read of `/proc` finds nothing, while the values stay in memory for the life of the process.
+
+The container copy at `/run/secrets/.env` is unlinked once its values are in memory, and the operator's checkout `.env` is never deleted.
+A read-only bind mount refuses the unlink, which is a supported deployment, and the process prints one warning and continues:
+
+```text
+enchiridion: could not unlink /run/secrets/.env; the secrets file is still on disk.
+```
+
+The scrubber replaces a loaded value of at least eight characters with `[redacted]`, and also known credential shapes and role-named fields.
+It runs on outbound text and on the status report fields.
+[Large language model backends](llm.md) covers the three filters.
+
+## Precedence
+
+The later columns run from the highest priority to the lowest.
+
+| Setting                              | First                             | Then                                  | Last                                   |
+| ------------------------------------ | --------------------------------- | ------------------------------------- | -------------------------------------- |
+| `config.cl` path                     | Current directory                 | Project root                          | Defaults, when neither exists          |
+| Budget caps                          | `config.cl` value                 | No cap when the section omits the key | Shipped cap when no `config.cl` exists |
+| `:http` entry key                    | `--bind`, `--port`, `--token-env` | `config.cl` entry                     | Shipped entry                          |
+| Channel start set (`http`, `fluxer`) | `--channel NAME`                  | `:enabled t` in the entry             | Channel not started                    |
+| Secret value                         | Process environment               | `.env` value                          | No value                               |
+| Provider                             | `:provider`                       | Recognized `:base-url` host           | Key present, then OpenAI               |
+| Cloud placement                      | Provider row value                | `:region`, `:project`, or `:location` | Environment variable                   |
+
+A command-line flag belongs to one process, overrides the loaded configuration for that invocation, and never writes the file.
+[Commands](commands.md) lists the flags and their validation.
+
+`:offline t` is not a precedence rule.
+It stops the start-up fetches without changing the configuration, and an explicit `providers refresh` or `providers models ID` still runs.
+
+## Troubleshooting
+
+| Symptom                                            | Cause                                                | Fix                                                              |
+| -------------------------------------------------- | ---------------------------------------------------- | ---------------------------------------------------------------- |
+| `Configuration is wrong at SECRETS.`               | The secret file is world readable                    | Run `chmod 600 .env`                                             |
+| Startup stops before any command runs              | `config.cl` has a reader error or an unbalanced form | Correct the form, then run the command again                     |
+| `No API key. Put NAME in .env or the environment.` | No credential was loaded for the selected provider   | Set `:api-key-env`, or put the provider row's variable in `.env` |
+
+## See also
+
+- [Getting started](getting-started.md): the first launch, the seed files, and the first session.
+- [Commands](commands.md): flags, commands, exit statuses, and the `secrets` output.
+- [Large language model backends](llm.md): provider resolution, the runtime catalog, handler ids, and the scrubber.
+- [Channels](channels.md): the webhook routes, the Fluxer gateway, and the terminal channel.

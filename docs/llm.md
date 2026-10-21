@@ -1,519 +1,757 @@
-# Models and secrets
+# Large language model backends
 
-The kernel calls one generic function, `complete`, and reads a `completion`. It
-never asks which backend answered. Two generic handlers exist, each owning one
-wire schema that many vendors speak: the OpenAI chat-completions handler serves
-OpenAI, OpenCode Go, Azure, OpenRouter, Groq and the long tail; the Anthropic
-Messages handler serves Anthropic's own endpoint and the Anthropic-shaped
-gateways. Two vendor-only handlers speak APIs only one cloud offers: Amazon
-Bedrock's InvokeModel path and Google Vertex's `:rawPredict` path. Three model
-tiers decide which model a piece of work uses. A separate module loads every
-secret into memory. It scrubs each loaded value, and each known key shape, out
-of text before that text reaches a model or a channel.
+Every model call passes through one generic function, `enchiridion.llm:complete`, and returns one `completion`.
+The kernel never asks which vendor answered, and a vendor is a registry entry and a data profile.
 
-## The provider protocol
+## The backend protocol
 
-The package `enchiridion.llm` defines three generic functions. A backend
-implements all three.
+A backend implements three generic functions.
 
-| Generic function     | Returns                                                |
-| -------------------- | ------------------------------------------------------ |
-| `complete`           | a `completion` for a list of messages                  |
-| `model-capabilities` | `:tools`, `:cache`, `:streaming`, `:cache-breakpoints` |
-| `backend-name`       | a short name for logs                                  |
+| Generic function     | Arguments                                                                | Returns                                                                          |
+| -------------------- | ------------------------------------------------------------------------ | -------------------------------------------------------------------------------- |
+| `complete`           | the backend, `messages`, and the keywords `model`, `tools`, and `budget` | a `completion`                                                                   |
+| `model-capabilities` | the backend                                                              | a plist with the keys `:tools`, `:cache`, `:streaming`, and `:cache-breakpoints` |
+| `backend-name`       | the backend                                                              | a short string for logs                                                          |
 
-`complete` receives the backend, `messages`, and the keywords `model`, `tools`,
-and `budget`. It returns a `completion`. `backendp` answers whether an object
-implements all three operations. SBCL 2.5.4 has no `defprotocol`, so the check
-calls `find-method` for `complete`, `model-capabilities`, and `backend-name`.
+`complete` continues a conversation.
+A nil `model` means the backend default, and `tools` holds the tool definitions.
+Every shipped backend ignores `budget`, which decides whether a turn starts.
 
-A `message` holds a role, content, a tool call id, and a list of tool calls. Four
-constructors build one: `system-message`, `user-message`, `assistant-message`,
-and `tool-message`. The role is user, assistant, system, or tool. A `tool-call`
-holds an id, a name, and the arguments as JSON text, because the model writes the
-arguments and the tool layer validates them.
+`backendp` checks for one method per operation with `find-method`, because Common Lisp has no protocol type.
+An object with a fourth required operation adds its method there.
 
-A `completion` holds the reply text, the tool calls, the model that answered, the
-stop reason, and four token counts. `completion-total-tokens` adds input and
-output only. A cache read is already part of the prompt count, and every backend
-stores the input count provider-normalised with the cache counts folded in, so the
-function does not add either one twice.
+### Messages
 
-## Handlers and the adapter registry
+A `message` holds a role, a content string, a tool-call id, and a list of tool calls.
+The role is `user`, `assistant`, `system`, or `tool`.
+The strings default to the empty string and the list defaults to the empty list.
 
-A provider names a **handler**, and a handler is one wire schema. The registry
-lives in `src/enchiridion/llm/registry.cl`; each handler file registers itself
-as it loads, so nothing in the core names a vendor.
+Four constructors build one, and the struct constructor is private.
+`system-message`, `user-message`, `assistant-message`, and `tool-message` set the role and take the text, the calls, or the call id that role needs.
 
-| Handler             | File           | Schema      | Used by                                                        |
-| ------------------- | -------------- | ----------- | -------------------------------------------------------------- |
-| `:openai-chat`      | `openai.cl`    | `:openai`   | OpenAI, OpenCode Go, Azure, OpenRouter, Groq, local servers, … |
-| `:anthropic-messages` | `anthropic.cl` | `:anthropic` | Anthropic's endpoint and Anthropic-shaped gateways          |
-| `:bedrock-invoke`   | `bedrock.cl`   | `:anthropic` | Amazon Bedrock's `/model/{id}/invoke` path                    |
-| `:bedrock-messages` | `bedrock.cl`   | `:anthropic` | Amazon Bedrock's native `/anthropic/v1/messages` endpoint     |
-| `:vertex-anthropic` | `vertex.cl`    | `:anthropic` | Claude on Google Vertex, `:rawPredict`                        |
+A `tool-call` holds an id, a name, and the arguments as JSON text.
+Nothing between the model and the tool layer parses that text.
 
-Bedrock and Vertex reuse the Messages request and reply builders from
-`anthropic.cl` and own only their transport, path, auth and version placement.
+### Completions
 
-`resolve-backend` picks a handler from the selected provider and calls its
-builder. An unsupported provider is a `configuration-error` that names the
-provider, its models.dev `npm` package, and the fix (`:api` plus `:base-url`
-in a `:providers` row). `:backend` still overrides the route by hand;
-`:backend :anthropic` with no `:provider` selects the Anthropic row, and any
-other value is a `configuration-error` at `:backend`.
+A `completion` is the reply, its calls, and the provider's billing numbers.
 
-| Keyword       | Wire shape        | Default endpoint prefix      |
-| ------------- | ----------------- | ---------------------------- |
-| `:openai`     | chat completions  | `https://api.openai.com/v1/` |
-| `:anthropic`  | the Messages API  | `https://api.anthropic.com/` |
+| Accessor                        | Type               | Default | Source                                        |
+| ------------------------------- | ------------------ | ------- | --------------------------------------------- |
+| `completion-text`               | string             | `""`    | the answer as text                            |
+| `completion-reasoning-text`     | string             | `""`    | chain of thought, kept apart from the answer  |
+| `completion-tool-calls`         | list               | `()`    | the calls, in the order requested             |
+| `completion-model`              | string             | `""`    | the model that actually answered              |
+| `completion-stop-reason`        | string             | `""`    | `stop`, `length`, or `tool_calls`             |
+| `completion-input-tokens`       | integer at least 0 | `0`     | prompt tokens, with cache counts folded in    |
+| `completion-output-tokens`      | integer at least 0 | `0`     | generated tokens                              |
+| `completion-cache-read-tokens`  | integer at least 0 | `0`     | cached prompt tokens the provider reports     |
+| `completion-cache-write-tokens` | integer at least 0 | `0`     | prompt tokens written to the provider's cache |
 
-## The runtime catalog
+`completion-total-tokens` adds input and output only.
+The input count is provider-normalized, with cache reads folded in.
 
-Provider knowledge is **not committed to the tree**, with one exception: the
-three rows in `config.cl` (`:openai`, `:opencode`, `:anthropic`) ship as
-configuration defaults, so the default path works with no catalog and no
-network. Everything else about a provider is generated at run time from
-[models.dev](https://models.dev):
+Reasoning text is never concatenated into the reply, and nothing persists it.
 
-- `enchiridion providers refresh` fetches `https://models.dev/api.json`
-  (`:providers-url`), trims it to the provider index, and writes
-  `run/providers.json`. The trim keeps each provider's `id`, `name`, `npm`,
-  `env`, `api` and `doc`, maps `npm` to a protocol, and computes a default
-  model. The trim decides the protocol only; the provider table in
-  `src/enchiridion/llm/providers.cl` (`+npm-adapters+`) maps that protocol, and
-  a provider id, to the handler that speaks it.
-- The trim's default-model rule: among the provider's models that support tool
-  calling, the newest `release_date` wins, tied by the smallest id; otherwise
-  the newest model overall; otherwise the smallest id.
-- The cache lives under `run/`, which git ignores and the Nix source filter
-  excludes. No fetched provider data ever enters the store.
-- A missing or corrupt cache is not an error. The three shipped rows in
-  `config.cl` (`:openai`, `:opencode`, `:anthropic`) still work, and anything
-  else reports that `providers refresh` has not run.
-- `${ENV_VAR}` inside a models.dev `api` value is expanded from the loaded
-  secret table, which is how providers whose endpoint contains an account id
-  (Cloudflare Workers AI, Snowflake Cortex) work without a special case.
-- Azure is reachable from the catalog: `@ai-sdk/azure` maps to the default
-  endpoint `https://${AZURE_RESOURCE_NAME}.openai.azure.com/`, with
-  `${AZURE_RESOURCE_NAME}` expanded from the loaded secret table. When that
-  variable is absent the row has no endpoint, and the error says to set
-  `:base-url`.
-- `:providers-ttl-seconds` (default 86400) is live: it is compared at start up
-  to decide when the cached provider index is stale. The commands that run a
-  turn (`ask`, `chat`, `serve`) refresh at context build, once per process: the
-  catalog when the cached copy is missing or older than the TTL, and the
-  selected provider's own model list when a key is present and its cache is
-  stale. Inspection commands (`help`, `version`, `secrets`, `providers list`,
-  `tools`, …) never fetch and never write a cache. `:offline t` stops all of
-  that, the model list included. The two exceptions are the operator's own act
-  and still run: `enchiridion providers refresh` and `enchiridion providers
-  models ID`.
+`model-capabilities` reports what a backend supports.
 
-## Provider rows
-
-A row is the unit of configuration. The three shipped rows are configuration
-defaults in `config.cl`, and an operator row of the same shape overrides them
-field by field. A row whose `:id` matches a models.dev provider overrides that
-provider; a new `:id` adds one.
-
-```lisp
-(:providers
- ((:id my-llm :name "My LLM" :api :openai-chat :profile :openai
-   :base-url "https://llm.internal/v1/"
-   :api-key-env "MY_LLM_KEY"
-   :headers (("X-Tenant" "acme"))
-   :models ("m-1" "m-2"))
-  (:id deepseek :api-key-env "DEEPSEEK_KEY")
-  (:id amazon-bedrock :api :bedrock-invoke :profile :bedrock-invoke
-   :region "us-east-1")))
-```
-
-| Row key           | Effect                                                                    |
-| ----------------- | ------------------------------------------------------------------------- |
-| `:id`             | The provider id, required                                                 |
-| `:name`           | Display name                                                              |
-| `:api`            | The handler id                                                            |
-| `:profile`        | The quirk profile to apply                                                |
-| `:base-url`       | The endpoint                                                              |
-| `:api-key-env`    | One variable name, or a list (Bedrock needs several)                      |
-| `:model`          | The default model for this provider                                       |
-| `:models`         | A static model list, when the endpoint cannot be asked                    |
-| `:headers`, `:query-params` | Extra request headers and query parameters                      |
-| `:region`, `:project`, `:location` | Cloud placement for Bedrock and Vertex                     |
-
-Any dialect field may be overridden directly on the row: `:auth-scheme`,
-`:auth-header`, `:chat-path`, `:models-path`, `:max-tokens-field`,
-`:system-role`, `:reasoning-field`. That is what makes a one-off endpoint a
-configuration line rather than a patch.
-
-A header may be written either as `("Name" "value")` or as
-`("Name" . "value")`; both reach the wire identically.
-
-`:provider :custom` is the generic case: a row with no preset at all, built
-entirely from the top-level `:llm` keys (`:backend`, `:base-url`,
-`:api-key-env`, `:headers`, `:model-*`). `:base-url` is required.
-
-The top-level `:providers-ttl-seconds`, `:models-ttl-seconds`, `:offline`,
-`:headers`, `:query-params` and `:profile` keys are not specific to `:custom`:
-each one works for whichever provider is selected. `:headers`, `:query-params`
-and `:profile` are merged into the selected provider's row, and a value written
-in the row wins over the top-level one.
-
-## Quirk profiles
-
-Every "OpenAI-compatible" vendor is compatible with a different subset. Those
-differences are data, in `src/enchiridion/llm/dialects.cl`, and a provider picks
-a profile rather than a branch.
-
-| Profile                | What it encodes                                                                 |
-| ---------------------- | -------------------------------------------------------------------------------- |
-| `:openai`              | The generic wire                                                                 |
-| `:openai-local`        | No credential header, no `tool_choice` (Ollama, LM Studio, llama.cpp)             |
-| `:ollama`              | As above, and models are listed at `api/tags`                                     |
-| `:azure`               | `api-key` header, deployment in the path, `api-version` query, `max_completion_tokens`, the `developer` role |
-| `:openrouter`          | Attribution header, `reasoning`, cache write tokens in `prompt_tokens_details`    |
-| `:deepseek`            | `reasoning_content`, cache hits in `prompt_cache_hit_tokens`                      |
-| `:google-openai`       | Bearer on `/v1beta/openai/`, no `tool_choice`, no `parallel_tool_calls`           |
-| `:qwen`                | No `parallel_tool_calls`, `enable_thinking` in the body                           |
-| `:zai`                 | `thinking` in the body, `reasoning_content` in the reply                          |
-| `:groq`                | Drops `stream_options` and `parallel_tool_calls`, which it rejects                |
-| `:cloudflare-gateway`  | `cf-aig-authorization` alongside the upstream key                                 |
-| `:anthropic`           | Anthropic's own endpoint, unchanged                                               |
-| `:anthropic-gateway`   | A bearer token instead of `x-api-key`                                             |
-| `:bedrock-invoke`      | `anthropic_version` in the body, betas in `anthropic_beta`, no 1h cache TTL       |
-| `:bedrock-messages`    | The native Messages path under `bedrock-mantle`                                   |
-| `:vertex`              | `anthropic_version` in the body, no model in the body, model in the URL           |
-
-A dialect also decides where the chain of thought is read from. It is stored
-apart, in `completion-reasoning-text`, and never concatenated into the reply:
-reasoning is not the answer.
-
-## Model lists
-
-A model list is asked of the provider that holds the account, not of the repo:
-
-| Handler                | Endpoint                                                        |
-| ---------------------- | --------------------------------------------------------------- |
-| `:openai-chat`         | `GET {base-url}{models-path}` (`data[].id`; `api/tags` on Ollama) |
-| `:anthropic-messages`  | `GET {base-url}v1/models`, paginated with `limit`/`after_id`      |
-| `:bedrock-invoke`, `:bedrock-messages` | `ListFoundationModels` on the Bedrock control plane |
-| `:vertex-anthropic`    | Not offered by Google; the catalog list is used                  |
-
-The list is cached at `run/models/<provider>.json` with a fetch time and obeys
-`:models-ttl-seconds`. The commands that run a turn (`ask`, `chat`, `serve`)
-refresh it at context build, once per process, when a key is present and the
-cache is stale; an inspection command never fetches, and `:offline t` stops the
-refresh along with the rest of start-up fetching. `enchiridion providers models
-ID` refreshes it by hand, which is the operator's own act, so it still runs
-under `:offline t`. A failure is one warning line and the cached or configured
-model; a turn is never stopped by a model list.
-
-## Providers
-
-The three shipped rows, the catalog's rows and the operator's rows are merged in
-that order, field by field.
-
-| Provider     | Base URL                        | Default model         | Key variable        |
-| ------------ | ------------------------------- | --------------------- | ------------------- |
-| `:openai`    | `https://api.openai.com/v1/`    | `gpt-5.6-luna`        | `OPENAI_API_KEY`    |
-| `:opencode`  | `https://opencode.ai/zen/go/v1` | `deepseek-v4.1-flash` | `OPENCODE_API_KEY`  |
-| `:anthropic` | `https://api.anthropic.com/`    | `claude-sonnet-5-5`   | `ANTHROPIC_API_KEY` |
-
-`detect-provider` picks one in this order:
-
-1. An explicit `:provider`. If it names a provider that nothing knows, that is a
-   configuration error: the message says to run `providers refresh` or to add a
-   `:providers` row. It does not fall through to base-URL detection.
-2. A `:base-url` that names a known host: `opencode.ai`, `api.anthropic.com`,
-   `api.openai.com`, then any cached catalog provider's `api` host.
-3. A present `OPENAI_API_KEY`, then `OPENCODE_API_KEY`, then
-   `ANTHROPIC_API_KEY`.
-4. Exactly one cached provider whose `env` name is present.
-5. Otherwise `:openai`, because it is the default.
-
-`default-api-key-env` returns `:api-key-env` when the file sets it, and
-otherwise the selected provider's first environment variable.
-
-`provider-key-names` returns the configured `:api-key-env`, every shipped and
-configured row's variables, the selected provider's full variable list, and the
-cached providers' variable names that are credential shaped. It deliberately
-does **not** return `AWS_ACCESS_KEY_ID`, `GOOGLE_APPLICATION_CREDENTIALS` or
-`CLOUDFLARE_ACCOUNT_ID` unless that provider is the one selected, because a name
-in this list is read from `.env` and then removed from the process environment.
-
-`resolve-backend` lets an explicit `:base-url` or `:model-primary` win over the
-provider row. The kernel calls `complete` with a model name, and it never reads
-the provider.
+| Backend            | `:tools` | `:streaming` | `:cache` | `:cache-breakpoints` |
+| ------------------ | -------- | ------------ | -------- | -------------------- |
+| OpenAI chat        | t        | t            | t        | nil                  |
+| Anthropic Messages | t        | t            | t        | t                    |
+| Amazon Bedrock     | t        | nil          | t        | t                    |
+| Google Vertex      | t        | t            | t        | t                    |
 
 ## Model tiers
 
-Three tiers name the work, not the model. Each tier maps to one model name.
+| Tier       | Work                          | Model variable    |
+| ---------- | ----------------------------- | ----------------- |
+| `:primary` | a reasoning turn              | `*model-primary*` |
+| `:cheap`   | memory digests and compaction | `*model-cheap*`   |
+| `:sleep`   | the sleep agent               | `*model-sleep*`   |
 
-| Tier       | Work                          | Default model         |
-| ---------- | ----------------------------- | --------------------- |
-| `:primary` | a reasoning turn              | `deepseek-v4.1-flash` |
-| `:cheap`   | memory digests and compaction | `deepseek-v4.1-flash` |
-| `:sleep`   | the sleep agent               | `*model-cheap*`       |
+`sleep-model` answers `*model-cheap*` when `*model-sleep*` is nil.
+The sleep agent reads the configured `:model-sleep`, and `configuration.md` owns the defaults.
+`tier` maps a name to `:primary`, `:cheap`, or `:sleep`, and an unknown name or nil becomes `:primary`.
+`model-for-tier` returns the model for a tier, and `enchiridion:model-for` reads the configured name.
 
-`*model-primary*` and `*model-cheap*` both hold `deepseek-v4.1-flash`.
-`*model-sleep*` holds nil, and `sleep-model` answers `*model-cheap*` when it does,
-so the sleep agent runs on the cheap model by default. The names are
-`primary-model`, `cheap-model`, and `sleep-model`, because a function called
-`sleep` in a package that uses `CL` is a package lock error.
+## The adapter registry
 
-`tier` normalizes a name to `:primary`, `:cheap`, or `:sleep`. An unknown name
-becomes `:primary` rather than a signal, and nil means `:primary`. `model-for-tier`
-returns the model name for a tier.
+An adapter is one wire.
+Each handler registers its adapter as it loads, so the core names no vendor.
 
-`enchiridion:model-for` is the config reader. It reads `:model-primary`,
-`:model-cheap`, or `:model-sleep` from the `:llm` section of config.cl, and it
-falls back to the shipped defaults.
+An adapter holds an id, a schema, a builder, a model lister, and one documentation line.
+The schema is `:openai`, `:anthropic`, or nil for a wire of its own.
 
-Where each tier runs:
+`register-api-handler` adds an adapter and replaces one with the same id.
+A non-keyword id signals `configuration-error` at `:api` with the detail `An adapter id must be a keyword, not ~S.`
+`find-api-handler` returns an adapter or nil, and `registered-api-handlers` returns every id sorted, while `provider-supported-p` tests a provider.
 
-| Caller            | Tier                                                |
-| ----------------- | --------------------------------------------------- |
-| a kernel turn     | the model the caller passes, or the backend default |
-| `run-sleep-pass`  | `:sleep`                                            |
-| `compact-session` | `:cheap`                                            |
+Five adapters exist.
 
-## Request and reply
+| Adapter id            | File           | Schema       | Profile               | Wire                                              |
+| --------------------- | -------------- | ------------ | --------------------- | ------------------------------------------------- |
+| `:openai-chat`        | `openai.cl`    | `:openai`    | `:openai`             | chat completions, with a dialect for each vendor  |
+| `:anthropic-messages` | `anthropic.cl` | `:anthropic` | `:anthropic`          | the Messages API                                  |
+| `:bedrock-invoke`     | `bedrock.cl`   | `:anthropic` | `:bedrock-invoke`     | Bedrock InvokeModel with a Messages body          |
+| `:bedrock-messages`   | `bedrock.cl`   | `:anthropic` | `:bedrock-messages`   | the Messages transport behind the Bedrock gateway |
+| `:vertex-anthropic`   | `vertex.cl`    | `:anthropic` | `:vertex`             | Anthropic models on Vertex AI                     |
 
-`completion-request` builds the request body as JSON text. The object holds
-`model`, `stream` false, and `messages`. With tools, it adds `tools` and
-`tool_choice` `"auto"`. `message->request-message` adds `tool_call_id` to a tool
-message and `tool_calls` to an assistant message that asked for any. It adds
-neither key to any other message, because some servers refuse an unexpected field.
+`providers.cl` registers generic builders for `:openai-chat` and `:anthropic-messages`.
+A handler that registers a builder without a model lister keeps its builder and gains the generic lister.
+`handler-protocol`, `handler-profile`, `protocol-profile`, `profile-handler-id`, and `backend-handler-id` convert between an adapter id, a schema, a profile, and a `:backend` value.
+A `:backend` value may also name an adapter id.
 
-`parse-completion` reads the first choice and fills the completion.
+## Provider rows
 
-| Completion slot      | Source field                                |
-| -------------------- | ------------------------------------------- |
-| `input-tokens`       | `usage.prompt_tokens`                       |
-| `output-tokens`      | `usage.completion_tokens`                   |
-| `cache-read-tokens`  | `usage.prompt_tokens_details.cached_tokens` |
-| `cache-write-tokens` | `usage.cache_creation_input_tokens`         |
+A provider row is data.
+It names an endpoint, the variables that hold its key, and the adapter or profile that speaks its wire.
+`configuration.md` owns the row keys and the shipped rows.
 
-A reply with no choices signals `backend-error`, because an empty completion and
-a model that said nothing are the same thing to the caller. `parse-json` turns an
-object into a plist with keyword keys, an array into a list, and JSON null into
-nil. `provider-error-message` reads the provider's own error text, and it answers
-one short line when the reply is not JSON at all.
+Three sources merge field by field, most specific first: the operator's rows, the shipped rows, and the cached catalog.
+A key present with a nil value wins.
+The row becomes a `provider` record before a handler sees it.
 
-### The Messages API
+| Field                    | Type               | Meaning                                                        |
+| ------------------------ | ------------------ | -------------------------------------------------------------- |
+| `provider-id`            | keyword            | the row id, normalized from a keyword or a string              |
+| `provider-name`          | string             | the display name                                               |
+| `provider-api`           | symbol or nil      | the adapter id                                                 |
+| `provider-profile`       | symbol or nil      | the dialect profile                                            |
+| `provider-base-url`      | string             | the endpoint, with any `${NAME}` placeholder expanded          |
+| `provider-key` and `provider-env` | string and list of strings | the credential value and every variable name that can hold it |
+| `provider-model` and `provider-default-model` | string or nil | the selected model and the row's fallback                    |
+| `provider-cached-models` | list of model rows | models named directly in the row, for an endpoint with no list |
+| `provider-headers` and `provider-query-params` | alists | extra request headers and query parameters                  |
+| `provider-options`       | plist              | handler options, reached with `provider-option`                |
+| `provider-doc` and `provider-source` | string and keyword | the catalog line and `:catalog`, `:shipped`, or `:config` |
 
-`anthropic-completion-request` builds the body for the Messages API. The object
-holds `model`, `max_tokens` (required by the API), and `messages`. The mapping is
-not the OpenAI one.
+The adapter comes from a caller's override, then the row's `:api`, then the npm package, then the profile.
+The profile comes from the row's `:profile`, then the npm package, then the adapter, then the protocol, and finally `:openai`.
+The base URL comes from an override, then the row, then the npm package's vendor default.
+A row with no adapter still yields a record.
 
-- A system message is hoisted to a top level `system` array and never appears in
-  `messages`. Several system messages become one text block, concatenated in
-  order.
-- A tool message becomes a USER message whose content holds a `tool_result` block
-  with `tool_use_id`. Consecutive tool messages merge into one user message, in
-  order, and a text message that follows the results joins that same message after
-  them, because a `tool_result` block has to come first in its message.
-- An assistant message carries its text and then a `tool_use` block per call. The
-  input is a JSON object: the stored argument text is read with
-  `com.inuoe.jzon:parse`, which keeps objects as hash tables, and not with
-  `parse-json`, which turns them into plists that jzon writes back as arrays. An
-  empty or absent argument string becomes an empty object.
-- Tools are flat `name`, `description`, `input_schema` objects. The registry's
-  `parameters` key is renamed, and `tool_choice` `{"type": "auto"}` is added only
-  when there are tools.
-- `cache_control` `{"type": "ephemeral"}` goes on the last system block and the
-  last tool definition, which is at most two of the four breakpoints the API
-  allows, and never on the incoming user message. `:cache-ttl` adds a `ttl` field.
+The options plist holds `:npm`, `:protocol`, `:backend`, `:dialect-overrides`, and the keys `:max-tokens`, `:models-ttl-seconds`, `:region`, `:project`, `:location`, `:cache-p`, `:cache-ttl`, `:betas`, `:timeout`, and `:retries`.
+A row value wins over the configuration value for the same key.
 
-A field the request does not need is absent and never nil: the JSON writer turns
-nil into `false`, and an empty `messages` array has to be `[]` rather than
-`false`.
+The credential is read from the secret loader first and the process environment second.
+An explicit key wins over both.
+A key variable that is set counts as present even when its value is empty.
 
-`anthropic-parse-completion` reads the reply text itself with
-`com.inuoe.jzon:parse`, because `parse-json` cannot tell an empty content array
-from an absent field and would collapse a tool input into a plist. It
-concatenates every text block into `completion-text`, turns each `tool_use` block
-into a tool call whose arguments are the input written back as JSON text, maps the
-stop reason, and folds the usage.
+The model is the configured `:model-primary`, then the row's `:model`, then its `:default-model`.
+A turn may override it with the `model` argument of `complete`.
+Top-level `:headers`, `:query-params`, and `:profile` fill a selected row that does not set them.
 
-| Completion slot      | Source field                                            |
-| -------------------- | ------------------------------------------------------- |
-| `input-tokens`       | `usage.input_tokens` plus both cache counts (see below) |
-| `output-tokens`      | `usage.output_tokens`                                   |
-| `cache-read-tokens`  | `usage.cache_read_input_tokens`                         |
-| `cache-write-tokens` | `usage.cache_creation_input_tokens`                     |
+`detect-provider` selects in this order.
 
-Anthropic's `input_tokens` excludes the cache reads and the cache writes, so all
-three are added for `input-tokens` while the two cache slots are still filled. A
-reply with no content field at all signals `backend-error` with `:backend
-"anthropic"`. An empty content array is legal and becomes an empty completion,
-because a model may end a turn without saying anything. The stop reasons map as
-`end_turn` and `stop_sequence` to `stop`, `max_tokens` to `length`, and `tool_use`
-to `tool_calls`; anything else passes through as it came.
+1. An explicit `:provider` value.
+2. A `:base-url` whose host is `opencode.ai`, `api.anthropic.com`, or `api.openai.com`.
+3. A `:base-url` whose host matches a cached catalog provider.
+4. The presence of `OPENAI_API_KEY`.
+5. The presence of `OPENCODE_API_KEY`.
+6. The presence of `ANTHROPIC_API_KEY`.
+7. The one cached provider whose key variable is present.
+8. `:openai`.
+
+Two exported keys need an explicit `:provider` or `:base-url`, because OpenAI wins a tie.
+
+`backend-provider-id` pairs a `:backend` value with a row.
+An explicit `:provider` wins, and `:backend :anthropic` selects the Anthropic row even when an OpenAI key is present.
+
+### Resolution and its errors
+
+`resolve-provider` returns the selected provider, and `resolve-backend` returns a backend or refuses.
+
+| Condition                                 | Error                                                                                                                                                                      |
+| ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A `:backend` value names no adapter       | `configuration-error` at `:backend`: `No backend for ~S. :BACKEND is :OPENAI or :ANTHROPIC, or one of the adapter ids this build registered: ~{~A~^, ~}.`                  |
+| The provider has no adapter in this build | `configuration-error` at `:provider`: `~A (~A) has no adapter in this build~@[ (npm ~A)~]. Set :base-url and :api on its row under :providers in config.cl.`               |
+| The provider has no endpoint              | `configuration-error` at `:base-url`: `Provider ~A has no endpoint: set :base-url in its :providers row, or export the variable its default endpoint needs (~{~A~^, ~}).`  |
+| The row id is unknown                     | `configuration-error` at `:provider` with the detail `There is no provider called ~A.` The detail also names `enchiridion providers refresh` and a row under `:providers`. |
+
+A row under `:providers` without an `:id` signals `configuration-error` at `:providers` with the detail `A provider row under :providers has no :id: ~S`.
+
+`provider-env-for-id` returns a row's key variable names without resolving the provider.
+`default-api-key-env` returns the variable to export: the configured `:api-key-env`, or the selected provider's first name.
+`provider-key-names` returns every name that can hold a provider key, including names of providers that are not selected.
+
+## The runtime catalog
+
+Provider facts beyond the shipped rows come from models.dev at run time.
+`trim-catalog` keeps what a request needs, and the module caches the result under `run/`.
+
+| File                       | Contents                                                                                                                          |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `run/providers.json`       | one row per provider: id, name, npm package, key variables, endpoint, protocol, computed default model, doc                       |
+| `run/provider-models.json` | every model's metadata, keyed by provider: name, context window, output limit, tool calling, reasoning, four prices, release date |
+
+`*catalog-path*` holds the provider index, resolved from the run directory when the file loads.
+`ENCHIRIDION_PROVIDERS_PATH` overrides it.
+`*catalog-models-path*` overrides the metadata path, which otherwise sits beside the index as `provider-models.json`.
+`*catalog-url*` overrides the fetch URL, then `:providers-url`, then `https://models.dev/api.json`.
+
+The trim keeps these fields.
+
+- A provider row keeps `id`, `name`, `npm`, `env`, `api`, `doc`, a computed default model, and the protocol the npm package implies.
+- A model keeps `id`, `name`, `tool_call`, `reasoning`, `context`, `output`, `cost_input`, `cost_output`, `cost_cache_read`, `cost_cache_write`, and `release_date`.
+- Everything else models.dev carries is dropped.
+
+The default model is the newest model that can call tools, by `release_date` then `last_updated`.
+The smallest id breaks a tie, a model with no date sorts first, and a provider with no models has no default.
+
+`read-catalog-file` accepts this module's wrapper, with `meta` and `providers`, or the flat map models.dev serves.
+A missing, unreadable, or corrupt file answers nil, and the configured rows take over.
+
+`refresh-catalog` fetches the URL, trims the document, writes both files, and returns the index read back.
+Each write is a temporary file and a rename, so a failure leaves the previous cache in place.
+
+A transport refusal signals `transport-error` with the status and the detail `Could not fetch the provider catalog from ~A.`
+A body that cannot be read signals `configuration-error` at `:providers-url` with the detail `The provider catalog at ~A could not be read: ~A`.
+
+`catalog-expired-p` compares the file write date against a TTL, and a nil or non-positive TTL means always stale.
+The provider index uses `:providers-ttl-seconds`, and a model list uses `:models-ttl-seconds`.
+`:offline t` stops every startup fetch and every model list fetch.
+The operator's own `providers refresh` and `providers models` still run.
+
+## Quirk profiles and dialects
+
+A dialect is a record of overrides over the generic wire, and a profile is a named set of values for it.
+`dialect-field` answers its default when the dialect is nil, so a nil dialect is the generic wire.
+A profile that writes nil for a switch turns it off.
+
+| Slot                         | Default                                 | Meaning                                                                           |
+| ---------------------------- | --------------------------------------- | --------------------------------------------------------------------------------- |
+| `auth-scheme`                | `:bearer`                               | where the credential goes                                                         |
+| `auth-header`                | nil                                     | the header name for `:api-key-header`, default `api-key`                          |
+| `auth-prefix`                | `""`                                    | text before the credential in a vendor-named header                               |
+| `auth-query`                 | nil                                     | the parameter name for `:query-param`, default `key`                              |
+| `chat-path`                  | nil                                     | appended to the base URL, `{model}` is substituted, nil means the handler default |
+| `models-path`                | nil                                     | the model list path, nil means the handler default                                |
+| `query-params`               | `()`                                    | extra query parameters as name and value pairs                                    |
+| `extra-headers`              | `()`                                    | extra headers                                                                     |
+| `max-tokens-field`           | `:max-tokens`                           | `:max-tokens` or `:max-completion-tokens`, only the named one is written          |
+| `system-role`                | `"system"`                              | `system` or `developer`                                                           |
+| `send-tool-choice-p`         | t                                       | send `tool_choice` with tools                                                     |
+| `send-parallel-tool-calls-p` | t                                       | send `parallel_tool_calls` with tools                                             |
+| `send-stream-options-p`      | t                                       | send `stream_options` with a stream                                               |
+| `extra-body`                 | `()`                                    | extra request fields, as a plist of keyword names and values                      |
+| `reasoning-field`            | nil                                     | where the chain of thought arrives                                                |
+| `input-tokens-field`         | `"prompt_tokens"`                       | where input tokens arrive                                                         |
+| `output-tokens-field`        | `"completion_tokens"`                   | where output tokens arrive                                                        |
+| `cache-read-tokens-field`    | `"prompt_tokens_details.cached_tokens"` | where cache read tokens arrive                                                    |
+| `cache-write-tokens-field`   | `"cache_creation_input_tokens"`         | where cache write tokens arrive                                                   |
+| `version-location`           | `:header`                               | `:header` or `:body` for the API revision                                         |
+| `version-value`              | nil                                     | the revision, nil means the handler's constant                                    |
+| `model-in-body-p`            | t                                       | write the model into the body                                                     |
+| `beta-channel`               | `:header`                               | `:header` or `:body` for the beta feature list                                    |
+| `cache-ttl-supported-p`      | t                                       | accept a cache TTL                                                                |
+| `models-list-shape`          | `:data`                                 | `:data`, `:ollama`, `:openrouter`, or nil for no list                             |
+| `tool-arguments-form`        | `:either`                               | declared with no reader in this tree                                              |
+| `thinking-supported-p`       | t                                       | declared with no reader in this tree                                              |
+
+The `protocol` slot is recorded and read by no function.
+
+Sixteen profiles ship.
+
+| Profile               | Overrides                                                                                                                            |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `:openai`             | none                                                                                                                                 |
+| `:openai-local`       | `:auth-scheme :none`, `:send-tool-choice-p nil`                                                                                      |
+| `:ollama`             | as `:openai-local`, and `:models-path "api/tags"`, `:models-list-shape :ollama`                                                      |
+| `:azure`              | `api-key` header, `openai/deployments/{model}/chat/completions`, `api-version=2024-06-01`, `max_completion_tokens`, `developer` role |
+| `:openrouter`         | `X-Title: enchiridion`, `reasoning` field, cache write tokens under `prompt_tokens_details`                                          |
+| `:deepseek`           | `reasoning_content`, cache hits under `prompt_cache_hit_tokens`                                                                      |
+| `:google-openai`      | no `tool_choice`, no `parallel_tool_calls`                                                                                           |
+| `:qwen`               | no `parallel_tool_calls`, `enable_thinking` true in the body                                                                         |
+| `:zai`                | `reasoning_content`, `thinking` enabled in the body                                                                                  |
+| `:groq`               | no `stream_options`, no `parallel_tool_calls`                                                                                        |
+| `:cloudflare-gateway` | `cf-aig-authorization` header with the prefix `Bearer `                                                                              |
+| `:anthropic`          | none                                                                                                                                 |
+| `:anthropic-gateway`  | `:auth-scheme :bearer`                                                                                                               |
+| `:bedrock-invoke`     | SigV4, revision in the body as `bedrock-2023-05-31`, no model in the body, betas in the body, no 1h cache TTL                        |
+| `:bedrock-messages`   | SigV4, path `anthropic/v1/messages`                                                                                                  |
+| `:vertex`             | Google OAuth, revision in the body as `vertex-2023-10-16`, no model in the body, no model list                                       |
+
+A row may override seven dialect fields directly: `:auth-scheme`, `:auth-header`, `:chat-path`, `:models-path`, `:max-tokens-field`, `:system-role`, and `:reasoning-field`.
+A nil override is kept, because one of these fields genuinely means absent.
+
+`make-dialect-for` applies the profile and then the overrides.
+An unknown profile signals `configuration-error` at `:profile` with the detail `There is no provider profile called ~S. Known profiles: ~{~A~^, ~}.`
+An unknown key signals `configuration-error` at `:profile` with the detail `~S is not a provider dialect field.`
+
+### Provider packages
+
+models.dev names the AI SDK package, and the package decides whether this build can speak the provider.
+
+| npm package                              | Adapter               | Profile               | Vendor default endpoint                            |
+| ---------------------------------------- | --------------------- | --------------------- | -------------------------------------------------- |
+| `@ai-sdk/openai-compatible`              | `:openai-chat`        | none                  | none                                               |
+| `@ai-sdk/openai`                         | `:openai-chat`        | none                  | `https://api.openai.com/v1`                        |
+| `@ai-sdk/azure`                          | `:openai-chat`        | `:azure`              | `https://${AZURE_RESOURCE_NAME}.openai.azure.com/` |
+| `@openrouter/ai-sdk-provider`            | `:openai-chat`        | `:openrouter`         | none                                               |
+| `@ai-sdk/groq`                           | `:openai-chat`        | none                  | `https://api.groq.com/openai/v1`                   |
+| `@ai-sdk/mistral`                        | `:openai-chat`        | none                  | `https://api.mistral.ai/v1`                        |
+| `@ai-sdk/xai`                            | `:openai-chat`        | none                  | `https://api.x.ai/v1`                              |
+| `@ai-sdk/cerebras`                       | `:openai-chat`        | none                  | `https://api.cerebras.ai/v1`                       |
+| `@ai-sdk/togetherai`                     | `:openai-chat`        | none                  | `https://api.together.xyz/v1`                      |
+| `@ai-sdk/deepinfra`                      | `:openai-chat`        | none                  | `https://api.deepinfra.com/v1/openai`              |
+| `venice-ai-sdk-provider`                 | `:openai-chat`        | none                  | `https://api.venice.ai/api/v1`                     |
+| `@aihubmix/ai-sdk-provider`              | `:openai-chat`        | none                  | `https://aihubmix.com/v1`                          |
+| `@saladtechnologies-oss/ai-sdk-provider` | `:openai-chat`        | none                  | `https://ai.salad.cloud/v1`                        |
+| `@ai-sdk/gateway`                        | `:openai-chat`        | none                  | `https://ai-gateway.vercel.sh/v1`                  |
+| `ai-gateway-provider`                    | `:openai-chat`        | `:cloudflare-gateway` | `https://gateway.ai.cloudflare.com/v1`             |
+| `@ai-sdk/anthropic`                      | `:anthropic-messages` | `:anthropic`          | `https://api.anthropic.com`                        |
+| `@ai-sdk/amazon-bedrock`                 | `:bedrock-invoke`     | `:bedrock-invoke`     | none                                               |
+| `@ai-sdk/google-vertex/anthropic`        | `:vertex-anthropic`   | `:vertex`             | none                                               |
+
+A package that is absent is unsupported, and the refusal names the package.
+A `${NAME}` placeholder is expanded from the process environment.
+An absent or empty name makes the whole endpoint nil, which resolution reports as a provider with no endpoint.
+The value is not read from the secret loader.
+
+## The chat completions wire
+
+`:openai-chat` covers OpenAI, OpenCode Go, Azure, OpenRouter, Groq, Qwen, DeepSeek, Mistral, xAI, and the compatible long tail.
+
+### The request
+
+`completion-request` returns JSON text, built as data first because a dialect may rewrite a field.
+
+| Field                                   | When it is written                                                                                |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `model`                                 | always                                                                                            |
+| `stream`                                | always, false for every request this tree makes                                                   |
+| `messages`                              | always                                                                                            |
+| `max_tokens` or `max_completion_tokens` | when the connection has a positive reply cap, the dialect decides the spelling                    |
+| `tools`                                 | when the turn carries tool definitions, each wrapped as `{"type": "function", "function": {...}}` |
+| `tool_choice`                           | `"auto"` with the tools, when `send-tool-choice-p`                                                |
+| `parallel_tool_calls`                   | true with the tools, when `send-parallel-tool-calls-p`                                            |
+| `stream_options`                        | `{"include_usage": true}` when a stream and `send-stream-options-p` are both present              |
+| dialect extra body fields               | merged last, so a vendor switch is data                                                           |
+
+A message carries `role` and `content`.
+A tool message adds `tool_call_id` when its id is nonempty, and an assistant message adds `tool_calls` when it asked for any.
+Other messages carry neither key, because some servers reject an unexpected field.
+A dialect may rename the `system` role.
+
+Tool arguments are normalized to JSON text, with an absent field or the empty string becoming `{}`.
+
+### The reply
+
+`parse-completion` reads the first choice.
+
+| Completion slot                 | Source field                                                                  |
+| ------------------------------- | ----------------------------------------------------------------------------- |
+| `completion-text`               | `message.content`, or the empty string                                        |
+| `completion-reasoning-text`     | the dialect's reasoning field, on the message or at the top level             |
+| `completion-tool-calls`         | `message.tool_calls`, with arguments normalized to JSON text                  |
+| `completion-model`              | `model`, or the empty string                                                  |
+| `completion-stop-reason`        | `finish_reason`, or the empty string                                          |
+| `completion-input-tokens`       | the dialect's input field, default `prompt_tokens`                            |
+| `completion-output-tokens`      | the dialect's output field, default `completion_tokens`                       |
+| `completion-cache-read-tokens`  | the dialect's cache read field, default `prompt_tokens_details.cached_tokens` |
+| `completion-cache-write-tokens` | the dialect's cache write field, default `cache_creation_input_tokens`        |
+
+A reply with no choices signals `backend-error` with `:backend "openai"`.
+The detail is `The reply carried no choices: ~S`, which carries the reply's own `error` field.
+A dotted field name reads into a nested object.
+A provider that reports cached tokens at the top level under a name of its own is served by the dialect field.
+
+The request headers are `content-type: application/json`, `user-agent: enchiridion/0.1.0`, and `x-opencode-session`.
+The credential is applied after the request is built.
+
+The lister sends `GET {base-url}{models-path}`, with the dialect's path, default `models`, and its shape.
+The `:data` shape reads `{"data": [{"id": ...}]}`, and `:ollama` reads `{"models": [{"name": ...}]}`.
+A nil shape sends no request.
+
+A rich entry is recognized by a `pricing` object or a `supported_parameters` array.
+Per-token price strings are converted to USD per million for the model record, with `*read-eval*` bound to nil.
+A generic entry reads `context_length`, `context_window`, or `context`, and `max_output_tokens` or `output`.
+
+The request uses `openai-static-headers` and the credential through `auth-apply`.
+
+## The Anthropic Messages wire
+
+`:anthropic-messages` covers Anthropic's endpoint and every Anthropic-shaped gateway.
+`anthropic.cl` also owns the builders that Bedrock and Vertex call.
+
+### The request
+
+`anthropic-request-body` builds the body as data.
+`max_tokens` is required by the API, so it is always present and defaults to 4096.
+The messages array is a vector even when empty, because the JSON writer would otherwise write false.
+
+The mapping differs from the chat completions wire.
+
+- A system message is hoisted to a top-level `system` array and never appears in `messages`.
+  Several system messages become one text block joined by two newlines.
+- A tool message becomes a user message whose content is a `tool_result` block with `tool_use_id`.
+  The wire has no tool role.
+- Consecutive entries with the same role merge into one message.
+  Results from one round become one user message in call order, and a following text message joins it after the blocks.
+- An assistant message carries its text block and then one `tool_use` block per call.
+  A turn with neither text nor calls gets an empty text block, because the API refuses an empty content array.
+- A tool call's `input` is an object, parsed with the JSON parser directly because a plist would be written back as an array.
+- Tools are flat objects with `name`, `description`, and `input_schema`.
+  `tool_choice` is `{"type": "auto"}` and is present only with tools.
+
+Prompt caching is a breakpoint on the blocks that end the reusable prefix.
+With `cache-p` true, one `{"type": "ephemeral"}` object goes on the last system block and one on the last tool definition.
+The API allows four breakpoints, and this backend never places one on a conversation message.
+`cache-ttl` adds a `ttl` field, and a profile without TTL support drops it and keeps the breakpoint.
+
+| Field               | When it is written                                              |
+| ------------------- | --------------------------------------------------------------- |
+| `max_tokens`        | always, the connection's value or 4096                          |
+| `messages`          | always, as a vector                                             |
+| `system`            | when at least one system message exists                         |
+| `model`             | unless the dialect sets `model-in-body-p` to nil                |
+| `anthropic_version` | when the dialect puts the revision in the body                  |
+| `anthropic_beta`    | when betas exist and the dialect puts the beta list in the body |
+| `tools`             | when the turn carries tools                                     |
+| `tool_choice`       | with the tools                                                  |
+
+A field the request does not need is absent rather than nil, because the JSON writer writes nil as false.
+The default revision is `2023-06-01` in the `anthropic-version` header.
+A profile that puts the revision in the body names its own value and omits the header.
+
+### The reply
+
+The reply is read with the JSON parser's object type and not through `parse-json`.
+That distinction tells an empty content array from an absent field and keeps a tool input an object.
+
+| Completion slot                 | Source                                                           |
+| ------------------------------- | ---------------------------------------------------------------- |
+| `completion-text`               | every `text` block, concatenated in order with nothing inserted  |
+| `completion-reasoning-text`     | every `thinking` and `redacted_thinking` block, concatenated     |
+| `completion-tool-calls`         | every `tool_use` block, with the input written back as JSON text |
+| `completion-model`              | `model`                                                          |
+| `completion-stop-reason`        | `stop_reason` through the mapping below                          |
+| `completion-input-tokens`       | `input_tokens` plus both cache counts                            |
+| `completion-output-tokens`      | `output_tokens`                                                  |
+| `completion-cache-read-tokens`  | `cache_read_input_tokens`                                        |
+| `completion-cache-write-tokens` | `cache_creation_input_tokens`                                    |
+
+| Wire value      | Stop reason  |
+| --------------- | ------------ |
+| `end_turn`      | `stop`       |
+| `stop_sequence` | `stop`       |
+| `max_tokens`    | `length`     |
+| `tool_use`      | `tool_calls` |
+| anything else   | as it came   |
+
+A reply with no content field at all signals `backend-error` with `:backend "anthropic"`.
+The detail is `The reply carried no content blocks at all.` when the reply holds no provider message.
+Otherwise the detail is `The reply carried no content blocks: ~A`.
+An empty content array is legal and becomes an empty completion.
+
+The input count is normalized: `input_tokens` plus both cache counts, while the cache slots stay filled.
+`completion-total-tokens` stays input plus output on both wires.
+
+The Messages lister follows pages.
+
+Each request asks for `limit=1000` and uses `after_id` set to the last row of the previous page.
+`has_more` decides whether another page exists, and the lister stops after 64 pages.
+A row reports tool calling true and reasoning nil, and the display name comes from `display_name`.
+
+Every page uses the same authorization path as a chat request.
+
+## Amazon Bedrock
+
+Bedrock speaks the Messages schema with its own transport.
+Two adapters cover its entry points.
+
+| Adapter             | Method and path                    | Default host                             | Model       | Revision                                               | Betas                        | SigV4 service    |
+| ------------------- | ---------------------------------- | ---------------------------------------- | ----------- | ------------------------------------------------------ | ---------------------------- | ---------------- |
+| `:bedrock-invoke`   | `POST {base}model/{model}/invoke`  | `bedrock-runtime.{region}.amazonaws.com` | in the path | `anthropic_version` in the body (`bedrock-2023-05-31`) | `anthropic_beta` in the body | `bedrock`        |
+| `:bedrock-messages` | `POST {base}anthropic/v1/messages` | `bedrock-mantle.{region}.api.aws`        | in the body | `anthropic-version` header (`2023-06-01`)              | `anthropic-beta` header      | `bedrock-mantle` |
+
+A provider that names a base URL is trusted as the endpoint.
+Otherwise the URL is built from the region.
+
+The region is the row's `:region`, then `AWS_REGION`, then `AWS_DEFAULT_REGION`.
+There is no default region.
+Absence signals `configuration-error` at `:region` with the detail `No AWS region is configured: set :region on the provider, or AWS_REGION or AWS_DEFAULT_REGION in the environment.`
+
+The model comes from the turn, then the connection.
+Its absence signals `configuration-error` at `:model` with the detail `The Bedrock handler was asked for a completion with no model to ask for.`
+The invoke path escapes the model as one path segment, because an inference profile id carries a colon.
+
+The credential is chosen at request time.
+
+1. `AWS_BEARER_TOKEN_BEDROCK` wins outright.
+2. A provider key is used as a bearer token only when no AWS access key is available to sign with.
+3. Otherwise the request is signed with SigV4 and no credential header is written.
+
+The body is the Anthropic builder with the dialect's choices.
+The beta list is an array in the body or a comma separated header, and the cache TTL is dropped when unsupported.
+The content type is always sent, and the provider's headers are merged underneath.
+
+A reply that is not a JSON object signals `configuration-error` at `:reply`.
+The detail is `The Bedrock reply is not a JSON object: ~A`, truncated to 200 characters plus `...`.
+An object with a `message` field and no content is AWS's error envelope and signals `transport-error` with `:status 200` and the service's own words.
+Everything else goes to the Anthropic parser.
+
+The model list is one signed `GET` at `foundation-models?byProvider=anthropic` on `bedrock.{region}.amazonaws.com`, signed for the `bedrock` service.
+A row takes its id from `modelId`, `inferenceProfileId`, `id`, or the tail of `modelArn`, and its name from `modelName`, `inferenceProfileName`, or `name`.
+A row whose `providerName` is neither absent nor `anthropic` is dropped.
+Every row reports tool calling, and a malformed reply yields fewer rows and never an error.
+
+## Google Vertex
+
+`:vertex-anthropic` serves Anthropic models through Vertex AI's `:rawPredict`.
+The endpoint is per region and per project.
+
+| Setting    | Source                                                      | Error when absent                                                                                                                                     |
+| ---------- | ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `project`  | the row's `:project` option, then `GOOGLE_VERTEX_PROJECT`   | `configuration-error` at `:project`: `Vertex AI needs a Google Cloud project: pass :project in the provider's options, or set GOOGLE_VERTEX_PROJECT.` |
+| `location` | the row's `:location` option, then `GOOGLE_VERTEX_LOCATION` | `configuration-error` at `:location`: `Vertex AI needs a region: pass :location in the provider's options, or set GOOGLE_VERTEX_LOCATION.`            |
+| `model`    | the turn, the provider model, or the provider default model | `configuration-error` at `:model`: `Vertex AI needs a model: it is a path segment, so there is no request the endpoint would accept without it.`      |
+
+The URL is `https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/anthropic/models/{model}:rawPredict`.
+A base URL on the row overrides the region-derived host, and the model is a path segment that is not percent encoded.
+
+The body is the Anthropic builder with `model-in-body-p` nil and `anthropic_version` set to `vertex-2023-10-16`.
+The request carries `authorization`, `content-type: application/json`, and `user-agent: enchiridion/0.1.0`, plus the provider's headers.
+It carries no `anthropic-version` header, because the revision is a body field here.
+
+The access token is fetched per request by `gcp-access-token` by default, and the provider profile is not read.
+This handler serves one vendor, and the four facts a dialect could carry are written in `vertex.cl`.
+
+Google publishes no Anthropic model list at this endpoint, so the lister returns nil and the caller falls back to the catalog.
 
 ## Transport and retries
 
-One transport and one retry loop.
+A request is a value.
 
-A request is a value: a URL, a body, a header list, and a timeout
-(`http-request` in `src/enchiridion/llm/http.cl`). A handler builds one, applies
-its credential with `auth-apply`, and hands it to `post-with-retries`. There is
-no second loop to drift from, and no per-vendor transport.
+| Field                  | Type                | Default |
+| ---------------------- | ------------------- | ------- |
+| `http-request-url`     | string              | `""`    |
+| `http-request-body`    | string              | `""`    |
+| `http-request-headers` | alist of conses     | `()`    |
+| `http-request-timeout` | integer, at least 1 | 60      |
 
-| Handler                | Path                         | Credential                                        |
-| ---------------------- | ---------------------------- | ------------------------------------------------- |
-| `:openai-chat`         | `{base-url}{chat-path}`      | `Authorization: Bearer`, or the profile's header   |
-| `:anthropic-messages`  | `{base-url}{chat-path}`      | `x-api-key` and `anthropic-version`, or Bearer     |
-| `:bedrock-invoke`      | `{base-url}model/{id}/invoke`| `AWS_BEARER_TOKEN_BEDROCK`, or SigV4               |
-| `:bedrock-messages`    | `{base-url}anthropic/v1/messages` | the same, signed for service `bedrock-mantle` |
-| `:vertex-anthropic`    | `{base-url}.../{model}:rawPredict` | `Authorization: Bearer` from GCP OAuth       |
+`http-post` sends it with read and connect timeouts both set to the request timeout.
+`http-get` is the one GET, with `+http-get-timeout+` at 10 seconds.
 
-The chat-completions handler sends a JSON content type, the user agent
-`enchiridion/0.1.0`, and the `x-opencode-session` header; OpenCode Go needs that
-header as its routing key and its prompt cache key, and a generic server ignores
-it. The Messages handler sends `x-api-key` and the required `anthropic-version`,
-because that is what every documented example sends; a gateway profile replaces
-both through the same merge. `*http-post-function*` and `*http-get-function*`
-hold the transport and the one GET, so a test can replace either without a
-network.
+A handler builds the request, applies its credential, and hands it to `post-with-retries`.
+`post-with-retries` repeats 429 and every status at or above 500, up to the connection's `retries` extra attempts.
+Attempt n waits n times `*retry-delay*`, which is 2, so the default waits are 2 and 4 seconds.
+Every other 4xx is reported at once.
 
-`post-with-retries` repeats a 429 and any status at or above 500, up to `retries`
-extra attempts, and waits `*retry-delay*` seconds times the attempt number.
-`*retry-delay*` is 2, and a test binds it to 0. The 5xx rule covers Anthropic's
-500, 504, and 529. Any other 4xx becomes a `transport-error` at once, with
-`:status` and the provider's own error text. A wrong key or a wrong model does
-not become right by a second send.
+A failure becomes `transport-error` with `:status` and the detail `~D after ~D attempt~:P: ~A`: the status, the number of attempts, and the provider's error text.
+`provider-error-message` reads that text from an `error.message` object, an `error` string, a `message` field, or a `Message` field.
+A reply that is not JSON becomes the note `the provider replied with something that is not JSON`.
 
-## Signing
+The reply is parsed after `post-with-retries` returns, so a 200 that is not JSON is not retried.
 
-Two handlers cannot use a static header, because their credential signs the
-request:
+Three specials make the transport testable without a socket.
 
-- **Amazon Bedrock.** `AWS_BEARER_TOKEN_BEDROCK` selects a bearer token; the
-  absence of it selects AWS Signature Version 4 from `aws-sigv4.cl`, which signs
-  with `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and an optional
-  `AWS_SESSION_TOKEN` for the region in `:region`, `AWS_REGION` or
-  `AWS_DEFAULT_REGION`. The signer registers itself under `:aws-sigv4`, and the
-  file ships AWS's published test vectors as fixtures.
-- **Google Vertex.** `vertex.cl` asks `gcp-oauth.cl` for a bearer token: an
-  `GOOGLE_VERTEX_ACCESS_TOKEN` or `GCLOUD_ACCESS_TOKEN` when one is set,
-  otherwise an RS256 JWT built from the service account at
-  `GOOGLE_APPLICATION_CREDENTIALS` and exchanged at Google's token endpoint. The
-  token is cached in memory until it expires. `gcloud` is never required.
+| Special                | Default     | Use                                              |
+| ---------------------- | ----------- | ------------------------------------------------ |
+| `*http-post-function*` | `http-post` | the one POST, bound in tests                     |
+| `*http-get-function*`  | `http-get`  | the one GET for the catalog and model lists      |
+| `*retry-delay*`        | 2           | base retry delay in seconds, bound to 0 in tests |
 
-Both signers are functions in the `*auth-signers*` table, so nothing in the core
-knows that AWS or Google exists.
+Headers are merged case-insensitively, and a header written as a two element list becomes a cons before it reaches the transport.
+
+## Request signing and credentials
+
+Four schemes write a static header or parameter, one sends nothing, and two sign the request.
+
+| Scheme            | Effect                                                               |
+| ----------------- | -------------------------------------------------------------------- |
+| `:bearer`         | `Authorization: Bearer KEY`                                          |
+| `:api-key-header` | `NAME: PREFIXKEY`, with the dialect's header name, default `api-key` |
+| `:x-api-key`      | `x-api-key: KEY`                                                     |
+| `:query-param`    | `?NAME=KEY`, with the dialect's parameter name, default `key`        |
+| `:none`           | no credential                                                        |
+| `:aws-sigv4`      | signed by the registered SigV4 signer                                |
+| `:gcp-oauth`      | a bearer token from the registered Google signer                     |
+
+`auth-apply` appends the credential and dialect query parameters to the URL, keeping an existing query string.
+It merges the credential headers, the dialect's extra headers, and the caller's extra headers, and a signer's headers win a name clash.
+
+### AWS Signature Version 4
+
+`aws-sigv4.cl` builds a canonical request from the method, path, query, headers, and body hash, and signs the string to sign with a derived key.
+The Authorization header is `AWS4-HMAC-SHA256 Credential=.../..., SignedHeaders=..., Signature=...`.
+
+The signed headers always include `host` and `x-amz-date`.
+`x-amz-content-sha256` is included by default, and `x-amz-security-token` when a session token exists.
+The credential is read from the secret loader first and the environment second, and an explicit credential wins over both.
+
+| Variable                   | Use                                      |
+| -------------------------- | ---------------------------------------- |
+| `AWS_ACCESS_KEY_ID`        | the access key                           |
+| `AWS_SECRET_ACCESS_KEY`    | the secret key                           |
+| `AWS_SESSION_TOKEN`        | an optional session token                |
+| `AWS_REGION`               | the region when the row names none       |
+| `AWS_DEFAULT_REGION`       | the region after `AWS_REGION`            |
+| `AWS_BEARER_TOKEN_BEDROCK` | a bearer token that replaces a signature |
+
+A missing access key or secret key signals `configuration-error` at `:aws-credentials`.
+The detail is `No AWS credential is available to sign with: set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or load them as secrets.`
+
+The region, service, and method are bound around the signer call.
+A nil `*aws-service*` means `bedrock`, a nil `*aws-request-method*` means `POST`, and the signer is registered under `:aws-sigv4`.
+
+### Google Cloud OAuth
+
+`gcp-oauth.cl` is the only source of a Google access token.
+Two sources are tried in order.
+
+1. A token the operator minted, from `GOOGLE_VERTEX_ACCESS_TOKEN` then `GCLOUD_ACCESS_TOKEN`, read from the secret loader then the environment.
+   It is used as it stands and is not cached.
+2. A service account JSON at `GOOGLE_APPLICATION_CREDENTIALS`.
+   Its PKCS#8 private key signs an RS256 JWT, which is exchanged at `https://oauth2.googleapis.com/token` for a token with the `cloud-platform` scope.
+
+It is cached in memory until `expires_in` minus 60 seconds, or for 3600 seconds when no `expires_in` arrives.
+Nothing is written to disk, the assertion lifetime is 3600 seconds, and the token request has a 30 second timeout.
+
+A token endpoint refusal is a `transport-error` with its own `error_description`.
+An unreadable reply signals `backend-error` with `:backend "gcp"` and the detail `The Google token endpoint answered with something that is not JSON: ~A`.
+A reply with no access token signals the same condition with the detail `The Google token endpoint returned no access token: ~A`.
+
+| Condition                     | Error detail                                                                                                                                                   |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| No credential at all          | `No Google credential: set GOOGLE_APPLICATION_CREDENTIALS to a service account file, or GOOGLE_VERTEX_ACCESS_TOKEN or GCLOUD_ACCESS_TOKEN to an access token.` |
+| The named file does not exist | `~A names ~A, which does not exist.`                                                                                                                           |
+| The file is not JSON          | `~A could not be read as JSON: ~A`                                                                                                                             |
+| A field is missing            | `The service account has no ~A (~A).`                                                                                                                          |
+| The private key is not PEM    | `The service account private_key is not a PEM block: it has no BEGIN and END banners.`                                                                         |
+| The base64 cannot be decoded  | `The service account private key is not readable base64: ~A`                                                                                                   |
+| The DER is malformed          | `The service account private key is malformed: ~A`                                                                                                             |
+
+All of them signal `configuration-error` at `:gcp-credentials`.
+
+The signer is registered under `:gcp-oauth`.
+
+## Model lists
+
+`provider-models` returns the model rows a provider can serve.
+The provider's endpoint is asked when its adapter has a lister, and the answer is cached.
+The chat completions lister reads `{base-url}{models-path}`, and the Messages lister reads `v1/models` in pages.
+Bedrock reads the control plane model list, and Vertex offers none.
+
+The cache file is `run/models/{provider}.json`.
+The name is the id lowercased, with every character outside letters, digits, hyphen, underscore, and dot replaced by a hyphen.
+`*model-cache-directory*` overrides the directory.
+Each file carries `fetched_at`, `fetched_at_iso`, and a `models` array.
+
+A cached list is fresh for `:models-ttl-seconds`, and the row option wins over the configuration.
+`refresh` skips the cache, and `force` overrides `:offline`.
+
+A failure is never a signal.
+The fallback order is the last cached list at any age, the row's own `:models`, the catalog's list, and nothing.
+One line goes to standard error: `enchiridion: could not list models for ~A: ~A`.
+The operator's `providers models ID` command bypasses `:offline` and may refresh one provider's cache.
+With `:offline t` and no `force`, the cache, the row's models, and the catalog answer without a request.
+
+Cost and limit metadata from the catalog is joined by model id.
+The live list keeps its ids and names and takes the metadata's prices, context window, output limit, and capability flags.
+
+The record is a `model-info`.
+It holds `model-info-id`, `model-info-name`, `model-info-tool-call-p`, `model-info-reasoning-p`, `model-info-context`, `model-info-output`, `model-info-cost-input`, `model-info-cost-output`, `model-info-cost-cache-read`, `model-info-cost-cache-write`, and `model-info-source`.
+The costs are USD per million tokens, and the source is `:provider`, `:catalog`, or `:config`.
+A nil cost or limit means the source did not state the fact.
 
 ## Token accounting
 
-The kernel records each completion as a `spend-row` on the agent, and it writes
-the same numbers to the `usage` table. The ledger keeps four provider numbers
-apart: input, output, cache read, and cache write.
+Every backend fills four token slots from the provider's usage object, and the cache split is kept apart from ordinary input.
 
-| Function             | Returns                                                  |
-| -------------------- | -------------------------------------------------------- |
-| `record-spend`       | one `spend-row` on the agent                             |
-| `spend`              | every row, oldest first                                  |
-| `spend-since`        | the rows from an index onwards                           |
-| `spend-summary`      | the rows summed, with the last model and the round count |
-| `spend-total`        | the tokens in one window                                 |
-| `budget-exhausted-p` | true when the spend reached a cap                        |
-| `persist-usage`      | one `usage` row in the store                             |
+The two wires count input differently and are normalized to one meaning.
 
-`spend-since` takes an index. A caller records `(length (spend agent))` before a
-turn. It asks for the tail after the turn, because one turn with tool calls makes
-several model calls. The completion that comes back is only the last of them.
-`spend-total` sums the whole in-memory ledger for window `:tick`, and the last
-86400 seconds for window `:day`. `budget-exhausted-p` reads
-`:max-tokens-per-tick` or `:max-tokens-per-day` from the agent budget plist. A
-missing cap never stops the work, so unattended work has no limit until the
-operator sets one.
+| Wire             | Reported input                  | Stored input                                                                     |
+| ---------------- | ------------------------------- | -------------------------------------------------------------------------------- |
+| Chat completions | `prompt_tokens`, cache included | the reported number                                                              |
+| Messages         | `input_tokens`, cache excluded  | `input_tokens` plus `cache_read_input_tokens` plus `cache_creation_input_tokens` |
 
-The store sums the same rows for a report. `usage-summary` groups by `:model`,
-`:channel`, or `:day`, and `usage-total-since` sums from a time. The `:day` group
-uses the local calendar day of the row. The budget window stays the rolling
-twenty-four hours, because a burst across midnight must count in full.
-
-`estimate-tokens` gives the prompt a cheap estimate of one token per four
-characters. The ledger uses the provider numbers, so the estimate never changes a
-bill.
+A missing, null, or non-integer count becomes zero.
+`completion-total-tokens` adds input and output only.
+The kernel records each completion in the spend ledger and the usage table, and `supervisor.md` owns both.
 
 ## Secrets
 
-`secrets-file` returns the file to read. The container path `/run/secrets/.env`
-wins when it exists. Otherwise the function tries each directory in order, and the
-first `.env` wins. `main.cl` passes the current directory and then the project
-root, because the binary can live in a store path.
+`configuration.md` owns the secret file, its mode, and the `.env` format.
+This section covers the loader functions and the scrubber.
 
-`load-secrets` reads the file and then the named environment variables.
-`parse-env-line` reads one `NAME=VALUE` line. It skips a blank line, a comment
-that starts with `#` or `;`, and a malformed line. It also removes a matching
-pair of quotes. `load-secrets-from` reads a stream. A malformed line never stops
-the start, so one typo in `.env` costs one secret and not the run.
+### Loading
 
-| Function           | Returns                                            |
-| ------------------ | -------------------------------------------------- |
-| `register-secret`  | the name, after it stores the value and the source |
-| `secret-present-p` | true when the name is loaded                       |
-| `secret-value`     | the value, or nil                                  |
-| `secret-source`    | `:file`, `:env`, or `:argument`                    |
-| `secret-names`     | every loaded name, sorted                          |
-| `clear-secrets`    | nothing, after it forgets every value              |
+`load-secrets` takes a path and a list of variable names, loads both, and returns every loaded name.
+The caller unsets those names from its own environment afterward.
+`parse-env-line` skips a blank line, a comment, and a malformed line, and removes matching quotes.
 
-`register-secret` ignores an empty value and a value that is not a string. A new
-secret clears the combined pattern, so the next scrub rebuilds it.
-`*loaded-secrets*` holds the values and `*loaded-sources*` holds the source note,
-and neither table prints a value.
+| Accessor           | Returns                                               |
+| ------------------ | ----------------------------------------------------- |
+| `register-secret`  | the name, after storing the value and the source      |
+| `secret-present-p` | true when the name is loaded                          |
+| `secret-value`     | the value, or nil                                     |
+| `secret-source`    | `:file`, `:env`, or `:argument`                       |
+| `secret-names`     | every loaded name, sorted                             |
+| `clear-secrets`    | nothing, after forgetting every value and the pattern |
 
-`configured-secret-names` collects the `:api-key-env`, the Fluxer `:token-env`,
-and the webhook `:token-env` from config.cl. `load-configured-secrets` in
-`main.cl` loads those names, then unsets each one from the process environment.
-The value stays in memory for the life of the process, and a child process
-inherits nothing.
+An empty value and a non-string value are ignored, and a new secret clears the combined pattern.
 
-`secret-value` reads a value. Four call sites read one: `main.cl` twice,
-`backend-api-key` in the OpenAI client, and the Fluxer channel. The scrubber does
-not call it, because `pattern` reads `*loaded-secrets*` directly. Nothing prints a
-value, and `enchiridion secrets` prints a name and its source.
+`credential-variable-p` decides which variable names hold a credential, from the name only, and the test is case-insensitive.
+A name is a credential when it is one of `OPENAI_API_KEY`, `OPENCODE_API_KEY`, `ANTHROPIC_API_KEY`, `FLUXER_BOT_TOKEN`, or `ENCHIRIDION_HTTP_TOKEN`.
+It is also one when it contains `_API_KEY`, `_APIKEY`, `_TOKEN`, `_SECRET`, `_PASSWORD`, `_PASSWD`, `_PRIVATE_KEY`, or `AUTHORIZATION`.
+Ordinary runtime names are not credentials, including `PATH`, `HOME`, `SBCL_HOME`, `CL_SOURCE_REGISTRY`, and the `XDG_` names.
 
-## The scrubber
+The names a configuration says hold secrets belong to `configuration.md`.
+The supervisor unions them with `provider-key-names` before it loads.
 
-`scrub` replaces every match with `[redacted]`. Three filters feed one combined
-pattern.
+### The scrubber
 
-| Filter  | What it matches                                                                                              |
-| ------- | ------------------------------------------------------------------------------------------------------------ |
-| Literal | a loaded value of at least `*minimum-secret-length*` characters                                              |
-| Shape   | `Bearer` tokens, `sk-` keys, `ghp_` tokens, `xox` tokens, JWTs, and `key=value` pairs that name a credential |
-| Role    | a field named token, secret, password, or api_key, whatever the value looks like                             |
+`scrub` replaces every match with `[redacted]`, using one combined pattern built from three filters.
 
-`*minimum-secret-length*` is 8. A shorter loaded value never reaches the literal
-filter, because one short secret would turn the whole transcript into
-`[redacted]`.
+| Filter  | Matches                                                                                                                               |
+| ------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| Literal | any loaded value of at least `*minimum-secret-length*` characters                                                                     |
+| Shape   | a bearer token, an `sk-` key, a `gh[pousr]_` token, an `xox[baprs]-` token, a JWT, or a `key=value` pair whose key names a credential |
+| Role    | a field named token, secret, password, api key, credential, or authorization, whatever the value looks like                           |
 
-The literal parts come first and longest first, so a short secret cannot match the
-head of a longer one. `pattern` rebuilds the combined pattern when the number of
-loaded secrets changes. `scrubber` always returns a scanner, because the shape
-patterns exist even when nothing is loaded. `+role-names+` holds the field names
-for the role filter, and it includes token, secret, password, api_key,
-api_secret, credentials, authorization, and the private key.
+The shape thresholds are 8 character bodies for `sk-` and `xox` tokens, 16 for `gh` tokens, and 6 for a credential-named `key=value` pair.
+A bearer token is the word after `Bearer`, and a JWT is a token that begins with `eyJ`.
 
-`scrub-object` recurses through strings, conses, vectors, and hash tables.
-`scrub-tree` does the same and also replaces the value of a role-named field
-outright. That filter catches a credential this process never loaded, which is the
-prompt injection case. `seal` and `unseal` turn the replacement off and on, and
-`sealed-p` reports the state.
+`*minimum-secret-length*` is 8.
 
-Where the scrubber runs: the kernel scrubs the compiled prompt and the operator
-text before a turn. Every tool result becomes scrubbed text. The store scrubs
-every string on the way to a column. A non-string comes back unchanged, because a
-scrubber that signals would take the agent down with it.
+The literal parts are sorted longest first, and the pattern is rebuilt when the number of loaded secrets changes.
+The shape patterns apply even when no secret is loaded.
 
-## Related
+| Operation      | Effect                                                                              |
+| -------------- | ----------------------------------------------------------------------------------- |
+| `scrub`        | text with every match replaced, and a non-string returned unchanged                 |
+| `scrub-object` | every string and every key inside a cons, vector, or hash table scrubbed            |
+| `scrub-tree`   | every string scrubbed, and the value of a role-named field replaced with the marker |
+| `seal`         | stop replacing, for a test that must re-read a value                                |
+| `unseal`       | resume replacing                                                                    |
+| `sealed-p`     | the current state                                                                   |
 
-- [Memory](memory.md)
-- [Configuration](configuration.md)
-- [Commands](commands.md)
-- [Supervisor and heartbeat](supervisor.md)
-- [Testing](testing.md)
+`scrub-tree` does not descend into a hash table, so a table needs `scrub-object`.
+The role filter catches a credential this process never loaded.
+
+A non-string comes back unchanged from `scrub`.
+The kernel scrubs the prompt, the operator text, and every tool result, and the broker scrubs every result it returns.
+`memory.md` owns the store's scrubbing.
+
+## Troubleshooting
+
+| Symptom                                                        | Cause                                                         | Fix                                                                     |
+| -------------------------------------------------------------- | ------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| `There is no provider called X.`                               | no configured row and no cached catalog entry                 | run `providers refresh`, or add the row under `:providers`              |
+| `X (x) has no adapter in this build (npm ...).`                | the package has no adapter in this build                      | set `:base-url` and `:api` on the row                                   |
+| `Provider x has no endpoint`                                   | no base URL and an absent placeholder variable                | set `:base-url`, or export the variable the endpoint needs              |
+| `transport-error` with `429 after N attempts`                  | the provider kept refusing after the retry budget             | check the account quota, then raise `:retries` or `:timeout` on the row |
+| `could not list models for X` on standard error                | the model endpoint failed or the adapter has no lister        | ignore it, set `:models` on the row, or run `providers models ID` later |
+| `No AWS region is configured`                                  | the row, `AWS_REGION`, and `AWS_DEFAULT_REGION` are all empty | set one of them                                                         |
+| `No AWS credential is available to sign with`                  | an access key or a secret key is missing                      | set both AWS variables, or use `AWS_BEARER_TOKEN_BEDROCK`               |
+| A reply with no choices or no content blocks                   | the provider returned an error envelope                       | read the transport error or the provider's message                      |
+
+## See also
+
+- [Configuration](configuration.md) for the provider row keys, the shipped rows, and the secret name list.
+- [Tools](tools.md) for the tool definitions that `complete` receives and the tool calls a completion returns.
+- [Commands](commands.md) for `providers`, `secrets`, and the exit statuses of each command.
+- [Supervisor and heartbeat](supervisor.md) for the spend ledger, the budget windows, and the process that holds the key.
+- [Memory](memory.md) for the store's own scrubbing and the search that reads stored turns.

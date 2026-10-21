@@ -1,120 +1,60 @@
 # Development
 
-This page covers the source tree, the load order, the style rules, and the
-commit policy. [Testing](testing.md) covers the suite and the build gate.
+This chapter covers the source tree, the build, the package layout, the load order, the code style, the validation stack, and the commit policy.
+It is written for a developer who will change the code.
 
 ## Repository layout
 
-| Path                       | Holds                                             |
-| -------------------------- | ------------------------------------------------- |
-| `enchiridion.asd`          | The core system and its load order                |
-| `src/main.cl`              | The entry script. ASDF does not load it           |
-| `src/broker-exec.cl`       | The agent-side half of the broker                 |
-| `src/enchiridion/`         | The core, one file or one directory per subsystem |
-| `t/`                       | The test systems and the suites                   |
-| `config.example.cl`        | The tracked template for the configuration        |
-| `flake.nix`                | Build, check, and test                            |
-| `docker/Dockerfile`        | The image build. Docker is the boundary           |
-| `.dockerignore`            | What the image build context excludes             |
-| `docker/entrypoint.sh`     | The two users, then the supervisor                |
-| `docker/enchiridion.sh`    | The wrapper the image installs as the program      |
-| `docker/isolation-test.sh` | The isolation checks, run by hand in the image    |
-| `compose.yml`              | The server deployment for the image               |
-| `docs/`                    | This documentation                                |
-| `LICENSE`                  | The BSD Zero Clause License                       |
+| Path                 | Contents                                                                   |
+| -------------------- | -------------------------------------------------------------------------- |
+| `enchiridion.asd`    | The core system and its load order.                                        |
+| `src/main.cl`        | The program: the command table and the entry point. ASDF does not load it. |
+| `src/broker-exec.cl` | The agent side of the broker, run as a child process.                      |
+| `src/enchiridion/`   | The core, one file or one directory per subsystem.                         |
+| `t/`                 | The test systems and the suites.                                           |
+| `config.example.cl`  | The tracked template for `config.cl`.                                      |
+| `flake.nix`          | The build, the checks, the shells, and the test run.                       |
+| `docker/`            | The image, the entrypoint, the wrapper, and the isolation test.            |
+| `compose.yml`        | The server deployment for the image.                                       |
+| `docs/`              | This documentation.                                                        |
 
-`src/main.cl` is not a system component on purpose. Loading a system must never
-start an agent, and the top level form of this file is the program. The check
-gate compiles it explicitly, so the file is still covered.
+`src/main.cl` and `src/broker-exec.cl` are programs, not system components.
+Loading a system must never start an agent, so neither file is a component of `enchiridion.asd`.
+The gate compiles both files explicitly, so they are still checked.
 
-## The Nix inputs
+## Build
 
-The flake tracks `github:NixOS/nixpkgs/nixpkgs-unstable` by branch, and
-`flake.lock` records the commit. Run `nix flake update nixpkgs` to move the lock
-to the branch tip, then run `nix run .#check` and `nix run .#test` before you
-commit the lock. The input is not updated by itself: a checkout keeps the commit
-in its lock, so a build is reproducible until someone updates it.
+The build is a Nix flake.
+The flake pins `nixpkgs` by branch and records the commit in `flake.lock`.
+Every Lisp dependency comes from `nixpkgs`, built with the SBCL that the flake builds from the release tarball, so the Nix build and the container image use one compiler.
+The gate loads the compiled dependencies from the store and does not compile them again.
 
-nixpkgs carries SBCL 2.6.8. The flake builds SBCL 2.6.9 from the release tarball
-so the Nix build and the Docker image use one version, and it uses the nixpkgs
-SBCL as the bootstrap compiler. Every Lisp dependency comes from nixpkgs, built
-with that SBCL, and the gate loads the store fasls instead of compiling the
-dependencies itself.
+```sh
+nix develop                      # the development shell
+nix develop .#full               # the shell with the C toolchain, full git, colima, and clang-tools
+nix run .#check                  # compile every system file and both programs
+nix run .#test                   # check, then run both test systems
+nix run .#enchiridion -- help    # run the program from the flake
+nix build                        # the package
+```
 
-### Closure sizes
+The default shell carries no C toolchain.
+Nix builds the C dependencies, so a toolchain is necessary only when a new C-backed Lisp dependency is compiled by hand, and `nix develop .#full` is the shell for that work.
 
-Measured with `nix path-info -rSh` on `aarch64-darwin`:
+The flake rewrites the interpreter path inside SBCL's sources to `coreutils`, which keeps the Darwin runtime dependencies and the package closure small.
+`nixpkgs` can rename the phase that carries the rewrite, and the rewrite then stops matching without a warning.
+After an update of `nixpkgs`, run this command and expect `0`:
 
-| Target                                | Closure |
-| ------------------------------------- | ------- |
-| `packages.aarch64-darwin.enchiridion` | 222 MB  |
-| `devShells.aarch64-darwin.default`    | 407 MB  |
-| `devShells.aarch64-darwin.full`       | 3.0 GB  |
+```sh
+nix path-info -r .#packages.<system>.enchiridion | grep -cE 'shell_cmds|bootstrap-tools'
+```
 
-The package figure is SBCL and the Lisp libraries. Two parts of the Darwin
-figure are easy to reintroduce, so the composition is recorded here:
-
-- SBCL's own closure is 144 MB, down from 431 MB. nixpkgs substitutes
-  `${posixUtils}/bin/env` into SBCL's sources, and on Darwin `posixUtils` is
-  `darwin.shell_cmds`, whose closure reaches `libxo`, `gettext` and 267 MB of
-  `bootstrap-tools`. The flake rewrites that path to `coreutils` in
-  `sbclPatchPhase`, so neither `shell_cmds` nor `bootstrap-tools` appears
-  anywhere in the package closure. The rewrite is silent when it misses: if a
-  future nixpkgs renames `sbclPatchPhase`, the override becomes a no-op and the
-  reference returns, so the check that catches it is
-  `nix path-info -r .#packages.<system>.enchiridion | grep -cE
-  'shell_cmds|bootstrap-tools'`, which must be 0.
-- The default shell is 407 MB, down from 3.2 GB, because it uses `mkShellNoCC`
-  and `gitMinimal`. `mkShell` propagates `stdenv-darwin` (1.3 GB), and `pkgs.git`
-  pulls `python3`, which pulls the same toolchain; together they are 1.6 GB the
-  default shell never uses. Nix builds the C dependencies, so the toolchain is
-  only needed when someone compiles a new C-backed Lisp dependency by hand. The
-  rule is explicit: `default` is the lean shell, with no C toolchain and no git
-  python extras; `nix develop .#full` is the complete shell, with `pkgs.mkShell`,
-  full `pkgs.git`, colima, and clang-tools.
-
-The Linux closures need a Linux builder; they are not measured here.
-
-`$out/lib` holds `src/` and `enchiridion.asd` only, 2.1 MB. `t/`, `docs/`,
-`docker/`, `compose.yml`, `flake.nix`, `README.md`, and `LICENSE` are not
-runtime inputs and do not ship.
-
-## The runtime provider catalog
-
-No provider or model data is committed to this tree, apart from the three rows
-in `config.cl` (`:openai`, `:opencode`, `:anthropic`) that ship as configuration
-defaults, so the default path works with no catalog and no network.
-`src/enchiridion/llm/catalog.cl` fetches
-[models.dev](https://models.dev/api.json) at run time and caches the trimmed
-index under `run/providers.json` and the model metadata under
-`run/provider-models.json`, and each provider's own model list is cached under
-`run/models/<provider>.json`. All of them live under `run/`, which `.gitignore`
-and the flake source filter already exclude, so a refresh can never put provider
-data into the store. `enchiridion providers refresh` runs the fetch by hand;
-`ENCHIRIDION_PROVIDERS_PATH` points the write at another path, which is how the
-cache is inspected without touching an operator's run directory.
-
-The cloud handlers sign their requests, so the system depends on `ironclad`
-(HMAC-SHA256 for AWS Signature V4, RS256 for the Vertex service-account JWT) and
-`cl-base64` for the URL-safe encoding. Both are in `lispPackageNames` in
-`flake.nix`.
-
-### Generated and ignored paths
-
-These live beside the source. `.gitignore` excludes all of them:
-
-| Path                                 | Holds                                                           |
-| ------------------------------------ | --------------------------------------------------------------- |
-| `config.cl`                          | Your configuration. The tracked template is `config.example.cl` |
-| `.env`                               | Secret values, mode 600                                         |
-| `agents/`                            | The agent directory, written on first launch                    |
-| `run/`                               | The control file and the status file of a running supervisor, and the provider caches `providers.json`, `provider-models.json`, and `models/<provider>.json` |
-| `PLAN.md`                            | The design record. It holds rationale, not instructions         |
-| `research/`, `enchiridion-property/` | Local working directories                                       |
+The package installs `src/` and `enchiridion.asd` under `$out/lib` and nothing else.
+`t/`, `docs/`, `docker/`, `compose.yml`, `flake.nix`, `README.md`, and `LICENSE` are not runtime inputs.
 
 ## Packages
 
-One package per subsystem, and the package name mirrors the directory:
+Each subsystem owns one package, and the package name follows the directory:
 
 ```text
 enchiridion              enchiridion.llm          enchiridion.memory
@@ -126,97 +66,88 @@ enchiridion.plugin       enchiridion.tools.builtin enchiridion.channel.fluxer
 enchiridion.supervisor   enchiridion.user
 ```
 
-`src/enchiridion/packages.cl` holds every definition. No package uses another
-package in full. Each one names what it imports with `:import-from`, so a call
-reads as `enchiridion.llm:complete` and the reader knows where it lives.
+`src/enchiridion/packages.cl` holds every definition.
+No package uses another package in full.
+Each definition names its imports with `:import-from`, so a call reads as `enchiridion.llm:complete` and the source of the symbol is visible at the call site.
 
-`enchiridion.user` is the package the configuration file is read in. A
-`config.cl` starts with `(in-package #:enchiridion.user)`.
+`enchiridion.user` is the package that a configuration file is read in.
+Every `config.cl` begins with `(in-package #:enchiridion.user)`.
 
 ## Load order
 
-`enchiridion.asd` is `:serial t`, so the order is fixed and deliberate.
+`enchiridion.asd` is `:serial t`, so the load order is fixed.
 
-1. `packages` and `compat`. The package definitions come before every file that
-   uses them, and `compat` is the only file with implementation extensions.
+1. `packages` and `compat`. The definitions come before every file that uses them, and `compat` is the only file with implementation-specific code.
 2. `config`, `git`, `errors`.
-3. `llm`: `secrets`, `protocol`, `openai`, `anthropic`.
+3. `llm`: `secrets`, `protocol`, `json`, `http`, `registry`, `dialects`, `auth`, `openai`, `anthropic`, `aws-sigv4`, `bedrock`, `gcp-oauth`, `vertex`, `catalog`, `providers`.
 4. `memory`: `blocks`, `store`, `tiers`, `seed`, `state`.
-5. `tools`: `schema`, `registry`, `pipe`, `broker`, then the builtins `file`,
-   `shell`, `search`, `blockops`, `meta`, `web`, `register`.
+5. `tools`: `schema`, `registry`, `pipe`, `broker`, then the builtins `file`, `shell`, `search`, `blockops`, `meta`, `web`, `register`.
 6. `plugin`: `loader`, `verify`, `manifest`.
 7. `channel`: `protocol`, `http`, `fluxer`.
 8. `supervisor`, `kernel`, `sleep`, then `channel/cli`.
 
-Two orderings carry a reason. `channel/protocol` loads before the supervisor
-because the supervisor speaks it. `channel/cli` loads last, because the command
-table calls both the supervisor and the kernel. Forward declarations for nine
-signatures would only make a second copy of those signatures.
+Two positions in that order are deliberate.
+`channel/protocol` loads before the supervisor because the supervisor speaks the protocol.
+`channel/cli` loads last because the command table calls both the supervisor and the kernel, and a forward declaration for each signature would be a second copy that can drift.
 
-## Style
+## Code style
 
-The code follows the lisp-lang.org style guide. The rules below are the ones a
-reviewer checks first.
+The code follows the [lisp-lang.org style guide](https://lisp-lang.org/style-guide/).
+The rules below are the ones a review checks first.
 
 ### Naming
 
-Lowercase, single dashes, complete words. `user-count`, never `user-cnt`.
-Specials take `*earmuffs*` and constants take `+constants+`. A predicate on one
-word ends in `p`, and a predicate on several words ends in `-p`.
+Lowercase words separated by single dashes.
+Spell a word in full: `user-count`, never `user-cnt`.
+A special variable takes `*earmuffs*`, and a constant takes `+plus-signs+`.
+A predicate on one word ends in `p`, and a predicate on several words ends in `-p`.
 
 ### Formatting
 
-Two spaces per form. Both branches of an `if` stay on one line. The limit is 100
-columns. `;;;;` states the purpose at the top of a file, and `;;;` separates
-regions. `;;` marks a region inside a form, and `;` is a short note at the end
-of a line.
+Indent by two spaces.
+Keep both branches of an `if` on one line.
+Limit a line to 100 columns.
+`;;;;` states the purpose of a file at the top, `;;;` separates regions, `;;` marks a region inside a form, and `;` adds a note at the end of a line.
 
 ### Types
 
-Every function carries an `ftype` declaration before its `defun`. Every CLOS
-slot carries `:type`, in the order `:accessor`, `:initarg`, `:initform`,
-`:type`, `:documentation`. The types are documentation the compiler enforces.
+Declare an `ftype` before every `defun`.
+Give every CLOS slot a `:type`, and write the slots in the order `:accessor`, `:initarg`, `:initform`, `:type`, `:documentation`.
+The declarations are documentation that the compiler checks.
 
 ### Conditions
 
-Conditions, not formatted strings. A `define-condition` carries the data and a
-`:report` method, so a caller can inspect the condition and a reader gets a
-sentence.
+Use a condition and a `:report` method instead of a formatted string.
+The condition carries the data for a caller, and the report gives a reader one sentence.
 
-### Flow
+### Control flow
 
-`when` and `unless` in place of a bare `if`. A long condition moves into a named
-predicate.
+Use `when` or `unless` in place of a bare `if`.
+Move a long condition into a named predicate.
 
 ### Portability
 
-`src/enchiridion/compat.cl` is the only file that contains implementation
-extensions, such as `sb-ext:run-program`, `sb-ext:posix-getenv`, and reader
-conditionals. Everything above it is standard Common Lisp.
+`src/enchiridion/compat.cl` is the only file with implementation-specific code, such as `sb-ext:run-program`, `sb-ext:posix-getenv`, and reader conditionals.
+Every file above it is standard Common Lisp.
 
-## The validation stack
+## Validation
 
-| Layer                 | Tool                                                                                          |
-| --------------------- | --------------------------------------------------------------------------------------------- |
-| Compile-time types    | SBCL `declaim` specifiers                                                                     |
-| Warnings as errors    | The `:around-compile` hook in each `.asd` file                                                |
-| Tool argument schemas | `cl-jschema`                                                                                  |
-| Unit tests            | `rove`                                                                                        |
-| Property tests        | `rove` loops and `random`. The system declares `cl-quickcheck`, and no property file calls it |
+| Layer                 | Tool                                                                                            |
+| --------------------- | ----------------------------------------------------------------------------------------------- |
+| Compile-time types    | SBCL `declaim` specifiers                                                                       |
+| Warnings as errors    | The `:around-compile` hook in each `.asd` file                                                  |
+| Tool argument schemas | `cl-jschema`                                                                                    |
+| Unit tests            | `rove`                                                                                          |
+| Property tests        | `rove` loops with `random`. The system declares `cl-quickcheck`, and no property file calls it. |
 
-`plugin/verify.cl` proclaims `(optimize (safety 3) (debug 3))` while it loads
-one plugin file. A bad plugin therefore hits a bounds check or a slot type
-error. No other file proclaims an optimization level.
+`plugin/verify.cl` proclaims `(optimize (safety 3) (debug 3))` while it loads one plugin file, so a bad plugin stops at a bounds check or a slot type error.
+No other file proclaims an optimization level.
 
 ### The build gate
 
-A compile warning is a failure. Both `enchiridion.asd` and
-`t/enchiridion-tests.asd` install an `:around-compile` hook that binds
-`asdf:*compile-file-warnings-behaviour*` to `:error` and catches warnings while
-the file compiles. The hook is scoped to the system, so a warning from a
-dependency does not stop the build.
-
-Run the gate with:
+A compile warning is a failure.
+`enchiridion.asd` and `t/enchiridion-tests.asd` install an `:around-compile` hook that binds `asdf:*compile-file-warnings-behaviour*` to `:error` and collects the warnings while a file compiles.
+The hook is scoped to the system, so a warning from a dependency does not stop the build.
 
 ```sh
 nix run .#check
@@ -224,36 +155,44 @@ nix run .#check
 
 ## Tests
 
-The suite lives in `t/`, and it mirrors the source tree. Two systems exist:
-`enchiridion-tests` is the suite every commit passes, and
-`enchiridion-tests/property` is slower and separate. [Testing](testing.md)
-covers both, the rove bridge, and the coverage of each file.
+The suite lives in `t/` and mirrors the source tree.
+`enchiridion-tests` is the system that every commit passes, and `enchiridion-tests/property` is the slower property system.
+[Testing](testing.md) covers both systems, the rove bridge, and the coverage of each module.
 
 ## Commit policy
 
 - The branch is `main`.
-- One commit per logical unit. A unit is a testable increment, not a timer.
+- One commit per logical unit. A unit is a change that can be tested on its own, not a measure of time.
 - The subject is in the imperative mood.
-- The design record asks for a body that states why and names the invariant.
-  The commits in this repository carry a title only.
-- Every commit is signed. The global configuration sets `commit.gpgsign` to
-  true, `gpg.format` to `ssh`, and `user.signingkey` to the operator's key.
-- Signature verification needs an allowed signers file. Without one, `git log
---show-signature` reports `N` even when the signature is present. Set it with:
+- A commit body is optional. Every commit in this repository carries a title only.
+- Every commit is signed. The global Git configuration sets `commit.gpgsign` to true, `gpg.format` to `ssh`, and `user.signingkey` to the operator's key.
+
+Signature verification needs an allowed signers file.
+Without one, `git log --show-signature` reports `N` even when the signature is present.
 
 ```sh
 git config --global gpg.ssh.allowedSignersFile ~/.ssh/allowed_signers
 ```
 
-The file holds one line, the signing identity and the public key:
+The file holds one line for each signing identity:
 
 ```text
 you@example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA...
 ```
 
-## Related
+## Writing the documentation
 
-- [Documentation index](index.md)
+The pages follow the shape of the BSD handbooks, and the [FreeBSD Documentation Project Primer](https://docs.freebsd.org/en/books/fdp-primer/writing-style/) is the reference for the style.
+
+- State current behaviour only. No change history, no measurement taken during a change, and no reference to the plan that produced the code.
+- Put a fact on one page. Link to the page that owns the fact instead of restating it.
+- Open a section with one sentence that says what the subject is, then give the common case, then the reference detail.
+- Do not pin a compiler or a tool version in prose. The build files record the version.
+- Define an acronym at its first use on the page, then use the acronym.
+- Give a tested example. A trivial working example is better than no example.
+- Use the formal register: imperative steps, no contractions, one sentence per line.
+
+## See also
+
 - [Testing](testing.md)
-- [Configuration](configuration.md)
-- [Deployment](deployment.md)
+- [Documentation index](index.md)

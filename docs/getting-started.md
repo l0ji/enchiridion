@@ -1,212 +1,223 @@
 # Getting started
 
-enchiridion is an autonomous agent harness written in Common Lisp. It runs one
-agent in a directory of Markdown files. Nix builds the program, and every
-dependency comes from the flake. The operator runs a command, and the command
-prints and exits or starts a session. A first launch creates the agent
-directory and stops, so the operator can edit the seed files first. The same
-command table backs the shell and the REPL.
+The procedure below builds the harness from a checkout, writes the agent directory, and starts the first conversation.
+A reader who completes it has a working agent directory, a provider credential, and a session that answers.
 
-## What you need
+## How the pieces fit
 
-- Nix, with flakes enabled.
-- A host on the flake systems list: `x86_64-linux`, `aarch64-linux`, or
-  `aarch64-darwin`.
-- Git, when you want history in the agent directory. The harness writes the
-  files without git and skips only the commit.
-- Docker, when you want the container image. It builds on amd64 and arm64.
+The checkout holds the source, the Nix flake, `config.cl`, and `.env`.
+The agent directory holds one agent's files, memory, and history.
+Its location is `<home>/agents/default/`, where `<home>` is the current directory or `ENCHIRIDION_HOME`.
+The supervisor process holds the model client, the secrets, the store, and the channels.
+Agent code runs in a child process, under a separate uid in the container (see [Deployment](deployment.md)).
+`chat` and `serve` start a supervisor, and inspection commands do not.
+The first launch writes the seed files and stops.
 
-The flake supplies SBCL 2.6.9 and every Lisp library for development, with no
-Quicklisp. The Docker image uses Quicklisp, because it has no Nix.
+## Requirements
 
-## Build, check, and test
+- Nix with flakes enabled. The flake supplies the Lisp implementation and every library.
+- A host on `x86_64-linux`, `aarch64-linux`, or `aarch64-darwin`.
+- Git, for the history of the agent directory. The harness writes the files without Git and skips only the commit.
+- A provider credential. Without `config.cl`, the shipped default selects OpenAI and reads `OPENAI_API_KEY` (see [Large language model backends](llm.md)).
+- A terminal, for the terminal channel.
 
-```sh
-nix develop                      # development shell
-nix develop .#full               # the heavy shell, with the Docker tooling
-nix run .#check                  # compile every file
-nix run .#test                   # run the test suite
-nix run .#enchiridion -- help    # print the command list
-```
+## Obtain the source
 
-| Command                         | What it does                                                               |
-| ------------------------------- | -------------------------------------------------------------------------- |
-| `nix develop`                   | Start the development shell with SBCL, SQLite, slynk, nixfmt, and git.     |
-| `nix develop .#full`            | Default shell plus the C toolchain, full git, colima, and clang-tools.     |
-| `nix run .#check`               | Compile the systems and the two entry scripts. A warning fails the build.  |
-| `nix run .#test`                | Run the test systems `enchiridion-tests` and `enchiridion-tests/property`. |
-| `nix run .#enchiridion -- help` | Run the program with the `help` command.                                   |
-| `nix run .#enchiridion`         | Run the program with no command. This is the first launch.                 |
-| `nix run .`                     | Run the same program through the `default` app.                            |
-| `docker compose build`          | Build the container image from `docker/Dockerfile`.                        |
+Place a checkout of the repository on the local disk.
+Run every command in this chapter from the checkout root, which holds `enchiridion.asd` and `flake.nix`.
 
-Use `nix develop .#full` for the container workflow and for compiling a new
-C-backed Lisp dependency by hand.
+## Build and test
 
-`.#check` is the gate. It compiles every system file, then `src/main.cl` and
-`src/broker-exec.cl` on their own. A compiler warning becomes an error, so a
-clean build is the only passing build.
+1. Compile every file and the two entry scripts:
 
-The `check` command in the program runs the same gate:
+   ```sh
+   nix run .#check
+   ```
 
-```sh
-nix run .#enchiridion -- check
-```
+2. Run the unit suite and the property suite:
 
-## First launch
+   ```sh
+   nix run .#test
+   ```
 
-Run the program with no command:
+`nix run .#check` prints `enchiridion-check passed.` and exits 0 on success.
+`nix run .#test` prints `enchiridion-test passed.` and exits 0 on success.
+A compile error stops either gate with a non-zero status.
+The `check` command in the program runs the same gate in the checkout (see [Commands](commands.md#check)).
+
+The development shell supplies a Lisp REPL and a source run.
+The heavier shell adds the C toolchain and the container workflow.
 
 ```sh
-nix run .#enchiridion
+nix develop          # the development shell
+nix develop .#full   # the heavier shell
 ```
 
-The first launch creates the agent directory and writes these files:
+## Perform the first launch
 
-| File                        | What it holds                                                                     |
-| --------------------------- | --------------------------------------------------------------------------------- |
-| `GUIDE.md`                  | The operator walkthrough.                                                         |
-| `SOUL.md`                   | The agent identity. The template is a placeholder.                                |
-| `OPERATOR.md`               | Who the agent works for. The template is a placeholder.                           |
-| `WORLD.md`                  | The environment: paths, commands, and conventions. The template is a placeholder. |
-| `BOOTSTRAP.md`              | The first steps, worked through one time.                                         |
-| `skills/example-welcome.cl` | An example skill.                                                                 |
-| `tools/example-echo.cl`     | An example tool.                                                                  |
-| `state.json`                | The runtime state, with the bootstrap step at zero.                               |
+The first launch writes the agent directory and exits.
+It starts no supervisor.
 
-Rules for these files:
+1. Run the program with no command and no flags:
 
-- The program creates a seed file when it is absent, and never overwrites one.
-- A second `init` run reports the files it finds and writes only the gaps. A
-  second run with no command prints a ready line and starts nothing.
-- The agent directory becomes a git repository. The first commit is
-  `Create the agent directory`.
-- A host with no git, or with no git identity, still gets the files. Only the
-  commit fails.
-- The agent cannot write `SOUL.md`, `OPERATOR.md`, or `WORLD.md` until
-  bootstrap hands over.
+   ```sh
+   nix run .#enchiridion
+   ```
 
-The first launch prints the status line, then this advice, and exits 0:
+2. Read the printed path and the file list.
+   The path is absolute.
+
+The output names every seed file it wrote:
 
 ```text
+No agent directory found. Creating /path/to/checkout/agents/default/.
+  GUIDE.md
+  SOUL.md
+  OPERATOR.md
+  WORLD.md
+  BOOTSTRAP.md
+  skills/example-welcome.cl
+  tools/example-echo.cl
+  state.json
 Bootstrap has not started. Edit SOUL.md, OPERATOR.md, and WORLD.md first,
 then run `enchiridion chat`. See agents/default/GUIDE.md for the walkthrough.
 ```
 
-A write that fails prints the names and the reasons, then exits 1.
+The command exits 0 when every seed file is written.
+A write problem prints the failures and exits 1.
 
-The `init` command does the same work on demand:
-
-```sh
-nix run .#enchiridion -- init
-```
-
-## Where the files live
-
-The home root is `ENCHIRIDION_HOME` when the operator sets it. Without it, the
-home root is the current directory. A checkout sets neither, so the harness
-uses the directory it starts in.
-
-| Path                                | What it holds                                                                       |
-| ----------------------------------- | ----------------------------------------------------------------------------------- |
-| `<home>/agents/default/`            | The agent directory.                                                                |
-| `<home>/run/enchiridion.control`    | Control requests, one per line.                                                     |
-| `<home>/run/enchiridion.status`     | The status file the supervisor rewrites.                                            |
-| `<home>/run/broker.sock`            | The broker socket, when the operator sets `ENCHIRIDION_HOME`.                       |
-| `<home>/agents/default/broker.sock` | The broker socket, when `ENCHIRIDION_HOME` is unset.                                |
-| `<current directory>/config.cl`     | The operator configuration. The project root is the second place the harness looks. |
-| `<current directory>/.env`          | The secret file. The current directory wins over the project root.                  |
-
-Two more variables set the roots:
-
-| Variable             | Effect                                                     |
-| -------------------- | ---------------------------------------------------------- |
-| `ENCHIRIDION_HOME`   | Set the home root for the agent directory and `run/`.      |
-| `ENCHIRIDION_SOURCE` | Set the project root for a copy with no checkout above it. |
-
-## Talk to the agent
-
-```sh
-nix run .#enchiridion -- chat
-nix run .#enchiridion -- ask "What is in WORLD.md?"
-nix run .#enchiridion -- serve
-```
-
-| Command      | What it does                                                            |
-| ------------ | ----------------------------------------------------------------------- |
-| `chat`       | Start the REPL in the foreground. The process also runs a supervisor.   |
-| `ask "TEXT"` | Run one turn in a short-lived session, print the reply, and exit.       |
-| `serve`      | Start the supervisor and poll the control file until the process stops. |
-
-`chat` reads a line, then sends the line as a turn. A line that starts with `/`
-is a command, for example `/help`. The prompt is `enchiridion> `. The line
-`/quit` leaves the session. An end of input also leaves.
-
-`/help` prints every command in the slash form the REPL reads, and it adds the
-REPL-only `/stop`, `/quit`, and `/who`. The shell-only commands `chat` and
-`serve` are not on that list. A lone word that names a REPL command, such as
-`help`, prints ``Commands start with a slash: try `/help`.`` and sends no turn.
-Two or more words, and a word that names nothing, are still turns.
-
-Ctrl-C does not leave the session either. It aborts the line being typed or the
-turn being answered, prints `interrupted.`, and the prompt comes back. Use
-`/quit` or end of input to leave.
-
-The reply goes to standard output. A token line goes to standard error:
+A later launch with no command and an agent directory in place prints one line:
 
 ```text
-deepseek-v4.1-flash  in 1204  out 96  cached 1024
+Agent directory is ready. Run `enchiridion chat`, or `enchiridion help`.
 ```
 
-The line shows the model, the input tokens, and the output tokens. It adds
-`cached N` and `wrote N` when the provider reports cache tokens.
+A seed file is created when absent and never overwritten.
+A rerun reports the files it kept and writes only the missing ones.
+`enchiridion init` performs the same work on demand (see [Commands](commands.md#init)).
 
-## Common first-run failures
+The launch also creates a nested `.git/` repository and its `.gitignore` when Git is available.
+`GUIDE.md` is the walkthrough and `BOOTSTRAP.md` holds the first steps.
+The other three Markdown files hold the agent's identity, its operator context, and its environment.
 
-| What you see                                                                                                                 | Cause                                                         | What to do                                                                              |
-| ---------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| `Configuration is wrong at :api-key.` and `No API key. Put OPENAI_API_KEY in .env or the environment.` The exit status is 1. | The process holds no API key.                                 | Put the key in `.env` or the environment. The variable name comes from `:api-key-env`.  |
-| `enchiridion: stdin is not a terminal, so the cli channel stays down.`                                                       | The terminal channel needs a terminal on standard input.      | Run `serve` from a terminal. In a pipe, `chat` reads an end of input and exits at once. |
-| `reload: no supervisor is running, so nothing was asked.` The exit status is 1.                                              | `reload`, `channels`, and `heartbeat` need a live supervisor. | Start `serve` in another terminal. `health` reads the status file only.                 |
-| There is no command called NAME. Try `help`. The exit status is 2. At the REPL the last words are ``Try `/help`.``.                                     | The name is not in the command table.                         | Run `help`, or read [Commands](commands.md).                                            |
-| `The --bind, --port and --token-env flags belong to --channel http.` The exit status is 2.                                   | A webhook flag came without `--channel http`.                 | Add `--channel http` to the command.                                                    |
-| `There is no channel called NAME. The channels are cli, http and fluxer.` The exit status is 2.                              | The `--channel` value is not one of the three channels.       | Use `cli`, `http`, or `fluxer`.                                                         |
-| `The port must be a number between 1 and 65535, not X.` The exit status is 2.                                                | The `--port` value is not a port number.                      | Give a number in the range.                                                             |
-| `enchiridion: not keeping a transcript: ...`                                                                                 | The memory store did not open.                                | The reply still prints. Check the path in `:memory :db`.                                |
+## Edit the seed files
 
-Under `serve`, a process with no terminal repeats that line about once per
-second. The terminal channel returns at once. The supervisor waits one second,
-then starts the channel again, for as long as the process runs. A `chat`
-session is different, because the REPL reads an end of input and returns. A
-store that will not open costs the transcript, and it does not cost the turn.
+Edit three files before the first session:
 
-## A map of the pages
+1. Edit `SOUL.md`. State the agent's name, voice, values, and refusals.
 
-| Page                                        | What it covers                                        |
-| ------------------------------------------- | ----------------------------------------------------- |
-| [Documentation index](index.md)             | The full list of pages.                               |
-| [Configuration](configuration.md)           | `config.cl`, every key, and the environment.          |
-| [Commands](commands.md)                     | Every command, its arguments, and its exit status.    |
-| [Channels](channels.md)                     | The channel protocol, `cli`, `http`, and `fluxer`.    |
-| [Supervisor and heartbeat](supervisor.md)   | The supervisor, the status file, and the heartbeat.   |
-| [Deployment](deployment.md)                 | The container, the two users, and the isolation test. |
-| [Memory](memory.md)                         | The blocks, the three tiers, and the store.           |
-| [Models and secrets](llm.md)                | The backends, the model tiers, and the scrubber.      |
-| [Tools](tools.md)                           | The registry, the broker, and every builtin tool.     |
-| [Plugins and self-modification](plugins.md) | The manifest, the verifier, and the loader.           |
-| [Testing](testing.md)                       | The two test systems and how to add a test.           |
-| [Development](development.md)               | The layout, the packages, and the style rules.        |
-| [README](../README.md)                      | The build and run summary.                            |
+2. Edit `OPERATOR.md`. State who the operator is, what a good answer looks like, and when the agent may act or interrupt.
 
-## Related
+3. Edit `WORLD.md`. State the real paths, commands, and conventions on this machine.
 
-- [Configuration](configuration.md)
-- [Commands](commands.md)
-- [Channels](channels.md)
-- [Supervisor and heartbeat](supervisor.md)
-- [Deployment](deployment.md)
-- [Memory](memory.md)
-- [Models and secrets](llm.md)
-- [Tools](tools.md)
-- [Testing](testing.md)
-- [Development](development.md)
+Leave `BOOTSTRAP.md` in place.
+While it is present and its steps are not all done, a write through the memory block tool to `SOUL.md`, `OPERATOR.md`, or `WORLD.md` is refused.
+No shipped tool marks a bootstrap step done, so the handover does not occur through the turn surface.
+[Memory](memory.md) covers the state machine.
+
+## Add the provider credential
+
+`config.cl` holds paths and behavior, never a secret value.
+The credential comes from `.env` beside the checkout or from the process environment.
+
+1. Create `.env` in the checkout root:
+
+   ```sh
+   cat > .env <<'EOF'
+   OPENAI_API_KEY=replace-with-the-provider-key
+   EOF
+   chmod 600 .env
+   ```
+
+2. Confirm the name, the source, and the mode:
+
+   ```sh
+   nix run .#enchiridion -- secrets
+   ```
+
+The `secrets` command prints one line per loaded name and then the file it read:
+
+```text
+OPENAI_API_KEY from file
+secrets file /path/to/checkout/.env mode #o600 present
+```
+
+The loader refuses a world-readable file before it reads one pair, with the path, the mode, and the `chmod` needed to fix it.
+
+The shipped default selects OpenAI.
+For another provider, copy `config.example.cl` to `config.cl` and edit it (see [Configuration](configuration.md)).
+
+## Start the first conversation
+
+`chat` runs the read-eval-print loop (REPL) in the foreground, and `ask` runs one turn and exits.
+
+1. Enter the development shell, name the Lisp implementation for child processes, and start the REPL:
+
+   ```sh
+   nix develop
+   export ENCHIRIDION_SBCL=$(command -v sbcl)
+   sbcl --script src/main.cl chat
+   ```
+
+2. Type a message at the `enchiridion>` prompt, `/help` for the command list, and `/quit` to leave.
+
+For one turn without a session, run:
+
+```sh
+sbcl --script src/main.cl ask "What can you do?"
+```
+
+The reply goes to standard output.
+The token line goes to standard error, as `<model>  in <input>  out <output>`.
+The line adds `  cached <N>` and `  wrote <N>` when the provider reports cache tokens.
+The session loads `SOUL.md`, `OPERATOR.md`, and `WORLD.md` as memory blocks.
+Writes to those blocks stay refused while `BOOTSTRAP.md` is pending (see [Memory](memory.md)).
+
+### Shell and REPL
+
+A shell command is one program invocation that prints and exits with a status.
+`chat` and `serve` are shell-only commands.
+The REPL holds one process.
+A line without a slash is a turn, and a line with a slash is a command.
+Every command except `chat` and `serve` is available in the REPL.
+`/stop`, `/quit`, and `/who` exist only in the REPL.
+Ctrl-C interrupts the line or the turn and returns to the prompt.
+`/quit`, end of input, SIGTERM, and SIGHUP leave the session (see [Commands](commands.md)).
+
+## Where state lives
+
+| Path                                | Holds                                               |
+| ----------------------------------- | --------------------------------------------------- |
+| `<checkout>/config.cl`              | Operator configuration, optional and gitignored     |
+| `<checkout>/.env`                   | Credentials, optional, mode 600                     |
+| `<home>/agents/default/`            | Seed files, skills, tools, `state.json`, store      |
+| `<home>/run/enchiridion.control`    | Control requests, one per line                      |
+| `<home>/run/enchiridion.status`     | Status file the supervisor rewrites                 |
+| `<home>/run/broker.sock`            | Broker socket, when `ENCHIRIDION_HOME` is set       |
+| `<home>/agents/default/broker.sock` | Broker socket, when `ENCHIRIDION_HOME` is unset     |
+| `agents/default/memory.db`          | Default memory store, unless `:memory :db` sets one |
+
+`<home>` is the current directory at launch.
+Set `ENCHIRIDION_HOME` to move both `agents/default/` and `run/` under one other directory.
+Set `ENCHIRIDION_SOURCE` to name the project root for an installed copy with no checkout above it.
+The store path, the block limits, and the run files are described in [Memory](memory.md) and [Supervisor and heartbeat](supervisor.md).
+
+## Troubleshooting
+
+| Symptom                                                       | Cause                                                             | Fix                                                                                       |
+| ------------------------------------------------------------- | ----------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `Could not write:` after the first launch                     | The home root is not writable                                     | Create a writable directory, then set `ENCHIRIDION_HOME` to it                            |
+| `No API key. Put OPENAI_API_KEY in .env or the environment.`  | No credential was loaded for the selected provider                | Write the key to `.env` or export the variable, then retry                                |
+| `.env is mode #o644 and every uid can read it.`               | The world read bit is set on the secret file                      | Run `chmod 600 .env`                                                                      |
+| `not keeping a transcript: Configuration is wrong at MEMORY.` | The memory store cannot be opened at the configured path          | Make the home root writable, or set `:memory :db` (see [Configuration](configuration.md)) |
+| `There is no command called ...`                              | An unknown command, or a flag read as a command                   | Run `help`, and put flags before the command                                              |
+| `The broker did not start before the timeout.`                | The child Lisp is missing, or its cache directory is not writable | Run from `nix develop` with `ENCHIRIDION_SBCL` set (see [Commands](commands.md))          |
+| `stdin is not a terminal, so the cli channel stays down.`     | `serve` owns the terminal channel without a terminal              | Run in a terminal, or use another channel (see [Channels](channels.md))                   |
+
+## See also
+
+- [Configuration](configuration.md): every section and key, the provider rows, and the precedence rules.
+- [Commands](commands.md): the command table, flags, exit statuses, the REPL, and signals.
+- [Supervisor and heartbeat](supervisor.md): what `serve` starts and what the `run/` files hold.
+- [Memory](memory.md): the seed files, the bootstrap handover, and the memory store.
+- [Large language model backends](llm.md): provider selection, credential variables, and scrubbing.

@@ -48,7 +48,7 @@ A sectioned configuration is a list of section keywords and `(key value)` entrie
 (defparameter *enchiridion-config*
   '(:llm
     (:provider :opencode)
-    (:model-primary "deepseek-v4.1-flash")
+    (:model-primary nil)
     :channels
     (:http (:enabled nil) (:port 8787))))
 ```
@@ -78,9 +78,9 @@ A reader that needs a number falls back to its default or refuses the value when
 | `:provider`                                                | keyword or string                       | `:openai`                       | Provider id to select, or `:custom`. A name that resolves to nothing is a configuration error.                        |
 | `:backend`                                                 | keyword                                 | `:openai`                       | Wire protocol and matching provider row. `:openai`, `:anthropic`, or a registered adapter id.                         |
 | `:base-url`                                                | string or `nil`                         | `nil`                           | Endpoint override. `nil` takes the provider row's endpoint.                                                           |
-| `:model-primary`                                           | string                                  | `"deepseek-v4.1-flash"`         | Model for reasoning turns.                                                                                            |
-| `:model-cheap`                                             | string                                  | `"deepseek-v4.1-flash"`         | Model for memory digests and compaction.                                                                              |
-| `:model-sleep`                                             | string                                  | `"deepseek-v4.1-flash"`         | Model for the sleep-time agent.                                                                                       |
+| `:model-primary`                                           | string or `nil`                         | `nil`                           | Model for reasoning turns. `nil` takes the selected provider row's model.                                             |
+| `:model-cheap`                                             | string or `nil`                         | `nil`                           | Model for memory digests and compaction. `nil` takes the provider row's model.                                       |
+| `:model-sleep`                                             | string or `nil`                         | `nil`                           | Model for the sleep-time agent. `nil` takes the provider row's model.                                                 |
 | `:api-key-env`                                             | string or `nil`                         | `nil`                           | Variable that holds the provider key. `nil` lets the provider row decide.                                             |
 | `:max-tokens`                                              | integer                                 | `4096`                          | Reply cap for one request. The dialect names the field.                                                               |
 | `:providers`                                               | list of rows                            | three shipped rows              | Define or override providers by id.                                                                                   |
@@ -208,11 +208,13 @@ Write both keys when the file has a `:budget` section (see [Supervisor and heart
 
 | Key             | Type    | Default | Meaning                                              |
 | --------------- | ------- | ------- | ---------------------------------------------------- |
-| `:agent-uid`    | integer | `1000`  | User identifier (uid) for agent code and the broker. |
+| `:agent-uid`    | integer | `1000`  | User identifier for agent code and the broker in the container. |
 | `:proc-hidepid` | integer | `2`     | Declared `/proc` hidepid value. No code reads it.    |
 
 The supervisor runs as root in the container deployment and holds the secrets.
-The broker and agent code drop to `:agent-uid`, which the harness passes to both the broker and plugin verification.
+The broker and the reload verification use `:agent-uid`.
+The `--verify-plugin` path always passes uid 1000, whatever this key says (see [Plugins and self-modification](plugins.md)).
+A checkout has no uid split: the supervisor, the broker child, and agent code run as the operator's user (see [Deployment](deployment.md)).
 No Lisp path reads `:proc-hidepid`, and the container entry point reads `ENCHIRIDION_HIDEPID` instead (see [Deployment](deployment.md)).
 
 ## The :memory section
@@ -222,7 +224,8 @@ No Lisp path reads `:proc-hidepid`, and the container entry point reads `ENCHIRI
 | `:db`           | string or `nil`                   | `nil`                                                                          | SQLite store path. `nil` selects `agents/default/memory.db`.      |
 | `:block-limits` | property list of label to integer | `:persona 1200`, `:operator 800`, `:world 1500`, `:session 400`, `:ledger 250` | Declared character limit for each memory block. No code reads it. |
 
-The store path can also be a pathname object, and the container deployment sets an absolute path on the state volume.
+The store path can also be a pathname object.
+The default is under the agent directory, which is on the state volume in the container.
 No code reads the configured `:block-limits` value.
 The effective limits come from `*default-block-limits*` in the memory module, which also holds `:bootstrap` with a limit of 300.
 Raising a limit raises the fixed token cost of every prompt (see [Memory](memory.md)).
@@ -283,6 +286,10 @@ The loader reads every pair, then every variable name the configuration mentions
 
 After the load, the process removes every loaded name and every credential-shaped variable from its own environment.
 A child process inherits nothing, and a later read of `/proc` finds nothing, while the values stay in memory for the life of the process.
+
+On a checkout, the file stays on disk and agent code runs as the same user, so its file and shell tools can read `.env`.
+The environment scrub keeps the values out of the child environment, but it is not a file system boundary.
+The container deployment unlinks the file and runs agent code as another user, and that is the deployment with the secret guarantee (see [Deployment](deployment.md)).
 
 The container copy at `/run/secrets/.env` is unlinked once its values are in memory, and the operator's checkout `.env` is never deleted.
 A read-only bind mount refuses the unlink, which is a supported deployment, and the process prints one warning and continues:

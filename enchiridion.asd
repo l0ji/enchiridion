@@ -107,6 +107,7 @@
            (:file "shell")
            (:file "search")
            (:file "blockops")
+           (:file "memory")
            (:file "meta")
            (:file "web")
            (:file "register")))))

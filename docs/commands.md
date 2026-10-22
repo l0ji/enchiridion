@@ -90,7 +90,7 @@ Before the first launch, they write the seed files instead.
 | ----------- | ---------------------------------------------------- | --------------------------------------------------- | ----------- |
 | `init`      | 0 or 1                                               | Create the agent directory and seed files           | 0 or 1      |
 | `ask`       | 1 or more                                            | One turn in a short-lived session                   | 0 or 1      |
-| `check`     | none                                                 | Compile the tree under safety 3                     | 0 or 1      |
+| `check`     | none                                                 | Compile every system file and both entry scripts     | 0 or 1      |
 | `skills`    | 0 to 2: `list`, `show NUMBER`                        | List or show skills                                 | 0, 1, or 2  |
 | `tools`     | 0 to 2: `list`, `show NAME`                          | List or show tools                                  | 0, 1, or 2  |
 | `blocks`    | 0 to 2: `show`, `edit NUMBER`                        | Blocks with character counts and capacity           | 0, 1, or 2  |
@@ -108,7 +108,7 @@ Before the first launch, they write the seed files instead.
 | `providers` | 0 to 2: `list`, `show ID`, `models ID`, `refresh`    | Provider list, one provider, its models, or a refresh | 0, 1, or 2 |
 | `version`   | none                                                 | Version and build provenance                        | 0           |
 | `help`      | 0 or 1                                               | Command list, or detail for one                     | 0 or 2      |
-| `bootstrap` | 0 or 1: `status`, `run`, `reset`                     | Bootstrap state, remaining steps, or a reset        | 0 or 2      |
+| `bootstrap` | 0 to 2: `status`, `run`, `step N`, `reset`          | Bootstrap state, steps, or a reset                  | 0 or 2      |
 | `health`    | none                                                 | Read the running supervisor's status                | 0 or 1      |
 | `reload`    | none                                                 | Ask a running supervisor to reload its code         | 0 or 1      |
 | `channels`  | 0 to 2: `list`, `enable NAME`, `disable NAME`        | List, enable, or disable a channel                  | 0, 1, or 2  |
@@ -289,16 +289,20 @@ A bad action prints `NAME takes show or edit.` and returns 2.
 
 ### bootstrap
 
-`bootstrap` reads and resets the bootstrap state.
+`bootstrap` reads, records, and resets the bootstrap state.
 `status` prints one line: `Bootstrap step N of M: <summary>` while steps remain, `Bootstrap complete.` when `BOOTSTRAP.md` is absent, or `Bootstrap complete: N of N steps done.` when the file is present and every step is done.
+`step N` records one step and prints the new status line.
 `run` prints `bootstrap has N steps left:` and the remaining steps, or `bootstrap is complete; the agent owns the seed files.`
 `reset` restores `BOOTSTRAP.md` from `BOOTSTRAP.done.md` when the live file is absent, clears the record, and prints `bootstrap reset to its first step.`
-A bad action prints `bootstrap takes status, run or reset.` and returns 2.
-No shipped tool marks a step done, so the handover does not occur through the turn surface (see [Memory](memory.md)).
+A bad action prints `bootstrap takes status, run, step NUMBER or reset.` and returns 2.
+An invalid or unknown step prints `bootstrap step needs a step number.` or `There is no bootstrap step N.` and returns 2.
+The meta tool action `bootstrap-step` records a step from the turn surface, and the last step archives `BOOTSTRAP.md`.
+[Getting started](getting-started.md#hand-over-the-bootstrap) gives the procedure, and [Memory](memory.md#the-bootstrap) covers the state machine.
 
 ### journey
 
 `journey list` prints up to 20 commits as `REV SUBJECT`, or `the agent directory has no history yet.`
+The kernel commits after each successful turn with `Turn N via CHANNEL`, and [Memory](memory.md#the-agent-repository) owns that behavior.
 A revision argument is a 1-based position in the log or a revision string.
 `show REV` prints the revision text, `edit REV` prints `edit <directory> by hand; the change is <revision>.`, and `rm REV` reverts the revision and prints the Git output.
 A missing revision prints `journey show needs a revision or a number.` (or the matching line for `edit` and `rm`) and returns 2.

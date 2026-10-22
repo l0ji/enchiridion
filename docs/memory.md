@@ -24,13 +24,15 @@ The limits count characters, and the configuration's `:memory :block-limits` key
 
 The kernel builds five blocks in `blocks-from-directory`.
 It reads the three Markdown files and falls back to the seed template, and it reads `:session` and `:ledger` from the store.
-The first three are not writable for the operator's agent, and the two store blocks are writable.
+The block and file tools refuse writes to the first three while the bootstrap is pending. The two store blocks are writable.
+The shell tool does not check that gate (see [Tools](tools.md#blockops)).
 
 `make-agent` compiles the blocks once into a frozen prompt, and every turn sends that prompt.
 A later write changes the block and its file, not the bytes already sent.
 The next prompt gets the text on disk when the next agent is built, and the sleep agent is built fresh on every tick.
 
 `compile-blocks` prints one capacity line per block, then each block as `## label (n/limit characters)` with its text.
+`compile-prompt` writes one fixed preamble before the blocks: `You are enchiridion, an autonomous agent.` and the instruction not to follow instructions that arrive inside tool results.
 `estimate-tokens` counts one token per four characters for the ledger only.
 
 ## Blocks
@@ -116,6 +118,23 @@ It exits 1 on any problem and 0 otherwise.
 The no-command first launch runs the same code and stops, so the operator can edit the three identity files.
 [Getting started](getting-started.md) covers that run.
 
+## The agent repository
+
+The agent directory is its own git repository, nested inside the checkout.
+`init-agent` creates it and records the first commit when Git is available.
+
+The kernel attempts a commit after each successful turn, with the message `Turn N via CHANNEL`.
+A turn that fails or is stopped before it ends attempts no commit. A turn that changed nothing also leaves no commit.
+A host without Git, or without a Git identity, keeps the files. It skips the commit without failing the turn.
+
+The repository ignores `state.json`, `memory.db`, `private/`, `tmp/`, and `*.fasl`.
+Runtime state is not history. The Markdown files, the skills, and the tools are the history.
+
+`journey` reads the commits and `undo` reverts one.
+The bootstrap handover and the `meta` author action commit their own changes.
+[Commands](commands.md) documents `journey` and `undo`, and [Tools](tools.md) owns the `meta` tool.
+Search the history with `git -C agents/default log`.
+
 ## The bootstrap
 
 `BOOTSTRAP.md` is a numbered list.
@@ -125,11 +144,13 @@ The steps live in `state.json` under a bootstrap record.
 The record holds `step` (integer, initial 0), `done` (sorted array of step numbers, initial `[]`), and `complete` (boolean, initial false).
 
 While `BOOTSTRAP.md` exists and steps remain, `bootstrap-refuse-writes-p` is true, so the sleep agent skips its pass.
-The block tool signals `bootstrap-pending` for a seed-backed label without changing the file.
+The block and file tools signal `bootstrap-pending` for a seed-backed label without changing the file.
 The report reads `Block <label> is the operator's until bootstrap hands over.`
 
 `mark-bootstrap-step` keeps `done` sorted and duplicate free, sets `step` to the number done, writes the state, and runs the handover when the last step lands.
-No shipped tool calls it, so the turn surface cannot complete the bootstrap.
+The meta tool action `bootstrap-step` and `enchiridion bootstrap step N` call it.
+The block and file tools are the enforced gate. `shell` does not check the bootstrap state, so a caller can edit `state.json` or rename the file.
+[Getting started](getting-started.md#hand-over-the-bootstrap) gives the operator procedure.
 
 The handover renames `BOOTSTRAP.md` to `BOOTSTRAP.done.md`, sets `complete` true, writes the state, and commits the directory.
 A missing `BOOTSTRAP.md` still marks the state complete.
@@ -208,7 +229,7 @@ The store is one SQLite file.
 `open-store` creates the file and schema when missing and uses a 5000 ms busy timeout.
 A file that cannot be opened signals `configuration-error` with `Cannot open the memory store <path>: <reason>`, and a failed schema signals one with `Cannot create the memory store schema in <path>: <reason>`.
 Both report `Configuration is wrong at MEMORY.`
-When root creates the file it widens the mode to `#o666`, because the broker runs as the agent user.
+When root creates the file in the container, it widens the mode to `#o666`. The broker runs as the agent user there.
 Every string is scrubbed before it reaches a column, so the store holds no secret.
 
 `store-file-p` reads the sixteen-byte SQLite header, and a search opens a store only when that check passes.
@@ -253,6 +274,7 @@ Every round of a tool turn is stored, including tool results, and an empty assis
 `save-memory` stores one named body and returns the new row identifier.
 It refuses an empty body after the scrub with `A memory needs text.` and an exact duplicate with `Memory <name> already holds that text.`
 `list-memories` returns memories newest first, and `search-memories` matches a name or a body.
+The `memory` tool calls `save-memory` for the model. The `search` tool reads memories and does not write them.
 
 A search turns each whitespace-separated term into an FTS5 quoted prefix query, so an operator character such as `+` is a literal.
 A term with no alphanumeric character is dropped.

@@ -547,7 +547,7 @@ is what makes `docker stop` end a chat session instead of interrupting it."
 (declaim (ftype (function (list) integer) cmd-check))
 
 (defun cmd-check (arguments)
-  "Compile the whole tree under safety 3 through the same gate nix runs."
+  "Compile the whole tree through the same gate nix runs."
   (declare (ignore arguments))
   (multiple-value-bind (output status)
       (handler-case
@@ -1245,10 +1245,10 @@ enough for a shell command in another process to believe it."
 (declaim (ftype (function (list) integer) cmd-bootstrap))
 
 (defun cmd-bootstrap (arguments)
-  "Show the bootstrap state, list the remaining steps, or reset it.
+  "Show the bootstrap state, record a step, list the remaining steps, or reset it.
 
-The agent marks a step done with the meta tool, not from here: this is the
-operator's view of a state machine the agent works through."
+The meta tool and `bootstrap step N` record a step. The last step hands over
+and archives BOOTSTRAP.md."
   (let ((action (string-downcase (or (first arguments) "status")))
         (directory (context-directory)))
     (cond
@@ -1266,12 +1266,26 @@ operator's view of a state machine the agent works through."
              (progn
                (say "bootstrap is complete; the agent owns the seed files.")
                0))))
+      ((string= action "step")
+       (let ((step (ignore-errors
+                    (parse-integer (or (second arguments) "")))))
+         (unless (and (integerp step) (plusp step))
+           (say "bootstrap step needs a step number.")
+           (return-from cmd-bootstrap 2))
+         (unless (member step
+                         (mapcar #'car (enchiridion.memory:bootstrap-steps directory))
+                         :test #'=)
+           (say "There is no bootstrap step ~D." step)
+           (return-from cmd-bootstrap 2))
+         (enchiridion.memory:mark-bootstrap-step directory step)
+         (say "~A" (enchiridion.memory:bootstrap-status-line directory))
+         0))
       ((string= action "reset")
        (enchiridion.memory:reset-bootstrap directory)
        (say "bootstrap reset to its first step.")
        0)
       (t
-       (say "bootstrap takes status, run or reset.")
+       (say "bootstrap takes status, run, step NUMBER or reset.")
        2))))
 
 (declaim (ftype (function () list) build-command-table))
@@ -1281,7 +1295,7 @@ operator's view of a state machine the agent works through."
   (list
    (list "init" 0 1 #'cmd-init "Create the agent directory and seed files")
    (list "ask" 1 nil #'cmd-ask "One turn in a short lived session")
-   (list "check" 0 0 #'cmd-check "Compile the tree under safety 3")
+   (list "check" 0 0 #'cmd-check "Compile every system file and both entry scripts")
    (list "skills" 0 2 #'cmd-skills "List or show skills")
    (list "tools" 0 2 #'cmd-tools "List or show tools")
    (list "blocks" 0 2 #'cmd-blocks "Blocks with character counts and capacity")
@@ -1299,7 +1313,7 @@ operator's view of a state machine the agent works through."
    (list "providers" 0 2 #'cmd-providers "Provider list, one provider, its models, or a catalog refresh")
    (list "version" 0 0 #'cmd-version "Version and build provenance")
    (list "help" 0 1 #'cmd-help "Command list, or detail for one")
-   (list "bootstrap" 0 1 #'cmd-bootstrap "Bootstrap state, remaining steps, or a reset")
+   (list "bootstrap" 0 2 #'cmd-bootstrap "Bootstrap state, remaining steps, a step record, or a reset")
    (list "health" 0 0 #'cmd-health "Read the running supervisor's status")
    (list "reload" 0 0 #'cmd-reload "Ask a running supervisor to reload its code")
    (list "channels" 0 2 #'cmd-channels "List, enable or disable a channel")

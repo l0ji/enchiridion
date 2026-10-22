@@ -57,7 +57,7 @@ ENV XDG_CACHE_HOME=/opt/enchiridion-cache \
 # not download Quicklisp again.
 RUN sbcl --non-interactive --no-userinit --no-sysinit \
       --eval '(load "/opt/quicklisp/setup.lisp")' \
-      --eval '(ql:quickload (list "alexandria" "cl-ppcre" "dexador" "com.inuoe.jzon" "cl-jschema" "usocket" "bordeaux-threads" "hunchentoot" "websocket-driver-client" "dbi" "dbd-sqlite3"))'
+      --eval '(ql:quickload (list "alexandria" "cl-ppcre" "dexador" "com.inuoe.jzon" "cl-jschema" "usocket" "bordeaux-threads" "hunchentoot" "websocket-driver-client" "dbi" "dbd-sqlite3" "ironclad" "cl-base64"))'
 
 # Compile the core into the fasl cache. A compile error stops the build here.
 RUN sbcl --non-interactive --no-userinit --no-sysinit \

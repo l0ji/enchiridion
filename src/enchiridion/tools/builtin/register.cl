@@ -12,5 +12,6 @@
      (register-shell-tools)
      (register-search-tools)
      (register-block-tools)
+     (register-memory-tools)
      (register-meta-tools)
      (register-web-tools)))

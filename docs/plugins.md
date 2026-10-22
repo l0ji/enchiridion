@@ -51,7 +51,7 @@ The loader reads two directories and writes one registry, and that surface is th
 | ------------------------------- | --------------------------------------------- | -------------------------------------------------------------------------- |
 | A tool name                     | Add a name, or replace one already registered | `register-tool` overwrites the hash table entry by lowercased name         |
 | A tool description and schema   | Yes                                           | The manifest carries both to the model-facing proxy                        |
-| A tool handler                  | Yes                                           | The handler runs in the broker child, as the agent user                    |
+| A tool handler                  | Yes                                           | The handler runs in the broker child. In the container that child is the agent user |
 | A skill                         | Yes                                           | A file under `skills/` loads before the files under `tools/`               |
 | The core system                 | No                                            | The loader reads only the agent directory                                  |
 | A channel                       | No                                            | The command builds the channel list before the supervisor starts           |
@@ -127,6 +127,8 @@ nix run .#enchiridion -- --verify-plugin agents/default
 ```
 
 The command passes the directory to a one-shot child with uid 1000, which drops to uid 1000 before it reads a file, so a runaway file runs as the agent user and an ordinary user skips the drop.
+The command always passes 1000, whatever `:sandbox :agent-uid` says.
+The reload path is the one that uses the configured uid (see [Configuration](configuration.md)).
 
 | Condition                               | Exit status | Output                               |
 | --------------------------------------- | ----------- | ------------------------------------ |
@@ -250,8 +252,10 @@ The same control file carries the channel and heartbeat requests, and [Superviso
 
 - Verification proves that a file compiles, loads without a warning, and passes its own self-test, and it does not prove that the handler behaves correctly.
 - Top-level forms run once in the verification child and again in the load that follows, so a file with a load-time side effect performs it twice.
-- A handler runs with the rights of the agent user, and it can change any file that user can write.
-  In the container, the core is protected by file ownership and not by the loader.
+- A handler runs in the broker child, and it can change any file that child's user can write.
+  In the container that user is uid 1000, and the core is protected by file ownership and not by the loader.
+  On a checkout the child runs as the operator's user, so it can change the source tree, the agent directory, and `.env`.
+  The broker boundary keeps secrets out of the child environment. It is not a file system sandbox outside the container.
 - The schema budget is shared by every tool and is 2000 estimated tokens.
   An oversized plugin schema makes `registry-tool-definitions` signal `budget-exceeded`, and every turn then fails with the message `The SCHEMA budget is spent: N of 2000 tokens.`
 - The supervisor reads only the manifest of an agent file, so it cannot see a handler before the load.

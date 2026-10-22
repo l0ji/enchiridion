@@ -39,8 +39,9 @@ a commit that can be read and reverted.
 | `BOOTSTRAP.md` | the operator | the first steps, worked through once |
 | `GUIDE.md` | the operator | this file |
 
-Until bootstrap hands over, the agent cannot edit the first three files. After
-handover, the sleep-time agent maintains all three.
+Until the bootstrap hands over, the block and file tools refuse agent writes to
+the first three files. The shell tool does not check that gate. After handover,
+the sleep-time agent maintains all three.
 
 ## The first run
 
@@ -53,15 +54,18 @@ handover, the sleep-time agent maintains all three.
 4. Run `enchiridion chat`.
 
 The agent reads the three files on its first turn and asks about what they leave
-open. It writes the answers back. It creates its first skill after that.
+open. The answers belong in the three files, and the operator writes them until
+the bootstrap hands over.
 
 ## Bootstrap
 
-`BOOTSTRAP.md` holds the handover procedure as a numbered list. The agent works
-through one step per turn and records each step in `state.json`. Writes to
-`SOUL.md`, `OPERATOR.md`, and `WORLD.md` are refused until the last step, so the
-operator's guidance cannot be edited away before handover. When the last step is
-done, the agent archives the file as `BOOTSTRAP.done.md`.
+`BOOTSTRAP.md` holds the handover procedure as a numbered list. The agent
+records each step with the meta tool action `bootstrap-step`. The operator can
+record one with `enchiridion bootstrap step N`.
+
+The last step archives `BOOTSTRAP.md` as `BOOTSTRAP.done.md`, commits the
+directory, and opens the block tool. `enchiridion bootstrap reset` restores the
+file and clears the record. The harness documentation records the state machine.
 
 ## Commands
 
@@ -78,22 +82,28 @@ done, the agent archives the file as `BOOTSTRAP.done.md`.
 | `enchiridion usage` | the token ledger, with the cache columns |
 | `enchiridion undo N` | roll back the Nth commit in this directory |
 
-The REPL accepts every command with a leading slash. `/stop` and `/who` exist
-only in the REPL because they act on a turn that is running.
+The REPL accepts every command except `chat` and `serve` with a leading slash.
+`/stop`, `/quit`, and `/who` exist only in the REPL because they act on a turn
+that is running.
 
-## What the agent cannot see
+## What the agent can reach
 
-The agent cannot reach the operator's keys. The supervisor reads `.env` from a
-tmpfs at startup, holds the values in memory, removes them from its own
-environment, and deletes the file. Agent code runs in a separate process under a
-different user and has no view of the supervisor's environment. This is a
-property of the deployment and not a setting.
+In the container deployment, the supervisor runs as root, holds the secrets,
+and agent code runs as uid 1000. The supervisor reads `.env` from a tmpfs,
+removes the values from its environment, and deletes the container copy. The
+agent cannot read the file or the supervisor's environment there.
+
+A checkout has no uid split. The supervisor, the broker child, and agent code
+run as the operator's user, and the agent's file and shell tools can read any
+file that user can read. The checkout `.env` stays on disk. Use the container
+when the key must stay out of the agent's reach.
 
 ## History
 
-This directory is its own git repository. Every change the agent makes is a
-commit signed with the operator's key, so its history is separate from the
-source tree.
+This directory is its own git repository. The kernel attempts a commit after
+each successful turn with the message `Turn N via CHANNEL`, using the operator's
+Git configuration. A host without Git or without a Git identity keeps the files
+and skips the commit. The history is separate from the source tree.
 
     git -C agents/default log
     git -C agents/default diff
@@ -203,21 +213,24 @@ short and dated, and delete the ones that stopped being true.
 (defparameter +bootstrap+
   "# Bootstrap
 
-The first steps. Work through them in order, one turn each, and record each step
-as done in `state.json`.
+The first steps. Work through them in order, one turn each. The meta tool
+records a step, and the last step archives this file.
 
 1. Read `SOUL.md`, `OPERATOR.md`, and `WORLD.md`.
 2. List, in one message, every question those three files do not answer.
 3. Wait for the answers. Do not guess at a fact that was not given.
-4. Write the answers into the three files.
+4. Propose the answers for the three files. The operator writes them, because
+   the block and file tools refuse agent writes until handover.
 5. Create one skill under `skills/`, and use it once in this session.
-6. Write one memory, and read it back with the memory tool.
-7. Record each step above as done in `state.json`.
-8. When every step is done, archive this file as `BOOTSTRAP.done.md` and report
-   the handover to the operator.
+6. Write one memory with the memory tool, and read it back with the search tool.
+7. Record each step with the meta tool action `bootstrap-step`.
+8. When every step is done, the last record archives this file and reports the
+   handover to the operator.
 
-Writes to `SOUL.md`, `OPERATOR.md`, and `WORLD.md` are refused until the last
-step. The operator's guidance cannot be edited away before handover.
+The block and file tools refuse writes to `SOUL.md`, `OPERATOR.md`, and
+`WORLD.md` until the live file is gone. The shell tool does not check that gate.
+The operator's guidance cannot be edited away through the block or file tools
+before handover.
 
 After handover this file is read-only history, and the sleep-time agent owns the
 three identity files.

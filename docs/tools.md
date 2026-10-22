@@ -129,7 +129,9 @@ The generation check runs only when a caller passes the `generation` keyword, an
 
 ## The broker and the sandbox boundary
 
-The supervisor holds the keys and the model, and agent code runs in a child as the agent user.
+The supervisor holds the keys and the model, and agent code runs in a child process.
+In the container deployment the child runs as the agent user, uid 1000.
+A checkout has no uid split: the child runs as the operator's user and keeps that user's file rights (see [Deployment](deployment.md)).
 Only one length-prefixed JSON request and its reply cross the line, and the process that holds the secrets never compiles or runs agent code.
 
 | Item               | Value                                                                         |
@@ -177,7 +179,9 @@ The function accepts a `timeout` keyword and does not enforce it on the socket r
 It drops to the requested uid when it runs as root and the uid is positive, and a non-root process stays where it is.
 Each frame is answered by operation: `ping` answers the string `ok`, `load-generation` calls the plugin loader with the directory and generation and answers `{"ok": ..., "report": ...}`, and every other operation is a tool name dispatched through `dispatch`.
 A success is scrubbed and returned under `result`, because a tool result is the last place a secret can enter a transcript.
-A tool request runs in the child, so the shell tool and every agent-authored handler run as the agent user and not as the supervisor.
+A tool request runs in the child, not in the supervisor.
+In the container the child runs as the agent user.
+On a checkout it runs as the operator's user, so the shell tool and every agent-authored handler have that user's file rights.
 
 `--verify-plugin DIRECTORY --uid N` verifies every agent file in the directory and prints the report, exiting 0 when the generation is good and 1 when it is not.
 The main mode requires `--socket`, prints `broker-exec: --socket PATH is required.` on standard error and exits 2 when it is absent.
@@ -207,7 +211,8 @@ A reload replaces the agent's code without stopping the process, and the supervi
    The `reload` command and the meta tool both do this.
 3. The supervisor verifies the new generation in a one-shot child and refuses the generation when verification exits nonzero.
 4. The supervisor registers one proxy tool per verified manifest, with the new generation and `broker-side-p` true.
-5. The supervisor asks the broker child to load the generation, and the child compiles it as the agent user.
+5. The supervisor asks the broker child to load the generation.
+   In the container the child compiles it as the agent user. On a checkout the child runs as the operator's user.
 
 The command is `nix run .#enchiridion -- reload`.
 It needs a running supervisor, which `serve` starts.
@@ -219,7 +224,9 @@ The model sees a proxy tool for each manifest, and its handler refuses with `con
 A call whose operation reaches the child goes through the real handler there.
 
 Verification is a separate process, so a file that kills the compiler cannot take the running generation with it.
-The verifier runs as the agent user, with the minimal environment, and its combined output returns to the supervisor.
+In the container the verifier runs as the agent user with the minimal environment.
+On a checkout it runs as the operator's user.
+Its combined output returns to the supervisor.
 `plugins.md` owns the manifest and the verification report.
 
 ## Adding a tool
@@ -272,7 +279,7 @@ A tool registered this way lives until the image exits, does not reach another p
 
 The handler receives a hash table with string keys, because `dispatch` normalizes the arguments before it calls the handler.
 The helper `argument` in `file.cl` reads a key from a table or a property list, so a handler is usable from a test that holds the plist directly.
-A built-in is registered in the supervisor and in the broker child, which calls `register-builtin-tools` before it serves its first request, so the same ten names exist on both sides of the socket.
+A built-in is registered in the supervisor and in the broker child, which calls `register-builtin-tools` before it serves its first request, so the same eleven names exist on both sides of the socket.
 
 ## The registry reference
 
@@ -304,7 +311,7 @@ The registry is a hash table with `equal` test, so a tool name is a lowercase st
 
 ## Built-in tools
 
-`register-builtin-tools` calls six registrars and registers ten tools.
+`register-builtin-tools` calls seven registrars and registers eleven tools.
 
 | Tool         | Required             | Optional                                                          |
 | ------------ | -------------------- | ----------------------------------------------------------------- |
@@ -316,13 +323,14 @@ The registry is a hash table with `equal` test, so a tool name is a lowercase st
 | `shell`      | `command`            | `timeout`                                                         |
 | `search`     | `query`              | `scope`, `path`, `limit`                                          |
 | `blockops`   | none                 | `action`, `label`, `old`, `new`, `text`, `directory`              |
-| `meta`       | none                 | `action`, `directory`, `limit`, `name`, `kind`, `text`, `confirm` |
+| `memory`     | `name`, `text`       | none                                                              |
+| `meta`       | none                 | `action`, `directory`, `limit`, `name`, `kind`, `text`, `confirm`, `step` |
 | `web`        | none                 | `action`, `url`, `query`, `limit`                                 |
 
 ### The result cap
 
-Eight of the ten tools pass at least one result through `cap-result`.
-The tools that never cap a result are `write-file` and `edit-file`, whose results are short by construction.
+Eight of the eleven tools pass at least one result through `cap-result`.
+The tools that never cap a result are `write-file`, `edit-file`, and `memory`, whose results are short by construction.
 
 | Name              | Value                                                                   |
 | ----------------- | ----------------------------------------------------------------------- |
@@ -414,6 +422,15 @@ The file scope visits files with the extensions `md`, `txt`, `cl`, `lisp`, `json
 It skips the directories `.git`, `node_modules`, `run`, and `cache`, visits at most 2000 files, and matches each line case-insensitively as `PATH:LINE: TEXT`.
 A file that raises a file error is skipped, and the default root is the `path` argument, then `$ENCHIRIDION_HOME/agents/default/`, then the default pathname.
 
+### `memory`
+
+`memory` saves one named memory in the store that `search` reads.
+
+`name` and `text` are required strings.
+The result is `saved memory NAME as ID`.
+An empty name signals `schema-error` with the detail `name must be a non-empty string.`, and a non-string text signals it with `text must be a string.`
+The store's own empty and duplicate refusals belong to `memory.md`.
+
 ### `blockops`
 
 `blockops` reads and changes the Markdown memory blocks.
@@ -453,17 +470,23 @@ The last three checks run before the file is written, and the write happens last
 The limits and the scan belong to the memory module, and `memory.md` owns them.
 The CLI writes the seed files directly and does not pass through this gate, because the rule protects the operator from the agent.
 
+> **Important:** The block and file tools honour the bootstrap gate.
+> `write-file` and `edit-file` refuse the three identity paths while it is pending.
+> `shell` does not check it, and the gate reads the `directory` argument, so a caller that names another directory is not gated by the agent's bootstrap.
+> The gate is a rule that the agent follows, not a sandbox boundary.
+
 ### `meta`
 
 `meta` acts on the agent repository.
 
 `action` defaults to `journey`, `directory` defaults to the agent directory, `limit` defaults to 20, and `kind` defaults to `tool`.
-`name` is required for `author`, `text` is required for `author`, and `confirm` is required for `undo`.
+`name` is required for `author`, `text` is required for `author`, `confirm` is required for `undo`, and `step` is required for `bootstrap-step`.
 
 `journey` returns the last commits from `git log --oneline -n LIMIT`, with a 20 second limit, and the result is capped.
 `author` writes one file and commits it when the directory is a repository.
 A `tool` writes `tools/NAME.cl`, and a `skill` writes `skills/NAME.md`.
 The result is `wrote PATH` when no commit was attempted, `wrote PATH and committed NONE` when the repository had nothing to commit, or `wrote PATH and committed HASH` when it committed.
+`bootstrap-step` records one step with `mark-bootstrap-step` and answers `bootstrap step N recorded. STATUS`.
 `undo` reverts the last commit with `git revert --no-edit HEAD` and returns the capped output.
 `reload` appends one line to the control file and answers `reload requested in PATH`.
 
@@ -474,6 +497,7 @@ The refusals are these.
 | Unknown action                          | `schema-error`, detail `Unknown meta action ~A.`                                           |
 | A name outside `[A-Za-z0-9_-]+`         | `schema-error`, detail `name must be one segment of letters, digits, dash, or underscore.` |
 | A kind other than `tool` or `skill`     | `schema-error`, detail `kind must be tool or skill.`                                       |
+| A missing or unknown bootstrap step     | `schema-error`, detail `step must be a positive integer.` or `There is no bootstrap step N.` |
 | `text` is not a string                  | `schema-error`, detail `text must be a string.`                                            |
 | The authored file already exists        | `tool-error` for `meta`, detail `PATH already exists.`                                     |
 | `undo` without `confirm` equal to `yes` | `schema-error`, detail `undo requires confirm yes.`                                        |

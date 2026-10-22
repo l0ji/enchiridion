@@ -144,12 +144,46 @@ not fail on the shape of the thing it was called with."
     (cap-result (format nil "~{~A~^~%~}"
                         (subseq lines (1- from) to)))))
 
+(defparameter +seed-backed-identity-files+
+  '(("SOUL.md" . :soul) ("OPERATOR.md" . :operator) ("WORLD.md" . :world))
+  "The files the bootstrap gate protects, and the label each one reports.")
+
+(defun absolute-pathname (path)
+  "Return PATH as an absolute pathname, relative to the current directory."
+  (let ((path (pathname path)))
+    (if (uiop:absolute-pathname-p path)
+        path
+        (merge-pathnames path (uiop:getcwd)))))
+
+(defun canonical-pathname (path)
+  "Return PATH with symlinks resolved when it exists, or absolute when it does not."
+  (or (ignore-errors (truename path)) (absolute-pathname path)))
+
+(defun seed-backed-identity-label (path)
+  "Return the label PATH reports when it is a seed-backed identity file."
+  (let ((target (canonical-pathname path))
+        (agent (canonical-pathname (enchiridion:agent-directory))))
+    (loop for (name . label) in +seed-backed-identity-files+
+          when (uiop:pathname-equal
+                target
+                (canonical-pathname (merge-pathnames name agent)))
+            return label)))
+
+(defun check-seed-backed-write (path)
+  "Refuse a write to an identity file while the bootstrap is pending."
+  (let ((label (seed-backed-identity-label path)))
+    (when (and label
+               (enchiridion.memory:bootstrap-refuse-writes-p
+                (enchiridion:agent-directory)))
+      (error 'enchiridion.errors:bootstrap-pending :label label))))
+
 (defun tool-write (args)
   "Write TEXT to PATH, creating parent directories."
   (let ((path (pathname (argument args "path")))
         (text (argument args "text")))
     (unless (stringp text)
       (error 'enchiridion.errors:schema-error :detail "text must be a string."))
+    (check-seed-backed-write path)
     (ensure-directories-exist path)
     (with-open-file (stream path :direction :output
                                  :if-exists :supersede
@@ -162,30 +196,32 @@ not fail on the shape of the thing it was called with."
   "Replace one unique occurrence of OLD with NEW in PATH."
   (let* ((path (pathname (argument args "path")))
          (old (argument args "old"))
-         (new (argument args "new"))
-         (text (uiop:read-file-string path :external-format :utf-8))
-         (position (and (stringp old)
-                        (plusp (length old))
-                        (search old text))))
-    (unless (and (stringp old) (plusp (length old)))
-      (error 'enchiridion.errors:schema-error :detail "old must be a non-empty string."))
-    (unless position
-      (error 'enchiridion.errors:tool-error
-             :tool "edit-file"
-             :detail "The old text does not occur in the file."))
-    (when (search old text :start2 (1+ position))
-      (error 'enchiridion.errors:tool-error
-             :tool "edit-file"
-             :detail "The old text occurs more than once; make it unique."))
-    (let ((updated (concatenate 'string
-                                (subseq text 0 position)
-                                new
-                                (subseq text (+ position (length old))))))
-      (with-open-file (stream path :direction :output
-                                   :if-exists :supersede
-                                   :external-format :utf-8)
-        (write-string updated stream))
-      (format nil "edited ~A" (namestring path)))))
+         (new (argument args "new")))
+    (check-seed-backed-write path)
+    (let* ((text (uiop:read-file-string path :external-format :utf-8))
+           (position (and (stringp old)
+                          (plusp (length old))
+                          (search old text))))
+      (unless (and (stringp old) (plusp (length old)))
+        (error 'enchiridion.errors:schema-error
+               :detail "old must be a non-empty string."))
+      (unless position
+        (error 'enchiridion.errors:tool-error
+               :tool "edit-file"
+               :detail "The old text does not occur in the file."))
+      (when (search old text :start2 (1+ position))
+        (error 'enchiridion.errors:tool-error
+               :tool "edit-file"
+               :detail "The old text occurs more than once; make it unique."))
+      (let ((updated (concatenate 'string
+                                  (subseq text 0 position)
+                                  new
+                                  (subseq text (+ position (length old))))))
+        (with-open-file (stream path :direction :output
+                                     :if-exists :supersede
+                                     :external-format :utf-8)
+          (write-string updated stream))
+        (format nil "edited ~A" (namestring path))))))
 
 (defun tool-glob (args)
   "Return the paths matching PATTERN."

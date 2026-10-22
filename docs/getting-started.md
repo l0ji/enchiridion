@@ -9,9 +9,14 @@ The checkout holds the source, the Nix flake, `config.cl`, and `.env`.
 The agent directory holds one agent's files, memory, and history.
 Its location is `<home>/agents/default/`, where `<home>` is the current directory or `ENCHIRIDION_HOME`.
 The supervisor process holds the model client, the secrets, the store, and the channels.
-Agent code runs in a child process, under a separate uid in the container (see [Deployment](deployment.md)).
+Agent code runs in a child process.
+In the container it runs under a separate uid. A checkout has no uid split, so the supervisor, the broker child, and agent code run as the operator's user (see [Deployment](deployment.md)).
 `chat` and `serve` start a supervisor, and inspection commands do not.
 The first launch writes the seed files and stops.
+
+> **Warning:** A checkout has no uid split.
+> The checkout `.env` stays on disk, and agent code runs as the same user, so its file and shell tools can read the key.
+> Use the container when the key must stay out of the agent's reach.
 
 ## Requirements
 
@@ -111,9 +116,35 @@ Edit three files before the first session:
 3. Edit `WORLD.md`. State the real paths, commands, and conventions on this machine.
 
 Leave `BOOTSTRAP.md` in place.
-While it is present and its steps are not all done, a write through the memory block tool to `SOUL.md`, `OPERATOR.md`, or `WORLD.md` is refused.
-No shipped tool marks a bootstrap step done, so the handover does not occur through the turn surface.
-[Memory](memory.md) covers the state machine.
+While it is present and its steps are not all done, the block and file tools refuse a write to `SOUL.md`, `OPERATOR.md`, or `WORLD.md`.
+
+> **Important:** The block and file tools honour the gate.
+> `shell` does not check it.
+> The gate is a rule the agent follows, not a sandbox boundary (see [Tools](tools.md#blockops)).
+
+### Hand over the bootstrap
+
+The agent works the numbered list and records each step with the meta tool action `bootstrap-step`.
+The operator can record one step from the shell:
+
+```sh
+enchiridion bootstrap step 1
+enchiridion bootstrap status
+```
+
+After the last step, the status prints the line `Bootstrap complete.` The handover archives `BOOTSTRAP.md` as `BOOTSTRAP.done.md`, and the block and file tools accept writes.
+The handover commits the agent directory.
+
+If a session cannot record a step, renaming the file is the manual fallback:
+
+```sh
+mv agents/default/BOOTSTRAP.md agents/default/BOOTSTRAP.done.md
+```
+
+A manual rename opens the gate but leaves the state record and the commit alone.
+
+`enchiridion bootstrap reset` restores `BOOTSTRAP.md` and clears the record.
+[Memory](memory.md#the-bootstrap) covers the state machine, and [Commands](commands.md#bootstrap) covers the command.
 
 ## Add the provider credential
 
@@ -144,8 +175,9 @@ secrets file /path/to/checkout/.env mode #o600 present
 
 The loader refuses a world-readable file before it reads one pair, with the path, the mode, and the `chmod` needed to fix it.
 
-The shipped default selects OpenAI.
-For another provider, copy `config.example.cl` to `config.cl` and edit it (see [Configuration](configuration.md)).
+The shipped default selects OpenAI when no `config.cl` exists.
+The tracked template pins no provider, so a copied `config.example.cl` selects the provider whose key is in `.env`.
+Copy it when changing a model, an endpoint, a channel, or a budget (see [Configuration](configuration.md)).
 
 ## Start the first conversation
 

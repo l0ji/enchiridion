@@ -317,6 +317,18 @@ previous values are always put back."
       (ok (string= "gpt-5.6-luna"
                    (enchiridion.llm::openai-connection-model backend))))))
 
+(deftest the-default-config-uses-the-shipped-provider-model ()
+  ;; The default configuration leaves the model keys NIL, so the OpenAI row's
+  ;; own model is the one a keyless default asks for. A stale literal here
+  ;; sends an OpenAI key to a model the endpoint does not serve.
+  (with-shipped-providers
+    (enchiridion.llm.secrets:clear-secrets)
+    (let ((backend (enchiridion.llm:resolve-backend
+                    :config (enchiridion:default-config) :api-key "k")))
+      (ok (search "api.openai.com" (enchiridion.llm:backend-name backend)))
+      (ok (string= "gpt-5.6-luna"
+                   (enchiridion.llm::openai-connection-model backend))))))
+
 (deftest an-openai-key-selects-openai ()
   (enchiridion.llm.secrets:clear-secrets)
   (enchiridion.llm.secrets:register-secret "OPENAI_API_KEY" "fake-openai-key-123456")

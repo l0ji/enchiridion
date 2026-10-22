@@ -60,7 +60,7 @@ either way, and the commit is what turns it into a journey entry."
 (declaim (ftype (function (t) string) meta-run))
 
 (defun meta-run (args)
-  "Run a meta action: journey, author, undo, or reload."
+  "Run a meta action: journey, author, bootstrap-step, undo, or reload."
   (let* ((action (string-downcase (or (argument args "action") "journey")))
          (directory (meta-directory args)))
     (cond
@@ -91,6 +91,19 @@ either way, and the commit is what turns it into a journey entry."
          (format nil "wrote ~A~@[ and committed ~A~]"
                  (namestring path)
                  (commit-author-change directory path))))
+      ((string= action "bootstrap-step")
+       (let* ((step (argument args "step"))
+              (steps (enchiridion.memory:bootstrap-steps directory)))
+         (unless (and (integerp step) (plusp step))
+           (error 'enchiridion.errors:schema-error
+                  :detail "step must be a positive integer."))
+         (unless (member step (mapcar #'car steps) :test #'=)
+           (error 'enchiridion.errors:schema-error
+                  :detail (format nil "There is no bootstrap step ~D." step)))
+         (enchiridion.memory:mark-bootstrap-step directory step)
+         (cap-result
+          (format nil "bootstrap step ~D recorded. ~A"
+                  step (enchiridion.memory:bootstrap-status-line directory)))))
       ((string= action "undo")
        (unless (string= (or (argument args "confirm") "") "yes")
          (error 'enchiridion.errors:schema-error
@@ -120,10 +133,11 @@ either way, and the commit is what turns it into a journey entry."
   (list
    (enchiridion.tools:make-tool
     :name "meta"
-    :description "Read the journey, author a tool or skill, undo, or request a reload."
+    :description "Read the journey, author a tool or skill, record a bootstrap step, undo, or request a reload."
     :schema '(:object :properties
               ((:action :string) (:directory :string) (:limit :integer)
-               (:name :string) (:kind :string) (:text :string) (:confirm :string)))
+               (:name :string) (:kind :string) (:text :string) (:confirm :string)
+               (:step :integer)))
     :handler #'meta-run)))
 
 (defun register-meta-tools ()

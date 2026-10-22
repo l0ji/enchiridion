@@ -144,7 +144,7 @@ A reader therefore sees the old file or the new one, and never half of either.
 | `started`    | integer | When `supervisor-start` ran, as a universal time                 |
 | `updated`    | integer | When the process last wrote the file, as a universal time        |
 | `generation` | integer | The loaded code generation                                       |
-| `bootstrap`  | string  | One line of bootstrap state                                      |
+| `bootstrap`  | string  | One line of bootstrap state, computed when the supervisor is built |
 | `report`     | string  | The last control report, scrubbed                                |
 | `report-ok`  | boolean | False after a refused request, and true before the first request |
 | `handled`    | integer | How many control requests the process has answered               |
@@ -156,6 +156,9 @@ A reader therefore sees the old file or the new one, and never half of either.
 A channel row holds `name`, `state`, and `enabled`.
 `enabled` is true when the configuration enables the channel or when this process runs it.
 A channel started by a `--channel` flag is therefore not reported as disabled while it is live.
+
+The `bootstrap` line is computed once when the supervisor is built and is written unchanged on every pass.
+A bootstrap step completed during the process lifetime does not appear in the status file until a later process reads it.
 
 The heartbeat object holds the state of the schedule.
 
@@ -301,7 +304,8 @@ The `GET /health` route reads the live process instead of the file, because a fi
 A reload produces a new code generation through the reload hook.
 The daemon supplies a hook that verifies the agent files in a one-shot child and loads them in the broker.
 The hook returns a plist of `:ok-p`, `:generation`, and `:report`.
-The broker runs as a separate process under the agent user, and [Deployment](deployment.md) documents that split.
+In the container, the broker runs as a separate process under the agent user.
+On a checkout it runs as the operator's user, and [Deployment](deployment.md) documents that split and its limits.
 The supervisor records the generation only when `:ok-p` is true.
 A refused generation changes nothing, so the last good code keeps serving.
 

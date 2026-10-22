@@ -151,6 +151,39 @@
        (progn
          (enchiridion.tools.builtin:register-builtin-tools)
          (dolist (name '("index" "read-file" "write-file" "edit-file" "glob"
-                         "shell" "search" "blockops" "meta" "web"))
+                         "shell" "search" "blockops" "memory" "meta" "web"))
            (ok (enchiridion.tools:find-tool name))))
     (enchiridion.tools:clear-registry)))
+
+(deftest memory-tool-saves-a-memory ()
+  (with-scratch-directory (scratch)
+    (let ((enchiridion.memory.store:*store-path*
+            (merge-pathnames "memory.db" scratch)))
+      (ok (search "saved memory notes"
+                  (enchiridion.tools.builtin:memory-run
+                   (list :name "notes" :text "hello"))))
+      (let ((store (enchiridion.memory.store:open-store
+                    :path enchiridion.memory.store:*store-path*)))
+        (unwind-protect
+             (let ((row (first (enchiridion.memory.store:search-memories store "notes"))))
+               (ok row)
+               (ok (string= "hello" (getf row :body))))
+          (enchiridion.memory.store:close-store store))))))
+
+(deftest meta-records-bootstrap-steps-and-hands-over ()
+  (with-scratch-directory (scratch)
+    (let* ((directory (merge-pathnames "agents/default/" scratch))
+           (text (namestring directory)))
+      (enchiridion.memory:init-agent directory)
+      (ok (search "bootstrap step 1 recorded"
+                  (enchiridion.tools.builtin:meta-run
+                   (list :action "bootstrap-step" :step 1 :directory text))))
+      (ok (= 1 (getf (enchiridion.memory:bootstrap-status directory) :step)))
+      (ok (signals (enchiridion.tools.builtin:meta-run
+                    (list :action "bootstrap-step" :step 99 :directory text))
+                   'enchiridion.errors:schema-error))
+      (dolist (step (enchiridion.memory:bootstrap-steps directory))
+        (enchiridion.tools.builtin:meta-run
+         (list :action "bootstrap-step" :step (car step) :directory text)))
+      (ok (probe-file (merge-pathnames "BOOTSTRAP.done.md" directory)))
+      (ng (probe-file (merge-pathnames "BOOTSTRAP.md" directory))))))

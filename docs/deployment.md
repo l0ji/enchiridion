@@ -5,6 +5,11 @@ Root runs the supervisor, which holds the secrets and the model client.
 Uid 1000 runs every tool and every line of agent code, and the state volume is the only writable tree that survives the container.
 An operator can build the image, supply the secret file, start the webhook, and prove the split with the isolation test.
 
+The two users and the unlinked secret file are properties of the image.
+A checkout has no uid split: the supervisor, the broker child, and agent code run as the operator's user.
+The loader leaves the checkout `.env` in place, so agent code can read it.
+Use the image when the secret must stay out of the agent's reach.
+
 ## The container image
 
 `docker/Dockerfile` builds in two stages on the `clfoundation/sbcl` image on Debian bookworm.
@@ -140,6 +145,45 @@ A checkout without the variable keeps it in the agent directory.
 
 A named volume keeps the tree across `docker stop` and `docker compose down`.
 `docker compose down -v` or `docker volume rm` removes it.
+
+## Backup, restore, and upgrade
+
+Stop the Compose service, or the standalone container, before a backup, so the store and the run files do not change during the copy.
+The volume name depends on the deployment.
+The standalone run line below uses `enchiridion-state`. Compose prefixes its project name, so its volume is `enchiridion_enchiridion-state`.
+`docker volume ls` lists the actual name when the project was renamed.
+
+```sh
+volume=enchiridion-state   # or enchiridion_enchiridion-state for Compose
+docker compose stop        # or: docker stop enchiridion
+docker run --rm \
+  -v "$volume":/state:ro \
+  -v "$PWD":/backup \
+  alpine tar czf /backup/enchiridion-state.tgz -C /state .
+```
+
+Restore into a stopped service with the same volume:
+
+```sh
+volume=enchiridion-state   # or enchiridion_enchiridion-state for Compose
+docker run --rm \
+  -v "$volume":/state \
+  -v "$PWD":/backup \
+  alpine sh -c 'rm -rf /state/* && tar xzf /backup/enchiridion-state.tgz -C /state'
+```
+
+The archive holds the agent directory, the memory store, and the run files.
+A restore replaces the whole tree, so back up before it and stop the service first.
+
+An upgrade rebuilds the image and starts the service on the same volume:
+
+```sh
+docker compose build
+docker compose up -d
+```
+
+The state volume survives the replacement.
+The store schema creates missing tables and has no migration code, so a schema change that adds a column needs a manual migration.
 
 ## Deploying the container
 

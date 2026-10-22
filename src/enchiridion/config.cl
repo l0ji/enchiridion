@@ -94,9 +94,12 @@ store path. The model defaults match the shipped adapter defaults."
     (:provider :openai)
     (:backend :openai)
     (:base-url nil)
-    (:model-primary "deepseek-v4.1-flash")
-    (:model-cheap "deepseek-v4.1-flash")
-    (:model-sleep "deepseek-v4.1-flash")
+    ;; NIL means the selected provider row's model. A named model here is an
+    ;; override for every provider, and the shipped row already knows which
+    ;; model its endpoint can serve.
+    (:model-primary nil)
+    (:model-cheap nil)
+    (:model-sleep nil)
     ;; NIL and not a variable name: the provider table in the LLM module names
     ;; the key variable for the provider that was selected, and a name shipped
     ;; here would pin every install to OpenAI's. NIL means the provider decides.

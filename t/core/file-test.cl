@@ -76,3 +76,37 @@
                     text :cap 20 :spill-directory scratch)))
       (ok (search "truncated 180 characters" capped))
       (ok (search "full result at" capped)))))
+
+(deftest seed-backed-writes-are-refused-until-handover ()
+  (with-scratch-directory (scratch)
+    (let ((previous-home (uiop:getenv "ENCHIRIDION_HOME")))
+      (enchiridion.compat:set-environment-variable "ENCHIRIDION_HOME" (namestring scratch))
+      (unwind-protect
+           (let* ((directory (merge-pathnames "agents/default/" scratch))
+                  (soul (merge-pathnames "SOUL.md" directory)))
+             (enchiridion.tools:clear-registry)
+             (enchiridion.tools.builtin:register-builtin-tools)
+             (enchiridion.memory:init-agent directory)
+             (ok (signals (enchiridion.tools:dispatch
+                           "write-file"
+                           (list :path (namestring soul) :text "new soul"))
+                          'enchiridion.errors:bootstrap-pending))
+             (ok (signals (enchiridion.tools:dispatch
+                           "edit-file"
+                           (list :path (namestring soul)
+                                 :old "# Soul" :new "# Changed"))
+                          'enchiridion.errors:bootstrap-pending))
+             (dolist (step (enchiridion.memory:bootstrap-steps directory))
+               (enchiridion.memory:mark-bootstrap-step directory (car step)))
+             (ok (search "wrote"
+                         (enchiridion.tools:dispatch
+                          "write-file"
+                          (list :path (namestring soul) :text "new soul"))))
+             (ok (search "edited"
+                         (enchiridion.tools:dispatch
+                          "edit-file"
+                          (list :path (namestring soul) :old "new" :new "changed")))))
+        (enchiridion.tools:clear-registry)
+        (if previous-home
+            (enchiridion.compat:set-environment-variable "ENCHIRIDION_HOME" previous-home)
+            (enchiridion.compat:unset-environment-variable "ENCHIRIDION_HOME"))))))

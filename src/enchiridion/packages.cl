@@ -299,7 +299,8 @@ child; the supervisor never loads it."))
   (:use #:cl)
   (:export
    #:register-builtin-tools #:file-index #:file-index-forms #:shell-run
-   #:search-run #:block-ops #:meta-run #:web-fetch #:cap-result #:spill-path)
+   #:search-run #:block-ops #:memory-run #:meta-run #:web-fetch
+   #:cap-result #:spill-path)
   (:documentation
    "The built-in tools. Index before read, cap every result, and spill the
 middle of anything oversized to a file the agent can go and read."))

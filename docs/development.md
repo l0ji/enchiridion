@@ -14,6 +14,7 @@ It is written for a developer who will change the code.
 | `t/`                 | The test systems and the suites.                                           |
 | `config.example.cl`  | The tracked template for `config.cl`.                                      |
 | `flake.nix`          | The build, the checks, the shells, and the test run.                       |
+| `flake.lock`         | The pinned `nixpkgs` revision.                                             |
 | `docker/`            | The image, the entrypoint, the wrapper, and the isolation test.            |
 | `compose.yml`        | The server deployment for the image.                                       |
 | `docs/`              | This documentation.                                                        |
@@ -49,8 +50,23 @@ After an update of `nixpkgs`, run this command and expect `0`:
 nix path-info -r .#packages.<system>.enchiridion | grep -cE 'shell_cmds|bootstrap-tools'
 ```
 
-The package installs `src/` and `enchiridion.asd` under `$out/lib` and nothing else.
+The package installs `src/` and `enchiridion.asd` under `$out/lib` and the wrapper as `$out/bin/enchiridion`.
 `t/`, `docs/`, `docker/`, `compose.yml`, `flake.nix`, `README.md`, and `LICENSE` are not runtime inputs.
+
+### Updating nixpkgs
+
+The input does not update by itself.
+A checkout keeps the commit in its lock, so a build is reproducible until someone updates it.
+
+```sh
+nix flake update nixpkgs
+nix run .#check
+nix run .#test
+nix path-info -r .#packages.<system>.enchiridion | grep -cE 'shell_cmds|bootstrap-tools'
+```
+
+The last command must print `0`.
+Commit `flake.lock` with the update.
 
 ## Packages
 
@@ -81,7 +97,7 @@ Every `config.cl` begins with `(in-package #:enchiridion.user)`.
 2. `config`, `git`, `errors`.
 3. `llm`: `secrets`, `protocol`, `json`, `http`, `registry`, `dialects`, `auth`, `openai`, `anthropic`, `aws-sigv4`, `bedrock`, `gcp-oauth`, `vertex`, `catalog`, `providers`.
 4. `memory`: `blocks`, `store`, `tiers`, `seed`, `state`.
-5. `tools`: `schema`, `registry`, `pipe`, `broker`, then the builtins `file`, `shell`, `search`, `blockops`, `meta`, `web`, `register`.
+5. `tools`: `schema`, `registry`, `pipe`, `broker`, then the builtins `file`, `shell`, `search`, `blockops`, `memory`, `meta`, `web`, `register`.
 6. `plugin`: `loader`, `verify`, `manifest`.
 7. `channel`: `protocol`, `http`, `fluxer`.
 8. `supervisor`, `kernel`, `sleep`, then `channel/cli`.
@@ -142,6 +158,7 @@ Every file above it is standard Common Lisp.
 
 `plugin/verify.cl` proclaims `(optimize (safety 3) (debug 3))` while it loads one plugin file, so a bad plugin stops at a bounds check or a slot type error.
 No other file proclaims an optimization level.
+The `check` gate compiles with the default safety settings. Only plugin verification uses safety 3.
 
 ### The build gate
 

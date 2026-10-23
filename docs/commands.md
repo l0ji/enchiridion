@@ -138,7 +138,7 @@ nix run .#enchiridion -- COMMAND ARGS
 An argument is accepted and ignored.
 It prints the status line and one line per file, prefixed `  created `, `  kept    `, or `  problem `.
 A problem prints `  problem (NAME . CONDITION)` and returns 1.
-The first launch does the same work (see [Getting started](getting-started.md#perform-the-first-launch)).
+The first launch does the same work (see [Getting started](getting-started.md#create-the-agent)).
 
 ### ask
 
@@ -297,7 +297,15 @@ A bad action prints `NAME takes show or edit.` and returns 2.
 A bad action prints `bootstrap takes status, run, step NUMBER or reset.` and returns 2.
 An invalid or unknown step prints `bootstrap step needs a step number.` or `There is no bootstrap step N.` and returns 2.
 The meta tool action `bootstrap-step` records a step from the turn surface, and the last step archives `BOOTSTRAP.md`.
-[Getting started](getting-started.md#hand-over-the-bootstrap) gives the procedure, and [Memory](memory.md#the-bootstrap) covers the state machine.
+After the last step, `bootstrap status` prints the line `Bootstrap complete.` The handover archives `BOOTSTRAP.md` as `BOOTSTRAP.done.md`, opens the block and file tools, and commits the agent directory.
+If a session cannot record a step, rename the file by hand:
+
+```sh
+mv agents/default/BOOTSTRAP.md agents/default/BOOTSTRAP.done.md
+```
+
+A manual rename opens the gate but leaves the state record and the commit alone.
+[Memory](memory.md#the-bootstrap) covers the state machine.
 
 ### journey
 
@@ -560,7 +568,7 @@ It is read before the command table, so it is not a command row.
 A missing directory prints `--verify-plugin takes a directory.` and returns 2.
 
 Verification runs in a separate child process, so a file that kills the compiler cannot take the running generation with it.
-The child drops to a user identifier (uid) of 1000 before it reads one agent file when the parent runs as root.
+The child clears its groups and drops to the configured `:sandbox :agent-uid` and `:agent-gid` before it reads one agent file when the parent runs as root.
 It compiles and loads every Lisp file under `skills/` and `tools/`, collects every warning, and runs every plugin self-test.
 The report goes to standard output.
 
@@ -592,6 +600,8 @@ The packaged wrapper sets the variable.
 | `COMMAND: no supervisor is running, so nothing was asked.`           | No live supervisor answers the control file                           | Start `serve` in another terminal                                    |
 | `channel NAME is not implemented yet.`                               | The supervisor did not build that channel                             | Enable the channel in the configuration, or pass `--channel NAME`    |
 | `The broker did not start before the timeout.`                       | The child Lisp is missing, or its cache directory is not writable     | Run from `nix develop`, and set `ENCHIRIDION_SBCL` to the SBCL path  |
+| `Git is required. Install Git and put it on PATH, or set ENCHIRIDION_GIT.` | The Git executable did not answer at startup                   | Install Git, or point `ENCHIRIDION_GIT` at it                        |
+| `config.cl is required. Copy config.example.cl to config.cl and edit it.` | No `config.cl` was found beside the checkout                  | Copy `config.example.cl` to `config.cl`                            |
 | `--verify-plugin` reports a failure                                  | An agent file warns, fails to compile, or fails its self-test         | Correct the file, then verify again                                  |
 | `enchiridion: stdin is not a terminal, so the cli channel stays down.`| `serve` supervises the terminal channel without a terminal            | Run `serve` in a terminal, or use another channel                    |
 

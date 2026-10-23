@@ -10,7 +10,8 @@ After it, an operator can select a provider, enable channels, and cap unattended
 The file is `config.cl`.
 The harness loads it with the Lisp `load` function before any command runs, so treat the file as code.
 The load defines `enchiridion.user::*enchiridion-config*`, and that value becomes the active configuration for the life of the process.
-An absent file, or a file that binds no variable, is not an error: the harness starts on the shipped defaults.
+The file is required. An absent file stops startup with exit 2 and `Configuration is wrong at CONFIG.` plus `config.cl is required. Copy config.example.cl to config.cl and edit it.`
+A file that binds no variable is present, so it is accepted and the shipped defaults fill the missing keys.
 
 The file holds paths and behavior only.
 A secret value belongs in `.env` or the process environment, and the file names the variable that holds it.
@@ -36,7 +37,8 @@ Create the file from the template:
 cp config.example.cl config.cl
 ```
 
-A file with a read error stops startup before any command runs.
+An absent file stops startup before any command runs, with the required-file message above.
+A file with a read error also stops startup before any command runs.
 
 ## Shape
 
@@ -146,7 +148,7 @@ Provider knowledge beyond those rows comes from the runtime catalog, generated f
 
 An explicit `:provider` wins.
 Without one, detection uses a recognized `:base-url` host, then the key variables `OPENAI_API_KEY`, `OPENCODE_API_KEY`, `ANTHROPIC_API_KEY`, the one cached provider whose variable is present, then OpenAI.
-The shipped default is `:provider :openai`, so a process with no `config.cl` always uses OpenAI.
+A `config.cl` without `:provider` uses the detection order. It does not inherit the shipped `:provider :openai`.
 Two exported keys need an explicit `:provider` or `:base-url`.
 [Large language model backends](llm.md) lists the complete order.
 
@@ -208,13 +210,14 @@ Write both keys when the file has a `:budget` section (see [Supervisor and heart
 
 | Key             | Type    | Default | Meaning                                              |
 | --------------- | ------- | ------- | ---------------------------------------------------- |
-| `:agent-uid`    | integer | `1000`  | User identifier for agent code and the broker in the container. |
+| `:agent-uid`    | integer | `1000`  | User identifier for agent code and the broker in the container or a root-started checkout. |
+| `:agent-gid`    | integer | `1000`  | Group identifier for the same processes.             |
 | `:proc-hidepid` | integer | `2`     | Declared `/proc` hidepid value. No code reads it.    |
 
-The supervisor runs as root in the container deployment and holds the secrets.
-The broker and the reload verification use `:agent-uid`.
-The `--verify-plugin` path always passes uid 1000, whatever this key says (see [Plugins and self-modification](plugins.md)).
-A checkout has no uid split: the supervisor, the broker child, and agent code run as the operator's user (see [Deployment](deployment.md)).
+The supervisor runs as root in the container deployment and in a checkout started as root, and it holds the secrets.
+The broker, the reload verification, and `--verify-plugin` use `:agent-uid` and `:agent-gid`.
+A checkout started as the operator has no uid split: the supervisor, the broker child, and agent code run as that user.
+[Deployment](deployment.md) covers the root setup.
 No Lisp path reads `:proc-hidepid`, and the container entry point reads `ENCHIRIDION_HIDEPID` instead (see [Deployment](deployment.md)).
 
 ## The :memory section
@@ -247,6 +250,7 @@ A value of `:interval-seconds` that is not a positive integer becomes 900 (see [
 | `ENCHIRIDION_HOME`           | Home root for `agents/default/` and `run/`. Defaults to the current directory.                |
 | `ENCHIRIDION_SOURCE`         | Project root for the second `config.cl` path and for `.env`.                                  |
 | `ENCHIRIDION_SBCL`           | Lisp implementation for the broker and for plugin verification. The packaged wrapper sets it. |
+| `ENCHIRIDION_GIT`            | Git executable. The packaged wrapper and the container set it. Defaults to `git` on `PATH`.  |
 | `ENCHIRIDION_PROVIDERS_PATH` | Path of the provider catalog cache, instead of `run/providers.json`.                          |
 | `OPENAI_API_KEY`             | OpenAI credential, unless `:api-key-env` names another variable.                              |
 | `OPENCODE_API_KEY`           | OpenCode Go credential.                                                                       |
@@ -287,7 +291,7 @@ The loader reads every pair, then every variable name the configuration mentions
 After the load, the process removes every loaded name and every credential-shaped variable from its own environment.
 A child process inherits nothing, and a later read of `/proc` finds nothing, while the values stay in memory for the life of the process.
 
-On a checkout, the file stays on disk and agent code runs as the same user, so its file and shell tools can read `.env`.
+On a checkout started as the operator, the file stays on disk and agent code runs as the same user, so its file and shell tools can read `.env`.
 The environment scrub keeps the values out of the child environment, but it is not a file system boundary.
 The container deployment unlinks the file and runs agent code as another user, and that is the deployment with the secret guarantee (see [Deployment](deployment.md)).
 
@@ -308,8 +312,8 @@ The later columns run from the highest priority to the lowest.
 
 | Setting                              | First                             | Then                                  | Last                                   |
 | ------------------------------------ | --------------------------------- | ------------------------------------- | -------------------------------------- |
-| `config.cl` path                     | Current directory                 | Project root                          | Defaults, when neither exists          |
-| Budget caps                          | `config.cl` value                 | No cap when the section omits the key | Shipped cap when no `config.cl` exists |
+| `config.cl` path                     | Current directory                 | Project root                          | Startup stops with exit 2              |
+| Budget caps                          | `config.cl` value                 | No cap when the section omits the key | No config, no start                    |
 | `:http` entry key                    | `--bind`, `--port`, `--token-env` | `config.cl` entry                     | Shipped entry                          |
 | Channel start set (`http`, `fluxer`) | `--channel NAME`                  | `:enabled t` in the entry             | Channel not started                    |
 | Secret value                         | Process environment               | `.env` value                          | No value                               |

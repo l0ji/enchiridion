@@ -130,27 +130,28 @@ The generation check runs only when a caller passes the `generation` keyword, an
 ## The broker and the sandbox boundary
 
 The supervisor holds the keys and the model, and agent code runs in a child process.
-In the container deployment the child runs as the agent user, uid 1000.
-A checkout has no uid split: the child runs as the operator's user and keeps that user's file rights (see [Deployment](deployment.md)).
+In a split run (the container or a root-started checkout) the child runs as the agent user.
+A checkout started as the operator has no split: the child runs as that user and keeps their file rights (see [Deployment](deployment.md)).
 Only one length-prefixed JSON request and its reply cross the line, and the process that holds the secrets never compiles or runs agent code.
 
 | Item               | Value                                                                         |
 | ------------------ | ----------------------------------------------------------------------------- |
 | Default socket     | `/run/enchiridion/broker.sock`                                                |
 | Default child uid  | 1000                                                                          |
+| Default child gid  | 1000                                                                          |
 | Frame              | four-byte big-endian length, then UTF-8 bytes                                 |
 | Frame cap          | 16 MiB                                                                        |
 | Request operations | `ping`, `load-generation`, and any registered tool name                       |
 | `ping` reply       | the string `ok`                                                               |
 | Response envelope  | `{"ok": true, "result": ...}` or `{"ok": false, "error": ..., "detail": ...}` |
 
-`make-broker` returns a descriptor with a socket, a uid, a timeout of 30 seconds, and a call lock, and nothing starts until `broker-start`.
+`make-broker` returns a descriptor with a socket, a uid, a gid, a timeout of 30 seconds, and a call lock, and nothing starts until `broker-start`.
 The daemon passes its own socket path: `$ENCHIRIDION_HOME/run/broker.sock` when the variable is set, and `broker.sock` inside the agent directory when it is not.
 
 `broker-start` starts the child by default.
 `:in-process t` starts a server thread in the current process for tests, and it is not the security boundary.
 
-The child runs the SBCL named by `ENCHIRIDION_SBCL`, or `sbcl`, with `--script` on the installed `src/broker-exec.cl`, then `--socket PATH` and `--uid N`.
+The child runs the SBCL named by `ENCHIRIDION_SBCL`, or `sbcl`, with `--script` on the installed `src/broker-exec.cl`, then `--socket PATH`, `--uid N`, and `--gid N`.
 Its environment holds `PATH` as `/usr/local/bin:/usr/bin:/bin` and `HOME` as `ENCHIRIDION_HOME` or `/tmp`, plus `SBCL_HOME`, `CL_SOURCE_REGISTRY`, `ENCHIRIDION_HOME`, `ENCHIRIDION_SOURCE`, `ENCHIRIDION_SBCL`, `LD_LIBRARY_PATH`, `XDG_CACHE_HOME`, and `XDG_CONFIG_HOME` when they are set.
 No other variable is inherited, so a key in the supervisor's environment cannot reach the child, and `broker-verify-plugin` uses the same environment for its one-shot child.
 
@@ -176,14 +177,14 @@ The function accepts a `timeout` keyword and does not enforce it on the socket r
 ### The child
 
 `src/broker-exec.cl` loads the system, registers the built-in tools, installs the plugin loader as `*load-generation-function*`, and serves the socket.
-It drops to the requested uid when it runs as root and the uid is positive, and a non-root process stays where it is.
+It clears the supplementary groups, sets the requested gid, then the requested uid when it runs as root and the uid is positive. A non-root process stays where it is.
 Each frame is answered by operation: `ping` answers the string `ok`, `load-generation` calls the plugin loader with the directory and generation and answers `{"ok": ..., "report": ...}`, and every other operation is a tool name dispatched through `dispatch`.
 A success is scrubbed and returned under `result`, because a tool result is the last place a secret can enter a transcript.
 A tool request runs in the child, not in the supervisor.
-In the container the child runs as the agent user.
-On a checkout it runs as the operator's user, so the shell tool and every agent-authored handler have that user's file rights.
+In a split run the child runs as the agent user.
+In a checkout started as the operator it runs as that user, so the shell tool and every agent-authored handler have their file rights.
 
-`--verify-plugin DIRECTORY --uid N` verifies every agent file in the directory and prints the report, exiting 0 when the generation is good and 1 when it is not.
+`--verify-plugin DIRECTORY --uid N --gid N` verifies every agent file in the directory and prints the report, exiting 0 when the generation is good and 1 when it is not.
 The main mode requires `--socket`, prints `broker-exec: --socket PATH is required.` on standard error and exits 2 when it is absent.
 A startup failure exits 1 and an interrupt exits 130.
 A smoke test runs `sbcl --script src/broker-exec.cl --socket /tmp/enchiridion-broker.sock` from a development shell, so that ASDF can find the system.
@@ -212,7 +213,7 @@ A reload replaces the agent's code without stopping the process, and the supervi
 3. The supervisor verifies the new generation in a one-shot child and refuses the generation when verification exits nonzero.
 4. The supervisor registers one proxy tool per verified manifest, with the new generation and `broker-side-p` true.
 5. The supervisor asks the broker child to load the generation.
-   In the container the child compiles it as the agent user. On a checkout the child runs as the operator's user.
+   In a split run the child compiles it as the agent user. In a checkout started as the operator, the child runs as that user.
 
 The command is `nix run .#enchiridion -- reload`.
 It needs a running supervisor, which `serve` starts.
@@ -224,8 +225,8 @@ The model sees a proxy tool for each manifest, and its handler refuses with `con
 A call whose operation reaches the child goes through the real handler there.
 
 Verification is a separate process, so a file that kills the compiler cannot take the running generation with it.
-In the container the verifier runs as the agent user with the minimal environment.
-On a checkout it runs as the operator's user.
+In a split run the verifier runs as the agent user with the minimal environment.
+In a checkout started as the operator it runs as that user.
 Its combined output returns to the supervisor.
 `plugins.md` owns the manifest and the verification report.
 
@@ -506,7 +507,7 @@ The refusals are these.
 
 A directory that is not a git repository is not an error for `author`.
 The file is written, and the commit is skipped.
-A commit failure is silent for the same reason: a host with no identity or no git must not cost the operator the reply.
+A commit failure is silent for the same reason: a host with no identity, or a Git that refuses the commit, must not cost the operator the reply.
 
 ### `web`
 

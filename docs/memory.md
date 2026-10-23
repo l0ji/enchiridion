@@ -97,7 +97,7 @@ A rerun against a populated directory completes a half finished setup and report
 `seed-file-names` returns the eight relative names, and `agent-seeded-p` answers whether a directory holds at least one seed file.
 
 After the files are on disk and no write failed, `ensure-agent-repository` makes the directory a nested git repository and commits it.
-A host without git keeps the files and skips the commit.
+Git is required at startup. A host with Git but no Git identity keeps the files and skips the commit.
 
 `init-agent` returns an `init-result` with the directory, the files created, the files kept, and the problems.
 It also holds a flag that says whether the directory already held a seed file, and `init-status-line` renders one line.
@@ -121,7 +121,7 @@ The no-command first launch runs the same code and stops, so the operator can ed
 ## The agent repository
 
 The agent directory is its own git repository, nested inside the checkout.
-`init-agent` creates it and records the first commit when Git is available.
+`init-agent` creates it and records the first commit.
 
 The kernel attempts a commit after each successful turn, with the message `Turn N via CHANNEL`.
 A turn that fails or is stopped before it ends attempts no commit. A turn that changed nothing also leaves no commit.
@@ -150,7 +150,7 @@ The report reads `Block <label> is the operator's until bootstrap hands over.`
 `mark-bootstrap-step` keeps `done` sorted and duplicate free, sets `step` to the number done, writes the state, and runs the handover when the last step lands.
 The meta tool action `bootstrap-step` and `enchiridion bootstrap step N` call it.
 The block and file tools are the enforced gate. `shell` does not check the bootstrap state, so a caller can edit `state.json` or rename the file.
-[Getting started](getting-started.md#hand-over-the-bootstrap) gives the operator procedure.
+[Commands](commands.md#bootstrap) gives the operator procedure.
 
 The handover renames `BOOTSTRAP.md` to `BOOTSTRAP.done.md`, sets `complete` true, writes the state, and commits the directory.
 A missing `BOOTSTRAP.md` still marks the state complete.
@@ -229,7 +229,7 @@ The store is one SQLite file.
 `open-store` creates the file and schema when missing and uses a 5000 ms busy timeout.
 A file that cannot be opened signals `configuration-error` with `Cannot open the memory store <path>: <reason>`, and a failed schema signals one with `Cannot create the memory store schema in <path>: <reason>`.
 Both report `Configuration is wrong at MEMORY.`
-When root creates the file in the container, it widens the mode to `#o666`. The broker runs as the agent user there.
+When root creates the file in a split run, it widens the mode to `#o666`. The broker runs as the agent user.
 Every string is scrubbed before it reaches a column, so the store holds no secret.
 
 `store-file-p` reads the sixteen-byte SQLite header, and a search opens a store only when that check passes.

@@ -51,6 +51,7 @@ nix path-info -r .#packages.<system>.enchiridion | grep -cE 'shell_cmds|bootstra
 ```
 
 The package installs `src/` and `enchiridion.asd` under `$out/lib` and the wrapper as `$out/bin/enchiridion`.
+The wrapper puts the package Git on `PATH` and in `ENCHIRIDION_GIT`, because Git is a runtime dependency.
 `t/`, `docs/`, `docker/`, `compose.yml`, `flake.nix`, `README.md`, and `LICENSE` are not runtime inputs.
 
 ### Updating nixpkgs

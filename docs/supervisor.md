@@ -304,8 +304,8 @@ The `GET /health` route reads the live process instead of the file, because a fi
 A reload produces a new code generation through the reload hook.
 The daemon supplies a hook that verifies the agent files in a one-shot child and loads them in the broker.
 The hook returns a plist of `:ok-p`, `:generation`, and `:report`.
-In the container, the broker runs as a separate process under the agent user.
-On a checkout it runs as the operator's user, and [Deployment](deployment.md) documents that split and its limits.
+In a split run, the broker runs as a separate process under the agent user.
+In a checkout started as the operator it runs as that user, and [Deployment](deployment.md) documents the split and its limits.
 The supervisor records the generation only when `:ok-p` is true.
 A refused generation changes nothing, so the last good code keeps serving.
 

@@ -4,8 +4,8 @@ enchiridion is an autonomous agent harness written in Common Lisp.
 The supervisor process holds the model client, the secret values, the memory store, and the channels.
 The kernel compiles the memory blocks into one prompt for a session.
 A turn calls the model with that prompt, and calls it again for each round of tool calls, up to the tool-round limit.
-In the container deployment, agent code runs in a child process under its own user, and the supervisor never loads that code.
-A checkout has no uid split, so the supervisor, the broker child, and agent code run as the operator's user (see [Deployment](deployment.md)).
+In the container deployment and in a root-started checkout, agent code runs in a child process under its own user, and the supervisor never loads that code.
+A checkout started as the operator has no split (see [Deployment](deployment.md)).
 
 This documentation covers the operator's side of the program and the developer's side of it.
 It describes the behaviour of the code as it is, and it names the source file that owns each mechanism.
@@ -27,7 +27,7 @@ A fact lives on the page that owns it, and other pages link to that page instead
 
 Part I, starting the program:
 
-- [Getting started](getting-started.md) builds the program, writes the first agent directory, and holds the first conversation.
+- [Getting started](getting-started.md) creates one persistent agent and holds the first conversation.
 
 Part II, running the program:
 

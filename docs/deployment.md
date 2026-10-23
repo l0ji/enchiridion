@@ -5,10 +5,7 @@ Root runs the supervisor, which holds the secrets and the model client.
 Uid 1000 runs every tool and every line of agent code, and the state volume is the only writable tree that survives the container.
 An operator can build the image, supply the secret file, start the webhook, and prove the split with the isolation test.
 
-The two users and the unlinked secret file are properties of the image.
-A checkout has no uid split: the supervisor, the broker child, and agent code run as the operator's user.
-The loader leaves the checkout `.env` in place, so agent code can read it.
-Use the image when the secret must stay out of the agent's reach.
+The two users are a property of any root-started process. The image supplies them, and a checkout started as root uses the same drop. A checkout started as the operator has no split: the supervisor, the broker child, and agent code run as that user, and the loader leaves the `.env` in place.
 
 ## The container image
 
@@ -17,10 +14,13 @@ The build stage installs the C build libraries, installs Quicklisp, and download
 It compiles the core into a fasl cache, so a missing dependency or compile error stops the build.
 The runtime stage installs the runtime libraries and copies the compiled dependency tree, the core, and the source the cache is keyed on.
 The runtime image carries Steel Bank Common Lisp (SBCL), because the program and the broker child run as `--script` processes.
+Git is a runtime dependency, and both stages install it.
 
 The build context is the repository root.
 `.dockerignore` keeps `.git`, `docs/`, `t/`, `config.cl`, `.env`, and `.env.*` out, among other paths.
-The image carries no `config.cl` and no secret file, so configuration comes from the environment and the defaults in [Configuration](configuration.md).
+The image carries no `config.cl` and no secret file.
+The run line binds the checkout `config.cl` into `/opt/enchiridion/config.cl`, so the required file is present and the image stays free of local paths.
+A run line without that mount stops with `Configuration is wrong at CONFIG.`.
 
 | Item              | Value                                                                                                                    |
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------ |
@@ -40,7 +40,7 @@ The image installs these paths.
 `/opt/enchiridion` is the source tree the fasl cache is keyed on.
 `/opt/quicklisp` holds the dependency sources, `/opt/enchiridion-cache` holds the compiled files from the build stage, and `/etc/ssl/certs/ca-certificates.crt` is Debian's certificate bundle.
 The image sets `PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin`, `ENCHIRIDION_HOME=/var/lib/enchiridion`, `ENCHIRIDION_SOURCE=/opt/enchiridion`, and `ENCHIRIDION_SBCL=/usr/local/bin/sbcl`.
-It also sets `SBCL_HOME=/usr/local/lib/sbcl`, `XDG_CACHE_HOME=/opt/enchiridion-cache`, `CL_SOURCE_REGISTRY=/opt/enchiridion//:/opt/quicklisp/dists/quicklisp/software//`, and `SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt`.
+It also sets `ENCHIRIDION_GIT=/usr/bin/git`, `SBCL_HOME=/usr/local/lib/sbcl`, `XDG_CACHE_HOME=/opt/enchiridion-cache`, `CL_SOURCE_REGISTRY=/opt/enchiridion//:/opt/quicklisp/dists/quicklisp/software//`, and `SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt`.
 
 The fasl cache lives outside `/root`, because the broker child runs as uid 1000 and must read the compiled files.
 The wrapper in `docker/enchiridion.sh` sets the same paths with fallbacks and runs `sbcl --script /opt/enchiridion/src/main.cl`.
@@ -48,7 +48,7 @@ The wrapper in `docker/enchiridion.sh` sets the same paths with fallbacks and ru
 ## Root and the agent user
 
 The supervisor starts as uid 0 and keeps the secrets in its own memory.
-Every child that runs agent code drops to uid 1000 before reading an agent file.
+Every child that runs agent code clears its supplementary groups, sets gid 1000, then drops to uid 1000 before reading an agent file.
 The `:sandbox :agent-uid` key names that uid and defaults to 1000, and [Configuration](configuration.md) lists it.
 
 | User  | uid  | Job                                                       |
@@ -74,6 +74,47 @@ The state tree and `/run/enchiridion` are owned `1000:1000`.
 The state tree keeps the image default mode, and `/run/enchiridion` is 700.
 The run line mounts `/run/secrets` as `0:0` mode 700, and the operator supplies `/run/secrets/.env` at `600:0` when correct.
 The entrypoint logs the supervisor uid, the agent uid, the state directory, and the secrets directory before it hands over.
+
+## The host UID split
+
+The image supplies the split. A checkout can use the same split when the supervisor starts as root.
+
+1. Choose a state root the agent uid can reach, such as `/var/lib/enchiridion`.
+   Every parent directory needs the world execute bit, because the agent uid is not the operator.
+
+2. Set `ENCHIRIDION_HOME` to that root.
+   The supervisor creates `agents/default`, `run`, and `tmp`, and gives them to `:sandbox :agent-uid` and `:sandbox :agent-gid`.
+
+3. Keep the checkout `.env` at mode 600 owned by root, and keep `config.cl` root-owned when it holds a literal token.
+   The agent uid then cannot read either file.
+   Configure a Git identity and signing key for root, because the supervisor commits the agent directory as root.
+
+4. Run `init` and `serve` as root:
+
+   ```sh
+   sudo env ENCHIRIDION_HOME=/var/lib/enchiridion \
+     "$(command -v nix)" run .#enchiridion -- init
+   sudo env ENCHIRIDION_HOME=/var/lib/enchiridion \
+     "$(command -v nix)" run .#enchiridion -- serve
+   ```
+
+The broker child drops the supplementary groups, then the group id, then the user id.
+The user drop is `setuid`, not `seteuid`, so the child cannot return to root.
+
+The agent tree and the run files belong to the agent uid after the start.
+Edit the seed files with `sudo`, and read or repair the tree with `sudo`.
+
+Check the split from another root shell:
+
+```sh
+ps -o user,pid,command -ax | grep broker-exec
+```
+
+The broker line names the agent uid, and the supervisor line names root.
+
+A checkout started as the operator has no split.
+The loader leaves the `.env` in place, and agent code can read it.
+The image remains the simpler deployment when a root shell is not wanted.
 
 ## Supplying the secrets
 
@@ -207,13 +248,17 @@ The store schema creates missing tables and has no migration code, so a schema c
    A bind that answers the network needs the token, and the model call needs the provider key.
    [Configuration](configuration.md) names the provider key variables.
 
-3. Create the seed files on the state volume before the server starts:
+3. Copy `config.example.cl` to `config.cl`.
+   The run lines bind that file into the image, and a container without it stops at the required-file check.
+
+4. Create the seed files on the state volume before the server starts:
 
    ```sh
    docker run --rm \
      --tmpfs /run/secrets:mode=0700 \
      --cap-add SYS_ADMIN \
      -e ENCHIRIDION_REQUIRE_HIDEPID=1 \
+     -v "$PWD/config.cl":/opt/enchiridion/config.cl:ro \
      -v enchiridion-state:/var/lib/enchiridion \
      enchiridion:0.1.0 \
      init
@@ -222,7 +267,7 @@ The store schema creates missing tables and has no migration code, so a schema c
    The command prints `No agent directory found. Creating /var/lib/enchiridion/agents/default/.`, then one `  created NAME` line per seed file, and exits 0.
    [Getting started](getting-started.md) names the files.
 
-4. Start the container:
+5. Start the container:
 
    ```sh
    docker run -d --name enchiridion \
@@ -231,6 +276,7 @@ The store schema creates missing tables and has no migration code, so a schema c
      --cap-add SYS_ADMIN \
      -e ENCHIRIDION_REQUIRE_HIDEPID=1 \
      -v "$PWD/.env":/run/secrets/.env:ro \
+     -v "$PWD/config.cl":/opt/enchiridion/config.cl:ro \
      -v enchiridion-state:/var/lib/enchiridion \
      enchiridion:0.1.0 \
      serve --channel http --bind 0.0.0.0 --port 8787
@@ -238,7 +284,7 @@ The store schema creates missing tables and has no migration code, so a schema c
 
    The webhook answers on port 8787, and the file route keeps the secret out of the container environment.
 
-5. Read the entrypoint log with `docker logs enchiridion`; a correct start prints these four lines before the supervisor serves:
+6. Read the entrypoint log with `docker logs enchiridion`; a correct start prints these four lines before the supervisor serves:
 
    ```text
    entrypoint: /proc remounted with hidepid=2
@@ -247,10 +293,10 @@ The store schema creates missing tables and has no migration code, so a schema c
    entrypoint: secrets /run/secrets
    ```
 
-6. Prove the split with the three commands in [The isolation check](#the-isolation-check), and compare each line with the expected line.
+7. Prove the split with the three commands in [The isolation check](#the-isolation-check), and compare each line with the expected line.
    Each command exits 0 when every check in its pass succeeds.
 
-7. Stop the container with `docker stop enchiridion`.
+8. Stop the container with `docker stop enchiridion`.
    The supervisor answers `SIGTERM` through the same path as `Ctrl-C`, unwinds, and exits 130, and the named volume remains.
 
 ## The isolation check
@@ -350,25 +396,28 @@ A loopback deployment replaces the bind with `127.0.0.1` and may omit it.
 
 `compose.yml` describes one service and one named volume, and it mirrors the run line.
 The image is `${ENCHIRIDION_IMAGE:-enchiridion:0.1.0}`, the container is `enchiridion`, the restart policy is `unless-stopped`, and the command is `serve --channel http --bind 0.0.0.0 --port 8787`.
-It publishes `${ENCHIRIDION_PORT:-8787}:8787`, mounts a tmpfs at `/run/secrets` with mode 0700 and the `enchiridion-state` volume at `/var/lib/enchiridion`, and sets a 30-second stop grace period.
+It publishes `${ENCHIRIDION_PORT:-8787}:8787`, mounts a tmpfs at `/run/secrets` with mode 0700, the `enchiridion-state` volume at `/var/lib/enchiridion`, and the checkout `config.cl` at `/opt/enchiridion/config.cl` read-only, and sets a 30-second stop grace period.
 Logging uses the `json-file` driver with 10 MB per file and three files.
 The service adds `SYS_ADMIN`, sets `ENCHIRIDION_REQUIRE_HIDEPID=1`, and reads `env_file: .env` as not required.
 
 The Compose file starts the server on a fresh volume without seed files.
 The command binds `0.0.0.0`, so `ENCHIRIDION_HTTP_TOKEN` must be set or the policy check exits 2.
 
-1. Build the image with `docker compose build`.
+1. Copy `config.example.cl` to `config.cl` and edit it.
+   The service bind-mounts that file into the image.
 
-2. Write `.env` at the repository root with the token and the provider key, then run `chmod 600 .env`.
+2. Build the image with `docker compose build`.
+
+3. Write `.env` at the repository root with the token and the provider key, then run `chmod 600 .env`.
    The `env_file` entry supplies the names, and Compose reads the same file for `ENCHIRIDION_IMAGE` and `ENCHIRIDION_PORT`.
 
-3. Create the seed files with `docker compose run --rm enchiridion init`.
+4. Create the seed files with `docker compose run --rm enchiridion init`.
    The command prints one `  created NAME` line per seed file and exits 0.
 
-4. Start the service with `docker compose up -d`.
+5. Start the service with `docker compose up -d`.
    `docker compose logs enchiridion` prints the entrypoint lines in [Deploying the container](#deploying-the-container).
 
-5. Stop the service with `docker compose stop`.
+6. Stop the service with `docker compose stop`.
    The volume remains, and `docker compose down -v` removes it.
 
 The `env_file` route puts the token and the provider key into the container environment, and the loader removes each name from the supervisor process only.
@@ -386,6 +435,7 @@ The read-only bind mount in [Deploying the container](#deploying-the-container) 
 | `entrypoint: could not remount /proc with hidepid=2`                  | The remount failed and the deployment does not require it               | Add the capability and set `ENCHIRIDION_REQUIRE_HIDEPID=1`, or accept the missing proc guarantee |
 | `Configuration is wrong at SECRETS.` and a mode line                  | The secret file is world readable                                       | Run `chmod 600` on the file                                                                      |
 | `Configuration is wrong at HTTP-TOKEN.`                               | A non-loopback bind has no token                                        | Set `ENCHIRIDION_HTTP_TOKEN`, or bind `127.0.0.1`                                                |
+| `Configuration is wrong at CONFIG.`                                   | No `config.cl` was mounted or copied                                    | Copy `config.example.cl` to `config.cl` and mount it                                              |
 | `FAIL: /proc/1/environ is readable; hidepid is not active`            | Uid 1000 can read the supervisor's environment                          | Add the capability and restart the container                                                     |
 | `FAIL: NAME is in the agent environment`                              | `env_file` or `-e` put the name in the container environment            | Use the read-only bind mount and remove the `-e` entry                                           |
 | `FAIL: NAME is credential shaped and is in the agent environment`     | The container environment holds a name this configuration does not know | Remove the variable from the environment                                                         |

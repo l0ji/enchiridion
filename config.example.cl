@@ -29,6 +29,11 @@
     ;;; Base URL. Omit it, or leave NIL, for the provider default.
     ;;;(:base-url "https://api.openai.com/v1/")
 
+    ;;; Name of the variable in .env that holds the key. The file holds the
+    ;;; name, never the value. Omit it and the selected provider names the
+    ;;; variable: OPENAI_API_KEY, OPENCODE_API_KEY, or ANTHROPIC_API_KEY.
+    ;;;(:api-key-env "OPENAI_API_KEY")
+
     ;;; Model tiers. Primary handles reasoning turns. Cheap handles memory
     ;;; digests and compaction. Sleep handles the sleep-time agent, which can
     ;;; afford a stronger model because nothing is waiting on it. NIL means
@@ -36,11 +41,6 @@
     (:model-primary nil)
     (:model-cheap   nil)
     (:model-sleep   nil)
-
-    ;;; Name of the variable in .env that holds the key. The file holds the
-    ;;; name, never the value. Omit it and the selected provider names the
-    ;;; variable: OPENAI_API_KEY, OPENCODE_API_KEY, or ANTHROPIC_API_KEY.
-    ;;;(:api-key-env "OPENAI_API_KEY")
 
     ;;; The Messages API requires a max_tokens field on every request and has
     ;;; no default of its own. The OpenAI-shaped wire ignores this key.
@@ -156,10 +156,12 @@
     (:max-tokens-per-day 400000)
 
    :sandbox
-    ;;; The agent-side uid for the container image. The supervisor runs as uid 0
-    ;;; and holds the secrets; the broker and the reload verifier drop to this
-    ;;; uid. A checkout has no uid split.
+    ;;; The agent-side uid and gid for the container image, and for a checkout
+    ;;; started as root. The supervisor holds the secrets; the broker and the
+    ;;; reload verifier drop to this uid and gid. A checkout started as the
+    ;;; operator has no uid split.
     (:agent-uid 1000)
+    (:agent-gid 1000)
 
     ;;; Mount /proc with hidepid=2 so the sandbox cannot read the
     ;;; supervisor's environment or memory. This is an entrypoint setting

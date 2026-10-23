@@ -88,22 +88,23 @@ that is running.
 
 ## What the agent can reach
 
-In the container deployment, the supervisor runs as root, holds the secrets,
-and agent code runs as uid 1000. The supervisor reads `.env` from a tmpfs,
-removes the values from its environment, and deletes the container copy. The
-agent cannot read the file or the supervisor's environment there.
+In the container deployment, or a checkout started as root, the supervisor
+runs as root, holds the secrets, and agent code runs as uid 1000. In the
+container the supervisor reads `.env` from a tmpfs, removes the values from its
+environment, and deletes the container copy. The agent cannot read the file or
+the supervisor's environment in either setup.
 
-A checkout has no uid split. The supervisor, the broker child, and agent code
-run as the operator's user, and the agent's file and shell tools can read any
-file that user can read. The checkout `.env` stays on disk. Use the container
-when the key must stay out of the agent's reach.
+A checkout started as the operator has no uid split. The supervisor, the broker
+child, and agent code run as that user, and the agent's file and shell tools can
+read any file that user can read. The checkout `.env` stays on disk. Use the
+container or a root-started checkout when the key must stay out of reach.
 
 ## History
 
 This directory is its own git repository. The kernel attempts a commit after
 each successful turn with the message `Turn N via CHANNEL`, using the operator's
-Git configuration. A host without Git or without a Git identity keeps the files
-and skips the commit. The history is separate from the source tree.
+Git configuration. A host without a Git identity keeps the files and skips the
+commit. The history is separate from the source tree.
 
     git -C agents/default log
     git -C agents/default diff
@@ -497,9 +498,10 @@ there. Return the commit hash, or NIL.
 
 The repository is nested: the agent's history is its own, so `enchiridion
 undo` rolls a change back inside the agent directory and never inside the
-harness. A host with no git, and a build sandbox with no identity, both leave
-the files alone: they are written either way, and the commit is what turns
-them into a journey the operator can read.
+harness. A host with no Git identity, and a build sandbox with no identity,
+both leave the files alone: they are written either way, and the commit is what
+turns them into a journey the operator can read. Main refuses to start when
+the Git executable is missing.
 
 This lives with INIT-AGENT and not with the first launch, because
 `enchiridion init` and the first launch are the same thing on demand, and a

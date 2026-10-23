@@ -366,8 +366,8 @@ Every change the agent makes lands in git under the operator's key, and it
 lands here and not in the entry script: a turn typed at the REPL and a turn
 that wrote SOUL.md through a tool are the same turn, and neither should depend
 on a caller remembering to commit. A directory that is not a repository, a
-host with no git, and a tree with nothing to commit are all normal, all silent,
-and none of them may cost the operator the reply."
+host with no Git identity, and a tree with nothing to commit are all normal,
+all silent, and none of them may cost the operator the reply."
   (let ((directory (agent-directory agent)))
     (when directory
       (handler-case

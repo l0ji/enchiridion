@@ -31,6 +31,7 @@ load happens in the child, as the agent user.")
 (defstruct (broker (:constructor %make-broker))
   (socket #p"/run/enchiridion/broker.sock" :type pathname)
   (uid 1000 :type (integer 0 *))
+  (gid 1000 :type (integer 0 *))
   (timeout 30 :type real)
   (stream nil :type t)
   (server nil :type t)
@@ -40,7 +41,7 @@ load happens in the child, as the agent user.")
   (call-lock nil :type t))
 
 (defun make-broker (&key (socket #p"/run/enchiridion/broker.sock")
-                           (uid 1000) (timeout 30))
+                           (uid 1000) (gid 1000) (timeout 30))
   "Return a BROKER descriptor. Nothing starts until BROKER-START.
 
 The descriptor carries a lock because it carries one socket. A request is a
@@ -48,7 +49,7 @@ frame out and a frame back on the same stream, and two threads doing that at
 once interleave the writes and one of them reads the other's answer. The REPL
 and the reload poll could already collide; a second channel and the heartbeat
 make it certain."
-  (%make-broker :socket (pathname socket) :uid uid :timeout timeout
+  (%make-broker :socket (pathname socket) :uid uid :gid gid :timeout timeout
                 :call-lock (bordeaux-threads:make-lock "enchiridion broker call")))
 
 (defun json-object (&rest pairs)
@@ -190,13 +191,18 @@ second call into a race with the accept loop."
             (usocket:socket-close connection))))
     (error () nil)))
 
-(defun serve-broker (socket &key (uid nil))
+(defun serve-broker (socket &key (uid nil) (gid nil))
   "Bind SOCKET and serve requests. This is the child entry point.
 
 When UID is non-NIL and this process is root, drop to it before the socket is
-bound and before any agent file is loaded by the caller. A non-root test process
-stays where it is, because dropping to a uid it does not own would only fail."
+bound and before any agent file is loaded by the caller. The group id drops
+first, the supplementary groups are cleared, and the user drop is SETUID, so
+the child cannot return to root. A non-root test process stays where it is,
+because dropping to a uid it does not own would only fail."
   (when (and uid (plusp uid) (zerop (enchiridion.compat:process-uid)))
+    (enchiridion.compat:clear-supplementary-groups)
+    (when (and gid (plusp gid))
+      (enchiridion.compat:set-process-gid gid))
     (enchiridion.compat:set-process-uid uid))
   (let ((server (usocket:socket-listen socket nil :backlog 5 :reuse-address t)))
     (unwind-protect
@@ -214,17 +220,17 @@ secret in the supervisor's environment must not be one of these strings."
   (let ((entries (list (format nil "PATH=~A" "/usr/local/bin:/usr/bin:/bin")
                        (format nil "HOME=~A" (or (uiop:getenv "ENCHIRIDION_HOME") "/tmp")))))
     (dolist (name '("SBCL_HOME" "CL_SOURCE_REGISTRY" "ENCHIRIDION_HOME"
-                    "ENCHIRIDION_SOURCE" "ENCHIRIDION_SBCL"
+                    "ENCHIRIDION_SOURCE" "ENCHIRIDION_SBCL" "ENCHIRIDION_GIT"
                     "LD_LIBRARY_PATH" "XDG_CACHE_HOME" "XDG_CONFIG_HOME"))
       (let ((value (uiop:getenv name)))
         (when value
           (push (format nil "~A=~A" name value) entries))))
     entries))
 
-(declaim (ftype (function (pathname &key (:uid t) (:timeout t)) t)
+(declaim (ftype (function (pathname &key (:uid t) (:gid t) (:timeout t)) t)
                 broker-verify-plugin))
 
-(defun broker-verify-plugin (directory &key (uid 1000) (timeout 120))
+(defun broker-verify-plugin (directory &key (uid 1000) (gid 1000) (timeout 120))
   "Verify DIRECTORY in a one-shot child that runs as UID, and return two
 values: whether the child exited zero, and the child's combined output.
 
@@ -236,7 +242,8 @@ crosses the boundary in either direction."
         (arguments (list "--script" (namestring (broker-exec-path))
                          "--verify-plugin"
                          (namestring (uiop:ensure-directory-pathname directory))
-                         "--uid" (princ-to-string uid))))
+                         "--uid" (princ-to-string uid)
+                         "--gid" (princ-to-string gid))))
     (multiple-value-bind (output status)
         (enchiridion.compat:run-program-capture program arguments
                                                 :timeout timeout
@@ -290,7 +297,8 @@ report, a hash table with the keys ok, generation and report."
   (let* ((program (or (uiop:getenv "ENCHIRIDION_SBCL") "sbcl"))
          (arguments (list "--script" (namestring (broker-exec-path))
                           "--socket" (namestring (broker-socket broker))
-                          "--uid" (princ-to-string (broker-uid broker))))
+                          "--uid" (princ-to-string (broker-uid broker))
+                          "--gid" (princ-to-string (broker-gid broker))))
          (child (enchiridion.compat:run-program program arguments
                                                 :wait nil
                                                 :environment (child-environment))))

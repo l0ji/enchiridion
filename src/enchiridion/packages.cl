@@ -43,7 +43,9 @@ because a file in the repository is a file that ends up in a store path."))
    #:+implementation+
    #:environment #:environment-value #:environment-bound-p
    #:set-environment-variable #:unset-environment-variable
-   #:run-program #:run-program-blocking #:process-uid #:set-process-uid
+   #:run-program #:run-program-blocking
+   #:process-uid #:set-process-uid #:process-gid #:set-process-gid
+   #:clear-supplementary-groups
    #:process-user #:set-process-user #:implementation-dependency-p
    #:process-id #:process-kill
    #:script-arguments #:exit-with #:backtrace-string
@@ -58,7 +60,7 @@ able to rewrite itself without rewriting the porting layer."))
 (defpackage #:enchiridion.git
   (:use #:cl)
   (:export
-   #:git-available-p #:repository-p #:git-init #:git-commit-all
+   #:git-available-p #:git-program #:repository-p #:git-init #:git-commit-all
    #:git-log #:git-show #:git-diff #:git-revert #:git-head
    #:git-run #:git-current-branch #:git-test-environment #:*commit-environment*)
   (:documentation

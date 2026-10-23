@@ -167,6 +167,7 @@ store path. The model defaults match the shipped adapter defaults."
 
     :sandbox
     (:agent-uid 1000)
+    (:agent-gid 1000)
     (:proc-hidepid 2)
 
     :memory
@@ -369,7 +370,10 @@ fall back to the defaults."
   (let ((here (merge-pathnames "config.cl" (uiop:getcwd))))
     (or (probe-file here)
         (let ((root (project-root)))
-          (and root (probe-file (merge-pathnames "config.cl" root)))))))
+          (and root
+               (probe-file (merge-pathnames
+                            "config.cl"
+                            (uiop:ensure-directory-pathname root))))))))
 
 (declaim (ftype (function () t) read-config))
 

@@ -47,6 +47,7 @@
                  :timeout 5)))
     (unwind-protect
          (progn
+           (ok (= 1000 (enchiridion.tools.broker::broker-gid broker)))
            (enchiridion.tools.broker:broker-start broker :in-process t)
            (ok (enchiridion.tools.broker:broker-running-p broker))
            (ok (enchiridion.tools.broker:broker-health broker))

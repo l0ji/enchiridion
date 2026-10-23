@@ -105,6 +105,7 @@ ENV PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin \
     ENCHIRIDION_HOME=/var/lib/enchiridion \
     ENCHIRIDION_SOURCE=/opt/enchiridion \
     ENCHIRIDION_SBCL=/usr/local/bin/sbcl \
+    ENCHIRIDION_GIT=/usr/bin/git \
     SBCL_HOME=/usr/local/lib/sbcl \
     XDG_CACHE_HOME=/opt/enchiridion-cache \
     CL_SOURCE_REGISTRY=/opt/enchiridion//:/opt/quicklisp/dists/quicklisp/software// \

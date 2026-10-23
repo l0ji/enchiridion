@@ -33,7 +33,8 @@ either way, and the commit is what turns it into a journey entry."
 (defun git-capture (directory &rest arguments)
   "Run git in DIRECTORY and return its combined output and status."
   (enchiridion.compat:run-program-capture
-   "git" (cons "-C" (cons (namestring directory) arguments)) :timeout 20))
+   (enchiridion.git:git-program)
+   (cons "-C" (cons (namestring directory) arguments)) :timeout 20))
 
 (defun meta-journey (directory limit)
   "Return the last LIMIT commits in DIRECTORY."

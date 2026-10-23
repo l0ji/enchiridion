@@ -335,11 +335,63 @@ stale file left by a dead supervisor from a live one."
   #-sbcl (error "No uid reader is available in ~A." +implementation+))
 
 (defun set-process-uid (uid)
-  "Set the effective user id of this process to UID. There is no way back, and
-that is deliberate: the broker never becomes the supervisor."
-  #+sbcl (progn (sb-posix:seteuid uid) uid)
+  "Set the real, effective, and saved user id of this process to UID.
+There is no way back, and that is deliberate: the broker never becomes the
+supervisor. SETUID and not SETEUID, because an effective-only drop leaves the
+saved uid at root and agent code could call SETEUID to regain it."
+  #+sbcl (progn (sb-posix:setuid uid) uid)
   #-sbcl (progn (declare (ignore uid))
                 (error "No uid writer is available in ~A." +implementation+)))
+
+(declaim (ftype (function () (integer 0 *)) process-gid))
+
+#+sbcl
+(defun process-gid ()
+  "Return the effective group id of this process as an integer."
+  (sb-posix:getegid))
+
+#-sbcl
+(defun process-gid ()
+  "Return the effective group id, which is unavailable in ~A."
+  (error "No gid reader is available in ~A." +implementation+))
+
+(declaim (ftype (function (integer) integer) set-process-gid))
+
+#+sbcl
+(defun set-process-gid (gid)
+  "Set the real, effective, and saved group id of this process to GID.
+A SBCL build without SB-POSIX is not supported by this program."
+  (sb-posix:setgid gid)
+  gid)
+
+#-sbcl
+(defun set-process-gid (gid)
+  "Set the process group id, which is unavailable in ~A."
+  (declare (ignore gid))
+  (error "No gid writer is available in ~A." +implementation+))
+
+#+sbcl
+(sb-alien:define-alien-routine ("setgroups" %setgroups) sb-alien:int
+  (size sb-alien:unsigned-int)
+  (list sb-alien:system-area-pointer))
+
+(declaim (ftype (function () t) clear-supplementary-groups))
+
+#+sbcl
+(defun clear-supplementary-groups ()
+  "Clear every supplementary group of this process before the uid drop.
+SETUID does not change the group list, so a root child that keeps group 0 can
+still read group-owned files after it becomes the agent user. A failure here is
+an error and not a warning: the split without the group drop is not the split
+the documentation promises."
+  (when (minusp (%setgroups 0 (sb-sys:int-sap 0)))
+    (error "Could not clear the supplementary groups."))
+  t)
+
+#-sbcl
+(defun clear-supplementary-groups ()
+  "Clear supplementary groups, which is unavailable in ~A."
+  (error "No group writer is available in ~A." +implementation+))
 
 (defun process-user ()
   "Return the name of the user this process runs as, or NIL when it cannot be

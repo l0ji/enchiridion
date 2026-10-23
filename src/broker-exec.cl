@@ -42,19 +42,23 @@ format control of a SIMPLE-WARNING in its own representation."
   (let ((tail (member name arguments :test #'string=)))
     (when tail (second tail))))
 
-(defun broker-exec-drop-uid (uid)
-  "Drop to UID when this process is root and UID is a real user.
-A non-root process stays where it is: dropping to a uid it does not own would
+(defun broker-exec-drop-privileges (uid gid)
+  "Drop to UID and GID when this process is root and UID is a real user.
+The supplementary groups go first, then the group id, then the user id. A
+non-root process stays where it is: dropping to a uid it does not own would
 only fail, and the tests run as an ordinary user."
   (when (and uid (plusp uid) (zerop (enchiridion.compat:process-uid)))
+    (enchiridion.compat:clear-supplementary-groups)
+    (when (and gid (plusp gid))
+      (enchiridion.compat:set-process-gid gid))
     (enchiridion.compat:set-process-uid uid)))
 
-(defun broker-exec-verify (directory uid)
+(defun broker-exec-verify (directory uid gid)
   "Compile and self-test every agent file in DIRECTORY and report.
 Return 0 when the generation is good and 1 when it is not. The uid is dropped
 before a single agent file is read, so a verification that runs away runs away
 as the agent and not as the process that holds the secrets."
-  (broker-exec-drop-uid uid)
+  (broker-exec-drop-privileges uid gid)
   (handler-case
       (let ((result (enchiridion.plugin:verify-directory (pathname directory))))
         (format t "~A~%" (enchiridion.plugin:verify-report result))
@@ -93,9 +97,11 @@ function, which verification counts as a warning and therefore as a failure."
          (verify (broker-exec-argument arguments "--verify-plugin"))
          (socket (broker-exec-argument arguments "--socket"))
          (uid-text (broker-exec-argument arguments "--uid"))
-         (uid (and uid-text (parse-integer uid-text :junk-allowed t))))
+         (gid-text (broker-exec-argument arguments "--gid"))
+         (uid (and uid-text (parse-integer uid-text :junk-allowed t)))
+         (gid (and gid-text (parse-integer gid-text :junk-allowed t))))
     (when verify
-      (return-from broker-exec-main (broker-exec-verify verify uid)))
+      (return-from broker-exec-main (broker-exec-verify verify uid gid)))
     (unless socket
       (format *error-output* "broker-exec: --socket PATH is required.~%")
       (return-from broker-exec-main 2))
@@ -104,7 +110,7 @@ function, which verification counts as a warning and therefore as a failure."
           (enchiridion.tools.builtin:register-builtin-tools)
           (setf enchiridion.tools.broker:*load-generation-function*
                 #'broker-exec-load-generation)
-          (enchiridion.tools.broker:serve-broker (pathname socket) :uid uid)
+          (enchiridion.tools.broker:serve-broker (pathname socket) :uid uid :gid gid)
           0)
       (enchiridion.errors:enchiridion-error (condition)
         (format *error-output* "~&~A~%" condition)

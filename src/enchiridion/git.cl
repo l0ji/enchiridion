@@ -17,6 +17,11 @@
   "The program every call runs. Rebinding it is how a test proves the
 git-is-missing path without removing git from the machine.")
 
+(defun git-program ()
+  "Return the Git executable. ENCHIRIDION_GIT lets a Nix wrapper name the
+store path, because the broker child starts with a fixed PATH."
+  (or (uiop:getenv "ENCHIRIDION_GIT") +program+))
+
 (defparameter +ignored+
   '("state.json" "state.json.*" "memory.db" "memory.db-*" "private/" "tmp/" "*.fasl")
   "What the agent repository ignores. State and the database are runtime, not
@@ -47,7 +52,7 @@ ENVIRONMENT replaces the child environment when it is given. The tests use it
 to supply an author and to switch signing off in a build sandbox that has
 neither, and they build it with GIT-TEST-ENVIRONMENT so PATH survives."
   (enchiridion.compat:run-program-capture
-   +program+
+   (git-program)
    (cons "-C"
          (cons (namestring (uiop:ensure-directory-pathname directory))
                (mapcar #'princ-to-string arguments)))
@@ -79,8 +84,7 @@ environment is replaced and not merely added to."
 (declaim (ftype (function () boolean) git-available-p))
 
 (defun git-available-p ()
-  "Return T when git answers. A host without git is a host where journey and
-undo say so, rather than a host where a turn dies."
+  "Return T when Git answers. Main refuses to start when this is NIL."
   (handler-case
       (multiple-value-bind (output status) (git-run "." (list "--version"))
         (declare (ignore output))
@@ -173,9 +177,9 @@ second commit wait instead of losing the work.")
   "Stage everything in DIRECTORY and commit it with MESSAGE.
 
 Return the commit hash, or :NONE when there was nothing to commit, or NIL when
-git refused: a host with no identity, no key, or no git at all. Nothing here
-signals. A turn that changed nothing is the normal case, and neither that nor a
-missing git may cost the operator the reply.
+Git refuses: a host with no identity, no key, or a refusing commit hook.
+Nothing here signals. A turn that changed nothing is the normal case, and
+neither that nor a missing identity may cost the operator the reply.
 
 The whole stage-and-commit pair is one unit under *COMMIT-LOCK*: another
 thread's `git add` between this one's add and commit would commit the wrong

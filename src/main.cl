@@ -137,10 +137,16 @@ lives under it. A checkout uses the agent directory, which the operator owns."
 ;;;; that ends up in a store path.
 
 (defun load-config ()
-  "Load config.cl when it is there and return the configuration plist, or the
-defaults. The reader lives in the config module, so the shell and the system
-cannot disagree about what a configured model is."
-  (enchiridion:read-config))
+  "Load config.cl, make it active, and return the configuration plist.
+The file is required. A missing file is a configuration error with exit 2,
+because the shipped defaults are not a complete configuration for an install:
+the operator has to choose a provider and a state layout."
+  (let ((config (enchiridion:read-config)))
+    (when (eq enchiridion:*config-source* :defaults)
+      (error 'enchiridion.errors:configuration-error
+             :key :config
+             :detail "config.cl is required. Copy config.example.cl to config.cl and edit it."))
+    config))
 
 ;;;; The agent context.
 ;;;;
@@ -154,6 +160,70 @@ cannot disagree about what a configured model is."
   (or (second (assoc :agent-uid (enchiridion:config-section config :sandbox)
                      :test #'eq))
       1000))
+
+(defun agent-gid (config)
+  "Return the gid agent code runs as, from the :SANDBOX section."
+  (or (second (assoc :agent-gid (enchiridion:config-section config :sandbox)
+                     :test #'eq))
+      1000))
+
+(defun sandbox-home ()
+  "Return the home directory that holds agents/ and run/."
+  (uiop:pathname-parent-directory-pathname
+   (uiop:ensure-directory-pathname (enchiridion:run-directory))))
+
+(defun sandbox-directories ()
+  "Return the directories the agent uid owns in a split run."
+  (let ((home (sandbox-home)))
+    (list (merge-pathnames "agents/" home)
+          (uiop:ensure-directory-pathname (agent-directory))
+          (uiop:ensure-directory-pathname (enchiridion:run-directory))
+          (merge-pathnames "tmp/" home))))
+
+(defun check-sandbox-traversal (home)
+  "Signal a configuration error when HOME or an ancestor is not traversable by
+the agent. Root can chown the state tree, but it should not chown the operator's
+home directory, so the home directory itself must already allow the agent to
+enter it."
+  (let ((home (uiop:ensure-directory-pathname home)))
+    (loop for directory = home then (parent-directory directory)
+          while directory
+          do (let ((mode (enchiridion.compat:file-mode directory)))
+               (when (and mode (zerop (logand mode #o001)))
+                 (error 'enchiridion.errors:configuration-error
+                        :key :sandbox
+                        :detail (format nil "The agent uid cannot traverse ~A. Set ENCHIRIDION_HOME to a directory below a world executable parent, such as /var/lib/enchiridion." directory)))))))
+
+(defun chown-tree (directory uid gid)
+  "Give DIRECTORY and its contents to UID and GID. Signal on failure."
+  (let ((owner (if (plusp gid)
+                   (format nil "~D:~D" uid gid)
+                   (format nil "~D" uid)))
+        (path (namestring directory)))
+    (multiple-value-bind (output status)
+        (enchiridion.compat:run-program-capture
+         "chown" (list "-R" owner path) :timeout 60)
+      (unless (eql 0 status)
+        (error 'enchiridion.errors:configuration-error
+               :key :sandbox
+               :detail (format nil "Could not give ~A to ~A: ~A"
+                               path owner output))))))
+
+(defun prepare-sandbox (config)
+  "Prepare the state tree for the agent uid when this process is root.
+A non-root process has no way to split, so it returns NIL. A root process
+creates the state directories, checks that the agent can traverse the parents,
+and gives the tree to the agent uid and gid."
+  (let ((uid (agent-uid config))
+        (gid (agent-gid config)))
+    (when (and (plusp uid) (zerop (enchiridion.compat:process-uid)))
+      (let ((home (sandbox-home)))
+        (dolist (directory (sandbox-directories))
+          (ensure-directories-exist (merge-pathnames "x" directory)))
+        (check-sandbox-traversal home)
+        (dolist (directory (sandbox-directories))
+          (chown-tree directory uid gid)))
+      t)))
 
 (defun memory-store-path (config)
   "Return the store file CONFIG names, or the default beside the agent files.
@@ -372,12 +442,14 @@ sentence above says no socket rather than no network."
          (key (load-configured-secrets config))
          (_ (when (and refresh-models (plusp (length key)))
               (refresh-provider-knowledge config)))
+         (_ (prepare-sandbox config))
          (store (open-agent-store config))
          (backend (when (plusp (length key))
                     (enchiridion.llm:resolve-backend :config config :api-key key)))
          (broker (enchiridion.tools.broker:make-broker
                   :socket (broker-socket-path)
                   :uid (agent-uid config)
+                  :gid (agent-gid config)
                   :timeout 30))
          (agent (enchiridion.kernel:make-agent
                  :name "default"
@@ -434,7 +506,8 @@ and only a generation that exits zero is loaded for real."
       (multiple-value-bind (ok-p output)
           (enchiridion.tools.broker:broker-verify-plugin
            (uiop:ensure-directory-pathname directory)
-           :uid (agent-uid (context-config context)))
+           :uid (agent-uid (context-config context))
+           :gid (agent-gid (context-config context)))
         (unless ok-p
           (error 'enchiridion.errors:tool-error :tool "reload" :detail output))
         (install-agent-proxies context sources generation)
@@ -476,12 +549,13 @@ turn: the builtins still work, and the agent is told what happened."
 ;;;; commit that follows a turn lives in the kernel, so that every path to a
 ;;;; turn commits and no caller has to remember to.
 
-(defun verify-plugin-directory (directory)
+(defun verify-plugin-directory (directory &key (uid 1000) (gid 1000))
   "Verify DIRECTORY in a child process and print its report. Return an exit
-status. The child drops to the agent uid before it reads a single agent file."
+status. The child drops to the agent uid and gid before it reads a single agent
+file."
   (multiple-value-bind (ok-p output)
       (enchiridion.tools.broker:broker-verify-plugin
-       (uiop:ensure-directory-pathname directory) :uid 1000)
+       (uiop:ensure-directory-pathname directory) :uid uid :gid gid)
     (write-string output)
     (finish-output)
     (if ok-p 0 1)))
@@ -546,7 +620,8 @@ agent user, and only a generation that exits zero is loaded for real."
         (multiple-value-bind (ok-p output)
             (enchiridion.tools.broker:broker-verify-plugin
              (uiop:ensure-directory-pathname directory)
-             :uid (agent-uid (context-config context)))
+             :uid (agent-uid (context-config context))
+             :gid (agent-gid (context-config context)))
           (if (not ok-p)
               (list :ok-p nil :generation previous :report output)
               (progn
@@ -869,15 +944,20 @@ Only ASK refreshes the provider knowledge: it is the one command here that
 spends a turn. Every other command in this table inspects the configuration or
 the store, and an inspection must not open a socket or rewrite a cache."
   (let ((context (make-context :refresh-models (string= name "ask"))))
-    (unwind-protect
-         (let* ((cancelled (list nil))
-                (enchiridion.channel.cli:*command-context*
-                  (command-context-for
-                   context
-                   :respond (make-respond context cancelled)
-                   :cancel (lambda () (setf (car cancelled) t)))))
-           (enchiridion.channel.cli:run-command name arguments))
-      (close-context context))))
+    (let ((status
+            (unwind-protect
+                 (let* ((cancelled (list nil))
+                        (enchiridion.channel.cli:*command-context*
+                          (command-context-for
+                           context
+                           :respond (make-respond context cancelled)
+                           :cancel (lambda () (setf (car cancelled) t)))))
+                   (enchiridion.channel.cli:run-command name arguments))
+              (close-context context))))
+      ;; Seed files and the store are created by the command, so the ownership
+      ;; pass runs again after it as well as before.
+      (prepare-sandbox (context-config context))
+      status)))
 
 (declaim (ftype (function (string) boolean) supervisor-command-p))
 
@@ -989,6 +1069,16 @@ a port that is not a port."
          (format nil "The port must be a number between 1 and 65535, not ~A." port))
         (t nil)))))
 
+(defun require-git ()
+  "Signal a configuration error when the Git executable does not answer.
+Git is a runtime dependency: the agent directory is a repository, and every
+turn commits to it. The container installs Git, and the Nix wrapper puts the
+store Git on PATH and in ENCHIRIDION_GIT. A host install must do the same."
+  (unless (enchiridion.git:git-available-p)
+    (error 'enchiridion.errors:configuration-error
+           :key :git
+           :detail "Git is required. Install Git and put it on PATH, or set ENCHIRIDION_GIT.")))
+
 (declaim (ftype (function (&rest t) integer) main))
 
 (defun main (&rest argv)
@@ -1001,6 +1091,8 @@ launch is checked before the channel flags, because nothing may start before
 the operator has had a chance to edit the seed files."
   (handler-case
       (multiple-value-bind (options arguments) (split-options argv)
+        (load-config)
+        (require-git)
         (let ((command (or (first arguments) ""))
               (problem (validate-options options)))
           (when problem
@@ -1014,7 +1106,10 @@ the operator has had a chance to edit the seed files."
                  (format *error-output* "--verify-plugin takes a directory.~%")
                  (finish-output *error-output*)
                  (return-from main 2))
-               (verify-plugin-directory directory)))
+               (let ((config (load-config)))
+                 (verify-plugin-directory directory
+                                          :uid (agent-uid config)
+                                          :gid (agent-gid config)))))
             ((plusp (length command))
              (if (supervisor-command-p command)
                  ;; The flags come before the command. They are also read after
@@ -1079,6 +1174,7 @@ the operator has had a chance to edit the seed files."
           (finish-output)
           1)
         (progn
+          (prepare-sandbox (enchiridion:config))
           (format t "~&Bootstrap has not started. Edit SOUL.md, OPERATOR.md, and WORLD.md first,~%")
           (format t "then run `enchiridion chat`. See agents/default/GUIDE.md for the walkthrough.~%")
           (finish-output)
@@ -1104,7 +1200,6 @@ the operator has had a chance to edit the seed files."
      ;; Installed inside the handler, so there is no window where SIGTERM
      ;; reaches a process that has not armed it yet.
      (enchiridion.compat:install-shutdown-signals)
-     (load-config)
      ;; apply, not a plain call: MAIN is &rest over the arguments, so passing
      ;; the list as one argument would nest it and every command would look
      ;; absent.

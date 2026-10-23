@@ -1,5 +1,5 @@
 {
-  description = "enchiridion, an autonomous agent harness written in Common Lisp";
+  description = "enchiridion, an unstable autonomous agent harness with a strange memory model";
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
   outputs = { self, nixpkgs }:
     let
@@ -116,7 +116,7 @@
           pname = "enchiridion";
           version = "0.1.0";
           src = source;
-          nativeBuildInputs = [ sbcl pkgs.sqlite pkgs.makeWrapper ];
+          nativeBuildInputs = [ sbcl pkgs.sqlite pkgs.makeWrapper pkgs.gitMinimal ];
           buildInputs = [ pkgs.sqlite ];
           dontConfigure = true;
           # Compiling the system is the check, so this derivation is the gate
@@ -161,6 +161,8 @@
               --set XDG_CONFIG_HOME "$out/config" \
               --set ENCHIRIDION_SOURCE "$out/lib" \
               --set ENCHIRIDION_SBCL "${sbcl}/bin/sbcl" \
+              --set ENCHIRIDION_GIT "${pkgs.gitMinimal}/bin/git" \
+              --prefix PATH : "${pkgs.gitMinimal}/bin" \
               --add-flags '--script' \
               --add-flags "\"$out/lib/src/main.cl\""
 
@@ -251,6 +253,7 @@
             name = "enchiridion-dev";
             packages = [ sbcl pkgs.sqlite pkgs.nixfmt-rfc-style git ] ++ extra;
             SBCL_HOME = "${sbcl}/lib/sbcl";
+            ENCHIRIDION_GIT = "${git}/bin/git";
             CL_SOURCE_REGISTRY = devRegistry pkgs;
             ASDF_OUTPUT_TRANSLATIONS = "(:output-translations (t nil) :ignore-inherited-configuration)";
             LD_LIBRARY_PATH = library-path;

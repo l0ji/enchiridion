@@ -75,6 +75,7 @@
   ;; the two reads that the isolation tests depend on, so they are checked
   ;; here rather than being discovered to be missing inside a container.
   (ok (integerp (enchiridion.compat:process-uid)))
+  (ok (integerp (enchiridion.compat:process-gid)))
   (ok (stringp (enchiridion.compat:process-user))))
 
 (deftest a-backtrace-is-a-string ()

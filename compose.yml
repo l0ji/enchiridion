@@ -25,6 +25,7 @@ services:
       - /run/secrets:mode=0700
     volumes:
       - enchiridion-state:/var/lib/enchiridion
+      - ./config.cl:/opt/enchiridion/config.cl:ro
     stop_grace_period: 30s
     logging:
       driver: json-file

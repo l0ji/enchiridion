@@ -265,8 +265,10 @@ short: it is charged on every turn.\")
     (loop for word in '(\"welcome\" \"hello\" \"introduce yourself\")
           thereis (and (search word lower) t))))
 
-(defun welcome-line ()
-  \"Return the one line the agent says when this skill fires.\"
+(defun welcome-line (arguments)
+  \"Return the one line the agent says when this skill fires. A handler is
+called with the validated arguments, and this one needs none of them.\"
+  (declare (ignore arguments))
   \"Hello. I write my own skills and tools; this one is the example that came
 with the harness.\")
 
@@ -274,7 +276,8 @@ with the harness.\")
   \"Return T when this skill still recognises a greeting and only a greeting.
 A self-test takes no arguments: the loader calls it with none.\"
   (and (welcome-p \"hello\")
-       (not (welcome-p \"what time is it\"))))
+       (not (welcome-p \"what time is it\"))
+       (stringp (welcome-line (make-hash-table :test #'equal)))))
 
 (enchiridion.plugin:define-plugin example-welcome
   :tool (enchiridion.plugin:tool

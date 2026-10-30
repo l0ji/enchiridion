@@ -274,7 +274,7 @@ A value of `:interval-seconds` that is not a positive integer becomes 900 (see [
 | ---------------------------- | --------------------------------------------------------------------------------------------- |
 | `ENCHIRIDION_HOME`           | Home root for `agents/default/` and `run/`. Defaults to the current directory.                |
 | `ENCHIRIDION_SOURCE`         | Project root for the second `config.cl` path and for `.env`.                                  |
-| `ENCHIRIDION_SBCL`           | Lisp implementation for the broker and for plugin verification. The packaged wrapper sets it. |
+| `ENCHIRIDION_SBCL`           | Lisp implementation for the broker and for plugin verification. Without it the supervisor's own SBCL is used. The packaged wrapper sets it. |
 | `ENCHIRIDION_GIT`            | Git executable. The packaged wrapper and the container set it. Defaults to `git` on `PATH`.  |
 | `ENCHIRIDION_PROVIDERS_PATH` | Path of the provider catalog cache, instead of `run/providers.json`.                          |
 | `OPENAI_API_KEY`             | OpenAI credential, unless `:api-key-env` names another variable.                              |

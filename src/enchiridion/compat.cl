@@ -144,17 +144,19 @@ inside a container."
 
 (defun run-program (program arguments &key input (output :stream)
                                 (error-output :stream) directory search wait
-                                environment)
+                                environment (if-output-exists :error))
   "Start PROGRAM with ARGUMENTS and wait for it when WAIT. OUTPUT defaults to
 :stream, which means the child inherits this process's streams and a shell
 command writes where the operator is looking. Return the exit status.
 SBCL spells the stderr keyword :error, not :error-output; this function keeps
-the longer name and translates."
+the longer name and translates. IF-OUTPUT-EXISTS applies when OUTPUT is a
+pathname."
   #+sbcl
   (apply #'sb-ext:run-program program arguments
          :input input
          :output output
          :error error-output
+         :if-output-exists if-output-exists
          :directory directory
          :search search
          :wait wait
@@ -165,7 +167,7 @@ the longer name and translates."
   #-sbcl
   (progn
     (declare (ignore program arguments input output error-output directory
-                     search wait environment))
+                     search wait environment if-output-exists))
     (error "No process launcher is available in ~A." +implementation+)))
 
 (defun run-program-blocking (program arguments &key input)
@@ -254,6 +256,25 @@ translation has to be here rather than at five call sites."
   #-sbcl (progn
            (declare (ignore process signal))
            (error "No process signal sender is available in ~A." +implementation+)))
+
+(declaim (ftype (function () string) lisp-runtime-path))
+
+(defun lisp-runtime-path ()
+  "Return the path of the Lisp executable running this process.
+
+The broker child defaults to it: the same executable reads the fasls this
+process loaded, and a bare name would be looked up on the child's own PATH."
+  #+sbcl (uiop:native-namestring sb-ext:*runtime-pathname*)
+  #-sbcl (error "No runtime path is available in ~A." +implementation+))
+
+(declaim (ftype (function (t) t) process-exit-code))
+
+(defun process-exit-code (process)
+  "Return PROCESS's exit status, or NIL while it is still running."
+  #+sbcl (sb-ext:process-exit-code process)
+  #-sbcl (progn
+           (declare (ignore process))
+           (error "No process status reader is available in ~A." +implementation+)))
 
 (defun run-program-capture (program arguments &key (timeout nil) (environment nil))
   "Run PROGRAM with ARGUMENTS and return its combined output and exit status.

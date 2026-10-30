@@ -47,7 +47,7 @@ because a file in the repository is a file that ends up in a store path."))
    #:process-uid #:set-process-uid #:process-gid #:set-process-gid
    #:clear-supplementary-groups
    #:process-user #:set-process-user #:implementation-dependency-p
-   #:process-id #:process-kill
+   #:process-id #:process-kill #:process-exit-code #:lisp-runtime-path
    #:script-arguments #:exit-with #:backtrace-string
    #:encode-utf8 #:decode-utf8 #:run-program-capture #:temp-directory
    #:set-file-mode #:file-mode #:with-interrupt-handler #:signal-interactive-interrupt
@@ -373,7 +373,7 @@ this costs no interpreter of its own."))
    #:broker #:broker-start #:broker-stop #:broker-call #:broker-running-p
    #:make-broker #:broker-health #:serve-broker
    #:broker-verify-plugin #:broker-load-generation
-   #:*load-generation-function*)
+   #:*load-generation-function* #:*start-progress-function*)
   (:documentation
    "Supervisor side of the privilege boundary. Agent authored code runs in the
 child; the supervisor never loads it."))

@@ -98,7 +98,7 @@ A directory with no agent files is not a failure: the in-process loader reports 
 ## Verification in a child process
 
 Verification proves a generation before the process adopts it, and the daemon does not compile agent code: the process that holds the secrets must not run what the agent wrote.
-`broker-verify-plugin` starts the SBCL named by `ENCHIRIDION_SBCL`, or `sbcl`, on the installed `src/broker-exec.cl` with `--verify-plugin DIRECTORY --uid UID --gid GID` as a one-shot child, and the child clears its groups and drops to the uid and gid before it reads one agent file.
+`broker-verify-plugin` starts the SBCL named by `ENCHIRIDION_SBCL`, or the SBCL running the supervisor, on the installed `src/broker-exec.cl` with `--verify-plugin DIRECTORY --uid UID --gid GID` as a one-shot child, and the child clears its groups and drops to the uid and gid before it reads one agent file.
 The caller receives whether the child exited zero and the child's combined output, and the timeout is 120 seconds.
 
 Inside the child, `verify-directory` compiles and loads every agent file at `(safety 3)` and `(debug 3)`, runs the self-test of every plugin the load added, and discards the tools and plugins that verification registered.

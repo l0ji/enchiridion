@@ -612,7 +612,7 @@ warned.cl: IGNORE declaration for an unknown variable: Y
 Success returns 0, and a compile error, a warning, and a self-test that returns `nil` are all failures.
 
 The child is selected by `ENCHIRIDION_SBCL`.
-Without the variable the harness tries `sbcl`, and a source run must set the variable and give the child a writable compiled-file cache.
+Without the variable the child runs the same SBCL executable as the supervisor, and it reads the compiled files the supervisor loaded.
 The packaged wrapper sets the variable.
 [Plugins and self-modification](plugins.md) covers verification and the generation.
 
@@ -625,7 +625,8 @@ The packaged wrapper sets the variable.
 | `COMMAND needs the memory store, and none is open in this process.`  | The store did not open                                                | Set `:memory :db` to a writable path (see [Configuration](configuration.md)) |
 | `COMMAND: no supervisor is running, so nothing was asked.`           | No live supervisor answers the control file                           | Start `serve` in another terminal                                    |
 | `channel NAME is not implemented yet.`                               | The supervisor did not build that channel                             | Enable the channel in the configuration, or pass `--channel NAME`    |
-| `The broker did not start before the timeout.`                       | The child Lisp is missing, or its cache directory is not writable     | Run from `nix develop`, and set `ENCHIRIDION_SBCL` to the SBCL path  |
+| `The broker did not start before the timeout.`                       | The child did not bind its socket in 30 seconds                       | Read `run/broker.log`, and run from `nix develop`                    |
+| `The broker exited with status N before it started.`                 | The child failed while it loaded                                      | Read the log lines printed after the message                         |
 | `Git is required. Install Git and put it on PATH, or set ENCHIRIDION_GIT.` | The Git executable did not answer at startup                   | Install Git, or point `ENCHIRIDION_GIT` at it                        |
 | `config.cl is required. Copy config.example.cl to config.cl and edit it.` | No `config.cl` was found beside the checkout                  | Copy `config.example.cl` to `config.cl`                            |
 | `--verify-plugin` reports a failure                                  | An agent file warns, fails to compile, or fails its self-test         | Correct the file, then verify again                                  |

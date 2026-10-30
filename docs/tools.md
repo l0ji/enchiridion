@@ -145,14 +145,16 @@ Only one length-prefixed JSON request and its reply cross the line, and the proc
 | `ping` reply       | the string `ok`                                                               |
 | Response envelope  | `{"ok": true, "result": ...}` or `{"ok": false, "error": ..., "detail": ...}` |
 
-`make-broker` returns a descriptor with a socket, a uid, a gid, a timeout of 30 seconds, and a call lock, and nothing starts until `broker-start`.
+`make-broker` returns a descriptor with a socket, a uid, a gid, a timeout of 30 seconds, an optional log file, and a call lock, and nothing starts until `broker-start`.
+The daemon sets the log to `broker.log` in the run directory, and the child's standard output and error go there; without a log they are discarded.
 The daemon passes its own socket path: `$ENCHIRIDION_HOME/run/broker.sock` when the variable is set, and `broker.sock` inside the agent directory when it is not.
 
 `broker-start` starts the child by default.
 `:in-process t` starts a server thread in the current process for tests, and it is not the security boundary.
 
-The child runs the SBCL named by `ENCHIRIDION_SBCL`, or `sbcl`, with `--script` on the installed `src/broker-exec.cl`, then `--socket PATH`, `--uid N`, and `--gid N`.
-Its environment holds `PATH` as `/usr/local/bin:/usr/bin:/bin` and `HOME` as `ENCHIRIDION_HOME` or `/tmp`, plus `SBCL_HOME`, `CL_SOURCE_REGISTRY`, `ENCHIRIDION_HOME`, `ENCHIRIDION_SOURCE`, `ENCHIRIDION_SBCL`, `LD_LIBRARY_PATH`, `XDG_CACHE_HOME`, and `XDG_CONFIG_HOME` when they are set.
+The child runs the SBCL named by `ENCHIRIDION_SBCL`, or the SBCL executable running the supervisor, with `--script` on the installed `src/broker-exec.cl`, then `--socket PATH`, `--uid N`, and `--gid N`.
+Its environment holds `PATH` as `/usr/local/bin:/usr/bin:/bin` and `HOME` as `ENCHIRIDION_HOME` or `/tmp`, plus `SBCL_HOME`, `CL_SOURCE_REGISTRY`, `ASDF_OUTPUT_TRANSLATIONS`, `ENCHIRIDION_HOME`, `ENCHIRIDION_SOURCE`, `ENCHIRIDION_SBCL`, `LD_LIBRARY_PATH`, `XDG_CACHE_HOME`, and `XDG_CONFIG_HOME` when they are set.
+`ASDF_OUTPUT_TRANSLATIONS` points the child at the compiled files the supervisor already loaded; without it the child compiles the system into its own cache before it binds the socket.
 No other variable is inherited, so a key in the supervisor's environment cannot reach the child, and `broker-verify-plugin` uses the same environment for its one-shot child.
 
 ### The broker functions
@@ -201,6 +203,9 @@ A smoke test runs `sbcl --script src/broker-exec.cl --socket /tmp/enchiridion-br
 | The length exceeds 16 MiB                | `The broker frame is larger than 16 MiB.`  |
 
 `broker-start` tries to connect until the socket answers or the timeout expires, then signals `transport-error` with the detail `The broker did not start before the timeout.`
+A child that exits first stops the wait at once, with the detail `The broker exited with status N before it started.`
+Either detail is followed by the last 20 lines of the log when there is one.
+While it waits, `broker-start` calls `*start-progress-function*`, when it is set, with the whole seconds waited so far, about once a second, and the CLI uses it to show a status line from the second second on.
 A failed start kills the child with SIGTERM before the error propagates.
 
 ## The reload path
@@ -587,7 +592,8 @@ No built-in tool takes a filter argument and no production code calls the module
 | `The broker is not running.`                                             | the call was made before `broker-start`       | start the broker or the supervisor                         |
 | `The broker frame is larger than 16 MiB.`                                | a result exceeded the frame cap               | cap or spill the result in the tool                        |
 | `The broker closed during a frame body.`                                 | the child died mid-reply                      | check the child output and restart the broker              |
-| `The broker did not start before the timeout.`                           | the child never bound the socket              | check `ENCHIRIDION_SBCL` and the source registry           |
+| `The broker did not start before the timeout.`                           | the child never bound the socket              | read `run/broker.log`, and check `ENCHIRIDION_SBCL` and the source registry |
+| `The broker exited with status N before it started.`                     | the child failed while it loaded              | read the log lines that follow the message                 |
 | `There is no tool called X.` from `tools show`                           | the tool is not a built-in in a fresh process | add it under `builtin/`, or use the REPL that holds it     |
 | `Unknown block action`, `Unknown block label`, or `Unknown search scope` | an argument outside the documented values     | use one of the documented values                           |
 

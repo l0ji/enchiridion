@@ -450,7 +450,10 @@ sentence above says no socket rather than no network."
                   :socket (broker-socket-path)
                   :uid (agent-uid config)
                   :gid (agent-gid config)
-                  :timeout 30))
+                  :timeout 30
+                  :log (merge-pathnames "broker.log"
+                                        (uiop:ensure-directory-pathname
+                                         (enchiridion:run-directory)))))
          (agent (enchiridion.kernel:make-agent
                  :name "default"
                  :backend backend
@@ -525,12 +528,32 @@ and only a generation that exits zero is loaded for real."
     (setf (context-generation context) generation)
     generation))
 
+(defun start-broker-with-status (broker)
+  "Start BROKER, and show a status line on standard error while it takes more
+than a second. A warm start never prints; a slow one says what it waits for,
+and the line is finished either way so the next output starts on its own."
+  (let ((shown nil))
+    (let ((enchiridion.tools.broker:*start-progress-function*
+            (lambda (seconds)
+              (when (>= seconds 2)
+                (setf shown t)
+                (format *error-output* "~Cenchiridion: starting the tool broker... ~Ds"
+                        #\Return seconds)
+                (finish-output *error-output*)))))
+      (unwind-protect
+           (progn (enchiridion.tools.broker:broker-start broker)
+                  (when shown
+                    (format *error-output* " ready.")))
+        (when shown
+          (terpri *error-output*)
+          (finish-output *error-output*))))))
+
 (defun ensure-started (context)
   "Start the broker, load the agent's generation, and open a session.
 Idempotent. A generation that fails to load is reported and does not stop the
 turn: the builtins still work, and the agent is told what happened."
   (unless (context-started-p context)
-    (enchiridion.tools.broker:broker-start (context-broker context))
+    (start-broker-with-status (context-broker context))
     (handler-case (load-agent-generation context)
       (error (condition)
         (format *error-output* "~&enchiridion: agent code did not load: ~A~%"

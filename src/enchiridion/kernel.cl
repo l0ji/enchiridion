@@ -268,6 +268,27 @@ session formed by accident."
 
 ;;;; One turn.
 
+;; The progress hook. The kernel says what a turn is doing and the channel
+;; decides what an operator sees, so nothing here prints.
+(defvar *turn-progress-function* nil
+  "A function of an event keyword and a plist of details, or NIL.
+
+The events are :REQUEST before each model call, :RESPONSE after it (with
+:REASONING, the :TEXT of a round that also asked for tools, and :CALLS),
+:TOOL-START and :TOOL-END around each tool call (with :NAME, :ARGUMENTS,
+:RESULT and :FAILED), and :ROUND-LIMIT when the cap drops pending calls.")
+
+(defun note-progress (event &rest details)
+  "Tell *TURN-PROGRESS-FUNCTION* about EVENT. A display that fails is not a
+reason to fail the turn, so its errors stop here."
+  (when *turn-progress-function*
+    (ignore-errors (funcall *turn-progress-function* event details))))
+
+(defparameter +tool-round-limit-note+
+  "The tool round limit for this turn is reached, and no more tool calls will run. Reply to the operator now with what you have: what you did, what you found, and what is left."
+  "The user message a turn sends when the model still asks for tools at the
+cap, so the last round is an answer and not another request.")
+
 (defun complete-with-tools (backend messages model tools)
   "Call BACKEND with TOOLS only when there are any. A backend that has no tool
 support must not receive an empty :TOOLS keyword it never promised to accept."
@@ -296,12 +317,17 @@ rather than a guess about whether the call was useful."
     (t nil)))
 
 (defun execute-tool (agent call)
-  "Run CALL for AGENT and return two values: result text and outcome.
+  "Run CALL for AGENT and return three values: result text, outcome, and
+whether the call failed.
 
 A tool error becomes text in the transcript, not a broken turn. The model has
 to see the failure to correct the call; the operator does not need a crash for
 a misspelled argument. The outcome is 1 or 0 only when the tool itself reports
-an external result, otherwise NIL."
+an external result, otherwise NIL.
+
+The error text carries the condition's detail. The report alone says only
+that a tool failed, and neither the model nor the operator can fix a call
+from that."
   (handler-case
       (let* ((arguments (enchiridion.llm:parse-json
                          (enchiridion.llm:tool-call-arguments call)))
@@ -314,10 +340,14 @@ an external result, otherwise NIL."
                           (enchiridion.llm:tool-call-name call)
                           arguments)))
              (text (tool-result-text result)))
-        (values text (tool-outcome text)))
+        (values text (tool-outcome text) nil))
     (error (condition)
-      (let ((text (tool-result-text (format nil "error: ~A" condition))))
-        (values text 0)))))
+      (let* ((detail (and (typep condition 'enchiridion.errors:enchiridion-error)
+                          (enchiridion.errors:error-detail condition)))
+             (text (tool-result-text
+                    (format nil "error: ~A~@[ ~A~]" condition
+                            (and (stringp detail) (plusp (length detail)) detail)))))
+        (values text 0 t)))))
 
 (declaim (ftype (function (t t t) t) persist-usage))
 
@@ -439,12 +469,20 @@ caller that does is a caller that runs two turns at once."
                            (enchiridion.llm:user-message
                             (enchiridion.llm.secrets:scrub user-text))))
            (rounds 0)
+           (wrapped-up nil)
            (completion nil))
       (persist-turn store session "user" text :channel channel)
       (loop
         (when (and cancel-p (funcall cancel-p))
           (error 'enchiridion.errors:turn-cancelled :turn rounds))
+        (note-progress :request :round rounds)
         (setf completion (complete-with-tools backend messages model tools))
+        (note-progress :response
+                       :round rounds
+                       :reasoning (enchiridion.llm:completion-reasoning-text completion)
+                       :text (and (enchiridion.llm:completion-tool-calls completion)
+                                  (enchiridion.llm:completion-text completion))
+                       :calls (length (enchiridion.llm:completion-tool-calls completion)))
         (persist-usage store session (record-spend agent completion :channel channel))
         (when session
           (push completion (session-turns session)))
@@ -456,23 +494,42 @@ caller that does is a caller that runs two turns at once."
                       :model (enchiridion.llm:completion-model completion)
                       :channel channel)
         (let ((calls (enchiridion.llm:completion-tool-calls completion)))
-          (unless (and calls (< rounds (agent-tool-rounds agent)))
+          (when (or (null calls) wrapped-up)
             (return completion))
-          (incf rounds)
-          (setf messages
-                (append messages
-                        (list (enchiridion.llm:assistant-message
-                               (enchiridion.llm:completion-text completion)
-                               calls))))
-          (dolist (call calls)
-            (multiple-value-bind (result outcome) (execute-tool agent call)
-              (declare (ignore outcome))
-              (persist-turn store session "tool" result :channel channel)
-              (setf messages
-                    (append messages
-                            (list (enchiridion.llm:tool-message
-                                   result
-                                   (enchiridion.llm:tool-call-id call)))))))))
+          ;; At the cap the pending calls are dropped and the model gets one
+          ;; more round to answer. Returning the capped completion would hand
+          ;; the operator a reply with no text, because a round that asks for
+          ;; a tool usually says nothing.
+          (if (>= rounds (agent-tool-rounds agent))
+              (progn
+                (note-progress :round-limit :rounds rounds)
+                (setf wrapped-up t
+                      messages (append messages
+                                       (list (enchiridion.llm:user-message
+                                              +tool-round-limit-note+)))))
+              (progn
+                (incf rounds)
+                (setf messages
+                      (append messages
+                              (list (enchiridion.llm:assistant-message
+                                     (enchiridion.llm:completion-text completion)
+                                     calls))))
+                (dolist (call calls)
+                  (note-progress :tool-start
+                                 :name (enchiridion.llm:tool-call-name call)
+                                 :arguments (enchiridion.llm:tool-call-arguments call))
+                  (multiple-value-bind (result outcome failed) (execute-tool agent call)
+                    (declare (ignore outcome))
+                    (note-progress :tool-end
+                                   :name (enchiridion.llm:tool-call-name call)
+                                   :result result
+                                   :failed failed)
+                    (persist-turn store session "tool" result :channel channel)
+                    (setf messages
+                          (append messages
+                                  (list (enchiridion.llm:tool-message
+                                         result
+                                         (enchiridion.llm:tool-call-id call)))))))))))
       (incf (agent-turn agent))
       (commit-agent-turn agent channel)
       completion)))

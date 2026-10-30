@@ -147,6 +147,19 @@ It needs a backend and a provider key.
 The reply goes to standard output, scrubbed.
 The token line goes to standard error as `<model>  in <input>  out <output>`, with `  cached <N>` and `  wrote <N>` appended when the provider reports cache tokens.
 The model field is the answering model, or the configured primary model when the provider reports none.
+While the turn runs, its steps go to standard error, so standard output stays the reply alone:
+
+```
+  thought: The operator said hi. BOOTSTRAP.md says to read SOUL.md first...
+  -> read-file {"path":"SOUL.md"}  ok, 24 lines
+  -> search {"query":"handover"}  failed: Tool search failed. <the reason>
+  tool round limit reached after 8 rounds; asking for an answer
+```
+
+`thought:` is the model's reasoning when the provider returns it, cut to one line, and `said:` is text the model wrote beside a tool request.
+Each `->` line is one tool call with its arguments, then `ok` with the result's line count or `failed` with the error.
+On a terminal the step in flight shows a running clock (`thinking... 4s`) and the lines are dimmed; elsewhere only finished steps are written.
+`chat` shows the same steps.
 A completed turn returns 0, and a failed or cancelled turn returns 1.
 Without a key it prints `Configuration is wrong at API-KEY.` and `No API key. Put OPENAI_API_KEY in .env or the environment.` and returns 1.
 `ask` is the only one-shot command that refreshes provider knowledge when `:offline` is nil.

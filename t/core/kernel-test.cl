@@ -295,3 +295,81 @@
       (ok (= 8 (enchiridion.kernel:agent-turn agent))))
     (testing "and every completion is in the session"
       (ok (= 8 (length (enchiridion.kernel:session-turns session)))))))
+
+;; A backend that asks for a tool on every round until the turn tells it the
+;; round limit is reached, and only then answers in words.
+(defstruct (looping-backend (:constructor make-looping-backend))
+  (calls 0 :type integer))
+
+(defmethod enchiridion.llm:complete ((backend looping-backend) messages
+                                     &key model tools budget)
+  (declare (ignore model tools budget))
+  (incf (looping-backend-calls backend))
+  (let ((last (enchiridion.llm:message-content (car (last messages)))))
+    (if (and (stringp last) (search "round limit" last))
+        (enchiridion.llm::%make-completion
+         :text "what I found" :model "looping-model"
+         :input-tokens 5 :output-tokens 2)
+        (enchiridion.llm::%make-completion
+         :text "" :model "looping-model"
+         :tool-calls (list (enchiridion.llm::%make-tool-call
+                            :id (format nil "call-~D" (looping-backend-calls backend))
+                            :name "no-such-tool"
+                            :arguments "{}"))
+         :input-tokens 5 :output-tokens 2))))
+
+(defmethod enchiridion.llm:model-capabilities ((backend looping-backend))
+  (declare (ignore backend))
+  '(:tools t))
+
+(defmethod enchiridion.llm:backend-name ((backend looping-backend))
+  (declare (ignore backend))
+  "looping")
+
+(deftest a-turn-at-the-tool-round-cap-still-answers ()
+  (let* ((backend (make-looping-backend))
+         (agent (enchiridion.kernel:make-agent
+                 :backend backend
+                 :blocks (list (make-test-block "voice"))
+                 :tools-p nil
+                 :tool-rounds 2))
+         (completion (enchiridion.kernel:run-turn agent "hi")))
+    (testing "the turn ends on the model's words, not on a tool request"
+      (ok (string= "what I found" (enchiridion.llm:completion-text completion)))
+      (ok (null (enchiridion.llm:completion-tool-calls completion))))
+    (testing "two tool rounds ran, then one round to answer"
+      (ok (= 4 (looping-backend-calls backend))))))
+
+(deftest a-turn-reports-its-steps-to-the-progress-hook ()
+  (let* ((events '())
+         (agent (enchiridion.kernel:make-agent
+                 :backend (make-looping-backend)
+                 :blocks (list (make-test-block "voice"))
+                 :tools-p nil
+                 :tool-rounds 1))
+         (enchiridion.kernel:*turn-progress-function*
+           (lambda (event details) (push (cons event details) events))))
+    (enchiridion.kernel:run-turn agent "hi")
+    (setf events (nreverse events))
+    (testing "the steps arrive in the order the turn takes them"
+      (ok (equal '(:request :response :tool-start :tool-end
+                   :request :response :round-limit :request :response)
+                 (mapcar #'car events))))
+    (testing "a tool that fails says so, and says why"
+      (let ((end (cdr (find :tool-end events :key #'car))))
+        (ok (getf end :failed))
+        (ok (string= "no-such-tool" (getf end :name)))
+        (ok (search "no-such-tool" (getf end :result)))))))
+
+(deftest a-progress-hook-that-fails-does-not-fail-the-turn ()
+  (let* ((agent (enchiridion.kernel:make-agent
+                 :backend (make-fake-backend)
+                 :blocks (list (make-test-block "voice"))
+                 :tools-p nil))
+         (enchiridion.kernel:*turn-progress-function*
+           (lambda (event details)
+             (declare (ignore event details))
+             (error "display broke"))))
+    (ok (string= "fake reply"
+                 (enchiridion.llm:completion-text
+                  (enchiridion.kernel:run-turn agent "hi"))))))

@@ -110,6 +110,11 @@ The kernel runs a call in a fixed order.
 6. The result becomes scrubbed text in a tool message with the call id.
 7. The kernel appends the assistant message and one tool message per call, then asks the backend again.
 8. The loop stops when a completion carries no calls or when `tool-rounds` is reached, which defaults to 8.
+   At the cap the pending calls are dropped, the turn adds a user message saying no more tools will run, and the model's next completion is the reply.
+   A reply with no text prints `enchiridion: the model returned no reply text.` on standard error instead of an empty line.
+
+A failed tool call becomes the text `error: <report> <detail>`, so the model sees why the call failed and not only that it did.
+The kernel reports each step through `enchiridion.kernel:*turn-progress-function*`: `:request` and `:response` around each model call, `:tool-start` and `:tool-end` around each tool call, and `:round-limit` at the cap. The CLI renders them on standard error, and an error inside the hook never fails the turn.
 
 A string result is used as it stands, nil becomes the empty string, and any other value becomes JSON text when possible.
 A handler error becomes text that starts with `error: `, so one bad call costs one round and not the turn.

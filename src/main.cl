@@ -617,9 +617,12 @@ the count, which is worse than printing nothing."
                       (enchiridion.llm:primary-model)))
         (cache-read (enchiridion.llm:completion-cache-read-tokens completion))
         (cache-write (enchiridion.llm:completion-cache-write-tokens completion)))
-    (format t "~A~%"
-            (enchiridion.llm.secrets:scrub
-             (enchiridion.llm:completion-text completion)))
+    (let ((text (enchiridion.llm:completion-text completion)))
+      (if (plusp (length text))
+          (format t "~A~%" (enchiridion.llm.secrets:scrub text))
+          ;; An empty line reads as a hang or a lost reply. Say what happened.
+          (format *error-output* "~&enchiridion: the model returned no reply text~:[~; (it still asked for tools)~].~%"
+                  (enchiridion.llm:completion-tool-calls completion))))
     (format *error-output* "~A  in ~D  out ~D~A~A~%"
             (if (plusp (length model)) model fallback)
             (enchiridion.llm:completion-input-tokens completion)
@@ -632,6 +635,117 @@ the count, which is worse than printing nothing."
                 ""))
     (finish-output)
     (finish-output *error-output*)))
+
+;;;; Turn progress.
+;;;;
+;;;; A turn can spend a minute in model calls and tools before the reply
+;;;; prints, and silence for that long reads as a hang. The kernel reports each
+;;;; step through *TURN-PROGRESS-FUNCTION*, and this is the terminal's view of
+;;;; it. It writes to standard error, so standard output is still the reply
+;;;; alone and a script that captures it gets nothing else.
+
+(defparameter +progress-width+ 100
+  "The most characters one progress line shows of a reasoning, an argument
+list, or a result.")
+
+(defun progress-text (text &optional (width +progress-width+))
+  "Return TEXT scrubbed, on one line, and cut to WIDTH characters."
+  (let* ((flat (string-trim " "
+                            (substitute-if #\Space
+                                           (lambda (character)
+                                             (member character '(#\Newline #\Return #\Tab)))
+                                           (enchiridion.llm.secrets:scrub
+                                            (or text "")))))
+         (cut (> (length flat) width)))
+    (if cut
+        (format nil "~A..." (subseq flat 0 width))
+        flat)))
+
+(defun make-progress-printer (stream)
+  "Return a progress function that writes a turn's steps to STREAM.
+
+On a terminal the step in flight is one line with a running clock, redrawn
+by a ticker thread, and replaced by its outcome when the step ends. Anywhere
+else only the finished steps are written, one plain line each. The event
+:FINISH stops the ticker, and the caller sends it however the turn ends."
+  (let ((terminal (interactive-stream-p stream))
+        (lock (bordeaux-threads:make-lock "enchiridion progress"))
+        (ticker nil)
+        (ticking nil)
+        (label "")
+        (started 0))
+    (labels ((elapsed ()
+               (floor (- (get-internal-real-time) started)
+                      internal-time-units-per-second))
+             (draw ()
+               (format stream "~C~C[K~C[2m~A ~Ds~C[0m"
+                       #\Return #\Esc #\Esc label (elapsed) #\Esc)
+               (finish-output stream))
+             (start (text)
+               (setf label text
+                     started (get-internal-real-time))
+               (when terminal
+                 (bordeaux-threads:with-lock-held (lock)
+                   (setf ticking t)
+                   (draw))
+                 (setf ticker
+                       (bordeaux-threads:make-thread
+                        (lambda ()
+                          (loop
+                            (sleep 0.25)
+                            (bordeaux-threads:with-lock-held (lock)
+                              (unless ticking (return))
+                              (draw))))
+                        :name "enchiridion progress"))))
+             (stop ()
+               (when ticker
+                 (bordeaux-threads:with-lock-held (lock)
+                   (setf ticking nil))
+                 (bordeaux-threads:join-thread ticker)
+                 (setf ticker nil)
+                 (format stream "~C~C[K" #\Return #\Esc)
+                 (finish-output stream)))
+             (say (control &rest arguments)
+               (if terminal
+                   (format stream "~C[2m~?~C[0m~%" #\Esc control arguments #\Esc)
+                   (format stream "~?~%" control arguments))
+               (finish-output stream)))
+      (lambda (event details)
+        (case event
+          (:request
+           (start "  thinking..."))
+          (:response
+           (stop)
+           (let ((reasoning (getf details :reasoning))
+                 (text (getf details :text)))
+             (when (plusp (length reasoning))
+               (say "  thought: ~A" (progress-text reasoning)))
+             (when (plusp (length text))
+               (say "  said: ~A" (progress-text text)))))
+          (:tool-start
+           (start (format nil "  -> ~A ~A"
+                          (getf details :name)
+                          (progress-text (getf details :arguments) 70))))
+          (:tool-end
+           (let ((seconds (elapsed))
+                 (result (or (getf details :result) "")))
+             (stop)
+             (if (getf details :failed)
+                 (say "~A  failed: ~A" label
+                      (progress-text (if (eql 0 (search "error: " result))
+                                         (subseq result (length "error: "))
+                                         result)))
+                 (say "~A  ok, ~D line~:P~[~:;, ~:*~Ds~]"
+                      label
+                      (if (plusp (length result))
+                          (1+ (count #\Newline (string-right-trim '(#\Newline) result)))
+                          0)
+                      seconds))))
+          (:round-limit
+           (say "  tool round limit reached after ~D rounds; asking for an answer"
+                (getf details :rounds)))
+          (:finish
+           (stop)))))))
 
 (defun broker-reload (context supervisor)
   "Verify the agent files in a one-shot child, load them in the broker, and
@@ -684,12 +798,17 @@ over the webhook is not filed as a turn typed at the terminal."
                                    (enchiridion.llm:default-api-key-env
                                     (context-config context)))))
           (ensure-started context)
-          (let ((completion (enchiridion.kernel:run-turn
-                             (context-agent context) text
-                             :session (context-session context)
-                             :store (context-store context)
-                             :channel channel
-                             :cancel-p (lambda () (car cancelled)))))
+          (let* ((printer (make-progress-printer *error-output*))
+                 (completion
+                   (unwind-protect
+                        (let ((enchiridion.kernel:*turn-progress-function* printer))
+                          (enchiridion.kernel:run-turn
+                           (context-agent context) text
+                           :session (context-session context)
+                           :store (context-store context)
+                           :channel channel
+                           :cancel-p (lambda () (car cancelled))))
+                     (funcall printer :finish nil))))
             (print-completion completion (context-config context))
             0))
       (enchiridion.errors:turn-cancelled (condition)

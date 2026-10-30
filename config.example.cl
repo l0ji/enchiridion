@@ -181,6 +181,45 @@
     ;;; :persona 1200, :operator 800, :world 1500, :session 400, :ledger 250,
     ;;; and :bootstrap 300.
 
+    ;;; The episodic log and cue retrieval are on. Push is off until a paired
+    ;;; no-harm run says otherwise. Consolidation runs on its schedule, but a
+    ;;; pass with no assertion parser, canary set, utility task set, or tail
+    ;;; sampler is a reported no-op: it does not spend tokens on a candidate
+    ;;; nobody can promote.
+    (:enabled t)
+    (:retrieve t)
+    (:push nil)
+    (:record-sleep t)
+    (:pack-chars 4450)
+    (:push-max-fraction 0.5)
+    (:maintenance-batch 200)
+    (:graph-limit 20000)
+    (:t2-enabled t)
+    (:t2-interval-seconds 86400)
+    (:t2-episode-threshold 200)
+    (:t2-max-episodes-per-tick 20)
+    (:t2-max-tokens-per-pass 30000)
+    (:t2-max-tokens-per-promotion 75000)
+    (:t2-write-cap 400)
+    ;;; Operator-authored behavioural canaries. Each entry is a plist with
+    ;;; :name, :expect, and :family. A suite that has not run is not a pass.
+    (:canaries nil)
+    (:canary-min-families 4)
+    (:gate-margin 0.05)
+    (:gate-min-n 100)
+    (:gate-alpha 0.05)
+    (:tail-rarity-fraction 0.10)
+    (:tail-min-n 50)
+    (:tail-margin 0.02)
+    (:precision-min 0.8)
+    (:quarantine-max 0.5)
+    (:compaction-rebase-every 8)
+    (:compaction-rebase-turns 24)
+    ;;; A plist merged over the shipped memory parameter defaults. Every
+    ;;; weight and decay value is an invented default; changing one is a new
+    ;;; config hash and a new measurement run.
+    (:parameters nil)
+
    :sleep
     ;;; How often the sleep-time agent wakes to maintain the three identity
     ;;; files, consolidate memory, and work the task queue.

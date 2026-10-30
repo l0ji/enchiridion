@@ -702,19 +702,47 @@ file a block is backed by."
 (declaim (ftype (function (list) integer) cmd-memory))
 
 (defun cmd-memory (arguments)
-  "Search stored memories and past sessions for the query."
+  "Search sessions, memories and episodes, or run a log action.
+The first argument selects an action when it is STATUS, BACKFILL or BUILD.
+Anything else is a search query, so the common call keeps working."
   (let ((missing (require-store "memory")))
     (if missing
         missing
         (let* ((store (command-context-store (context)))
-               (query (join-arguments arguments))
-               (memories (ignore-errors (enchiridion.memory.store:search-memories store query)))
-               (turns (ignore-errors (enchiridion.memory.store:search-sessions store query))))
-          (say "memories: ~D" (length memories))
-          (dolist (row memories) (print-row row))
-          (say "turns: ~D" (length turns))
-          (dolist (row turns) (print-row row))
-          0))))
+               (action (string-downcase (or (first arguments) ""))))
+          (cond
+            ((string= action "status")
+             (let ((status (enchiridion.memory:memory-status store)))
+               (dolist (key '(:enabled :retrieve :push :episodes :retrievals
+                              :generations :live-generation
+                              :cue-index :canaries))
+                 (say "~(~A~): ~A" key (getf status key))))
+             0)
+            ((string= action "build")
+             (let ((report (enchiridion.memory:build-candidate store)))
+               (cond
+                 ((getf report :built)
+                  (say "generation ~D: ~D processed, ~D remaining, ~D assertion~:P, status ~(~A~)."
+                       (getf report :generation-id)
+                       (getf report :processed)
+                       (getf report :remaining)
+                       (getf report :assertions)
+                       (getf report :status))
+                  0)
+                 (t
+                  (say "no candidate built: ~(~A~)." (getf report :reason))
+                  1))))
+            (t
+             (let* ((query (join-arguments arguments))
+                    (memories (ignore-errors
+                               (enchiridion.memory.store:search-memories store query)))
+                    (turns (ignore-errors
+                            (enchiridion.memory.store:search-sessions store query))))
+               (say "memories: ~D" (length memories))
+               (dolist (row memories) (print-row row))
+               (say "turns: ~D" (length turns))
+               (dolist (row turns) (print-row row))
+               0)))))))
 
 (declaim (ftype (function (list) integer) cmd-sessions))
 
@@ -1302,7 +1330,7 @@ and archives BOOTSTRAP.md."
    (list "persona" 0 1 #'cmd-persona "SOUL.md")
    (list "operator" 0 1 #'cmd-operator "OPERATOR.md")
    (list "world" 0 1 #'cmd-world "WORLD.md")
-   (list "memory" 1 nil #'cmd-memory "Search sessions and memories")
+   (list "memory" 1 nil #'cmd-memory "Search sessions, memories and episodes")
    (list "sessions" 0 0 #'cmd-sessions "Stored sessions with turn counts")
    (list "journey" 0 2 #'cmd-journey "Everything the agent has learned or written")
    (list "undo" 1 1 #'cmd-undo "Roll back the nth change in the agent directory")

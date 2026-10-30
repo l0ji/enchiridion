@@ -431,6 +431,24 @@ session block."
                          (format nil "~D interrupted task~:P failed" recovered)
                          nil)))))
       (when store
+        ;; T1a: copy new turns into the log and derive the scalars the cue
+        ;; pack needs. This is model-free and runs before the sleep agent so
+        ;; the pass sees fresh state, and before compaction so it can never
+        ;; delay the reply path.
+        (attempt "memory maintenance"
+                 (lambda ()
+                   (let ((report (enchiridion.memory:maintenance store)))
+                     (cond
+                       ((null report) nil)
+                       ((getf report :failed)
+                        (setf ok-p nil)
+                        (format nil "memory maintenance failed: ~A"
+                                (getf report :failed)))
+                       ((plusp (getf report :derived 0))
+                        (format nil "~D episode~:P derived"
+                                (getf report :derived)))
+                       (t nil))))))
+      (when store
         (attempt "the harness blocks"
                  (lambda ()
                    (write-ledger-block supervisor store)

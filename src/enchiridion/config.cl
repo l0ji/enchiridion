@@ -173,6 +173,38 @@ store path. The model defaults match the shipped adapter defaults."
     :memory
     (:db nil)
     (:block-limits (:persona 1200 :operator 800 :world 1500 :session 400 :ledger 250))
+    ;; The episodic log and pull retrieval are on; push and promotion wait for
+    ;; measured instruments. T2 runs on schedule, but a pass with no deriver,
+    ;; canaries, utility task set, or tail sampler is a reported no-op rather
+    ;; than a token-burning candidate nobody can promote.
+    (:enabled t)
+    (:retrieve t)
+    (:push nil)
+    (:record-sleep t)
+    (:pack-chars 4450)
+    (:push-max-fraction 0.5)
+    (:maintenance-batch 200)
+    (:graph-limit 20000)
+    (:t2-enabled t)
+    (:t2-interval-seconds 86400)
+    (:t2-episode-threshold 200)
+    (:t2-max-episodes-per-tick 20)
+    (:t2-max-tokens-per-pass 30000)
+    (:t2-max-tokens-per-promotion 75000)
+    (:t2-write-cap 400)
+    (:canaries nil)
+    (:canary-min-families 4)
+    (:gate-margin 0.05)
+    (:gate-min-n 100)
+    (:gate-alpha 0.05)
+    (:tail-rarity-fraction 0.10)
+    (:tail-min-n 50)
+    (:tail-margin 0.02)
+    (:precision-min 0.8)
+    (:quarantine-max 0.5)
+    (:compaction-rebase-every 8)
+    (:compaction-rebase-turns 24)
+    (:parameters nil)
 
     :sleep
     (:enabled t)

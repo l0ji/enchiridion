@@ -284,12 +284,24 @@ support must not receive an empty :TOOLS keyword it never promised to accept."
                      (error () (princ-to-string result)))))))
     (enchiridion.llm.secrets:scrub text)))
 
+(defun tool-outcome (text)
+  "Return the external outcome a tool result carries, or NIL.
+A shell result says its exit status in the text. A timeout is a failure. Any
+other tool result carries no external signal, and the honest answer is NIL
+rather than a guess about whether the call was useful."
+  (cond
+    ((search "[exit 0]" text) 1)
+    ((search "[exit " text) 0)
+    ((search "[timed out" text) 0)
+    (t nil)))
+
 (defun execute-tool (agent call)
-  "Run CALL for AGENT and return its result as text.
+  "Run CALL for AGENT and return two values: result text and outcome.
 
 A tool error becomes text in the transcript, not a broken turn. The model has
 to see the failure to correct the call; the operator does not need a crash for
-a misspelled argument."
+a misspelled argument. The outcome is 1 or 0 only when the tool itself reports
+an external result, otherwise NIL."
   (handler-case
       (let* ((arguments (enchiridion.llm:parse-json
                          (enchiridion.llm:tool-call-arguments call)))
@@ -300,10 +312,12 @@ a misspelled argument."
                           arguments)
                          (enchiridion.tools:dispatch
                           (enchiridion.llm:tool-call-name call)
-                          arguments))))
-        (tool-result-text result))
+                          arguments)))
+             (text (tool-result-text result)))
+        (values text (tool-outcome text)))
     (error (condition)
-      (tool-result-text (format nil "error: ~A" condition)))))
+      (let ((text (tool-result-text (format nil "error: ~A" condition))))
+        (values text 0)))))
 
 (declaim (ftype (function (t t t) t) persist-usage))
 
@@ -343,15 +357,22 @@ that refuses the write prints one line and lets the turn finish, because
 losing the transcript is bad and losing the reply is worse. MODEL names what
 answered, which is empty for the operator's own turn. CHANNEL names the
 surface the turn arrived on, so the usage report can group by it."
-  (when (and store (stringp body) (plusp (length body)))
+  (when (and store
+             (stringp body)
+             (plusp (length body))
+             (not (and (eq channel :sleep)
+                       (not (enchiridion.memory:record-sleep-p)))))
     (handler-case
-        (enchiridion.memory.store:record-turn
-         store
-         :session (and session (session-id session))
-         :role role
-         :body body
-         :model (or model "")
-         :channel channel)
+        (let ((row (enchiridion.memory.store:record-turn
+                    store
+                    :session (and session (session-id session))
+                    :role role
+                    :body body
+                    :model (or model "")
+                    :channel channel)))
+          ;; RECORD-TURN writes the episode directly. The transcript, the
+          ;; search surface, and the cue candidates are the same log now.
+          row)
       (error (condition)
         (format *error-output* "~&enchiridion: could not record a turn: ~A~%"
                 condition)))))
@@ -401,11 +422,22 @@ caller that does is a caller that runs two turns at once."
     (let* ((snapshot (agent-snapshot agent))
            (tools (when (agent-tools-p agent)
                     (enchiridion.tools:registry-tool-definitions)))
+           (scrubbed (enchiridion.llm.secrets:scrub text))
+           (pack (when (and store (not (eq channel :sleep)))
+                   (nth-value 0
+                              (enchiridion.memory:retrieve-for-turn
+                               store scrubbed
+                               :session (or (and session (session-id session))
+                                            "default")
+                               :channel channel))))
+           (user-text (if (and pack (plusp (length pack)))
+                          (format nil "~A~%~%~A" pack scrubbed)
+                          scrubbed))
            (messages (list (enchiridion.llm:system-message
                             (enchiridion.llm.secrets:scrub
                              (prompt-text snapshot)))
                            (enchiridion.llm:user-message
-                            (enchiridion.llm.secrets:scrub text))))
+                            (enchiridion.llm.secrets:scrub user-text))))
            (rounds 0)
            (completion nil))
       (persist-turn store session "user" text :channel channel)
@@ -433,7 +465,8 @@ caller that does is a caller that runs two turns at once."
                                (enchiridion.llm:completion-text completion)
                                calls))))
           (dolist (call calls)
-            (let ((result (execute-tool agent call)))
+            (multiple-value-bind (result outcome) (execute-tool agent call)
+              (declare (ignore outcome))
               (persist-turn store session "tool" result :channel channel)
               (setf messages
                     (append messages

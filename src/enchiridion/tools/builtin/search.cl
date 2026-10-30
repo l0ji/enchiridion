@@ -155,7 +155,11 @@ file as the agent's memory."
                (dolist (row (enchiridion.memory.store:search-memories store query :limit limit))
                  (push (hit-line (format nil "memory ~A" (getf row :name))
                                  (getf row :body))
-                       results)))
+                       results))
+               ;; TURNS and MEMORIES are views over the one episodic log, so
+               ;; the two searches above cover every row. There is no third
+               ;; section to add.
+               nil)
           (enchiridion.memory.store:close-store store))))
     (cap-result
      (if results

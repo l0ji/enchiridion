@@ -46,6 +46,31 @@ rather than pretending to serialise."
            (bordeaux-threads:with-recursive-lock-held (,lock) ,@body)
            (progn ,@body)))))
 
+(defmacro with-store-transaction ((store) &body body)
+  "Run BODY inside one SQLite transaction while holding STORE's lock.
+
+The store writes multi-statement units that must not interleave with another
+thread: strict schema creation, an episode insert followed by its activation,
+and a generation promotion that flips one pointer and retires the old layer.
+Each statement is autocommitted by default, which would leave a half-written
+unit on a crash. BEGIN IMMEDIATE takes the write lock before the first read, so
+two writers cannot both pass a check and then collide.
+
+Nested use is not supported and does not occur in this tree. A body that
+signals rolls back; a body that returns commits."
+  (let ((store-var (gensym "STORE"))
+        (committed (gensym "COMMITTED")))
+    `(let ((,store-var ,store))
+       (with-store-lock (,store-var)
+         (exec ,store-var "BEGIN IMMEDIATE")
+         (let ((,committed nil))
+           (unwind-protect
+                (prog1 (progn ,@body)
+                  (exec ,store-var "COMMIT")
+                  (setf ,committed t))
+             (unless ,committed
+               (ignore-errors (exec ,store-var "ROLLBACK")))))))))
+
 (defparameter *store-path* nil
   "The store a caller gets when OPEN-STORE is not given a path. Main binds this
 from the operator configuration, so one process opens one store and the tool
@@ -108,92 +133,122 @@ size test, and it costs one read of sixteen bytes."
 ;;;; own even though its body holds semicolons.
 
 (defparameter +schema+
-  (list
-   "CREATE TABLE IF NOT EXISTS turns (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      session TEXT NOT NULL,
-      role TEXT NOT NULL,
-      body TEXT NOT NULL,
-      model TEXT NOT NULL DEFAULT '',
-      channel TEXT NOT NULL DEFAULT 'cli',
-      ts INTEGER NOT NULL)"
-   "CREATE INDEX IF NOT EXISTS turns_session ON turns(session)"
-   "CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts
-      USING fts5(body, content='turns', content_rowid='id')"
-   "CREATE TRIGGER IF NOT EXISTS turns_ai AFTER INSERT ON turns BEGIN
-      INSERT INTO turns_fts(rowid, body) VALUES (new.id, new.body);
-    END"
-   "CREATE TRIGGER IF NOT EXISTS turns_ad AFTER DELETE ON turns BEGIN
-      INSERT INTO turns_fts(turns_fts, rowid, body)
-        VALUES ('delete', old.id, old.body);
-    END"
-   "CREATE TRIGGER IF NOT EXISTS turns_au AFTER UPDATE ON turns BEGIN
-      INSERT INTO turns_fts(turns_fts, rowid, body)
-        VALUES ('delete', old.id, old.body);
-      INSERT INTO turns_fts(rowid, body) VALUES (new.id, new.body);
-    END"
+  (append
+   (list
+    ;; The session and ledger blocks. They are rows and not Markdown files
+    ;; because the harness writes them, not the agent, so they have no diff to
+    ;; review and no author to credit.
+    "CREATE TABLE IF NOT EXISTS blocks (
+       name TEXT PRIMARY KEY,
+       body TEXT NOT NULL,
+       ts INTEGER NOT NULL)"
 
-   "CREATE TABLE IF NOT EXISTS memories (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      body TEXT NOT NULL,
-      session TEXT NOT NULL DEFAULT '',
-      ts INTEGER NOT NULL)"
-   "CREATE INDEX IF NOT EXISTS memories_name ON memories(name)"
-   "CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
-      USING fts5(name, body, content='memories', content_rowid='id')"
-   "CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
-      INSERT INTO memories_fts(rowid, name, body)
-        VALUES (new.id, new.name, new.body);
-    END"
-   "CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
-      INSERT INTO memories_fts(memories_fts, rowid, name, body)
-        VALUES ('delete', old.id, old.name, old.body);
-    END"
-   "CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
-      INSERT INTO memories_fts(memories_fts, rowid, name, body)
-        VALUES ('delete', old.id, old.name, old.body);
-      INSERT INTO memories_fts(rowid, name, body)
-        VALUES (new.id, new.name, new.body);
-    END"
+    "CREATE TABLE IF NOT EXISTS usage (
+       id INTEGER PRIMARY KEY AUTOINCREMENT,
+       session TEXT NOT NULL DEFAULT '',
+       model TEXT NOT NULL DEFAULT '',
+       input INTEGER NOT NULL DEFAULT 0,
+       output INTEGER NOT NULL DEFAULT 0,
+       cache_read INTEGER NOT NULL DEFAULT 0,
+       cache_write INTEGER NOT NULL DEFAULT 0,
+       channel TEXT NOT NULL DEFAULT 'cli',
+       ts INTEGER NOT NULL)"
+    "CREATE INDEX IF NOT EXISTS usage_ts ON usage(ts)"
 
-   ;; The session and ledger blocks. They are rows and not Markdown files
-   ;; because the harness writes them, not the agent, so they have no diff to
-   ;; review and no author to credit.
-   "CREATE TABLE IF NOT EXISTS blocks (
-      name TEXT PRIMARY KEY,
-      body TEXT NOT NULL,
-      ts INTEGER NOT NULL)"
-
-   "CREATE TABLE IF NOT EXISTS usage (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      session TEXT NOT NULL DEFAULT '',
-      model TEXT NOT NULL DEFAULT '',
-      input INTEGER NOT NULL DEFAULT 0,
-      output INTEGER NOT NULL DEFAULT 0,
-      cache_read INTEGER NOT NULL DEFAULT 0,
-      cache_write INTEGER NOT NULL DEFAULT 0,
-      channel TEXT NOT NULL DEFAULT 'cli',
-      ts INTEGER NOT NULL)"
-   "CREATE INDEX IF NOT EXISTS usage_ts ON usage(ts)"
-
-   ;; The task queue. The CLI adds and removes, and the sleep agent drains it.
-   ;; Both go through the store, so a task survives a restart
-   ;; that a list in memory would not.
-   "CREATE TABLE IF NOT EXISTS tasks (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      body TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'pending',
-      ts INTEGER NOT NULL)"
-   "CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status, id)")
+    ;; The task queue. The CLI adds and removes, and the sleep agent drains it.
+    ;; Both go through the store, so a task survives a restart that a list in
+    ;; memory would not.
+    "CREATE TABLE IF NOT EXISTS tasks (
+       id INTEGER PRIMARY KEY AUTOINCREMENT,
+       body TEXT NOT NULL,
+       status TEXT NOT NULL DEFAULT 'pending',
+       ts INTEGER NOT NULL)"
+    "CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status, id)")
+   ;; The episodic memory tables are appended rather than copied so that the
+   ;; one schema list the store executes is also the one place a table is
+   ;; declared. The DDL file loads before this one; see enchiridion.asd.
+   enchiridion.memory:+episodic-schema+)
   "Every table this store creates, one statement per element. Each is IF NOT
-EXISTS, so opening a store is safe on every start and needs no migration for
-the shape this schema defines.")
+EXISTS, so opening a store is safe on every start. The episodic memory
+statements are appended from the DDL module, so the two halves cannot drift.")
 
 (defparameter +store-tables+
-  '("turns_fts" "turns" "memories_fts" "memories" "blocks" "usage" "tasks")
-  "What DROP-STORE removes, index table before row table. Dropping a table
-drops its triggers with it, so this list is also the whole trigger list.")
+  (append
+   '("blocks" "usage" "tasks")
+   enchiridion.memory:*episodic-tables*)
+  "What DROP-STORE removes, child table before parent table. The episodic
+memory list is child-first because its foreign keys are on.")
+
+(defparameter +store-views+
+  (append
+   '("turns" "memories")
+   enchiridion.memory:*episodic-views*)
+  "Views DROP-STORE removes before the tables they read. TURNS and MEMORIES
+are the compatibility views over EPISODES: the transcript and the saved
+memories are rows in the one episodic log.")
+
+;;;; The merge of the transcript and saved memories into the log.
+;;;;
+;;;; EPISODES is the one memory table. TURNS and MEMORIES are views over it.
+;;;; A database from before the merge still has the old tables, so OPEN-STORE
+;;;; copies their rows into EPISODES, drops the old tables and their FTS
+;;;; triggers, and creates the views. The migration is idempotent: the partial
+;;;; unique keys on SOURCE_TURN_ID and SOURCE_MEMORY_ID make a rerun a no-op.
+
+(defun sqlite-table-exists-p (store name)
+  "Return T when NAME is a table in STORE."
+  (not (null (query-rows store
+                         "SELECT name FROM sqlite_master
+                           WHERE type = 'table' AND name = ?"
+                         (list name)))))
+
+(defun migrate-legacy-memory (store)
+  "Merge old TURNS and MEMORIES rows into EPISODES, then create the views.
+A new store has neither table and only gets the views. Return T."
+  (with-store-transaction (store)
+    (when (sqlite-table-exists-p store "turns")
+      (exec store
+            "INSERT OR IGNORE INTO episodes
+               (session, role, body, model, ts, channel, provenance, authority,
+                cue_type, depth, span, context_key, horizon, source_turn_id)
+             SELECT session, role, body, model, ts, channel,
+                    CASE role WHEN 'user' THEN 'owner'
+                              WHEN 'assistant' THEN 'agent'
+                              ELSE 'untrusted' END,
+                    CASE role WHEN 'user' THEN 5
+                              WHEN 'assistant' THEN 3
+                              ELSE 1 END,
+                    'episodic', 0, '',
+                    session || ',' || session || ',' || lower(channel),
+                    2592000, id
+               FROM turns")
+      (dolist (trigger '("turns_ai" "turns_ad" "turns_au"))
+        (exec store (format nil "DROP TRIGGER IF EXISTS ~A" trigger)))
+      (exec store "DROP TABLE IF EXISTS turns_fts")
+      (exec store "DROP TABLE IF EXISTS turns"))
+    (when (sqlite-table-exists-p store "memories")
+      (exec store
+            "INSERT OR IGNORE INTO episodes
+               (session, role, body, model, name, ts, channel, provenance,
+                authority, cue_type, depth, span, context_key, horizon,
+                source_memory_id)
+             SELECT session, 'memory', body, '', name, ts, 'cli', 'owner',
+                    5, 'semantic', 0, '', session || ',' || session || ',cli',
+                    2592000, id
+               FROM memories")
+      (dolist (trigger '("memories_ai" "memories_ad" "memories_au"))
+        (exec store (format nil "DROP TRIGGER IF EXISTS ~A" trigger)))
+      (exec store "DROP TABLE IF EXISTS memories_fts")
+      (exec store "DROP TABLE IF EXISTS memories"))
+    (exec store
+          "CREATE VIEW IF NOT EXISTS turns AS
+             SELECT id, session, role, body, model, channel, ts
+               FROM episodes WHERE role <> 'memory'")
+    (exec store
+          "CREATE VIEW IF NOT EXISTS memories AS
+             SELECT id, name, body, session, ts
+               FROM episodes WHERE role = 'memory'"))
+  t)
 
 ;;;; Talking to the database.
 
@@ -303,11 +358,16 @@ that, because it is not text to a parser and NOT a term to match."
 
 ;;;; Opening and closing.
 
-(defun open-store (&key path (mode nil) (busy-timeout 5000))
+(defun open-store (&key path (mode nil) (busy-timeout 15000))
   "Open, and create when absent, the store at PATH. Return the store.
 
 PATH defaults to *STORE-PATH* and then to DEFAULT-STORE-PATH. The schema is
 created only when it is missing, so every start may call this.
+
+The whole schema is created in one transaction, foreign keys are on, and the
+busy timeout is fifteen seconds: the episodic memory generation promotion and the
+episode write both hold the write lock for more than one statement, and a five
+second wait was too short once a second writer existed.
 
 MODE, when it is an integer such as #o666, is applied to a file this call
 created. The supervisor runs as root and the broker as uid 1000, and SQLite
@@ -334,13 +394,29 @@ not an exposure."
                               :lock (bordeaux-threads:make-recursive-lock
                                      "enchiridion store"))))
       (handler-case
-          (dolist (statement +schema+)
-            (exec store statement))
+          (progn
+            ;; Foreign keys are per connection, so they are set after the
+            ;; connection exists and before any statement writes.
+            (exec store "PRAGMA foreign_keys = ON")
+            (with-store-transaction (store)
+              (dolist (statement +schema+)
+                (exec store statement))))
         (error (condition)
           (ignore-errors (dbi:disconnect connection))
           (error 'enchiridion.errors:configuration-error
                  :key :memory
                  :detail (format nil "Cannot create the memory store schema in ~A: ~A"
+                                 path condition))))
+      ;; The merge runs after the new schema exists and before any read. On a
+      ;; store from before the merge it copies the old tables and drops them;
+      ;; on a new store it only creates the compatibility views.
+      (handler-case
+          (migrate-legacy-memory store)
+        (error (condition)
+          (ignore-errors (dbi:disconnect connection))
+          (error 'enchiridion.errors:configuration-error
+                 :key :memory
+                 :detail (format nil "Cannot merge the old memory tables in ~A: ~A"
                                  path condition))))
       (when (and created-p mode)
         (enchiridion.compat:set-file-mode path mode))
@@ -411,9 +487,23 @@ secret that reached a turn must not reach the disk, whatever field it sits in."
     ;; them would hand this caller a row id that belongs to a different turn.
     (with-store-lock (store)
       (exec store
-            "INSERT INTO turns (session, role, body, model, channel, ts)
-               VALUES (?, ?, ?, ?, ?, ?)"
-            (list session role body model (string-downcase (string channel)) ts))
+            "INSERT INTO episodes
+               (session, role, body, model, ts, channel, provenance, authority,
+                cue_type, depth, span, context_key, horizon,
+                source_turn_id, source_memory_id)
+               VALUES (?, ?, ?, ?, ?, ?,
+                       CASE ? WHEN 'user' THEN 'owner'
+                              WHEN 'assistant' THEN 'agent'
+                              ELSE 'untrusted' END,
+                       CASE ? WHEN 'user' THEN 5
+                              WHEN 'assistant' THEN 3
+                              ELSE 1 END,
+                       'episodic', 0, '', ?, 2592000, NULL, NULL)"
+            (list session role body model ts (string-downcase (string channel))
+                  role
+                  role
+                  (format nil "~A,~A,~A" session session
+                          (string-downcase (string channel)))))
       (%make-turn-row :id (last-row-id store)
                       :session session
                       :role role
@@ -425,9 +515,12 @@ secret that reached a turn must not reach the disk, whatever field it sits in."
 (declaim (ftype (function (store) integer) session-count))
 
 (defun session-count (store)
-  "Return how many distinct sessions the store holds."
+  "Return how many distinct sessions the store holds.
+Saved memories carry a session field too, but they are not transcript turns,
+so the count excludes the memory role."
   (or (field (first (query-rows store
-                                "SELECT COUNT(DISTINCT session) AS n FROM turns"))
+                                "SELECT COUNT(DISTINCT session) AS n FROM episodes
+                                  WHERE role <> 'memory'"))
              "n")
       0))
 
@@ -442,7 +535,8 @@ turns it counts."
                       MIN(ts) AS started,
                       MAX(ts) AS ended,
                       COUNT(*) AS turns
-                 FROM turns
+                 FROM episodes
+                WHERE role <> 'memory'
                 GROUP BY session
                 ORDER BY ended DESC
                 LIMIT ?"
@@ -451,8 +545,10 @@ turns it counts."
 (declaim (ftype (function (store t) integer) delete-session))
 
 (defun delete-session (store id)
-  "Delete session ID and every turn in it. Return the turns removed."
-  (exec store "DELETE FROM turns WHERE session = ?" (list id)))
+  "Delete session ID and every episode in it. Return the rows removed.
+The log is append-only during operation; this is the operator's explicit
+delete, and it removes saved memories in the session as well."
+  (exec store "DELETE FROM episodes WHERE session = ?" (list id)))
 
 (defun search-sessions (store query &key (limit 20))
   "Return the turns whose body matches QUERY, best match first, newest ties last.
@@ -462,10 +558,12 @@ summarised, because a summary of a transcript is a model call that costs
 tokens and can be wrong."
   (let ((match (fts-query query)))
     (loop for row in (query-rows store
-                                 "SELECT t.id, t.session, t.role, t.body, t.model, t.channel, t.ts
-                                    FROM turns_fts
-                                    JOIN turns t ON t.id = turns_fts.rowid
-                                   WHERE turns_fts MATCH ?
+                                 "SELECT e.id, e.session, e.role, e.body,
+                                         e.model, e.channel, e.ts
+                                    FROM episodes_fts
+                                    JOIN episodes e ON e.id = episodes_fts.rowid
+                                   WHERE episodes_fts MATCH ?
+                                     AND e.role <> 'memory'
                                    ORDER BY rank
                                    LIMIT ?"
                                  (list match limit))
@@ -491,7 +589,9 @@ name is searchable."
        (error 'enchiridion.errors:configuration-error
               :key :memory
               :detail "A memory needs text."))
-      ((query-rows store "SELECT id FROM memories WHERE name = ? AND body = ?"
+      ((query-rows store
+                   "SELECT id FROM episodes
+                     WHERE role = 'memory' AND name = ? AND body = ?"
                    (list name body))
        (error 'enchiridion.errors:configuration-error
               :key :memory
@@ -501,8 +601,14 @@ name is searchable."
        ;; second writer between any two of them would pass the check twice.
        (with-store-lock (store)
          (exec store
-               "INSERT INTO memories (name, body, session, ts) VALUES (?, ?, ?, ?)"
-               (list name body (or session "") ts))
+               "INSERT INTO episodes
+                  (session, role, body, model, name, ts, channel, provenance,
+                   authority, cue_type, depth, span, context_key, horizon,
+                   source_turn_id, source_memory_id)
+                  VALUES (?, 'memory', ?, '', ?, ?, 'cli', 'owner', 5,
+                          'semantic', 0, '', ?, 2592000, NULL, NULL)"
+               (list (or session "") body name ts
+                     (format nil "~A,~A,cli" (or session "") (or session ""))))
          (last-row-id store))))))
 
 (defun list-memories (store &key (limit 100))
@@ -510,7 +616,8 @@ name is searchable."
 :SESSION, and :TS."
   (query-rows store
               "SELECT id, name, body, session, ts
-                 FROM memories
+                 FROM episodes
+                WHERE role = 'memory'
                 ORDER BY ts DESC, id DESC
                 LIMIT ?"
               (list limit)))
@@ -518,15 +625,18 @@ name is searchable."
 (defun search-memories (store query &key (limit 20))
   "Return the memories whose name or body matches QUERY, best match first.
 Each entry is a plist with :ID, :NAME, :BODY, :SESSION, and :TS."
-  (let ((match (fts-query query)))
+  (let ((match (fts-query query))
+        (like (format nil "%~A%" query)))
     (query-rows store
-                "SELECT m.id, m.name, m.body, m.session, m.ts
-                   FROM memories_fts
-                   JOIN memories m ON m.id = memories_fts.rowid
-                  WHERE memories_fts MATCH ?
-                  ORDER BY rank
+                "SELECT e.id, e.name, e.body, e.session, e.ts
+                   FROM episodes e
+                  WHERE e.role = 'memory'
+                    AND (e.id IN (SELECT rowid FROM episodes_fts
+                                   WHERE episodes_fts MATCH ?)
+                         OR lower(e.name) LIKE lower(?))
+                  ORDER BY e.ts DESC, e.id DESC
                   LIMIT ?"
-                (list match limit))))
+                (list match like limit))))
 
 ;;;; The two harness blocks.
 
@@ -750,13 +860,14 @@ transcript back does not read its own output and summarise that."
   (let ((rows (if not-channel
                   (query-rows store
                               "SELECT id, session, role, body, model, channel, ts
-                                 FROM turns
-                                WHERE channel <> ?
+                                 FROM episodes
+                                WHERE role <> 'memory' AND channel <> ?
                                 ORDER BY id DESC LIMIT ?"
                               (list (string-downcase (string not-channel)) limit))
                   (query-rows store
                               "SELECT id, session, role, body, model, channel, ts
-                                 FROM turns
+                                 FROM episodes
+                                WHERE role <> 'memory'
                                 ORDER BY id DESC LIMIT ?"
                               (list limit)))))
     (mapcar #'turn-row-from rows)))
@@ -770,6 +881,8 @@ transcript back does not read its own output and summarise that."
 
 The connection stays open, so a caller that wants the schema back calls
 OPEN-STORE again. Tests use this; the sessions command will use it to forget."
+  (dolist (view +store-views+)
+    (exec store (format nil "DROP VIEW IF EXISTS ~A" view)))
   (dolist (table +store-tables+)
     (exec store (format nil "DROP TABLE IF EXISTS ~A" table)))
   t)

@@ -87,8 +87,19 @@
         :default-component-class "cl-source-file.cl"
         :components
         ((:file "blocks")
+         ;; The EPISODIC DDL is data only and loads before the store so
+         ;; OPEN-STORE can create the whole schema from one list.
+         (:file "episodic-ddl")
          (:file "store")
+         ;; The memory model loads after the store because every function that
+         ;; writes reaches the store primitives. It loads before the tools and
+         ;; the kernel, which are its callers.
          (:file "tiers")
+         (:file "episodic")
+         (:file "cue")
+         (:file "episodic-hooks")
+         (:file "generations")
+         (:file "derive")
          (:file "seed")
          (:file "state")))
        (:module "tools"

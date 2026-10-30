@@ -232,10 +232,85 @@ did not think of."))
    #:bootstrap-refuse-writes-p #:mark-bootstrap-step
    ;; Tiers.
    #:tiered #:tiered-l0 #:tiered-l1 #:tiered-l2 #:build-tiers #:promote-tier
-   #:tier-for #:tier-name #:tier-misses #:note-tier-miss #:reset-tier-misses)
+   #:tier-for #:tier-name #:tier-misses #:note-tier-miss #:reset-tier-misses
+   ;; Episodic log, retrieval, generations, gates, and status.
+   ;; Schema and parameters.
+   #:+episodic-schema+ #:+ext-schema+ #:*episodic-tables*
+   #:*ext-tables* #:*episodic-views* #:ensure-episodic-schema
+   #:ensure-ext-schema #:table-names
+   #:*memory-parameters* #:parameter #:configure-memory
+   #:enabled-p #:retrieval-enabled-p #:push-enabled-p #:record-sleep-p
+   ;; Records.
+   #:episode #:make-episode
+   #:episode-id #:episode-session #:episode-role #:episode-body #:episode-ts
+   #:episode-event-ts #:episode-channel #:episode-provenance #:episode-origin
+   #:episode-authority #:episode-cue-type #:episode-depth #:episode-span
+   #:episode-rarity-raw #:episode-arousal-raw #:episode-context-key
+   #:episode-scene-trace #:episode-horizon #:episode-run-id
+   #:assertion #:make-assertion
+   #:assertion-id #:assertion-subject #:assertion-relation #:assertion-object
+   #:assertion-polarity #:assertion-episode-id #:assertion-span-start
+   #:assertion-span-end #:assertion-authority-basis #:assertion-valid-from
+   #:assertion-valid-to #:assertion-tx-from #:assertion-tx-to
+   #:assertion-authority #:assertion-provenance #:assertion-cue-type
+   #:assertion-schema-id #:assertion-run-id
+   #:link #:make-link #:link-src-kind #:link-src #:link-dst-kind #:link-dst
+   #:link-type #:link-weight #:link-obs #:link-updated-ts
+   #:activation #:make-activation #:activation-kind #:activation-id
+   #:activation-n-enc #:activation-last-enc #:activation-n-ret
+   #:activation-last-ret #:activation-created-ts #:activation-supp
+   #:activation-supp-ts #:activation-imp #:activation-distinctness
+   #:conflict #:make-conflict #:conflict-id #:conflict-kind #:conflict-left-id
+   #:conflict-right-id #:conflict-basis #:conflict-resolution-state
+   #:conflict-resolution #:conflict-resolver #:conflict-acting-query
+   #:intention #:make-intention #:intention-id #:intention-text
+   #:intention-trigger-kind #:intention-trigger-expr #:intention-state
+   #:intention-budget #:intention-cooldown #:intention-expiry
+   ;; Score terms and the required implementations.
+   #:terms #:make-terms #:terms-base #:terms-spread #:terms-temporal
+   #:terms-importance #:terms-cue-type #:terms-context #:terms-inhibition
+   #:terms-distinct #:retrieval-score #:retrieval-probability
+   #:retrieval-latency #:rank-normalise #:normalise-terms
+   #:base-level #:base-level-exact #:base-level-approx #:base-level-forms
+   #:associative-strength #:fan #:edge-weight #:decayed-edge-weight
+   #:spread-activation #:retrieve #:decay-update #:decay-sweep
+   #:inhibition-after-loss #:decay-inhibition #:consolidate
+   ;; Supporting mechanisms.
+   #:encoding-filter #:capture-p #:promotion-condition
+   #:write-episode #:tokenise #:term-coverage #:jaccard #:context-match
+   #:cue-type-match #:temporal-match #:conflict-kind-for #:detect-conflicts
+   #:resolve-conflict #:update-conditions-hold-p #:admission-rule
+   #:close-superseded #:assertion-from-row
+   #:judgement-of-learning #:isotonic-fit #:isotonic-predict
+   #:recalibrate #:search-externally-p #:record-outcome
+   #:candidates-for #:graph-for #:assertions-for #:episode-from-row
+   #:episode-candidate #:item-terms
+   #:*assertion-deriver* #:*procedure-inducer*
+   #:make-model-assertion-deriver #:parse-assertion-json
+   #:assertions-from-model-text
+   ;; Extension layer.
+   #:index-cue #:cue-index-for #:cue-index-many #:cue-index-size
+   #:prune-cue-index #:push-pack #:precondition-surfacing
+   #:learned-state-block #:fire-intentions #:assemble-pack
+   #:register-canary #:canary-check #:canary-report
+   #:retention-first-p #:utility-gate #:volume-gate #:consolidate-if-gated
+   #:run-arm #:compare-arms #:push-ab #:record-gate-row
+   #:+working-set-budget+ #:+push-max-fraction+
+   ;; Integration entry points. Defined in later files; exported here so the
+   ;; kernel and the command table have one visible interface.
+   #:retrieve-for-turn #:record-retrieval
+   #:record-retrieval-outcome #:maintenance
+   #:build-candidate #:promote-generation #:rollback-generation
+   #:start-candidate #:generation-status #:generation-assertion-count
+   #:live-assertion-count #:current-generation #:ensure-generation-state
+   #:rebuild-derived #:resolve-conflict-at-action #:forget-session
+   #:add-intention #:list-intentions #:cancel-intention
+   #:propose-change #:memory-status
+   #:live-generation-id #:with-generation #:render-pack)
   (:documentation
    "Memory blocks, the operator seed files that back the first three of them,
-the three loading tiers, and the bootstrap state machine."))
+the three loading tiers, the bootstrap state machine, and the episodic log
+with its retrieval, generations, and gates."))
 
 (defpackage #:enchiridion.memory.store
   (:use #:cl)
@@ -258,7 +333,13 @@ the three loading tiers, and the bootstrap state machine."))
    ;; The task queue. The CLI writes it and the sleep agent drains it.
    #:enqueue-task #:dequeue-task #:complete-task #:fail-task #:recover-tasks
    #:count-tasks #:list-tasks #:remove-task
-   #:task-row #:task-row-id #:task-row-body #:task-row-status #:task-row-ts)
+   #:task-row #:task-row-id #:task-row-body #:task-row-status #:task-row-ts
+   ;; The database primitives the memory layer uses. They are exported so
+   ;; that a derived module is part of this system rather than a caller reaching
+   ;; through a double colon. WITH-STORE-TRANSACTION is the multi-statement
+   ;; write primitive that strict schema creation and generation promotion need.
+   #:exec #:query-rows #:field #:last-row-id #:scrubbed #:fts-query
+   #:with-store-lock #:with-store-transaction #:store-connection)
   (:documentation
    "SQLite with FTS5 over raw messages. Returns real text: no summarisation and
 no model call, so a search costs nothing."))

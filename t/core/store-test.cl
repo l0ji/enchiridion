@@ -153,15 +153,15 @@ itself is what proves the trigger ran."
     (enchiridion.memory.store:record-turn
      store :session "b" :body "the unique phrase glockenspiel")
     (ok (= 2 (length (enchiridion.memory.store:search-sessions store "unique"))))
-    (ok (= 2 (index-hits store "turns_fts" "unique")))
+    (ok (= 2 (index-hits store "episodes_fts" "unique")))
     (ok (= 1 (enchiridion.memory.store:delete-session store "a")))
     (ok (= 1 (enchiridion.memory.store:session-count store)))
     (testing "the index forgot the row and not only the table"
       (ok (= 1 (length (enchiridion.memory.store:search-sessions store "unique"))))
       (ok (null (enchiridion.memory.store:search-sessions store "xylophone"))))
     (testing "and the index itself is clean, which the join alone cannot show"
-      (ok (zerop (index-hits store "turns_fts" "xylophone")))
-      (ok (= 1 (index-hits store "turns_fts" "unique"))))))
+      (ok (zerop (index-hits store "episodes_fts" "xylophone")))
+      (ok (= 1 (index-hits store "episodes_fts" "unique"))))))
 
 (deftest an-updated-body-replaces-its-index-entry ()
   (with-scratch-store (store)
@@ -170,7 +170,7 @@ itself is what proves the trigger ran."
       ;; EXEC is internal, and an UPDATE has no public caller yet. The trigger
       ;; it proves is the one a later migration or a sleep pass will lean on.
       (enchiridion.memory.store::exec
-       store "UPDATE turns SET body = ? WHERE id = ?"
+       store "UPDATE episodes SET body = ? WHERE id = ?"
        (list "the replacement glockenspiel"
              (enchiridion.memory.store:turn-row-id row)))
       (ok (null (enchiridion.memory.store:search-sessions store "xylophone")))
@@ -522,3 +522,45 @@ itself is what proves the trigger ran."
                             store "SELECT id FROM turns"))))
           (ok (= (* writers each) (length ids)))
           (ok (= (* writers each) (length (remove-duplicates ids)))))))))
+
+(deftest an-old-store-merges-its-turns-and-memories ()
+  (let* ((directory (scratch-directory))
+         (path (merge-pathnames "memory.db" directory)))
+    (ensure-directories-exist path)
+    (let ((connection (dbi:connect :sqlite3 :database-name (namestring path))))
+    (unwind-protect
+         (progn
+           (dbi:do-sql connection
+                       "CREATE TABLE turns (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                          session TEXT NOT NULL, role TEXT NOT NULL,
+                          body TEXT NOT NULL, model TEXT NOT NULL DEFAULT '',
+                          channel TEXT NOT NULL DEFAULT 'cli', ts INTEGER NOT NULL)")
+           (dbi:do-sql connection
+                       "CREATE TABLE memories (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                          name TEXT NOT NULL, body TEXT NOT NULL,
+                          session TEXT NOT NULL DEFAULT '', ts INTEGER NOT NULL)")
+           (dbi:do-sql connection
+                       "INSERT INTO turns (session, role, body, ts)
+                          VALUES ('old', 'user', 'the legacy xylophone', 1)")
+           (dbi:do-sql connection
+                       "INSERT INTO memories (name, body, session, ts)
+                          VALUES ('note', 'the legacy memory', 'old', 2)")
+           (dbi:disconnect connection)
+           (let ((store (enchiridion.memory.store:open-store :path path)))
+             (unwind-protect
+                  (progn
+                    (testing "both old tables are rows in the one log"
+                      (ok (= 2 (enchiridion.memory.store:field (first (enchiridion.memory.store:query-rows store "SELECT COUNT(*) AS n FROM episodes")) "n"))))
+                    (testing "the transcript view sees the turn"
+                      (ok (= 1 (length (enchiridion.memory.store:search-sessions
+                                        store "xylophone")))))
+                    (testing "the memories view sees the memory"
+                      (ok (= 1 (length (enchiridion.memory.store:search-memories
+                                        store "legacy")))))
+                    (testing "the old table names are views now"
+                      (ok (= 1 (enchiridion.memory.store:field (first (enchiridion.memory.store:query-rows store "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'view' AND name = 'turns'")) "n")))
+                      (ok (zerop (enchiridion.memory.store:field (first (enchiridion.memory.store:query-rows store "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'turns'")) "n")))))
+               (enchiridion.memory.store:close-store store))))
+      (uiop:delete-directory-tree directory
+                                  :validate t
+                                  :if-does-not-exist :ignore)))))

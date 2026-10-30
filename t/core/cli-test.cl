@@ -15,7 +15,8 @@
 
 (defparameter +plan-commands+
   '("init" "ask" "check" "skills" "tools" "blocks" "persona" "operator" "world"
-    "memory" "sessions" "journey" "undo" "usage" "budget" "tasks" "secrets"
+    "memory" "sessions" "journey" "undo" "usage" "budget" "tasks"
+    "secrets"
     "providers" "version" "help" "bootstrap" "health" "reload" "channels"
     "heartbeat" "chat" "serve")
   "The commands in table order.")

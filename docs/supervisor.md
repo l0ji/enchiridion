@@ -209,21 +209,26 @@ That is how a process that began with `:sleep :enabled nil` gains a schedule.
 
 ## The sleep agent and its phases
 
-A tick runs four phases in a fixed order.
+A tick runs five phases in a fixed order.
 Each phase has its own guard, so a failed phase adds a note and sets `:ok-p` false while the later phases still run.
 The notes are joined into one line by a semicolon, and a tick with no notes reports `idle`.
 
-| Order | Phase              | What it does                                                   |
-| ----- | ------------------ | -------------------------------------------------------------- |
-| 1     | Task recovery      | Marks every running task failed                                |
-| 2     | The harness blocks | Writes the ledger block and the session fallback               |
-| 3     | The sleep agent    | Claims one task, or runs one maintenance pass, or does nothing |
-| 4     | Compaction         | Rewrites the session block when new turns are due              |
+| Order | Phase               | What it does                                                   |
+| ----- | ------------------- | -------------------------------------------------------------- |
+| 1     | Task recovery       | Marks every running task failed                                |
+| 2     | Memory maintenance  | Copies old turns into the episodic log and derives scalars   |
+| 3     | The harness blocks  | Writes the ledger block and the session fallback               |
+| 4     | The sleep agent     | Claims one task, or runs one maintenance pass, or does nothing |
+| 5     | Compaction          | Rewrites the session block when new turns are due              |
 
-Phase 2 builds the ledger line from the session total and the rolling day total, and writes one line about the queue into an empty session block.
+Phase 2 is model-free.
+It calls `maintenance` in the memory module, which derives rarity and links for episodes without them and reports `N episodes derived` when it writes.
+A tick with nothing to copy adds no note.
+
+Phase 3 builds the ledger line from the session total and the rolling day total, and writes one line about the queue into an empty session block.
 Compaction overwrites that fallback.
 
-Phase 3 builds a fresh sleep agent on every tick over the same directory and broker as the operator's agent, with the three seed-backed blocks writable.
+Phase 4 builds a fresh sleep agent on every tick over the same directory and broker as the operator's agent, with the three seed-backed blocks writable.
 It claims the oldest pending task and runs one pass for it.
 With an empty queue it runs one maintenance pass when a turn newer than `last-sleep-turn` exists, and reports `idle` otherwise.
 The pass uses its own session and closes it afterwards.
@@ -243,9 +248,9 @@ The sleep agent refuses to run for a named reason, and each reason is a sentence
 
 A refused phase writes `sleep skipped: <reason>` or `compaction skipped: <reason>`.
 A budget the store cannot read adds `the budget is unreadable: <condition line>` in place of the refusal, and sets `:ok-p` false.
-A phase that raises writes `<phase> failed: <condition line>`, where the phase name is `task recovery`, `the harness blocks`, `the sleep agent`, or `compaction`.
+A phase that raises writes `<phase> failed: <condition line>`, where the phase name is `task recovery`, `memory maintenance`, `the harness blocks`, `the sleep agent`, or `compaction`.
 
-Phase 4 runs when four new turns exist and the newest is past `last-compacted-turn`.
+Phase 5 runs when four new turns exist and the newest is past `last-compacted-turn`.
 It runs as a separate compactor agent with no tools and uses the cheap model.
 The cursor lives on the supervisor, so a restart rereads the last few turns once.
 [Memory](memory.md) documents the compaction prompt and the block write.

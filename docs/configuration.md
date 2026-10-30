@@ -222,16 +222,41 @@ No Lisp path reads `:proc-hidepid`, and the container entry point reads `ENCHIRI
 
 ## The :memory section
 
-| Key             | Type                              | Default                                                                        | Meaning                                                           |
-| --------------- | --------------------------------- | ------------------------------------------------------------------------------ | ----------------------------------------------------------------- |
-| `:db`           | string or `nil`                   | `nil`                                                                          | SQLite store path. `nil` selects `agents/default/memory.db`.      |
-| `:block-limits` | property list of label to integer | `:persona 1200`, `:operator 800`, `:world 1500`, `:session 400`, `:ledger 250` | Declared character limit for each memory block. No code reads it. |
+| Key                        | Type                              | Default                                                                        | Meaning                                                           |
+| -------------------------- | --------------------------------- | ------------------------------------------------------------------------------ | ----------------------------------------------------------------- |
+| `:db`                      | string or `nil`                   | `nil`                                                                          | SQLite store path. `nil` selects `agents/default/memory.db`.      |
+| `:block-limits`            | property list of label to integer | `:persona 1200`, `:operator 800`, `:world 1500`, `:session 400`, `:ledger 250` | Declared character limit for each memory block. No code reads it. |
+| `:enabled`                 | boolean                           | `t`                                                                            | Master switch for the episodic log and the cue pack.              |
+| `:retrieve`                | boolean                           | `t`                                                                            | Put a cue pack in the user message.                               |
+| `:push`                    | boolean                           | `nil`                                                                          | Enable the four push channels. Off until measured.                |
+| `:record-sleep`            | boolean                           | `t`                                                                            | Append sleep and compaction turns to the log.                     |
+| `:pack-chars`              | integer                           | `4450`                                                                         | Cue pack budget in characters.                                    |
+| `:push-max-fraction`       | real                              | `0.5`                                                                          | Push cap as a fraction of the pack.                               |
+| `:maintenance-batch`       | integer                           | `200`                                                                          | Episodes per maintenance batch.                                   |
+| `:graph-limit`             | integer                           | `20000`                                                                        | Link rows one retrieval may load.                                 |
+| `:t2-enabled`              | boolean                           | `t`                                                                            | Schedule T2. Promotion is gated and needs the gate tables.        |
+| `:canaries`                | list or `nil`                     | `nil`                                                                          | Operator-authored behavioural checks.                             |
+| `:gate-margin`             | real                              | `0.05`                                                                         | Utility-gate minimum outcome delta.                               |
+| `:gate-min-n`              | integer                           | `100`                                                                          | Utility-gate minimum non-tied pairs.                              |
+| `:gate-alpha`              | real                              | `0.05`                                                                         | One-sided significance level for the sign test.                   |
+| `:tail-rarity-fraction`    | real                              | `0.10`                                                                         | Top fraction of records treated as rare by the tail gate.         |
+| `:tail-min-n`              | integer                           | `50`                                                                           | Minimum rare records in a tail sample.                            |
+| `:tail-margin`             | real                              | `0.02`                                                                         | Allowed tail-retention shortfall.                                 |
+| `:precision-min`           | real                              | `0.8`                                                                          | Promotion-precision floor.                                        |
+| `:quarantine-max`          | real                              | `0.5`                                                                          | Quarantine-rate ceiling.                                          |
+| `:compaction-rebase-every` | integer                           | `8`                                                                            | Compaction passes between raw-turn rebases.                       |
+| `:compaction-rebase-turns` | integer                           | `24`                                                                           | Raw turns read by a rebase.                                       |
+| `:parameters`              | plist or `nil`                    | `nil`                                                                          | Overrides merged over the shipped memory parameter defaults.      |
 
 The store path can also be a pathname object.
 The default is under the agent directory, which is on the state volume in the container.
 No code reads the configured `:block-limits` value.
 The effective limits come from `*default-block-limits*` in the memory module, which also holds `:bootstrap` with a limit of 300.
 Raising a limit raises the fixed token cost of every prompt (see [Memory](memory.md)).
+
+The log and the cue pack are on.
+Push, T2 promotion, the canaries, and the utility task set are designed but not wired into a turn yet; see [Episodic memory](episodic-memory.md) and the [design record](design/memory.md).
+Changing `:parameters` changes the retrieval score, so a change is a new configuration hash and a new measurement run.
 
 ## The :sleep section
 

@@ -97,7 +97,7 @@ Before the first launch, they write the seed files instead.
 | `persona`   | 0 or 1: `show`, `edit`                               | Show or point at `SOUL.md`                          | 0 or 2      |
 | `operator`  | 0 or 1: `show`, `edit`                               | Show or point at `OPERATOR.md`                      | 0 or 2      |
 | `world`     | 0 or 1: `show`, `edit`                               | Show or point at `WORLD.md`                         | 0 or 2      |
-| `memory`    | 1 or more                                            | Search sessions and memories                        | 0 or 1      |
+| `memory`    | 1 or more: a query, `status`, `build`                | Search the memory store, or run a log action        | 0, 1, or 2  |
 | `sessions`  | none                                                 | Stored sessions with turn counts                    | 0 or 1      |
 | `journey`   | 0 to 2: `list`, `show REV`, `edit REV`, `rm REV`     | Everything the agent has learned or written         | 0 or 2      |
 | `undo`      | exactly 1                                            | Roll back the nth change in the agent directory     | 0, 1, or 2  |
@@ -120,7 +120,7 @@ Every row also returns 2 for a wrong argument count.
 The exit column names what the handler can return after the count check.
 
 An absent action argument takes the default.
-The defaults are `list` for `skills`, `tools`, `channels`, `journey`, and `tasks`.
+The defaults are `list` for `skills`, `tools`, `channels`, `journey`, and `tasks`, and `status` for `episodic`.
 They are `show` for `blocks`, `persona`, `operator`, and `world`.
 They are `status` for `bootstrap`, and `on` for `heartbeat`.
 
@@ -336,7 +336,7 @@ COMMAND needs the memory store, and none is open in this process.
 
 ### memory
 
-`memory` searches stored memories and stored turns for the joined arguments.
+With a search query, `memory` searches the memories view and the turns view, both over the one episodic log.
 The output has two sections:
 
 ```text
@@ -346,7 +346,33 @@ turns: 0
 
 Each row prints as `  KEY: VALUE`.
 A search that fails prints no rows for that section.
+
+The first argument may also be an action on the episodic log:
+
+```sh
+enchiridion memory status
+enchiridion memory build
+```
+
+`status` prints the switch states and counts:
+
+```text
+enabled: T
+retrieve: T
+push: NIL
+episodes: 12
+retrievals: 3
+generations: 0
+live-generation: 0
+cue-index: 0
+canaries: 0
+```
+
+`build` runs one bounded T2 candidate build.
+With no assertion deriver installed it reports `no candidate built: no-deriver.` and exits 1.
+A build never changes the live layer; promotion is not exposed until the gates land.
 The exit status is 0 with a store and 1 without one.
+The command is also on the [Episodic memory page](episodic-memory.md).
 
 ### sessions
 

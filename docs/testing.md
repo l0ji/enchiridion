@@ -106,6 +106,9 @@ The bridge resolves the `suite-tests` accessor by name from `:rove/core/suite/pa
 | `seed-test.cl`, `secrets-test.cl`                        | The seed files, the first launch, the bootstrap, and the secrets rules |
 | `http-test.cl`, `fluxer-test.cl`                         | The webhook routes and the Fluxer direct-message rules                 |
 | `sleep-test.cl`                                          | The heartbeat, the sleep agent, and compaction                         |
+| `episodic-test.cl`                                     | The 24 memory design properties: log, cue index, push, canaries, gates |
+| `episodic-hooks-test.cl`                         | The turn seam, the cue pack, the merged views, and status                       |
+| `generation-test.cl`                          | Candidate isolation, promotion, rollback, updates, and the model parser |
 | `seed-property.cl`, `prompt-property.cl`                 | Seed round trips and byte-stable prompts                               |
 
 The container isolation test needs uid 1000 and a real secret tmpfs, so it does not run in this suite.

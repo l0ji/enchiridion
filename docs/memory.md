@@ -2,8 +2,10 @@
 
 Memory is what the agent carries from one turn to the next.
 Five named blocks are compiled into one prompt when the agent is built, and that prompt stays frozen for the session.
-A SQLite store holds the transcript, memories, harness blocks, ledger, and task queue, and SQLite full-text search (FTS5) indexes the text without a model call.
-The heartbeat rewrites the session block from recent turns, so the prompt does not grow with the transcript.
+A SQLite store holds one episodic log, the harness blocks, the usage ledger, and the task queue.
+The transcript and the saved memories are views over that one log, so a turn and a saved memory are the same kind of row.
+SQLite full-text search (FTS5) indexes the text without a model call.
+The heartbeat rewrites the session block from recent episodes, so the prompt does not grow with the log.
 
 ## The memory model
 
@@ -219,14 +221,14 @@ The machine runs Debian."))
 `promote-tier` moves up after `+misses-before-promotion+` (2) misses and clears the count.
 At L2 it clears and returns `:l2`, and `reset-tier-misses` clears without moving.
 
-The derivation is mechanical, and no shipped code calls it: `build-tiers` runs from the test suite only, so no live prompt reads a tier.
+The cue pack uses the L0 form of a record, so the tier rule is live on the retrieval path. L1 and L2 remain available through the tier functions and the search tool.
 
 ## The store
 
 The store is one SQLite file.
 `default-store-path` puts `memory.db` under `agents/default/` in `ENCHIRIDION_HOME`, or under the current directory, and the `:db` key or `*store-path*` overrides that path.
 
-`open-store` creates the file and schema when missing and uses a 5000 ms busy timeout.
+`open-store` creates the file and schema when missing and uses a 15000 ms busy timeout.
 A file that cannot be opened signals `configuration-error` with `Cannot open the memory store <path>: <reason>`, and a failed schema signals one with `Cannot create the memory store schema in <path>: <reason>`.
 Both report `Configuration is wrong at MEMORY.`
 When root creates the file in a split run, it widens the mode to `#o666`. The broker runs as the agent user.
@@ -236,23 +238,25 @@ Every string is scrubbed before it reaches a column, so the store holds no secre
 An empty or non-database file is therefore a leftover, and not a store.
 
 One connection serves several threads: `with-store-lock` runs a body under a recursive lock, and `exec` and `query-rows` take it themselves.
+`with-store-transaction` holds the write lock across a multi-statement unit, which is what the episode write and the generation promotion need.
 
-The schema is seventeen statements, each `IF NOT EXISTS`, so opening a store needs no migration.
+The schema is created in one transaction.
+`open-store` also executes the episodic schema from `episodic-ddl.cl`, so a new store has the log and the generation tables before the first turn.
+A database from before the merge still has `turns` and `memories` tables; `open-store` copies their rows into `episodes`, drops the old tables and their FTS triggers, and replaces both with views.
+The migration is idempotent, because the partial unique keys on `source_turn_id` and `source_memory_id` make a rerun a no-op.
 
-| Table          | Columns                                                                                   |
-| -------------- | ----------------------------------------------------------------------------------------- |
-| `turns`        | `id`, `session`, `role`, `body`, `model`, `channel`, `ts`                                 |
-| `memories`     | `id`, `name`, `body`, `session`, `ts`                                                     |
-| `blocks`       | `name`, `body`, `ts`                                                                      |
-| `usage`        | `id`, `session`, `model`, `input`, `output`, `cache_read`, `cache_write`, `channel`, `ts` |
-| `tasks`        | `id`, `body`, `status`, `ts`                                                              |
-| `turns_fts`    | An FTS5 external content table over `turns.body`                                          |
-| `memories_fts` | An FTS5 external content table over `memories.name` and `memories.body`                   |
+| Table or view | Kind  | Columns                                                                                   |
+| ------------- | ----- | ----------------------------------------------------------------------------------------- |
+| `episodes`    | table | The log: `id`, session, role, body, model, name, channel, provenance, authority, cue type, context, horizon, and the two source keys |
+| `episodes_fts` | FTS5 | External content over `episodes.body`                                                     |
+| `turns`       | view  | `id`, `session`, `role`, `body`, `model`, `channel`, `ts` for every non-memory episode    |
+| `memories`    | view  | `id`, `name`, `body`, `session`, `ts` for every memory episode                            |
+| `blocks`      | table | `name`, `body`, `ts`                                                                      |
+| `usage`       | table | `id`, `session`, `model`, `input`, `output`, `cache_read`, `cache_write`, `channel`, `ts`  |
+| `tasks`       | table | `id`, `body`, `status`, `ts`                                                              |
 
-The four indexes are `turns_session`, `memories_name`, `usage_ts`, and `tasks_status`.
-The search tables are external content tables over the row tables.
-Three triggers per table keep them in step through an insert, an update, and a delete.
-`+store-tables+` lists the seven tables in drop order, and `drop-store` drops them and leaves the connection open.
+`+store-tables+` lists the row tables in drop order, and `+store-views+` lists the views that `drop-store` removes first.
+Foreign keys are on, so the drop order is child first.
 `set-session-block` and `set-ledger-block` run the injection scan and limit check, and `session-block` and `ledger-block` read the rows.
 The heartbeat writes those rows, so no agent sees them first.
 The task queue functions are `enqueue-task`, `list-tasks`, `dequeue-task`, `complete-task`, `fail-task`, `recover-tasks`, `count-tasks`, and `remove-task`.
@@ -260,21 +264,23 @@ Their statuses and claim rule belong to [Supervisor and heartbeat](supervisor.md
 
 ## Sessions and search
 
-A session is a string on every turn row, so the store needs no session table.
-`fresh-session-id` returns 32 hexadecimal characters, and a session spans the smallest and largest timestamps of its turns.
+A session is a string on every episode, so the store needs no session table.
+`fresh-session-id` returns 32 hexadecimal characters, and a session spans the smallest and largest timestamps of its episodes.
 
-A turn row records session, role, body, model, channel, and universal time.
-The roles are `user`, `assistant`, and `tool`, and `record-turn` defaults the session to `default` and the role to `user`.
+An episode records session, role, body, model, channel, and universal time.
+The roles are `user`, `assistant`, `tool`, and `memory`.
+`record-turn` writes one episode and returns a `turn-row`; the `turns` view excludes memory rows.
 Every round of a tool turn is stored, including tool results, and an empty assistant body is skipped.
+Sleep turns are stored when `:record-sleep` is true, which it is by default; compaction excludes them from its own summary input by channel.
 
-`record-turn` returns the stored `turn-row`, and `recent-sessions` returns sessions newest first with `:id`, `:started`, `:ended`, and `:turns`.
-`session-count` counts distinct sessions, and `delete-session` removes a session's turns and returns the count.
-`search-sessions` returns matching turns best first, and `recent-turns` returns the newest turns, optionally excluding one channel.
+`recent-sessions` returns sessions newest first with `:id`, `:started`, `:ended`, and `:turns`.
+`session-count` counts distinct sessions, and `delete-session` removes a session's episodes and returns the count.
+`search-sessions` returns matching non-memory episodes best first, and `recent-turns` returns the newest non-memory episodes, optionally excluding one channel.
 
-`save-memory` stores one named body and returns the new row identifier.
+`save-memory` writes one episode with role `memory` and returns the new row identifier.
 It refuses an empty body after the scrub with `A memory needs text.` and an exact duplicate with `Memory <name> already holds that text.`
-`list-memories` returns memories newest first, and `search-memories` matches a name or a body.
-The `memory` tool calls `save-memory` for the model. The `search` tool reads memories and does not write them.
+`list-memories` returns memory episodes newest first, and `search-memories` matches a name or a body.
+The `memory` tool calls `save-memory` for the model. The `search` tool reads the same views and does not write them.
 
 A search turns each whitespace-separated term into an FTS5 quoted prefix query, so an operator character such as `+` is a literal.
 A term with no alphanumeric character is dropped.
@@ -283,16 +289,20 @@ A query left with no terms signals `schema-error` with `The query has no searcha
 The search functions and `recent-sessions` return 20 rows by default, and `recent-turns` returns 4.
 
 The search tool in [Tools](tools.md) reads the same store and opens it only when `store-file-p` passes.
+It returns one line per hit from the `turns` view and one from the `memories` view; there is no separate episode section because both views read the same log.
 
-Search the transcript and the saved memories from the shell.
+Search the log from the shell.
 
 ```sh
 enchiridion memory "open ports"
+enchiridion memory status
 enchiridion sessions
 ```
 
-`memory` prints the memories section and the turns section with their counts, and `sessions` prints one line per stored session with its turn count.
-[Commands](commands.md) documents both commands.
+The search form of `memory` prints the memories section and the turns section with their counts.
+`memory status` prints the log counts and switches.
+`sessions` prints one line per stored session with its turn count.
+[Commands](commands.md) documents the commands.
 
 ## The ledger
 
@@ -359,7 +369,8 @@ The cursor lives on the supervisor, and the pass excludes the `:sleep` channel, 
 
 ## See also
 
-- [Supervisor and heartbeat](supervisor.md) for the tick that writes the blocks and runs compaction.
+- [Episodic memory](episodic-memory.md) for the episodic log and the cue pack.
+- [Supervisor and heartbeat](supervisor.md) for the tick that writes the blocks, runs maintenance, and runs compaction.
 - [Large language model backends](llm.md) for the scrubber that cleans every string before it reaches a column.
 - [Tools](tools.md) for the search tool and the memory tool that read the store.
 - [Commands](commands.md) for `blocks`, `memory`, `sessions`, `usage`, and `bootstrap`.

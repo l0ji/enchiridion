@@ -76,6 +76,7 @@ Each subsystem owns one package, and the package name follows the directory:
 ```text
 enchiridion              enchiridion.llm          enchiridion.memory
 enchiridion.compat       enchiridion.llm.secrets  enchiridion.memory.store
+                                                     enchiridion.memory
 enchiridion.errors       enchiridion.tools        enchiridion.channel
 enchiridion.git          enchiridion.tools.pipe   enchiridion.channel.cli
 enchiridion.kernel       enchiridion.tools.broker enchiridion.channel.http
@@ -97,7 +98,9 @@ Every `config.cl` begins with `(in-package #:enchiridion.user)`.
 1. `packages` and `compat`. The definitions come before every file that uses them, and `compat` is the only file with implementation-specific code.
 2. `config`, `git`, `errors`.
 3. `llm`: `secrets`, `protocol`, `json`, `http`, `registry`, `dialects`, `auth`, `openai`, `anthropic`, `aws-sigv4`, `bedrock`, `gcp-oauth`, `vertex`, `catalog`, `providers`.
-4. `memory`: `blocks`, `store`, `tiers`, `seed`, `state`.
+4. `memory`: `blocks`, `episodic-ddl`, `store`, `tiers`, `episodic`, `cue`, `episodic-hooks`, `generations`, `derive`, `seed`, `state`.
+   The DDL file is data only and loads before the store so `open-store` can create the whole schema in one transaction.
+   The memory model loads after the store and before the kernel, which is its caller.
 5. `tools`: `schema`, `registry`, `pipe`, `broker`, then the builtins `file`, `shell`, `search`, `blockops`, `memory`, `meta`, `web`, `register`.
 6. `plugin`: `loader`, `verify`, `manifest`.
 7. `channel`: `protocol`, `http`, `fluxer`.

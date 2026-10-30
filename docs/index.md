@@ -40,6 +40,7 @@ Part II, running the program:
 Part III, how it works inside:
 
 - [Memory](memory.md) covers the blocks, the seed files, the tiers, the store, and compaction.
+- [Episodic memory](episodic-memory.md) covers the episodic log, the cue pack, and the memory integration.
 - [Large language model backends](llm.md) covers the backends, the provider catalog, the token accounting, and the scrubber.
 - [Tools](tools.md) covers the schema, the registry, the pipe, the broker, and every built-in tool.
 - [Plugins and self-modification](plugins.md) covers the manifest, verification, and the extension surface.
@@ -71,7 +72,7 @@ A first installation follows [Getting started](getting-started.md), then [Config
 
 An operator who runs the program follows [Supervisor and heartbeat](supervisor.md), then [Channels](channels.md), then [Deployment](deployment.md).
 
-A reader of the internals follows [Memory](memory.md), then [Tools](tools.md), then [Large language model backends](llm.md), then [Plugins and self-modification](plugins.md).
+A reader of the internals follows [Memory](memory.md), then [Episodic memory](episodic-memory.md), then [Tools](tools.md), then [Large language model backends](llm.md), then [Plugins and self-modification](plugins.md).
 
 A developer starts at [Development](development.md), then [Testing](testing.md).
 

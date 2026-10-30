@@ -416,8 +416,10 @@ An unknown scope signals it with the detail `Unknown search scope ~A.`
 A `path` argument selects the file walk whatever `scope` says.
 
 The store scope opens the store only when the file is already a database, so a search never creates one.
-It returns one line per hit with the prefix `session SESSION ROLE` or `memory NAME`, and the body is flattened to one line and cut to 400 characters with ` ...` when it was longer.
+It returns one line per hit with the prefix `session SESSION ROLE`, `memory NAME` or `episode ID`, and the body is flattened to one line and cut to 400 characters with ` ...` when it was longer.
+The episode section reads the episodic log, so a pack that showed an L0 line can be followed to the whole body.
 No match returns `no matches`, and `memory.md` owns the store and its search rules.
+[Episodic memory](episodic-memory.md) owns the log.
 
 The file scope visits files with the extensions `md`, `txt`, `cl`, `lisp`, `json`, and `org`.
 It skips the directories `.git`, `node_modules`, `run`, and `cache`, visits at most 2000 files, and matches each line case-insensitively as `PATH:LINE: TEXT`.

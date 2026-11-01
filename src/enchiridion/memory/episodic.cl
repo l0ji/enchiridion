@@ -25,15 +25,25 @@
 
 (defparameter *memory-parameters*
   (list
-   ;; The score weights, in the proposal's evidence order.
-   :base-weight        1.00   ; the anchor: the only term with a verified equation
-   :spread-weight      0.80   ; cue-driven priming, second because it is cue-specific
+   ;; The score weights. B, S and D are 0 and L is 1 because that is what the
+   ;; LongMemEval-S benchmark measured (bench/README.md): over 470 questions,
+   ;; BM25 alone ranked an answer turn in the top ten for 86.4% of questions
+   ;; against 73.0% for the proposal's blend (McNemar p < 0.0001). Once every
+   ;; episode carried its real age, B at weight 1.00 fell to 42.1%; at 0.05 it
+   ;; changed nothing significant and at 0.20 it cost 7.9 points. S at 0.20
+   ;; lowered NDCG@10 by 2.3 points. The proposal's values are kept in the
+   ;; comments as the prior they replace. The other terms are constant across
+   ;; the benchmark's episodes, so it says nothing about them and they keep
+   ;; their invented values.
+   :base-weight        0.00   ; proposal 1.00; the ACT-R base level, recency and frequency
+   :spread-weight      0.00   ; proposal 0.80; priming over the lexical link graph
    :temporal-weight    0.60   ; the knowledge-update term the documented systems lose
    :importance-weight  0.50   ; write-time signal, down-weighted: least reliable class
    :cue-type-weight    0.50   ; transfer-appropriate processing
    :context-weight     0.40   ; helps when the cue is impoverished
    :inhibition-weight  0.35   ; a penalty; must be able to lose to activation
-   :distinct-weight    0.30   ; a tie-breaker, not a driver
+   :distinct-weight    0.00   ; proposal 0.30; a tie-breaker over the link graph
+   :lexical-weight     1.00   ; L, the FTS5 BM25 relevance, rank-normalised
    ;; The base-level equation.
    :decay              0.50   ; d
    :encoding-weight    0.50   ; lambda_E: retrieval practice outranks re-reading
@@ -52,7 +62,16 @@
    :supp-half-life     86400  ; one day
    ;; Retrieval.
    :link-fanout        4      ; lexical links written per new episode
-   :top-k              8      ; the pack size
+   :top-k              12     ; the pack size, before the character budget cuts it
+   :pack-line-chars    400    ; the characters one pack record shows
+   :pack-excerpt       :cue   ; :CUE the cue's window, or :HEAD the first paragraph
+   :pack-neighbours    0      ; turns either side of a hit, same session, to add
+   :pack-header        t      ; prefix each record with its date and role; with the
+                              ; cheap model answering, +9.4 points of LongMemEval-S
+                              ; accuracy, temporal questions 0.394 -> 0.701
+   :rerank-pool        30     ; candidates a configured reranker may reorder
+   :dense-candidates   200    ; nearest episodes an embedder adds as candidates
+   :rrf-k              60     ; reciprocal rank fusion constant, BM25 with dense
    :working-set-chars  8000   ; slot five's character budget
    :prune-below        -4.00  ; base level under which a DERIVED row retires
    :retained-kinds     (list "episode") ; never retired: the log is the substrate
@@ -70,9 +89,12 @@
 and the provenance of each default.")
 
 (defun parameter (key &optional (parameters *memory-parameters*))
-  "Return the value of KEY in PARAMETERS, or signal when it is absent."
-  (or (getf parameters key)
-      (error "The memory model has no parameter ~S." key)))
+  "Return the value of KEY in PARAMETERS, or signal when it is absent.
+A key present with the value NIL returns NIL; only a missing key signals."
+  (let ((value (getf parameters key '%absent)))
+    (if (eq value '%absent)
+        (error "The memory model has no parameter ~S." key)
+        value)))
 
 ;;;; ---------------------------------------------------------------------
 (defun table-names ()
@@ -550,35 +572,46 @@ A CONTRADICTS edge does not propagate activation: it sets the conflict flag on
 both of its endpoints instead.  Propagating along it would make a record easier
 to retrieve *because* something contradicts it, which is the opposite of what
 the conflict ledger is for."
+  ;; The frontier is a table from node to the amount that reached it this
+  ;; hop. Every gain is linear in the amount, so expanding a node once with
+  ;; the summed amount gives the same totals as expanding each path to it
+  ;; separately, and the cost is one expansion per node per hop rather than
+  ;; one per path, which grows as fan^hops.
   (let ((total (make-hash-table :test #'equal))
         (flagged (make-hash-table :test #'equal))
-        (frontier '()))
+        (frontier (make-hash-table :test #'equal)))
     (dolist (source sources)
       (let ((key (node (getf source :kind) (getf source :id)))
             (weight (float (or (getf source :weight) 1.0))))
         (incf (gethash key total 0.0) weight)
-        (push (cons key weight) frontier)))
+        (incf (gethash key frontier 0.0) weight)))
     (loop for hop from 1 to max-hops
-          for next = '()
-          do (dolist (entry frontier)
-               (destructuring-bind (key . amount) entry
-                 (dolist (edge (gethash key graph))
-                   (let ((target (node (link-dst-kind edge) (link-dst edge))))
-                     (if (string-equal (link-type edge) "contradicts")
-                         (progn (setf (gethash key flagged) t)
-                                (setf (gethash target flagged) t))
-                         (let* ((strength (associative-strength
-                                           graph (link-src-kind edge)
-                                           (link-src edge)
-                                           :max-associative max-associative))
-                                (weight (decayed-edge-weight
-                                         (link-weight edge) (link-updated-ts edge)
-                                         now :half-life half-life))
-                                (gain (* amount weight strength
-                                          (expt (float decay) hop))))
-                           (when (plusp gain)
-                             (incf (gethash target total 0.0) gain)
-                             (push (cons target gain) next))))))))
+          for next = (make-hash-table :test #'equal)
+          for damping = (expt (float decay) hop)
+          do (maphash
+              (lambda (key amount)
+                (let ((edges (gethash key graph)))
+                  (when edges
+                    ;; Every edge leaving KEY shares its source, so the
+                    ;; associative strength is computed once per node.
+                    (let ((strength (associative-strength
+                                     graph (car key) (cdr key)
+                                     :max-associative max-associative)))
+                      (dolist (edge edges)
+                        (let ((target (node (link-dst-kind edge) (link-dst edge))))
+                          (if (string-equal (link-type edge) "contradicts")
+                              (progn (setf (gethash key flagged) t)
+                                     (setf (gethash target flagged) t))
+                              (let ((gain (* amount
+                                             (decayed-edge-weight
+                                              (link-weight edge)
+                                              (link-updated-ts edge)
+                                              now :half-life half-life)
+                                             strength damping)))
+                                (when (plusp gain)
+                                  (incf (gethash target total 0.0) gain)
+                                  (incf (gethash target next 0.0) gain))))))))))
+              frontier)
              (setf frontier next))
     (setf (gethash :conflict-flag total) flagged)
     total))
@@ -608,7 +641,7 @@ the conflict ledger is for."
                                 (&key (base 0.0) (spread 0.0) (temporal 0.0)
                                       (importance 0.0) (cue-type 0.0)
                                       (context 0.0) (inhibition 0.0)
-                                      (distinct 0.0))))
+                                      (distinct 0.0) (lexical 0.0))))
   (base 0.0 :type real)        ; B_i, ACT-R base level: recency and frequency
   (spread 0.0 :type real)      ; S_i, spreading activation over the link graph
   (temporal 0.0 :type real)    ; T-hat, +1 / 0 / -1, signed, not normalised
@@ -616,7 +649,8 @@ the conflict ledger is for."
   (cue-type 0.0 :type real)    ; P-hat, 1 / 0.5 / 0
   (context 0.0 :type real)     ; C-hat, 1 / 0.5 / 0
   (inhibition 0.0 :type real)  ; X-hat, supp in 0..1
-  (distinct 0.0 :type real))   ; D-hat, 1 - fan_i / max(fan)
+  (distinct 0.0 :type real)    ; D-hat, 1 - fan_i / max(fan)
+  (lexical 0.0 :type real))    ; L-hat, BM25 relevance to the cue
 
 (defun rank-normalise (values)
   "Return VALUES mapped onto [0, 1] by rank, preserving ties.
@@ -649,14 +683,17 @@ tie-break stays possible, which the prompt prefix cache requires."
        (coerce out 'list)))))
 
 (defun normalise-terms (term-list)
-  "Return TERM-LIST with the two unbounded terms rank-normalised in place."
+  "Return TERM-LIST with the three unbounded terms rank-normalised in place."
   (let ((bases (rank-normalise (mapcar #'terms-base term-list)))
-        (spreads (rank-normalise (mapcar #'terms-spread term-list))))
+        (spreads (rank-normalise (mapcar #'terms-spread term-list)))
+        (lexicals (rank-normalise (mapcar #'terms-lexical term-list))))
     (loop for term in term-list
           for base in bases
           for spread in spreads
+          for lexical in lexicals
           do (setf (terms-base term) base
-                   (terms-spread term) spread))
+                   (terms-spread term) spread
+                   (terms-lexical term) lexical))
     term-list))
 
 (defun retrieval-score (terms &optional (parameters *memory-parameters*))
@@ -673,7 +710,8 @@ fitting procedure that replaces them."
      (* (parameter :cue-type-weight parameters) (terms-cue-type terms))
      (* (parameter :context-weight parameters) (terms-context terms))
      (* (- (parameter :inhibition-weight parameters)) (terms-inhibition terms))
-     (* (parameter :distinct-weight parameters) (terms-distinct terms))))
+     (* (parameter :distinct-weight parameters) (terms-distinct terms))
+     (* (parameter :lexical-weight parameters) (terms-lexical terms))))
 
 (defun retrieval-probability (score &key (threshold 0.0) (noise 0.4))
   "Return 1 / (1 + exp( -( score - tau ) / s )), the ACT-R logistic.
@@ -744,7 +782,8 @@ score is computed here from stored fields; none is inferred."
                                (or (getf item :cue-type-implied) "episodic"))
      :context (context-match (getf item :context) context)
      :inhibition (decay-inhibition record now :parameters parameters)
-     :distinct (distinctiveness graph key candidate-keys max-fan))))
+     :distinct (distinctiveness graph key candidate-keys max-fan)
+     :lexical (float (or (getf item :lexical) 0.0)))))
 
 (defun retrieve (candidates cue context &key (parameters *memory-parameters*)
                                          (graph (make-hash-table :test #'equal))
@@ -827,6 +866,8 @@ changed."
     (loop for row in (enchiridion.memory.store:query-rows
                       store
                       "SELECT e.id, e.body, e.session, e.channel, e.cue_type,
+                              e.role, e.ts,
+                              bm25(episodes_fts) AS lexical,
                               e.context_key, e.horizon, e.scene_trace,
                               a.n_enc, a.last_enc, a.n_ret, a.last_ret,
                               a.created_ts, a.supp, a.supp_ts, a.imp,
@@ -849,11 +890,17 @@ changed."
           :id id
           :body (enchiridion.memory.store:field row "body")
           :session (enchiridion.memory.store:field row "session")
+          :role (enchiridion.memory.store:field row "role")
+          :ts (enchiridion.memory.store:field row "ts")
           :project (first (split-context-key
                            (enchiridion.memory.store:field row "context_key")))
           :context (split-context-key
                     (enchiridion.memory.store:field row "context_key"))
           :cue-type (enchiridion.memory.store:field row "cue_type")
+          ;; FTS5's bm25() is smaller for a better match, so it is negated:
+          ;; every other term is larger-is-better.
+          :lexical (let ((bm25 (enchiridion.memory.store:field row "lexical")))
+                     (if bm25 (- (float bm25)) 0.0))
           :valid-from nil
           :valid-to nil
           :activation
@@ -1142,10 +1189,14 @@ the new EPISODE, or NIL when the capture filter refused the text."
     (let ((id (enchiridion.memory.store:last-row-id store)))
       (enchiridion.memory.store:exec
        store
-       "INSERT OR IGNORE INTO activation
+       ;; The insert trigger has already written a default row; the
+       ;; encoding filter's importance and rarity replace its values.
+       "INSERT INTO activation
           (kind, id, n_enc, last_enc, n_ret, last_ret, created_ts,
            supp, supp_ts, imp, distinctness)
-          VALUES ('episode', ?, 1, ?, 0, NULL, ?, 0.0, NULL, ?, ?)"
+          VALUES ('episode', ?, 1, ?, 0, NULL, ?, 0.0, NULL, ?, ?)
+          ON CONFLICT (kind, id) DO UPDATE
+            SET imp = excluded.imp, distinctness = excluded.distinctness"
        (list id ts ts (importance-from-depth depth) rarity))
       (when derive-p
         (link-co-occurrences store id body ts parameters))

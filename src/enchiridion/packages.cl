@@ -271,7 +271,7 @@ did not think of."))
    ;; Score terms and the required implementations.
    #:terms #:make-terms #:terms-base #:terms-spread #:terms-temporal
    #:terms-importance #:terms-cue-type #:terms-context #:terms-inhibition
-   #:terms-distinct #:retrieval-score #:retrieval-probability
+   #:terms-distinct #:terms-lexical #:retrieval-score #:retrieval-probability
    #:retrieval-latency #:rank-normalise #:normalise-terms
    #:base-level #:base-level-exact #:base-level-approx #:base-level-forms
    #:associative-strength #:fan #:edge-weight #:decayed-edge-weight
@@ -300,15 +300,16 @@ did not think of."))
    #:+working-set-budget+ #:+push-max-fraction+
    ;; Integration entry points. Defined in later files; exported here so the
    ;; kernel and the command table have one visible interface.
-   #:retrieve-for-turn #:record-retrieval
+   #:retrieve-for-turn #:retrieve-rows-for-turn #:record-retrieval
    #:record-retrieval-outcome #:maintenance
    #:build-candidate #:promote-generation #:rollback-generation
    #:start-candidate #:generation-status #:generation-assertion-count
    #:live-assertion-count #:current-generation #:ensure-generation-state
-   #:rebuild-derived #:resolve-conflict-at-action #:forget-session
+   #:rebuild-derived #:graph-terms-on-p #:resolve-conflict-at-action #:forget-session
    #:add-intention #:list-intentions #:cancel-intention
    #:propose-change #:memory-status
-   #:live-generation-id #:with-generation #:render-pack)
+   #:live-generation-id #:with-generation #:render-pack #:pack-rows #:select-pack-rows
+   #:*memory-reranker* #:make-model-reranker #:rerank-rows #:parse-rerank-reply)
   (:documentation
    "Memory blocks, the operator seed files that back the first three of them,
 the three loading tiers, the bootstrap state machine, and the episodic log

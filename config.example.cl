@@ -189,6 +189,7 @@
     (:enabled t)
     (:retrieve t)
     (:push nil)
+    (:rerank nil)
     (:record-sleep t)
     (:pack-chars 4450)
     (:push-max-fraction 0.5)

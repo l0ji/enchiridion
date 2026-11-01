@@ -69,7 +69,8 @@ references.")
    "CREATE UNIQUE INDEX IF NOT EXISTS episodes_source_memory
       ON episodes(source_memory_id) WHERE source_memory_id IS NOT NULL"
    "CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts
-      USING fts5(body, content='episodes', content_rowid='id')"
+      USING fts5(body, content='episodes', content_rowid='id',
+                 tokenize='porter unicode61')"
    "CREATE TRIGGER IF NOT EXISTS episodes_ai AFTER INSERT ON episodes BEGIN
       INSERT INTO episodes_fts(rowid, body) VALUES (new.id, new.body);
     END"
@@ -97,6 +98,35 @@ references.")
       imp         INTEGER NOT NULL DEFAULT 5,
       distinctness REAL   NOT NULL DEFAULT 0.0,
       PRIMARY KEY (kind, id))"
+
+   ;; Every episode gets its activation row when it is written, whoever
+   ;; writes it. Without one the candidate query found no row, every episode
+   ;; was scored as created now with one encoding, and the base-level term was
+   ;; the same for every candidate, so recency and frequency did nothing. The
+   ;; write time is the episode's own TS. An explicit save is the owner saying
+   ;; the text matters, so it starts at the importance a depth-2 encoding gets;
+   ;; a turn starts at the depth-0 value. WRITE-EPISODE overwrites both with
+   ;; what its encoding filter computed.
+   "CREATE TRIGGER IF NOT EXISTS episodes_activation AFTER INSERT ON episodes BEGIN
+      INSERT OR IGNORE INTO activation
+        (kind, id, n_enc, last_enc, n_ret, last_ret, created_ts,
+         supp, supp_ts, imp, distinctness)
+        VALUES ('episode', new.id, 1, new.ts, 0, NULL, new.ts, 0.0, NULL,
+                CASE new.role WHEN 'memory' THEN 7 ELSE 3 END, 0.0);
+    END"
+   ;; A deleted episode takes its activation with it, so a forgotten session
+   ;; leaves no score row that a later id could inherit.
+   "CREATE TRIGGER IF NOT EXISTS episodes_activation_ad AFTER DELETE ON episodes BEGIN
+      DELETE FROM activation WHERE kind = 'episode' AND id = old.id;
+    END"
+   ;; The rows a store written before the trigger never got. Running it again
+   ;; changes nothing.
+   "INSERT OR IGNORE INTO activation
+      (kind, id, n_enc, last_enc, n_ret, last_ret, created_ts,
+       supp, supp_ts, imp, distinctness)
+      SELECT 'episode', id, 1, ts, 0, NULL, ts, 0.0, NULL,
+             CASE role WHEN 'memory' THEN 7 ELSE 3 END, 0.0
+        FROM episodes"
 
    "CREATE TABLE IF NOT EXISTS cue_index (
       term      TEXT    NOT NULL,

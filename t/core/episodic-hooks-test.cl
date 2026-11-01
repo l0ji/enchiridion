@@ -142,3 +142,182 @@
              (ok (enchiridion.memory:push-enabled-p))))
       (enchiridion.memory:configure-memory
        (enchiridion:default-config)))))
+
+
+(deftest every-episode-gets-an-activation-row-from-its-own-time ()
+  (with-store (store directory)
+    (let ((old (enchiridion.memory.store:record-turn
+                store :session "s" :role "user" :body "the old plan" :ts 1000))
+          (memory (enchiridion.memory.store:save-memory
+                   store "note" "the saved plan" :ts 2000)))
+      (testing "a turn's row starts at its write time with one encoding"
+        (let ((row (first (enchiridion.memory.store:query-rows
+                           store "SELECT * FROM activation WHERE kind = 'episode' AND id = ?"
+                           (list (enchiridion.memory.store:turn-row-id old))))))
+          (ok (= 1000 (enchiridion.memory.store:field row "created_ts")))
+          (ok (= 1 (enchiridion.memory.store:field row "n_enc")))
+          (ok (= 3 (enchiridion.memory.store:field row "imp")))))
+      (testing "a saved memory starts more important than a turn"
+        (ok (= 7 (count-rows store "SELECT imp AS n FROM activation
+                                     WHERE kind = 'episode' AND id = ?"
+                             (list memory)))))
+      (testing "the candidate carries the stored write time, so age can rank"
+        (let ((candidate (first (enchiridion.memory:candidates-for
+                                 store "old plan" :now 5000))))
+          (ok (= 1000 (enchiridion.memory::activation-created-ts
+                       (getf candidate :activation))))))
+      (testing "deleting the session removes its activation rows"
+        (enchiridion.memory.store:delete-session store "s")
+        (ok (= 0 (count-rows store "SELECT COUNT(*) AS n FROM activation
+                                     WHERE kind = 'episode' AND id = ?"
+                             (list (enchiridion.memory.store:turn-row-id old)))))))))
+
+(deftest a-store-without-activation-rows-is-backfilled-on-open ()
+  (multiple-value-bind (store directory) (scratch-store)
+    (unwind-protect
+         (let ((path (enchiridion.memory.store:store-path store)))
+           (enchiridion.memory.store:record-turn store :session "s" :body "kept text" :ts 42)
+           ;; A store from before the trigger: no activation row, version 1.
+           (enchiridion.memory.store::exec store "DELETE FROM activation")
+           (enchiridion.memory.store::set-schema-version store 1)
+           (enchiridion.memory.store:close-store store)
+           (setf store (enchiridion.memory.store:open-store :path path))
+           (ok (= 42 (count-rows store "SELECT created_ts AS n FROM activation")))
+           (ok (= enchiridion.memory.store::+schema-version+
+                  (enchiridion.memory.store::schema-version store))))
+      (ignore-errors (enchiridion.memory.store:close-store store))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(deftest a-candidate-carries-its-bm25-relevance ()
+  (with-store (store directory)
+    (enchiridion.memory.store:record-turn
+     store :session "s" :body "zebra zebra zebra stripes")
+    (enchiridion.memory.store:record-turn
+     store :session "s" :body "a long note that mentions a zebra once among many other words about the weather and the road and the town")
+    (let* ((candidates (enchiridion.memory:candidates-for store "zebra stripes"))
+           (scores (mapcar (lambda (c) (getf c :lexical)) candidates)))
+      (testing "every candidate has a score and the closer match scores higher"
+        (ok (= 2 (length candidates)))
+        (ok (every #'realp scores))
+        (ok (> (getf (find-if (lambda (c) (search "stripes" (getf c :body))) candidates)
+                     :lexical)
+               (getf (find-if (lambda (c) (search "weather" (getf c :body))) candidates)
+                     :lexical)))))
+    (testing "with only the lexical weight, the closer match ranks first"
+      (let* ((enchiridion.memory:*memory-parameters*
+               (let ((p (copy-list enchiridion.memory:*memory-parameters*)))
+                 (dolist (key '(:base-weight :spread-weight :temporal-weight
+                                :importance-weight :cue-type-weight :context-weight
+                                :inhibition-weight :distinct-weight)
+                               p)
+                   (setf (getf p key) 0.0))
+                 (setf (getf p :lexical-weight) 1.0)
+                 p))
+             (rows (enchiridion.memory:retrieve-rows-for-turn store "zebra stripes")))
+        (ok (search "stripes" (getf (getf (first rows) :item) :body)))))))
+
+(deftest a-cue-excerpt-shows-the-matching-middle-of-a-long-record ()
+  (let* ((filler (format nil "~{~A~^ ~}" (make-list 120 :initial-element "weather")))
+         (body (format nil "~A I graduated with a degree in Business Administration. ~A"
+                       filler filler))
+         (rows (list (list :item (list :kind "episode" :id 1 :body body)))))
+    (testing "the head excerpt misses a fact in the middle"
+      (let ((enchiridion.memory:*memory-parameters*
+              (list* :pack-excerpt :head enchiridion.memory:*memory-parameters*)))
+        (ok (null (search "Business" (enchiridion.memory:render-pack
+                                      rows :cue "what degree did I graduate with"))))))
+    (testing "the cue excerpt shows it, marked as cut on both sides"
+      (let* ((enchiridion.memory:*memory-parameters*
+               (list* :pack-excerpt :cue enchiridion.memory:*memory-parameters*))
+             (pack (enchiridion.memory:render-pack
+                    rows :cue "what degree did I graduate with")))
+        (ok (search "Business Administration" pack))
+        (ok (search "…" pack))
+        (ok (<= (length pack) (+ 400 120)))))
+    (testing "the second value is the rows the budget let in"
+      (multiple-value-bind (pack included)
+          (enchiridion.memory:render-pack (append rows rows) :budget 500)
+        (ok pack)
+        (ok (= 1 (length included)))))))
+
+(defmacro with-parameters ((&rest overrides) &body body)
+  `(let ((enchiridion.memory:*memory-parameters*
+           (list* ,@overrides enchiridion.memory:*memory-parameters*)))
+     ,@body))
+
+(deftest maintenance-writes-links-only-when-a-term-reads-them ()
+  (with-store (store directory)
+    (enchiridion.memory.store:record-turn store :session "s" :body "red kite over the hill")
+    (enchiridion.memory.store:record-turn store :session "s" :body "a red kite again")
+    (testing "with the graph terms at 0, episodes are derived and no link is written"
+      (with-parameters (:spread-weight 0.0 :distinct-weight 0.0)
+        (ok (= 2 (getf (enchiridion.memory:maintenance store) :derived)))
+        (ok (= 0 (count-rows store "SELECT COUNT(*) AS n FROM links")))))
+    (testing "turning spread on and rebuilding derives the links"
+      (with-parameters (:spread-weight 0.5)
+        (ok (= 2 (enchiridion.memory:rebuild-derived store)))
+        (ok (= 2 (getf (enchiridion.memory:maintenance store) :derived)))
+        (ok (plusp (count-rows store "SELECT COUNT(*) AS n FROM links")))))))
+
+(deftest a-pack-can-carry-dates-roles-and-neighbouring-turns ()
+  (with-store (store directory)
+    (enchiridion.memory.store:record-turn store :session "s" :role "user"
+                                          :body "where should I park" :ts 3900000000)
+    (enchiridion.memory.store:record-turn store :session "s" :role "assistant"
+                                          :body "the blue garage on fifth" :ts 3900000060)
+    (enchiridion.memory.store:record-turn store :session "t" :role "user"
+                                          :body "unrelated text" :ts 3900000120)
+    (with-parameters (:pack-neighbours 1 :pack-header t)
+      (let* ((rows (enchiridion.memory:retrieve-rows-for-turn store "blue garage"))
+             (expanded (enchiridion.memory:pack-rows store rows))
+             (pack (enchiridion.memory:render-pack expanded :cue "blue garage")))
+        (testing "the hit comes first and its session neighbour follows it"
+          (ok (= 1 (length rows)))
+          (ok (= 2 (length expanded)))
+          (ok (search "garage" (getf (getf (first expanded) :item) :body)))
+          (ok (search "park" (getf (getf (second expanded) :item) :body))))
+        (testing "a turn from another session is not a neighbour"
+          (ok (null (search "unrelated" pack))))
+        (testing "each record shows its UTC date and role after the ref tag"
+          (ok (search "] (2023-08-02, assistant) the blue garage" pack))
+          (ok (search "] (2023-08-02, user) where should I park" pack)))))
+    (testing "with both off, the pack is what it was"
+      (with-parameters (:pack-neighbours 0 :pack-header nil)
+        (let ((rows (enchiridion.memory:retrieve-rows-for-turn store "blue garage")))
+          (ok (equal rows (enchiridion.memory:pack-rows store rows)))
+          (ok (search "[ref episode-2] the blue garage"
+                      (enchiridion.memory:render-pack rows :cue "blue garage"))))))))
+
+(deftest a-reranker-only-reorders-and-a-failure-changes-nothing ()
+  (let ((rows (loop for i from 1 to 5
+                    collect (list :item (list :kind "episode" :id i
+                                              :body (format nil "record ~D" i))))))
+    (flet ((ids (rows) (mapcar (lambda (r) (getf (getf r :item) :id)) rows)))
+      (testing "the named rows come first, in the reranker's order, nothing is lost"
+        (ok (equal '(4 2 1 3 5)
+                   (ids (enchiridion.memory:rerank-rows
+                         rows "q" :pool 5
+                         :reranker (lambda (cue bodies)
+                                     (declare (ignore cue bodies))
+                                     (enchiridion.memory:parse-rerank-reply "4, 2, 2, 9" 5)))))))
+      (testing "rows past the pool keep their place"
+        (ok (equal '(2 1 3 4 5)
+                   (ids (enchiridion.memory:rerank-rows
+                         rows "q" :pool 3
+                         :reranker (lambda (cue bodies)
+                                     (declare (ignore cue bodies))
+                                     '(1)))))))
+      (testing "an error or an empty reply keeps the score order"
+        (let ((*error-output* (make-broadcast-stream)))
+          (ok (equal '(1 2 3 4 5)
+                     (ids (enchiridion.memory:rerank-rows
+                           rows "q" :pool 5
+                           :reranker (lambda (cue bodies)
+                                       (declare (ignore cue bodies))
+                                       (error "timeout")))))))
+        (ok (equal '(1 2 3 4 5)
+                   (ids (enchiridion.memory:rerank-rows
+                         rows "q" :pool 5
+                         :reranker (lambda (cue bodies)
+                                     (declare (ignore cue bodies))
+                                     (enchiridion.memory:parse-rerank-reply "none" 5))))))))))

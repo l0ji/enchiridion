@@ -470,6 +470,12 @@ sentence above says no socket rather than no network."
           (when backend
             (enchiridion.memory:make-model-assertion-deriver
              backend :model (enchiridion:model-for :cheap))))
+    ;; The reranker is on the turn path, so it is installed only when the
+    ;; :memory section asks for it.
+    (setf enchiridion.memory:*memory-reranker*
+          (when (and backend enchiridion.memory::*memory-rerank-p*)
+            (enchiridion.memory:make-model-reranker
+             backend :model (enchiridion:model-for :cheap))))
     (enchiridion.tools.builtin:register-builtin-tools)
     (%make-context :directory directory
                    :config config

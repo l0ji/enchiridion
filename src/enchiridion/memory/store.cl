@@ -378,14 +378,33 @@ that, because it is not text to a parser and NOT a term to match."
 
 ;;;; Opening and closing.
 
-(defparameter +schema-version+ 1
+(defparameter +schema-version+ 3
   "The schema version a store records in PRAGMA user_version once it is built.
 
 Every statement in +SCHEMA+ is CREATE ... IF NOT EXISTS, which adds a missing
 table but never a missing column. A change that alters an existing table bumps
 this number and adds its step to OPEN-STORE, keyed on the version a store
 reports, so an old store is brought forward once rather than failing on a
-column it never got.")
+column it never got.
+
+Version 2 adds the activation triggers and the activation backfill. Both are
+in +SCHEMA+, so a version-1 store only has to run the schema once more.
+
+Version 3 indexes episodes with the porter stemmer. SQLite cannot change an
+FTS5 table's tokenizer, so DROP-UNSTEMMED-INDEX drops an older index, the
+schema creates the new one, and the index is rebuilt from EPISODES.")
+
+(defun drop-unstemmed-index (store)
+  "Drop EPISODES_FTS when it exists without the porter tokenizer and return T,
+so the caller rebuilds it once the schema has recreated it. The index is
+external content: EPISODES keeps every body, so nothing is lost."
+  (let ((sql (field (first (query-rows store
+                                       "SELECT sql FROM sqlite_master
+                                         WHERE name = 'episodes_fts'"))
+                    "sql")))
+    (when (and sql (not (search "porter" sql)))
+      (exec store "DROP TABLE episodes_fts")
+      t)))
 
 (declaim (ftype (function (store) integer) schema-version))
 
@@ -458,8 +477,11 @@ not an exposure."
       (unless (schema-current-p store)
         (handler-case
             (with-store-transaction (store)
-              (dolist (statement +schema+)
-                (exec store statement)))
+              (let ((reindex (drop-unstemmed-index store)))
+                (dolist (statement +schema+)
+                  (exec store statement))
+                (when reindex
+                  (exec store "INSERT INTO episodes_fts(episodes_fts) VALUES ('rebuild')"))))
           (error (condition)
             (ignore-errors (dbi:disconnect connection))
             (error 'enchiridion.errors:configuration-error

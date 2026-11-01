@@ -132,3 +132,45 @@ assertions, not a signal, so one bad answer cannot take the builder down."
                (enchiridion.llm:completion-text completion)
                episode)
               nil))))
+
+;;;; Reranking. One cheap-model call reorders the best few candidates. The
+;;;; call is on the interactive path, so it is off unless the configuration
+;;;; turns it on, and every failure falls back to the score's own order.
+
+(defparameter +rerank-brief+
+  "You rank retrieved records for a question. Each record is numbered. Reply
+with the numbers of the records that help answer the question, most helpful
+first, separated by commas. Leave out records that do not help. Reply with
+numbers only, or with the word none.")
+
+(defun parse-rerank-reply (text count)
+  "Return the distinct indices 0..COUNT-1 named in TEXT, in the order given.
+The model numbers records from 1."
+  (let ((seen '()))
+    (dolist (match (cl-ppcre:all-matches-as-strings "\\d+" (or text "")))
+      (let ((index (1- (parse-integer match))))
+        (when (and (< -1 index count) (not (member index seen)))
+          (push index seen))))
+    (nreverse seen)))
+
+(defun make-model-reranker (backend &key model (chars 300))
+  "Return a reranker that asks BACKEND to order records. Each body is cut to
+CHARS characters around the cue, the same window the pack shows."
+  (lambda (cue bodies)
+    (let* ((tokens (remove-duplicates (tokenise cue) :test #'string=))
+           (listing (with-output-to-string (out)
+                      (loop for body in bodies
+                            for n from 1
+                            do (multiple-value-bind (start end)
+                                   (cue-window body tokens chars)
+                                 (format out "~D. ~A~%" n
+                                         (substitute #\Space #\Newline
+                                                     (subseq body start end)))))))
+           (completion (enchiridion.llm:complete
+                        backend
+                        (list (enchiridion.llm:system-message +rerank-brief+)
+                              (enchiridion.llm:user-message
+                               (format nil "Question: ~A~%~%~A" cue listing)))
+                        :model model)))
+      (parse-rerank-reply (enchiridion.llm:completion-text completion)
+                          (length bodies)))))

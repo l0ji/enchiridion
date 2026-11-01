@@ -624,3 +624,30 @@ itself is what proves the trigger ran."
                       rebuilt :session "s" :role "user" :body "back again"))
                  (enchiridion.memory.store:close-store rebuilt)))))
       (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(deftest an-unstemmed-index-is-rebuilt-with-the-stemmer ()
+  (let* ((directory (scratch-directory))
+         (path (merge-pathnames "memory.db" directory))
+         (store (enchiridion.memory.store:open-store :path path)))
+    (unwind-protect
+         (progn
+           (enchiridion.memory.store:record-turn store :session "s"
+                                                       :body "we parked by the river")
+           ;; A store from before version 3: the same index, no stemmer.
+           (enchiridion.memory.store::exec store "DROP TABLE episodes_fts")
+           (enchiridion.memory.store::exec
+            store "CREATE VIRTUAL TABLE episodes_fts
+                     USING fts5(body, content='episodes', content_rowid='id')")
+           (enchiridion.memory.store::exec
+            store "INSERT INTO episodes_fts(episodes_fts) VALUES ('rebuild')")
+           (enchiridion.memory.store::set-schema-version store 2)
+           (ok (null (enchiridion.memory.store:search-sessions store "parking")))
+           (enchiridion.memory.store:close-store store)
+           (setf store (enchiridion.memory.store:open-store :path path))
+           (testing "the reopened store finds the old row through a stemmed word"
+             (ok (= 1 (length (enchiridion.memory.store:search-sessions store "parking")))))
+           (testing "a new row is indexed by the recreated index"
+             (enchiridion.memory.store:record-turn store :session "s" :body "rivers rise")
+             (ok (= 2 (length (enchiridion.memory.store:search-sessions store "river"))))))
+      (ignore-errors (enchiridion.memory.store:close-store store))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))

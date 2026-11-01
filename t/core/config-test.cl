@@ -102,6 +102,11 @@
                (enchiridion:configured-secret-names
                 '(:llm (:api-key-env "")
                   :channels (:http (:enabled t) (:token-env "")))))))
+  (testing "the dense retrieval key is a configured secret too"
+    (ok (member "MY_EMBED_KEY"
+                (enchiridion:configured-secret-names
+                 '(:memory (:embed t) (:embed-key-env "MY_EMBED_KEY")))
+                :test #'string=)))
   (testing "a name repeated in two places is collected once"
     (let ((config '(:llm (:api-key-env "SAME_NAME")
                     :channels (:http (:enabled t) (:token-env "SAME_NAME")))))

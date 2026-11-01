@@ -314,7 +314,10 @@ one kind the shape filter cannot catch."
   (let ((names '()))
     (dolist (name (list (config-value config :api-key-env)
                         (getf (channel-config :fluxer config) :token-env)
-                        (getf (channel-config :http config) :token-env)))
+                        (getf (channel-config :http config) :token-env)
+                        ;; Dense retrieval's key, which may belong to a
+                        ;; provider other than the chat one.
+                        (config-section-value config :memory :embed-key-env nil)))
       (when (and (stringp name) (plusp (length name)))
         (pushnew name names :test #'string=)))
     (nreverse names)))

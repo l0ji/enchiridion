@@ -179,6 +179,13 @@ and a tier is never a security decision."
    "Ask this backend to continue MESSAGES. MODEL names the model to use and NIL
 means the backend's own default. Return a COMPLETION."))
 
+(defgeneric embed (this texts &key model dimensions)
+  (:documentation
+   "Return one embedding per string in TEXTS, in order, each a vector of
+SINGLE-FLOAT. MODEL names the embedding model. DIMENSIONS, when an integer,
+asks a model that supports truncation for that many components. A backend
+whose wire has no embeddings endpoint signals."))
+
 (defgeneric model-capabilities (this)
   (:documentation
    "Return a plist describing what this backend's models support: :TOOLS,

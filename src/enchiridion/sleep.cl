@@ -456,6 +456,15 @@ session block."
                         (format nil "~D episode~:P derived"
                                 (getf report :derived)))
                        (t nil))))))
+      (when (and store enchiridion.memory:*memory-embedder*)
+        ;; Dense vectors, when an embedder is configured. This one calls a
+        ;; model, so it is a separate step: a failed call reports here and the
+        ;; same episodes are tried on the next tick.
+        (attempt "memory embedding"
+                 (lambda ()
+                   (let ((written (enchiridion.memory:embed-pending store)))
+                     (when (plusp written)
+                       (format nil "~D episode~:P embedded" written))))))
       (when store
         (attempt "the harness blocks"
                  (lambda ()

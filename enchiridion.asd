@@ -96,6 +96,9 @@
          ;; the kernel, which are its callers.
          (:file "tiers")
          (:file "episodic")
+         ;; Dense candidates. After the scorer, whose candidate shape it
+         ;; reuses, and before the hooks, which call it.
+         (:file "vectors")
          (:file "cue")
          (:file "episodic-hooks")
          (:file "generations")

@@ -530,6 +530,61 @@ reply may be, and the reply cap comes from the provider's own option."
                    (or model (openai-connection-model connection))
                    :tools tools))
 
+;;;; Embeddings. The same base URL, key and auth scheme as the chat path, with
+;;;; the embeddings path appended. One request carries every text given; the
+;;;; caller batches.
+
+(defun embedding-request (model texts dimensions)
+  "Return the JSON body of one embeddings request."
+  (let ((body (make-hash-table :test #'equal)))
+    (setf (gethash "model" body) model
+          (gethash "input" body) (coerce texts 'vector))
+    (when (integerp dimensions)
+      (setf (gethash "dimensions" body) dimensions))
+    (com.inuoe.jzon:stringify body)))
+
+(defun parse-embeddings (data count)
+  "Return the COUNT vectors in DATA, an embeddings reply, ordered by index."
+  (let ((out (make-array count :initial-element nil)))
+    (dolist (entry (getf data :data))
+      (let ((index (getf entry :index))
+            (values (getf entry :embedding)))
+        (when (and (integerp index) (< -1 index count))
+          (setf (aref out index)
+                (map '(simple-array single-float (*))
+                     (lambda (x) (coerce x 'single-float))
+                     values)))))
+    (when (some #'null out)
+      (error 'enchiridion.errors:backend-error
+             :backend "openai"
+             :detail (format nil "The embeddings reply returned ~D of ~D vectors."
+                             (count-if-not #'null out) count)))
+    (coerce out 'list)))
+
+(defmethod embed ((connection openai-connection) texts &key model dimensions)
+  "Embed TEXTS through the connection's embeddings endpoint."
+  (if (null texts)
+      '()
+      (let* ((dialect (openai-connection-dialect connection))
+             (request (make-http-request
+                       :url (concatenate 'string
+                                         (openai-connection-base-url connection)
+                                         "embeddings")
+                       :body (embedding-request model texts dimensions)
+                       :timeout (openai-connection-timeout connection))))
+        (parse-embeddings
+         (parse-json
+          (post-with-retries
+           *http-post-function*
+           (auth-apply dialect
+                       (openai-connection-api-key connection)
+                       request
+                       :extra (openai-headers
+                               (openai-connection-session-id connection)
+                               (openai-connection-headers connection)))
+           (openai-connection-retries connection)))
+         (length texts)))))
+
 ;;;; The adapter.
 ;;;;
 ;;;; The provider table hands over an already resolved PROVIDER: endpoint, key,

@@ -288,6 +288,66 @@
           (ok (search "[ref episode-2] the blue garage"
                       (enchiridion.memory:render-pack rows :cue "blue garage"))))))))
 
+(deftest a-vector-survives-the-blob-round-trip ()
+  (let* ((v (enchiridion.memory::normalise-vector #(3.0 4.0 0.0 -1.5)))
+         (back (enchiridion.memory:decode-vector (enchiridion.memory:encode-vector v))))
+    (ok (= 16 (length (enchiridion.memory:encode-vector v))))
+    (ok (every #'= v back))
+    (ok (< (abs (- 1.0 (enchiridion.memory::dot back back))) 1e-5))))
+
+(deftest the-embeddings-wire-returns-vectors-in-input-order ()
+  (let* ((sent nil)
+         (enchiridion.llm::*http-post-function*
+           (lambda (request)
+             (setf sent request)
+             ;; Out of order on purpose: the index decides the position.
+             "{\"data\":[{\"index\":1,\"embedding\":[0.0,1.0]},
+                         {\"index\":0,\"embedding\":[1.0,0.0]}]}"))
+         (vectors (enchiridion.llm:embed
+                   (enchiridion.llm:openai-backend :api-key "test-key")
+                   '("first" "second") :model "emb-model" :dimensions 2)))
+    (ok (= 2 (length vectors)))
+    (ok (= 1.0 (aref (first vectors) 0)))
+    (ok (= 1.0 (aref (second vectors) 1)))
+    (ok (search "embeddings" (enchiridion.llm::http-request-url sent)))
+    (ok (search "\"dimensions\":2" (enchiridion.llm::http-request-body sent)))))
+
+(defun fake-embedder (texts)
+  "Map a text to a two-dimensional vector by meaning, for the test only: the
+car words and the vehicle words land together, everything else apart."
+  (mapcar (lambda (text)
+            (if (or (search "car" text) (search "vehicle" text) (search "sedan" text))
+                (vector 1.0 0.0)
+                (vector 0.0 1.0)))
+          texts))
+
+(deftest dense-candidates-reach-a-paraphrase-bm25-cannot ()
+  (with-store (store directory)
+    (enchiridion.memory.store:record-turn store :session "s" :body "I bought a used sedan last week")
+    (enchiridion.memory.store:record-turn store :session "s" :body "the weather was cold and grey")
+    (testing "BM25 alone finds nothing for a cue with no shared word"
+      (ok (null (enchiridion.memory:retrieve-rows-for-turn store "which vehicle is mine"))))
+    (let ((enchiridion.memory:*memory-embedder* #'fake-embedder)
+          (enchiridion.memory:*memory-embed-model* "fake"))
+      (testing "the embedder writes one vector per episode"
+        (ok (= 2 (enchiridion.memory:embed-pending store)))
+        (ok (= 0 (enchiridion.memory:embed-pending store))))
+      (testing "with dense candidates the paraphrase ranks first"
+        (let ((rows (enchiridion.memory:retrieve-rows-for-turn store "which vehicle is mine")))
+          (ok (search "sedan" (getf (getf (first rows) :item) :body)))))
+      (testing "a failing cue embedding falls back to BM25"
+        (let ((enchiridion.memory:*memory-embedder*
+                (lambda (texts) (declare (ignore texts)) (error "no network")))
+              (*error-output* (make-broadcast-stream)))
+          (ok (search "weather"
+                      (getf (getf (first (enchiridion.memory:retrieve-rows-for-turn
+                                          store "cold weather"))
+                                  :item)
+                            :body))))))
+    (testing "deleting the session removes its vectors"
+      (enchiridion.memory.store:delete-session store "s")
+      (ok (= 0 (count-rows store "SELECT COUNT(*) AS n FROM episode_vectors"))))))
+
 (deftest a-reranker-only-reorders-and-a-failure-changes-nothing ()
   (let ((rows (loop for i from 1 to 5
                     collect (list :item (list :kind "episode" :id i

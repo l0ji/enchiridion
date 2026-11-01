@@ -40,7 +40,7 @@ because a file in the repository is a file that ends up in a store path."))
 (defpackage #:enchiridion.compat
   (:use #:cl)
   (:export
-   #:+implementation+
+   #:+implementation+ #:single-float-bits #:bits-single-float
    #:environment #:environment-value #:environment-bound-p
    #:set-environment-variable #:unset-environment-variable
    #:run-program #:run-program-blocking
@@ -93,7 +93,7 @@ recover from a string."))
    ;; The protocol every backend implements. Three generic functions and the
    ;; check that stands in for satisfies, because SBCL has no
    ;; defprotocol.
-   #:complete #:model-capabilities #:backend-name #:backendp
+   #:complete #:embed #:model-capabilities #:backend-name #:backendp
    ;; The result and message shapes.
    #:message #:user-message #:assistant-message #:system-message
    #:tool-message #:message-role #:message-content #:message-tool-call-id
@@ -309,7 +309,10 @@ did not think of."))
    #:add-intention #:list-intentions #:cancel-intention
    #:propose-change #:memory-status
    #:live-generation-id #:with-generation #:render-pack #:pack-rows #:select-pack-rows
-   #:*memory-reranker* #:make-model-reranker #:rerank-rows #:parse-rerank-reply)
+   #:*memory-reranker* #:make-model-reranker #:rerank-rows #:parse-rerank-reply
+   #:*memory-embedder* #:*memory-embed-model* #:make-backend-embedder
+   #:embed-pending #:hybrid-candidates #:dense-ranking
+   #:encode-vector #:decode-vector)
   (:documentation
    "Memory blocks, the operator seed files that back the first three of them,
 the three loading tiers, the bootstrap state machine, and the episodic log

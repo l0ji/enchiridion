@@ -470,6 +470,23 @@ sentence above says no socket rather than no network."
           (when backend
             (enchiridion.memory:make-model-assertion-deriver
              backend :model (enchiridion:model-for :cheap))))
+    ;; Dense retrieval has its own endpoint and key, so a store can use an
+    ;; embeddings provider other than the chat one.
+    (let ((settings enchiridion.memory::*memory-embed-settings*))
+      (setf enchiridion.memory:*memory-embedder* nil)
+      (when (getf settings :enabled)
+        (let ((key (enchiridion.llm.secrets:secret-value (getf settings :key-env))))
+          (if (and key (plusp (length key)))
+              (setf enchiridion.memory:*memory-embed-model* (getf settings :model)
+                    enchiridion.memory:*memory-embedder*
+                    (enchiridion.memory:make-backend-embedder
+                     (enchiridion.llm:openai-backend :base-url (getf settings :base-url)
+                                                     :api-key key)
+                     :model (getf settings :model)
+                     :dimensions (getf settings :dimensions)))
+              (format *error-output*
+                      "~&enchiridion: :embed is on but ~A is empty; dense retrieval is off.~%"
+                      (getf settings :key-env))))))
     ;; The reranker is on the turn path, so it is installed only when the
     ;; :memory section asks for it.
     (setf enchiridion.memory:*memory-reranker*

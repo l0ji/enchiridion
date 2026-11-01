@@ -721,3 +721,16 @@ success to whatever ran it."
   #+sbcl (sb-ext:exit :code status)
   #-sbcl (progn (declare (ignore status))
                 (error "No exit is available in ~A." +implementation+)))
+;;;; IEEE single floats as their 32 bits. Embedding vectors are stored as
+;;;; packed little-endian float32, and the standard has no portable way to
+;;;; read a float's bits.
+
+(defun single-float-bits (float)
+  "Return FLOAT's IEEE 754 single bits as an unsigned 32-bit integer."
+  #+sbcl (ldb (byte 32 0) (sb-kernel:single-float-bits (coerce float 'single-float)))
+  #-sbcl (error "single-float-bits is not implemented for ~A." +implementation+))
+
+(defun bits-single-float (bits)
+  "Return the single float whose IEEE 754 bits are the 32-bit integer BITS."
+  #+sbcl (sb-kernel:make-single-float (if (logbitp 31 bits) (- bits (ash 1 32)) bits))
+  #-sbcl (error "bits-single-float is not implemented for ~A." +implementation+))

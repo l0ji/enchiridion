@@ -24,7 +24,7 @@ DROP-STORE drops these before the tables they read.")
 (defparameter *episodic-tables*
   '("generation_checks" "generation_derivations" "conflict_resolutions"
     "conflicts" "assertions" "change_events" "summaries" "procedures"
-    "schemas" "episodes_fts" "episodes" "cue_index" "activation" "links"
+    "schemas" "episodes_fts" "episode_vectors" "episodes" "cue_index" "activation" "links"
     "retrievals" "calibration" "canary" "gate_log" "change_proposals"
     "projections" "log_runs" "memory_state" "generations")
   "What DROP-STORE removes, child table before parent table.
@@ -119,6 +119,16 @@ references.")
    "CREATE TRIGGER IF NOT EXISTS episodes_activation_ad AFTER DELETE ON episodes BEGIN
       DELETE FROM activation WHERE kind = 'episode' AND id = old.id;
     END"
+   ;; One embedding per episode, written by EMBED-PENDING when an embedder is
+   ;; configured. VEC is the unit-length vector as packed little-endian
+   ;; float32, so a dot product is the cosine. A deleted episode takes its
+   ;; vector with it.
+   "CREATE TABLE IF NOT EXISTS episode_vectors (
+      id     INTEGER PRIMARY KEY REFERENCES episodes(id) ON DELETE CASCADE,
+      model  TEXT    NOT NULL,
+      dims   INTEGER NOT NULL,
+      vec    BLOB    NOT NULL)"
+
    ;; The rows a store written before the trigger never got. Running it again
    ;; changes nothing.
    "INSERT OR IGNORE INTO activation

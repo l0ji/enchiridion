@@ -34,6 +34,10 @@ resumable, so a large log is processed in bounded batches.")
   "Episodes one candidate generation may cover in this phase. A larger log is
 left for the next candidate; a later phase removes the bound.")
 
+(defparameter *memory-embed-settings* '(:enabled nil)
+  "The :memory section's embedding keys, as CONFIGURE-MEMORY read them. The
+harness builds the embedder from these; nothing here makes a connection.")
+
 (defparameter *memory-rerank-p* nil
   "When true, the harness installs a cheap-model reranker. Off until measured.")
 
@@ -56,6 +60,12 @@ its shipped default. Return the effective plist."
           *memory-retrieve-p* (not (null (value :retrieve t)))
           *memory-push-p* (not (null (value :push nil)))
           *memory-rerank-p* (not (null (value :rerank nil)))
+          *memory-embed-settings* (list :enabled (not (null (value :embed nil)))
+                                        :model (value :embed-model "text-embedding-3-small")
+                                        :dimensions (value :embed-dimensions 512)
+                                        :base-url (value :embed-base-url
+                                                         "https://api.openai.com/v1/")
+                                        :key-env (value :embed-key-env "OPENAI_API_KEY"))
           *memory-record-sleep-p* (not (null (value :record-sleep t)))
           *memory-maintenance-batch* (or (value :maintenance-batch 200) 200)
           *memory-t2-episodes-per-tick* (or (value :t2-max-episodes-per-tick 20) 20)
@@ -308,7 +318,7 @@ TOP-K NIL returns every candidate. This reads the store and writes nothing, so
 the benchmark can score the ranking the turn path uses without logging it.
 A cue with no searchable term returns NIL; a query error signals."
   (when (and store (tokenise text))
-    (let ((candidates (candidates-for store text :limit 200 :now now)))
+    (let ((candidates (hybrid-candidates store text :limit 200 :now now)))
       (when candidates
         (retrieve candidates text
                   (list "" session (string-downcase (string channel)))

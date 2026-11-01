@@ -176,6 +176,26 @@ itself is what proves the trigger ran."
       (ok (null (enchiridion.memory.store:search-sessions store "xylophone")))
       (ok (= 1 (length (enchiridion.memory.store:search-sessions store "glockenspiel")))))))
 
+(deftest statements-do-not-accumulate-on-the-connection ()
+  ;; The driver's DO-SQL left one prepared statement behind per call, and a
+  ;; query that was never freed left another. The supervisor's connection
+  ;; lives for days, so the count must stay bounded however many statements
+  ;; run; cl-sqlite's own statement cache holds sixteen.
+  (with-scratch-store (store)
+    (loop repeat 300
+          do (enchiridion.memory.store:record-turn store :session "s"
+                                                         :body "a counted turn")
+             (enchiridion.memory.store:search-sessions store "counted"))
+    (let ((handle (dbi.driver:connection-handle
+                   (enchiridion.memory.store:store-connection store))))
+      (ok (< (length (sqlite::sqlite-handle-statements handle)) 64)))
+    (testing "an exec still reports the rows it changed"
+      (ok (= 300 (enchiridion.memory.store::exec
+                  store "UPDATE episodes SET model = 'm' WHERE session = 's'"))))
+    (testing "a failing statement still signals a DBI error"
+      (signals (enchiridion.memory.store::exec store "INSERT INTO no_such_table VALUES (1)")
+               'dbi:dbi-programming-error))))
+
 (deftest a-memory-round-trips-and-a-duplicate-is-refused ()
   (with-scratch-store (store)
     (let ((id (enchiridion.memory.store:save-memory

@@ -267,9 +267,25 @@ column that skips it is a column that leaks."
 (declaim (ftype (function (store string &optional list) integer) exec))
 
 (defun exec (store statement &optional parameters)
-  "Run one statement on STORE and return the number of rows it changed."
+  "Run one statement on STORE and return the number of rows it changed.
+
+This is DBI:DO-SQL without its leak. The SQLite driver's DO-SQL reads the
+change count by preparing SELECT changes() and never finalizing it, so every
+statement left one prepared statement on the connection. A long-lived
+connection grew without bound, and closing it took time quadratic in the
+number of statements it had run. Both statements here go through cl-sqlite's
+cached prepare, which finalizes them. Errors are mapped exactly as DO-SQL
+maps them."
   (with-store-lock (store)
-    (dbi:do-sql (store-connection store) statement parameters)))
+    (let ((handle (dbi.driver:connection-handle (store-connection store))))
+      (handler-case (apply #'sqlite:execute-non-query handle statement parameters)
+        (sqlite:sqlite-error (e)
+          (error (if (eq (sqlite:sqlite-error-code e) :error)
+                     'dbi:dbi-programming-error
+                     'dbi:dbi-database-error)
+                 :message (sqlite:sqlite-error-message e)
+                 :error-code (sqlite:sqlite-error-code e))))
+      (sqlite:execute-single handle "SELECT changes()"))))
 
 (declaim (ftype (function (list) list) normalise-row))
 
@@ -289,9 +305,13 @@ write it the way it appears in this file. One door, one shape."
 (defun query-rows (store statement &optional parameters)
   "Run one query on STORE and return every row as a plist keyed by column."
   (with-store-lock (store)
+    ;; The query is freed, or its prepared statement would stay on the
+    ;; connection until it closes; see EXEC.
     (let ((query (dbi:prepare (store-connection store) statement)))
-      (dbi:execute query parameters)
-      (mapcar #'normalise-row (dbi:fetch-all query)))))
+      (unwind-protect
+           (progn (dbi:execute query parameters)
+                  (mapcar #'normalise-row (dbi:fetch-all query)))
+        (dbi:free-query-resources query)))))
 
 (declaim (ftype (function (t string) t) field))
 

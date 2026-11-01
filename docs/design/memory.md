@@ -91,11 +91,15 @@ It is enabled only after a paired no-harm run: at least 100 pairs, mean delta at
 
 ## Retrieval
 
-The score is the amended specification's eight terms.
-Only base-level activation and spreading activation are rank-normalised.
+The score is the amended specification's eight terms plus L, the full-text index's BM25 relevance.
+Base-level activation, spreading activation and L are rank-normalised.
 The temporal term stays signed.
-Top-k is 8.
-A record renders at L0, 400 characters.
+The shipped weights set the base level, spreading activation and distinctiveness to 0 and L to 1, because the LongMemEval-S measurement in [Episodic memory](../episodic-memory.md#measured-results) found that each of the three lowered recall against L alone.
+The specification's weights are kept in the parameter comments as the prior.
+Top-k is 12, cut by the pack's character budget.
+A record renders as the 400-character window of its body that holds the most cue terms.
+Each record carries its UTC date and role after the ref tag, which measured +9.4 points of answer accuracy.
+An optional cheap-model reranker (`:rerank`) reorders the top 30 before the cut, and optional dense candidates (`:embed`) are fused with BM25 by reciprocal rank.
 Full bodies remain available through the search tool.
 Ordering is deterministic by score, then kind, then id.
 The graph query is seeded from candidates and bounded at 20,000 rows.
@@ -175,7 +179,7 @@ Procedures: at most 64 admitted.
 Schemas: at most 32 active.
 Intentions: at most 3 injected per turn, default expiry 90 days.
 Calibration: rolling 2,000 rows per family.
-Pack: top-k 8.
+Pack: top-k 12.
 
 Overflow retires the lowest-activation derived row by setting `retired_ts`.
 Episodes are never retired.

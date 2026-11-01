@@ -54,3 +54,6 @@ run/
 *.swo
 *~
 .#*
+
+# The benchmark harness, its data and its run output.
+/bench/

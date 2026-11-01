@@ -352,3 +352,42 @@ and remove the directory. A failing test must not leave a thread behind."
              (ok (null (enchiridion.supervisor:status-report-ok-p status)))))
       (ignore-errors (enchiridion.supervisor:supervisor-stop supervisor))
       (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(deftest enabling-a-live-channel-does-not-start-it-twice ()
+  ;; A started channel reports :LIVE, not :RUNNING. The check used to read the
+  ;; state, so enable started a second restart loop on the same channel.
+  (let ((channel (make-instance 'stub-channel :name "stub")))
+    (with-scratch-supervisor (supervisor :channels (list channel))
+      (let ((thread (enchiridion.channel:channel-thread channel)))
+        (sleep 0.1)
+        (ok (eq :live (enchiridion.channel:channel-state channel)))
+        (ok (search "already up"
+                    (enchiridion.supervisor::handle-channels
+                     supervisor '("enable" "stub"))))
+        (ok (eq thread (enchiridion.channel:channel-thread channel))
+            "the channel still runs on the thread it started with")))))
+
+(deftest stopping-waits-for-the-tick-in-flight ()
+  ;; The heartbeat thread used to be destroyed mid-tick, which can unwind out
+  ;; of a store write with a transaction open.
+  (let* ((finished nil)
+         (directory (scratch-directory))
+         (supervisor (enchiridion.supervisor:make-supervisor
+                      :directory (namestring directory)
+                      :run-directory (namestring (merge-pathnames "run/" directory))
+                      :heartbeat-p nil
+                      :tick-function (lambda (supervisor)
+                                       (declare (ignore supervisor))
+                                       (sleep 0.5)
+                                       (setf finished t)
+                                       (list :ok-p t :report "slow tick")))))
+    (unwind-protect
+         (progn
+           (enchiridion.supervisor:supervisor-start supervisor)
+           (enchiridion.supervisor::handle-heartbeat supervisor '("run"))
+           (loop repeat 100
+                 until (enchiridion.supervisor:supervisor-tick-running-p supervisor)
+                 do (sleep 0.02))
+           (enchiridion.supervisor:supervisor-stop supervisor)
+           (ok finished "the tick ran to its end before stop returned"))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))

@@ -67,10 +67,18 @@ that answered a question nobody asked."
 (defun collect-search-files (path)
   "Return the searchable files under PATH, with a bounded walk."
   (let ((files '())
-        (seen 0))
+        (seen 0)
+        ;; Directories already walked, by truename. A symlink that points back
+        ;; up the tree would otherwise be followed until the stack ran out,
+        ;; because the file limit only counts files and a loop can hold none.
+        (visited (make-hash-table :test #'equal)))
     (labels ((walk (directory)
                (when (and (< seen +search-file-limit+)
-                          (not (skipped-directory-p directory)))
+                          (not (skipped-directory-p directory))
+                          (let ((key (namestring (or (ignore-errors (truename directory))
+                                                     directory))))
+                            (unless (gethash key visited)
+                              (setf (gethash key visited) t))))
                  (dolist (file (uiop:directory-files directory))
                    (when (and (searchable-file-p file) (< seen +search-file-limit+))
                      (incf seen)

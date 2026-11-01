@@ -798,6 +798,10 @@ over the webhook is not filed as a turn typed at the terminal."
                                    (enchiridion.llm:default-api-key-env
                                     (context-config context)))))
           (ensure-started context)
+          ;; A /stop is for the turn in flight. The REPL only reads one between
+          ;; turns, so a flag left over from it would cancel this turn and every
+          ;; turn after it.
+          (setf (car cancelled) nil)
           (let* ((printer (make-progress-printer *error-output*))
                  (completion
                    (unwind-protect
@@ -845,9 +849,9 @@ over the webhook is not filed as a turn typed at the terminal."
         (format nil "~A ~A" condition detail)
         (princ-to-string condition))))
 
-(declaim (ftype (function (t) function) make-channel-turn))
+(declaim (ftype (function (t &key (:block-p t)) function) make-channel-turn))
 
-(defun make-channel-turn (context)
+(defun make-channel-turn (context &key (block-p nil))
   "Return the function a channel calls to run one turn.
 
 The result is a plist, because every channel formats its own answer and none
@@ -855,10 +859,13 @@ of them should have to know what a completion is: :ok-p says whether the turn
 ran, :reply is the text to send, :error is one line when it did not, :reason
 separates a busy agent from a failure, and :usage sums what the turn cost.
 
-The turn takes the agent lock without waiting. A webhook client is better
-served by a 503 and a retry than by a connection held open behind somebody
-else's turn, and the reply is scrubbed here as well as in the kernel: the
-model can echo a secret back, and the outbound path is the last gate."
+By default the turn takes the agent lock without waiting. A webhook client is
+better served by a 503 and a retry than by a connection held open behind
+somebody else's turn. BLOCK-P T waits instead, which is what a channel with its
+own queue wants: the Fluxer worker answers one message at a time, and a message
+refused as busy is a message nobody ever answers. The reply is scrubbed here
+as well as in the kernel: the model can echo a secret back, and the outbound
+path is the last gate."
   (lambda (message)
     (handler-case
         (let ((text (enchiridion.channel:msg-text message))
@@ -871,13 +878,13 @@ model can echo a secret back, and the outbound path is the last gate."
                                     (context-config context)))))
           (ensure-started context)
           (let* ((agent (context-agent context))
-                 (before (length (enchiridion.kernel:spend agent)))
+                 (before (enchiridion.kernel:spend-count agent))
                  (completion (enchiridion.kernel:run-turn
                               agent text
                               :session (context-session context)
                               :store (context-store context)
                               :channel channel
-                              :block-p nil)))
+                              :block-p block-p)))
             (list :ok-p t
                   :reply (enchiridion.llm.secrets:scrub
                           (enchiridion.llm:completion-text completion))
@@ -1009,7 +1016,7 @@ it to chat as well would run a second REPL on a thread."
       ;; configuration it is handed, so a test and the supervisor use the same
       ;; reader and a short :fluxer entry cannot lose the operator's allowlist.
       (push (enchiridion.channel.fluxer:make-fluxer-channel
-             :turn (make-channel-turn context)
+             :turn (make-channel-turn context :block-p t)
              :config config)
             channels))
     (nreverse channels)))
@@ -1240,6 +1247,9 @@ A bad flag, an unknown channel and a refused configuration are exit 2, the
 status the command table already uses for a call it could not use. A first
 launch is checked before the channel flags, because nothing may start before
 the operator has had a chance to edit the seed files."
+  ;; SBCL starts every process from the same random state, so without this
+  ;; every session id and temporary file name repeats from one run to the next.
+  (setf *random-state* (make-random-state t))
   (handler-case
       (multiple-value-bind (options arguments) (split-options argv)
         (load-config)

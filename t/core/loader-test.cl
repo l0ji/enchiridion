@@ -280,3 +280,23 @@ tripwire: a manifest reader that evaluates the file fails on it.")
     (let ((path (write-source directory "tools/unreadable.cl" +unreadable-source+)))
       (ok (signals (enchiridion.plugin:plugin-manifests (list path))
                    'enchiridion.errors:configuration-error)))))
+
+(deftest the-supervisor-refuses-reader-tricks-in-an-agent-file ()
+  ;; The supervisor reads these files as root. A circular plist used to hang
+  ;; GETF for good, and #S built whatever structure the file named.
+  (with-scratch-directory (directory)
+    (dolist (text '("(define-plugin loop . #1=(:tool (tool \"x\" \"y\" :string) . #1#))"
+                    "(define-plugin made :tool #S(enchiridion.tools::tool))"
+                    "(define-plugin big :tool #99999999*1)"))
+      (let ((path (write-source directory "tools/tricky.cl" text)))
+        (ok (signals (enchiridion.plugin:plugin-manifests (list path))
+                     'enchiridion.errors:configuration-error)
+            text)))
+    (testing "an ordinary plugin still reads"
+      (let ((path (write-source directory "tools/plain.cl"
+                                "(define-plugin plain :tool (tool \"plain\" \"A tool.\" (:object :properties ((:text :string)))))")))
+        (ok (string= "plain"
+                     (enchiridion.plugin:manifest-name
+                      (first (enchiridion.plugin:plugin-manifests (list path))))))))
+    (testing "and nothing it named was interned in the plugin package"
+      (ok (null (find-symbol "MADE" :enchiridion.plugin))))))

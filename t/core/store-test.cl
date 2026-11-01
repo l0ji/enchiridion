@@ -564,3 +564,43 @@ itself is what proves the trigger ran."
       (uiop:delete-directory-tree directory
                                   :validate t
                                   :if-does-not-exist :ignore)))))
+
+(deftest a-session-with-derived-rows-can-be-deleted ()
+  ;; ASSERTIONS and CHANGE_EVENTS cite an episode without ON DELETE CASCADE,
+  ;; so with foreign keys on, deleting the episode used to fail outright.
+  (with-scratch-store (store)
+    (let ((turn (enchiridion.memory.store:record-turn
+                 store :session "doomed" :role "user" :body "the sky is green")))
+      (enchiridion.memory.store::exec
+       store "INSERT INTO generations (number, created_ts) VALUES (1, 0)")
+      (let ((generation (enchiridion.memory.store::last-row-id store)))
+        (enchiridion.memory.store::exec
+         store "INSERT INTO assertions
+                  (generation_id, subject, relation, object, episode_id, tx_from, run_id)
+                VALUES (?, 'sky', 'is', 'green', ?, 0, 1)"
+         (list generation (enchiridion.memory.store:turn-row-id turn))))
+      (ok (plusp (enchiridion.memory.store:delete-session store "doomed")))
+      (ok (zerop (enchiridion.memory.store:session-count store)))
+      (ok (null (enchiridion.memory.store::query-rows
+                 store "SELECT id FROM assertions"))
+          "what was derived from the session went with it"))))
+
+(deftest a-current-store-is-not-rebuilt-on-open ()
+  (let* ((directory (scratch-directory))
+         (path (merge-pathnames "memory.db" directory)))
+    (unwind-protect
+         (let ((store (enchiridion.memory.store:open-store :path path)))
+           (ok (= enchiridion.memory.store::+schema-version+
+                  (enchiridion.memory.store::schema-version store))
+               "a new store records its schema version")
+           (enchiridion.memory.store:close-store store)
+           (let ((again (enchiridion.memory.store:open-store :path path)))
+             (ok (enchiridion.memory.store::schema-current-p again))
+             (testing "a dropped store is rebuilt on the next open"
+               (enchiridion.memory.store:drop-store again)
+               (enchiridion.memory.store:close-store again)
+               (let ((rebuilt (enchiridion.memory.store:open-store :path path)))
+                 (ok (enchiridion.memory.store:record-turn
+                      rebuilt :session "s" :role "user" :body "back again"))
+                 (enchiridion.memory.store:close-store rebuilt)))))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))

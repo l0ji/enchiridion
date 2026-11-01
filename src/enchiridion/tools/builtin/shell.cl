@@ -9,13 +9,27 @@
 (defparameter +shell-timeout+ 30
   "Default seconds before a shell command is stopped.")
 
+(defparameter +shell-max-timeout+ 600
+  "The most seconds a shell command may ask for. The model chooses the timeout,
+and a turn holds the agent for as long as its command runs, so the choice is
+bounded here rather than trusted.")
+
+(declaim (ftype (function (t) (integer 1 *)) shell-timeout))
+
+(defun shell-timeout (requested)
+  "Return REQUESTED as a whole number of seconds between 1 and the maximum, or
+the default when it is not a number at all."
+  (if (realp requested)
+      (max 1 (min +shell-max-timeout+ (ceiling requested)))
+      +shell-timeout+))
+
 (declaim (ftype (function (t) string) shell-run))
 
 (defun shell-run (args)
   "Run COMMAND through /bin/sh and return combined output and exit status.
-A timeout ends the child and the result says so."
+A timeout ends the child and everything it started, and the result says so."
   (let* ((command (argument args "command"))
-         (timeout (or (argument args "timeout") +shell-timeout+)))
+         (timeout (shell-timeout (argument args "timeout"))))
     (unless (stringp command)
       (error 'enchiridion.errors:schema-error :detail "command must be a string."))
     (multiple-value-bind (output status)

@@ -159,3 +159,41 @@
   ;; signal. A real SIGTERM is sent by the integration check, not here, so the
   ;; suite does not end itself.
   (ok (member (enchiridion.compat:install-shutdown-signals) '(t nil) :test #'eq)))
+(defun capture-files ()
+  "Return the capture files left in the temporary directory."
+  (remove-if-not (lambda (path)
+                   (uiop:string-prefix-p "enchiridion-capture-"
+                                         (file-namestring path)))
+                 (uiop:directory-files (enchiridion.compat:temp-directory))))
+
+(deftest a-capture-returns-output-and-status-and-leaves-no-file ()
+  (let ((before (capture-files)))
+    (multiple-value-bind (output status)
+        (enchiridion.compat:run-program-capture
+         "/bin/sh" (list "-c" "echo out; echo err 1>&2; exit 3"))
+      (ok (search "out" output))
+      (ok (search "err" output) "standard error is in the same text")
+      (ok (eql 3 status)))
+    (multiple-value-bind (output status)
+        (enchiridion.compat:run-program-capture
+         "/bin/sh" (list "-c" "echo early; sleep 5") :timeout 0.2)
+      (ok (search "early" output) "output written before the timeout is kept")
+      (ok (eq :timeout status)))
+    (ok (equal before (capture-files))
+        "the capture file is never left behind")))
+
+(deftest a-timeout-ends-the-commands-children-too ()
+  ;; Killing /bin/sh alone left `sleep` running past its timeout.
+  (multiple-value-bind (output status)
+      (enchiridion.compat:run-program-capture
+       "/bin/sh" (list "-c" "sleep 30 & echo $!; wait") :timeout 0.5)
+    (ok (eq :timeout status))
+    (let ((pid (parse-integer output :junk-allowed t)))
+      (ok pid "the background job reported its pid")
+      (when pid
+        (sleep 0.2)
+        (multiple-value-bind (ignored alive)
+            (enchiridion.compat:run-program-capture
+             "/bin/sh" (list "-c" (format nil "kill -0 ~D 2>/dev/null" pid)))
+          (declare (ignore ignored))
+          (ok (not (eql 0 alive)) "the background job is gone"))))))

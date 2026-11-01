@@ -1,7 +1,6 @@
 # enchiridion
 
 enchiridion is an unstable autonomous agent harness with a strange memory model.
-The memory model is an append-only episodic log, a model-free cue pack, and a gated derived layer.
 
 ## Requirements
 

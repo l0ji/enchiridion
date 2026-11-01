@@ -358,6 +358,36 @@ that, because it is not text to a parser and NOT a term to match."
 
 ;;;; Opening and closing.
 
+(defparameter +schema-version+ 1
+  "The schema version a store records in PRAGMA user_version once it is built.
+
+Every statement in +SCHEMA+ is CREATE ... IF NOT EXISTS, which adds a missing
+table but never a missing column. A change that alters an existing table bumps
+this number and adds its step to OPEN-STORE, keyed on the version a store
+reports, so an old store is brought forward once rather than failing on a
+column it never got.")
+
+(declaim (ftype (function (store) integer) schema-version))
+
+(defun schema-version (store)
+  "Return the schema version STORE records, 0 for a store that records none."
+  (let ((value (field (first (query-rows store "PRAGMA user_version"))
+                      "user_version")))
+    (if (integerp value) value 0)))
+
+(defun set-schema-version (store version)
+  "Record VERSION as STORE's schema version. A pragma takes no parameter, so
+the number is written into the statement, and only an integer is accepted."
+  (check-type version (integer 0 *))
+  (exec store (format nil "PRAGMA user_version = ~D" version)))
+
+(defun schema-current-p (store)
+  "Return T when STORE was built at the current schema version and still has
+its tables. DROP-STORE resets the version, and the table check covers a store
+whose tables went some other way."
+  (and (>= (schema-version store) +schema-version+)
+       (sqlite-table-exists-p store "episodes")))
+
 (defun open-store (&key path (mode nil) (busy-timeout 15000))
   "Open, and create when absent, the store at PATH. Return the store.
 
@@ -394,30 +424,41 @@ not an exposure."
                               :lock (bordeaux-threads:make-recursive-lock
                                      "enchiridion store"))))
       (handler-case
-          (progn
-            ;; Foreign keys are per connection, so they are set after the
-            ;; connection exists and before any statement writes.
-            (exec store "PRAGMA foreign_keys = ON")
+          ;; Foreign keys are per connection, so they are set after the
+          ;; connection exists and before any statement writes.
+          (exec store "PRAGMA foreign_keys = ON")
+        (error (condition)
+          (ignore-errors (dbi:disconnect connection))
+          (error 'enchiridion.errors:configuration-error
+                 :key :memory
+                 :detail (format nil "Cannot open the memory store ~A: ~A"
+                                 path condition))))
+      ;; A current store skips the schema and the merge. Both take the write
+      ;; lock, and the search tool opens the store on every call.
+      (unless (schema-current-p store)
+        (handler-case
             (with-store-transaction (store)
               (dolist (statement +schema+)
-                (exec store statement))))
-        (error (condition)
-          (ignore-errors (dbi:disconnect connection))
-          (error 'enchiridion.errors:configuration-error
-                 :key :memory
-                 :detail (format nil "Cannot create the memory store schema in ~A: ~A"
-                                 path condition))))
-      ;; The merge runs after the new schema exists and before any read. On a
-      ;; store from before the merge it copies the old tables and drops them;
-      ;; on a new store it only creates the compatibility views.
-      (handler-case
-          (migrate-legacy-memory store)
-        (error (condition)
-          (ignore-errors (dbi:disconnect connection))
-          (error 'enchiridion.errors:configuration-error
-                 :key :memory
-                 :detail (format nil "Cannot merge the old memory tables in ~A: ~A"
-                                 path condition))))
+                (exec store statement)))
+          (error (condition)
+            (ignore-errors (dbi:disconnect connection))
+            (error 'enchiridion.errors:configuration-error
+                   :key :memory
+                   :detail (format nil "Cannot create the memory store schema in ~A: ~A"
+                                   path condition))))
+        ;; The merge runs after the new schema exists and before any read. On
+        ;; a store from before the merge it copies the old tables and drops
+        ;; them; on a new store it only creates the compatibility views.
+        (handler-case
+            (progn
+              (migrate-legacy-memory store)
+              (set-schema-version store +schema-version+))
+          (error (condition)
+            (ignore-errors (dbi:disconnect connection))
+            (error 'enchiridion.errors:configuration-error
+                   :key :memory
+                   :detail (format nil "Cannot merge the old memory tables in ~A: ~A"
+                                   path condition)))))
       (when (and created-p mode)
         (enchiridion.compat:set-file-mode path mode))
       store)))
@@ -548,7 +589,19 @@ turns it counts."
   "Delete session ID and every episode in it. Return the rows removed.
 The log is append-only during operation; this is the operator's explicit
 delete, and it removes saved memories in the session as well."
-  (exec store "DELETE FROM episodes WHERE session = ?" (list id)))
+  ;; ASSERTIONS and CHANGE_EVENTS name their episode without ON DELETE
+  ;; CASCADE, and foreign keys are on, so an episode a derivation used cannot be
+  ;; deleted before what was derived from it. What cites a session's episodes
+  ;; goes first, in the same transaction, so a failure removes nothing.
+  ;; Conflicts over a removed assertion cascade on their own.
+  (with-store-transaction (store)
+    (dolist (table '("change_events" "assertions"))
+      (exec store
+            (format nil "DELETE FROM ~A WHERE episode_id IN
+                           (SELECT id FROM episodes WHERE session = ?)"
+                    table)
+            (list id)))
+    (exec store "DELETE FROM episodes WHERE session = ?" (list id))))
 
 (defun search-sessions (store query &key (limit 20))
   "Return the turns whose body matches QUERY, best match first, newest ties last.
@@ -817,21 +870,25 @@ from the argument, so the grouping is never a string a caller supplies."
                       (usage-totals row)))
             rows)))
 
-(declaim (ftype (function (store integer) list) usage-total-since))
+(declaim (ftype (function (store integer &key (:channel t)) list) usage-total-since))
 
-(defun usage-total-since (store since)
+(defun usage-total-since (store since &key channel)
   "Return every column of the ledger summed from SINCE, a universal time.
 A store with no rows answers zeroes rather than NIL, so a caller that prints
-the number never has to ask whether the ledger exists."
+the number never has to ask whether the ledger exists. CHANNEL, when given,
+sums only the rows that channel wrote."
   (check-type since integer)
   (usage-totals
    (first (query-rows store
-                      "SELECT SUM(input) AS input, SUM(output) AS output,
-                              SUM(cache_read) AS cache_read,
-                              SUM(cache_write) AS cache_write,
-                              COUNT(*) AS calls
-                         FROM usage WHERE ts >= ?"
-                      (list since)))))
+                      (format nil "SELECT SUM(input) AS input, SUM(output) AS output,
+                                          SUM(cache_read) AS cache_read,
+                                          SUM(cache_write) AS cache_write,
+                                          COUNT(*) AS calls
+                                     FROM usage WHERE ts >= ?~:[~; AND channel = ?~]"
+                              channel)
+                      (if channel
+                          (list since (string-downcase (string channel)))
+                          (list since))))))
 
 (declaim (ftype (function (store t) list) usage-session-total))
 
@@ -885,6 +942,7 @@ OPEN-STORE again. Tests use this; the sessions command will use it to forget."
     (exec store (format nil "DROP VIEW IF EXISTS ~A" view)))
   (dolist (table +store-tables+)
     (exec store (format nil "DROP TABLE IF EXISTS ~A" table)))
+  (set-schema-version store 0)
   t)
 
 ;;;; The task queue.

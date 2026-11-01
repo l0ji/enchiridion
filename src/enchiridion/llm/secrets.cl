@@ -457,30 +457,44 @@ secret cannot match the head of a longer one and leave the tail behind."
                                         (>= (length value) *minimum-secret-length*))
                                 collect (quote-meta-chars value))
                         #'> :key #'length))
-             (parts (append literals +shape-patterns+)))
+             (parts (append literals +shape-patterns+))
+             (text nil)
+             (scanner nil))
         ;; A separator BETWEEN the parts, never one after the last. Writing
         ;; "part then |" in a loop leaves the alternation ending on an empty
         ;; branch, and cl-ppcre refuses to compile that: the scanner never
         ;; builds and every call to scrub signals a regex error instead of
         ;; removing anything.
-        (setf *pattern* (with-output-to-string (stream)
-                          (write-string "(?:" stream)
-                          (loop for part in parts
-                                for first = t then nil
-                                do (unless first
-                                     (write-string "|" stream))
-                                   (write-string part stream))
-                          (write-string ")" stream))
-              *scanner* (create-scanner *pattern*)
+        (setf text (with-output-to-string (stream)
+                     (write-string "(?:" stream)
+                     (loop for part in parts
+                           for first = t then nil
+                           do (unless first
+                                (write-string "|" stream))
+                              (write-string part stream))
+                     (write-string ")" stream))
+              scanner (create-scanner text))
+        ;; The scanner is published before the pattern and the stamp, so a
+        ;; reader that sees a current stamp also sees its scanner.
+        (setf *scanner* scanner
+              *pattern* text
               *pattern-stamp* count)))
     *pattern*))
 
 (defun scrubber ()
   "Return the compiled scanner. There is always one, because the shape
 patterns exist even when nothing has been loaded: a key this process never
-saw is still a key."
-  (pattern)
-  *scanner*)
+saw is still a key.
+
+REGISTER-SECRET on another thread clears the cached scanner, and it can do so
+between the rebuild and the read of *SCANNER*. Reading NIL there used to make
+SCRUB return the text untouched, so the read loops until it holds a scanner:
+at worst one call scrubs with the scanner from just before the new secret."
+  (loop
+    (pattern)
+    (let ((scanner *scanner*))
+      (when scanner
+        (return scanner)))))
 
 (defun scrub (text)
   "Return TEXT with every loaded secret and every known secret shape replaced

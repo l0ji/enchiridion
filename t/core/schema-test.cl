@@ -42,3 +42,13 @@
 
 (deftest schema-tokens-is-a-positive-estimate ()
   (ok (plusp (enchiridion.tools:schema-tokens +schema+))))
+
+(deftest an-object-schema-with-no-properties-takes-no-arguments ()
+  ;; The default schema of a plugin with no tool form. Every call to it used
+  ;; to fail with NIL is not a HASH-TABLE from inside the validator.
+  (ok (enchiridion.tools:validate-arguments '(:object :properties ()) nil))
+  (ok (enchiridion.tools:validate-arguments '(:object :properties ())
+                                            (make-hash-table :test #'equal)))
+  (ok (signals (enchiridion.tools:validate-arguments '(:object :properties ())
+                                                     (list :surprise 1))
+               'enchiridion.errors:schema-error)))

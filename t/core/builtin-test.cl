@@ -187,3 +187,55 @@
          (list :action "bootstrap-step" :step (car step) :directory text)))
       (ok (probe-file (merge-pathnames "BOOTSTRAP.done.md" directory)))
       (ng (probe-file (merge-pathnames "BOOTSTRAP.md" directory))))))
+
+(deftest web-search-keeps-the-first-topics ()
+  (let ((enchiridion.tools.builtin::*web-get-function*
+          (lambda (url &rest arguments)
+            (declare (ignore url arguments))
+            "{\"AbstractText\":\"Answer\",\"AbstractURL\":\"https://answer\",
+              \"RelatedTopics\":[{\"Text\":\"one\",\"FirstURL\":\"https://1\"},
+                                 {\"Text\":\"two\",\"FirstURL\":\"https://2\"},
+                                 {\"Text\":\"three\",\"FirstURL\":\"https://3\"}]}")))
+    (let ((text (enchiridion.tools.builtin:web-fetch
+                 (list :action "search" :query "q" :limit 2))))
+      (ok (search "Answer" text) "the abstract leads")
+      (ok (search "one" text) "the first topic is kept")
+      (ok (not (search "three" text)) "the last one is the one cut"))
+    (ok (signals (enchiridion.tools.builtin:web-fetch
+                  (list :action "search" :query "q" :limit 0))
+                 'enchiridion.errors:schema-error))))
+
+(deftest web-fetch-bounds-and-labels-what-it-reads ()
+  (let ((enchiridion.tools.builtin::*web-get-function*
+          (lambda (url &rest arguments)
+            (declare (ignore arguments))
+            (if (search "binary" url)
+                (make-array 64 :element-type '(unsigned-byte 8) :initial-element 0)
+                (make-array (* 3 1024 1024) :element-type '(unsigned-byte 8)
+                                            :initial-element (char-code #\a))))))
+    (ok (search "binary content"
+                (enchiridion.tools.builtin:web-fetch
+                 (list :action "fetch" :url "https://example.com/binary")))
+        "binary is described, not printed as numbers")
+    (ok (search "truncated"
+                (enchiridion.tools.builtin::web-get "https://example.com/large"))
+        "a body past the limit is cut and says so")))
+
+(deftest shell-timeouts-are-bounded ()
+  (ok (= enchiridion.tools.builtin::+shell-max-timeout+
+         (enchiridion.tools.builtin::shell-timeout 1000000)))
+  (ok (= 1 (enchiridion.tools.builtin::shell-timeout -5)))
+  (ok (= enchiridion.tools.builtin::+shell-timeout+
+         (enchiridion.tools.builtin::shell-timeout "soon"))))
+
+(deftest a-file-search-survives-a-symlink-loop ()
+  (with-scratch-directory (scratch)
+    (write-text (merge-pathnames "notes.md" scratch) "needle here")
+    (ensure-directories-exist (merge-pathnames "inner/" scratch))
+    (enchiridion.compat:run-program-capture
+     "/bin/ln" (list "-s" (namestring scratch)
+                     (namestring (merge-pathnames "inner/back" scratch))))
+    (ok (search "needle"
+                (enchiridion.tools.builtin::search-files-run
+                 (list :query "needle" :path (namestring scratch))))
+        "the walk ends and still finds the file")))

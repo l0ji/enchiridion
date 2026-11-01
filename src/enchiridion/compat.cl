@@ -218,6 +218,16 @@ tree, so the broker framing and anything else that writes bytes agree."
   #-sbcl (progn (declare (ignore octets))
                 (error "No UTF-8 decoder is available in ~A." +implementation+)))
 
+(declaim (ftype (function (vector) string) decode-utf8-lenient))
+
+(defun decode-utf8-lenient (octets)
+  "Return OCTETS decoded as UTF-8, with every malformed sequence replaced.
+For text that came from outside, a web page cut at a byte limit among them,
+where one bad byte must not cost the whole result."
+  #+sbcl (sb-ext:octets-to-string octets :external-format '(:utf-8 :replacement #\?))
+  #-sbcl (progn (declare (ignore octets))
+                (error "No UTF-8 decoder is available in ~A." +implementation+)))
+
 (declaim (ftype (function () pathname) temp-directory))
 
 (defun temp-directory ()
@@ -240,10 +250,16 @@ SBCL's PROCESS-KILL wants a signal number and a keyword is a type error, which
 an IGNORE-ERRORS then hides: the process is never killed and nothing says so.
 The mapping lives here because it is an implementation detail.")
 
-(declaim (ftype (function (t t) t) process-kill))
+(declaim (ftype (function (t t &optional t) t) process-kill))
 
-(defun process-kill (process signal)
+(defun process-kill (process signal &optional (whom :pid))
   "Send SIGNAL to PROCESS. SIGNAL is a keyword or a number.
+
+WHOM is :PID for the process alone, or :PROCESS-GROUP for every process in its
+group. A child started without an inherited standard input leads its own group,
+so the group is the child and everything it started: a shell command that
+backgrounds a job, or a pipeline, dies with it rather than outliving its
+timeout.
 
 On the pinned SBCL, (SB-EXT:PROCESS-KILL p :SIGTERM) signals a type error and
 (SB-EXT:PROCESS-KILL p 15) works. Every caller writes the keyword, so the
@@ -252,10 +268,51 @@ translation has to be here rather than at five call sites."
           process
           (if (integerp signal)
               signal
-              (or (cdr (assoc signal +signal-numbers+)) 15)))
+              (or (cdr (assoc signal +signal-numbers+)) 15))
+          whom)
   #-sbcl (progn
-           (declare (ignore process signal))
+           (declare (ignore process signal whom))
            (error "No process signal sender is available in ~A." +implementation+)))
+
+(declaim (ftype (function (t) t) process-reap))
+
+(defun process-reap (process)
+  "Wait for PROCESS to be gone and release what SBCL holds for it.
+
+Without this a killed child stays a zombie and its process object stays on
+SBCL's active list for the life of this process. The wait is bounded: a child
+stuck in the kernel after SIGKILL is not a reason to hang the caller."
+  #+sbcl
+  (progn
+    (loop repeat 200
+          until (sb-ext:process-exit-code process)
+          do (sleep 0.01))
+    (when (sb-ext:process-exit-code process)
+      (ignore-errors (sb-ext:process-close process)))
+    process)
+  #-sbcl
+  (progn
+    (declare (ignore process))
+    (error "No process reaper is available in ~A." +implementation+)))
+
+(defmacro with-deadline ((seconds &key on-timeout) &body body)
+  "Run BODY, and when it runs longer than SECONDS, unwind it and return the
+value of ON-TIMEOUT instead. SECONDS NIL means no limit.
+
+The unwind is an interrupt in the running thread, so every UNWIND-PROTECT in
+BODY runs. SBCL's timeout is a SERIOUS-CONDITION and not an ERROR, which is
+why a caller's ordinary error handlers do not swallow it on the way out."
+  (let ((limit (gensym "LIMIT")))
+    #+sbcl
+    `(let ((,limit ,seconds))
+       (if ,limit
+           (handler-case (sb-ext:with-timeout ,limit ,@body)
+             (sb-ext:timeout () ,on-timeout))
+           (progn ,@body)))
+    #-sbcl
+    `(let ((,limit ,seconds))
+       (declare (ignore ,limit))
+       ,@body)))
 
 (declaim (ftype (function () string) lisp-runtime-path))
 
@@ -290,46 +347,68 @@ when it is given, or NIL to inherit. The git tests use it to supply an author
 and to switch signing off without writing any configuration file."
   #+sbcl
   (let* ((directory (temp-directory))
-         (path (merge-pathnames
-                (format nil "enchiridion-capture-~D.txt" (random most-positive-fixnum))
-                directory))
+         (stream nil)
          (process nil)
          (deadline (and timeout
                         (+ (get-internal-real-time)
                            (* timeout internal-time-units-per-second)))))
     (unwind-protect
          (progn
-           (ensure-directories-exist path)
-           (ignore-errors (delete-file path))
+           (ensure-directories-exist directory)
            ;; A file, not a pipe. With :WAIT NIL SBCL's string stream is not
            ;; flushed by the child's exit, and :PIPE is not an accepted
-           ;; :OUTPUT value. A pathname is the one output sink that works for
-           ;; a short lived child and keeps stderr on the same text.
+           ;; :OUTPUT value. A file is the one output sink that works for a
+           ;; short lived child and keeps stderr on the same text.
+           ;;
+           ;; MKSTEMP creates the file exclusively, and it is unlinked at once:
+           ;; the child writes to the descriptor and the result is read back
+           ;; through it. Nothing is opened by name afterwards, because the
+           ;; directory belongs to the agent uid in a split run and the
+           ;; supervisor calling this is root. A name opened twice there is a
+           ;; name the agent can point at any file on the system in between.
+           (multiple-value-bind (fd name)
+               (sb-posix:mkstemp
+                (uiop:native-namestring
+                 (merge-pathnames "enchiridion-capture-XXXXXX" directory)))
+             (ignore-errors (sb-posix:unlink name))
+             (setf stream (sb-sys:make-fd-stream
+                           fd :input t :output t
+                              :external-format '(:utf-8 :replacement #\?)
+                              :buffering :full
+                              :auto-close t)))
            (setf process (apply #'sb-ext:run-program program arguments
                                              :search t
-                                             :output path
+                                             :output stream
                                              :error :output
-                                             :if-output-exists :supersede
                                              :wait nil
                                              (when environment
                                                (list :environment environment))))
-           (loop
-             (let ((code (sb-ext:process-exit-code process)))
-               (when code
-                 (return (values (if (probe-file path)
-                                     (uiop:read-file-string path)
-                                     "")
-                                 code))))
-             (when (and deadline (> (get-internal-real-time) deadline))
-               (ignore-errors (process-kill process :sigterm))
-               (sleep 0.1)
-               (ignore-errors (process-kill process :sigkill))
-               (return (values (if (probe-file path)
-                                   (uiop:read-file-string path)
-                                   "")
-                               :timeout)))
-             (sleep 0.01)))
-      (ignore-errors (delete-file path))))
+           ;; Read to the end rather than to FILE-LENGTH: the stream has no
+           ;; file name attached, and SBCL refuses FILE-LENGTH on it.
+           (flet ((captured ()
+                    (file-position stream 0)
+                    (with-output-to-string (text)
+                      (let ((buffer (make-string 4096)))
+                        (loop for count = (read-sequence buffer stream)
+                              while (plusp count)
+                              do (write-string buffer text :end count))))))
+             (loop
+               (let ((code (sb-ext:process-exit-code process)))
+                 (when code
+                   (return (values (captured) code))))
+               (when (and deadline (> (get-internal-real-time) deadline))
+                 ;; The group, not the pid: /bin/sh -c leaves its own children
+                 ;; running when only the shell is killed.
+                 (ignore-errors (process-kill process :sigterm :process-group))
+                 (sleep 0.1)
+                 (ignore-errors (process-kill process :sigkill :process-group))
+                 (process-reap process)
+                 (return (values (captured) :timeout)))
+               (sleep 0.01))))
+      (when process
+        (ignore-errors (process-reap process)))
+      (when stream
+        (ignore-errors (close stream)))))
   #-sbcl
   (progn
     (declare (ignore program arguments timeout environment))

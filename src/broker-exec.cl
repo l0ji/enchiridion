@@ -93,6 +93,9 @@ function, which verification counts as a warning and therefore as a failure."
 
 (defun broker-exec-main ()
   "Parse the small command line and serve until killed, or verify and exit."
+  ;; The same seed as the supervisor otherwise, and so the same temporary file
+  ;; names in the same shared directory.
+  (setf *random-state* (make-random-state t))
   (let* ((arguments (enchiridion.compat:script-arguments))
          (verify (broker-exec-argument arguments "--verify-plugin"))
          (socket (broker-exec-argument arguments "--socket"))

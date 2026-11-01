@@ -47,9 +47,11 @@ because a file in the repository is a file that ends up in a store path."))
    #:process-uid #:set-process-uid #:process-gid #:set-process-gid
    #:clear-supplementary-groups
    #:process-user #:set-process-user #:implementation-dependency-p
-   #:process-id #:process-kill #:process-exit-code #:lisp-runtime-path
+   #:process-id #:process-kill #:process-reap #:with-deadline
+   #:process-exit-code #:lisp-runtime-path
    #:script-arguments #:exit-with #:backtrace-string
-   #:encode-utf8 #:decode-utf8 #:run-program-capture #:temp-directory
+   #:encode-utf8 #:decode-utf8 #:decode-utf8-lenient #:run-program-capture
+   #:temp-directory
    #:set-file-mode #:file-mode #:with-interrupt-handler #:signal-interactive-interrupt
    #:install-shutdown-signals #:shutdown-interrupt-p #:signal-shutdown-interrupt)
   (:documentation
@@ -101,7 +103,7 @@ recover from a string."))
    #:completion-model #:completion-stop-reason #:completion-reasoning-text
    #:completion-input-tokens #:completion-output-tokens
    #:completion-cache-read-tokens #:completion-cache-write-tokens
-   #:completion-total-tokens
+   #:completion-total-tokens #:copy-completion
    ;; The adapter registry and the provider record it speaks. A handler
    ;; registers itself under an id; the provider table resolves an id to the
    ;; handler and hands it a PROVIDER. Nothing here names a vendor, which is
@@ -505,7 +507,7 @@ the shell. It is the only writer of run/enchiridion.status, which is what lets
    ;; compiled from, what the caps are, and where it writes.
    #:agent-backend #:agent-blocks #:agent-budget #:agent-directory
    #:compile-prompt #:prompt #:prompt-text #:prompt-tokens #:snapshot-p
-   #:record-spend #:spend #:spend-since #:spend-summary #:reset-spend
+   #:record-spend #:spend #:spend-since #:spend-count #:spend-summary #:reset-spend
    #:budget-exhausted-p #:spend-row
    #:session #:make-session #:session-id #:session-turns #:end-session
    #:heartbeat #:task-queue #:enqueue-task #:dequeue-task #:task-queue-length

@@ -110,6 +110,7 @@ the empty strings the shape has always allowed."
   (blocks '() :type list)
   (snapshot nil :type (or null prompt))
   (spend '() :type list)
+  (spend-dropped 0 :type (integer 0 *))
   (turn 0 :type (integer 0 *))
   (budget nil :type list)
   (directory nil :type (or null pathname))
@@ -159,8 +160,29 @@ than pretending to serialise."
   (channel :cli :type keyword)
   (time 0 :type integer))
 
+(defparameter +spend-keep+ 1000
+  "How many spend rows an agent keeps in memory. A serving process lives for
+weeks, and a ledger that only grows is a leak. The store keeps every row; this
+list is the per-turn report and the budget fallback when no store is open.")
+
+(defparameter +session-turns-keep+ 256
+  "How many completions a session keeps. Each holds the whole reply text.")
+
+(defun keep-newest (list keep)
+  "Cut LIST, newest first, to KEEP entries once it has grown to twice that.
+Return the list and how many entries were dropped. Cutting at twice the limit
+keeps the cost of counting the list off every push."
+  (let ((length (length list)))
+    (if (< length (* 2 keep))
+        (values list 0)
+        (progn
+          (setf (cdr (nthcdr (1- keep) list)) nil)
+          (values list (- length keep))))))
+
 (defun record-spend (agent completion &key (channel :cli))
-  "Add one row for COMPLETION to AGENT's ledger and return it."
+  "Add one row for COMPLETION to AGENT's ledger and return it.
+The in-memory ledger keeps the newest rows only; SPEND-COUNT still counts every
+row ever recorded, so an index taken before a turn stays valid after a cut."
   (let ((row (%make-spend-row
               :model (enchiridion.llm:completion-model completion)
               :input (enchiridion.llm:completion-input-tokens completion)
@@ -170,7 +192,17 @@ than pretending to serialise."
               :channel channel
               :time (get-universal-time))))
     (push row (agent-spend agent))
+    (multiple-value-bind (kept dropped) (keep-newest (agent-spend agent) +spend-keep+)
+      (setf (agent-spend agent) kept)
+      (incf (agent-spend-dropped agent) dropped))
     row))
+
+(declaim (ftype (function (agent) (integer 0 *)) spend-count))
+
+(defun spend-count (agent)
+  "Return how many spend rows AGENT has ever recorded, including the ones the
+in-memory ledger has since dropped. This is the index SPEND-SINCE takes."
+  (+ (agent-spend-dropped agent) (length (agent-spend agent))))
 
 (declaim (ftype (function (agent) list) spend))
 
@@ -183,12 +215,12 @@ than pretending to serialise."
 (defun spend-since (agent index)
   "Return AGENT's spend rows from INDEX onwards, oldest first.
 
-A caller records (length (spend agent)) before a turn and asks for the tail
+A caller records (spend-count agent) before a turn and asks for the tail
 after it. That is the only way to report what one turn cost: a turn with tool
 calls makes several model calls, and the completion it returns is only the
 last of them."
   (check-type index (integer 0 *))
-  (nthcdr index (spend agent)))
+  (nthcdr (max 0 (- index (agent-spend-dropped agent))) (spend agent)))
 
 (declaim (ftype (function (list) list) spend-summary))
 
@@ -221,7 +253,8 @@ turn used tools at all."
 
 (defun reset-spend (agent)
   "Forget every row in AGENT's ledger."
-  (setf (agent-spend agent) '())
+  (setf (agent-spend agent) '()
+        (agent-spend-dropped agent) 0)
   nil)
 
 (defun spend-total (agent &key (window :tick))
@@ -288,6 +321,36 @@ reason to fail the turn, so its errors stop here."
   "The tool round limit for this turn is reached, and no more tool calls will run. Reply to the operator now with what you have: what you did, what you found, and what is left."
   "The user message a turn sends when the model still asks for tools at the
 cap, so the last round is an answer and not another request.")
+
+(defparameter +tool-round-limit-reply+
+  "I reached the tool round limit for this turn before I could finish. Ask me to continue and I will pick up from here."
+  "The reply a capped turn falls back to when the model said nothing at all.")
+
+(defun blank-text-p (text)
+  "Return T when TEXT is NIL or only whitespace."
+  (or (null text)
+      (zerop (length (string-trim '(#\Space #\Tab #\Newline #\Return) text)))))
+
+(defun wrap-up-completion (completion fallback-text)
+  "Return COMPLETION as the last answer of a capped turn.
+
+The wrap-up round still carries the tool definitions, because a provider that
+sees tool calls in the history refuses a request that declares no tools, and a
+model can ask for a tool anyway. Its calls are not run, so they are dropped,
+and a round that said nothing answers with FALLBACK-TEXT: the last words the
+model spoke in this turn, or a note that the cap was reached. A capped turn
+never hands the operator an empty reply."
+  (if (and (null (enchiridion.llm:completion-tool-calls completion))
+           (not (blank-text-p (enchiridion.llm:completion-text completion))))
+      completion
+      (let ((final (enchiridion.llm:copy-completion completion)))
+        (setf (enchiridion.llm:completion-tool-calls final) '())
+        (when (blank-text-p (enchiridion.llm:completion-text final))
+          (setf (enchiridion.llm:completion-text final)
+                (if (blank-text-p fallback-text)
+                    +tool-round-limit-reply+
+                    fallback-text)))
+        final)))
 
 (defun complete-with-tools (backend messages model tools)
   "Call BACKEND with TOOLS only when there are any. A backend that has no tool
@@ -470,6 +533,7 @@ caller that does is a caller that runs two turns at once."
                             (enchiridion.llm.secrets:scrub user-text))))
            (rounds 0)
            (wrapped-up nil)
+           (last-words nil)
            (completion nil))
       (persist-turn store session "user" text :channel channel)
       (loop
@@ -485,7 +549,9 @@ caller that does is a caller that runs two turns at once."
                        :calls (length (enchiridion.llm:completion-tool-calls completion)))
         (persist-usage store session (record-spend agent completion :channel channel))
         (when session
-          (push completion (session-turns session)))
+          (push completion (session-turns session))
+          (setf (session-turns session)
+                (keep-newest (session-turns session) +session-turns-keep+)))
         ;; Every round is written down, and the last one is the reply the
         ;; operator reads. Persisting only the rounds that asked for a tool
         ;; would store the questions and forget every answer.
@@ -493,9 +559,13 @@ caller that does is a caller that runs two turns at once."
                       (enchiridion.llm:completion-text completion)
                       :model (enchiridion.llm:completion-model completion)
                       :channel channel)
+        (unless (blank-text-p (enchiridion.llm:completion-text completion))
+          (setf last-words (enchiridion.llm:completion-text completion)))
         (let ((calls (enchiridion.llm:completion-tool-calls completion)))
-          (when (or (null calls) wrapped-up)
+          (when (null calls)
             (return completion))
+          (when wrapped-up
+            (return (setf completion (wrap-up-completion completion last-words))))
           ;; At the cap the pending calls are dropped and the model gets one
           ;; more round to answer. Returning the capped completion would hand
           ;; the operator a reply with no text, because a round that asks for

@@ -424,20 +424,37 @@ one at once."
   (supervisor-write-status supervisor)
   supervisor)
 
+(defparameter +tick-drain-seconds+ 30
+  "How long SUPERVISOR-STOP waits for a heartbeat tick to finish.")
+
 (declaim (ftype (function (supervisor) supervisor) supervisor-stop))
 
 (defun supervisor-stop (supervisor)
   "Stop every channel, clear the running flag, and write the last status.
 Return SUPERVISOR.
 
-The heartbeat thread is destroyed before the last status is written, and the
-tick in flight, if there is one, is left to unwind: its task is claimed as
-running and the next process marks it failed. Killing it mid-write would leave
-the store locked by a dead thread."
+The heartbeat thread is given +TICK-DRAIN-SECONDS+ to finish the tick in
+flight and leave, because the store closes after this returns and a thread
+killed mid-write would leave it locked. A tick that outlasts the drain is
+stopped and reported; its task stays claimed as running and the next process
+marks it failed."
   (setf (supervisor-running-p supervisor) nil)
   (let ((beat (supervisor-heartbeat-thread supervisor)))
     (when (and beat (bordeaux-threads:thread-alive-p beat))
-      (ignore-errors (bordeaux-threads:destroy-thread beat)))
+      ;; The loop sees the cleared flag within a second, or when the tick in
+      ;; flight returns. Killing it mid-tick can unwind out of an SQLite call
+      ;; with a transaction open, so it is the last resort, not the first.
+      (let ((deadline (+ (get-internal-real-time)
+                         (* +tick-drain-seconds+ internal-time-units-per-second))))
+        (loop while (and (bordeaux-threads:thread-alive-p beat)
+                         (< (get-internal-real-time) deadline))
+              do (sleep 0.05)))
+      (when (bordeaux-threads:thread-alive-p beat)
+        (format *error-output*
+                "~&enchiridion: a heartbeat tick outlasted the ~D second drain and was stopped.~%"
+                +tick-drain-seconds+)
+        (finish-output *error-output*)
+        (ignore-errors (bordeaux-threads:destroy-thread beat))))
     (setf (supervisor-heartbeat-thread supervisor) nil))
   (dolist (channel (supervisor-channels supervisor))
     (handler-case (enchiridion.channel:channel-stop channel)
@@ -566,7 +583,10 @@ a keyword, because both spellings reach here."
            ((null name) "which channel?")
            ((null channel) (format nil "channel ~A is not implemented yet." name))
            ((string= action "enable")
-            (if (eq (enchiridion.channel:channel-state channel) :running)
+            ;; The thread and not the state: a started channel reports :LIVE or
+            ;; :FAILED, never :RUNNING, and its restart loop is still going.
+            (if (let ((thread (enchiridion.channel:channel-thread channel)))
+                  (and thread (bordeaux-threads:thread-alive-p thread)))
                 (format nil "~A is already up." name)
                 (progn (start-channel supervisor channel)
                        (format nil "~A is up." name))))

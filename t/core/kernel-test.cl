@@ -373,3 +373,72 @@
     (ok (string= "fake reply"
                  (enchiridion.llm:completion-text
                   (enchiridion.kernel:run-turn agent "hi"))))))
+
+;; A backend that never stops asking for a tool, even after the cap note. The
+;; first round says something; the rest say nothing.
+(defstruct (stubborn-backend (:constructor make-stubborn-backend))
+  (calls 0 :type integer)
+  (first-words "" :type string))
+
+(defmethod enchiridion.llm:complete ((backend stubborn-backend) messages
+                                     &key model tools budget)
+  (declare (ignore messages model tools budget))
+  (incf (stubborn-backend-calls backend))
+  (enchiridion.llm::%make-completion
+   :text (if (= 1 (stubborn-backend-calls backend))
+             (stubborn-backend-first-words backend)
+             "")
+   :model "stubborn-model"
+   :tool-calls (list (enchiridion.llm::%make-tool-call
+                      :id (format nil "call-~D" (stubborn-backend-calls backend))
+                      :name "no-such-tool"
+                      :arguments "{}"))
+   :input-tokens 5 :output-tokens 2))
+
+(defmethod enchiridion.llm:model-capabilities ((backend stubborn-backend))
+  (declare (ignore backend))
+  '(:tools t))
+
+(defmethod enchiridion.llm:backend-name ((backend stubborn-backend))
+  (declare (ignore backend))
+  "stubborn")
+
+(deftest a-capped-turn-never-answers-with-nothing ()
+  (flet ((final-turn (first-words)
+           (let* ((backend (make-stubborn-backend :first-words first-words))
+                  (agent (enchiridion.kernel:make-agent
+                          :backend backend
+                          :blocks (list (make-test-block "voice"))
+                          :tools-p nil
+                          :tool-rounds 1)))
+             (values (enchiridion.kernel:run-turn agent "hi") backend))))
+    (testing "a model that kept asking for tools answers with its last words"
+      (multiple-value-bind (completion backend) (final-turn "checking the logs")
+        (ok (string= "checking the logs" (enchiridion.llm:completion-text completion)))
+        (ok (null (enchiridion.llm:completion-tool-calls completion))
+            "the dropped calls are not handed back")
+        (ok (= 3 (stubborn-backend-calls backend)) "one round, the cap, one answer")))
+    (testing "a model that never said anything gets the cap note"
+      (let ((completion (final-turn "")))
+        (ok (search "tool round limit"
+                    (enchiridion.llm:completion-text completion)))))))
+
+(deftest the-ledger-is-bounded-and-its-index-stays-valid ()
+  (let* ((agent (enchiridion.kernel:make-agent
+                 :backend (make-fake-backend)
+                 :blocks (list (make-test-block "voice"))
+                 :tools-p nil))
+         (completion (enchiridion.llm::%make-completion
+                      :text "x" :model "m" :input-tokens 1 :output-tokens 1))
+         (keep enchiridion.kernel::+spend-keep+))
+    (dotimes (index (* 3 keep))
+      (enchiridion.kernel:record-spend agent completion))
+    (ok (< (length (enchiridion.kernel:spend agent)) (* 2 keep))
+        "the in-memory ledger stops growing")
+    (ok (= (* 3 keep) (enchiridion.kernel:spend-count agent))
+        "the count still covers every row")
+    (let ((before (enchiridion.kernel:spend-count agent)))
+      (enchiridion.kernel:record-spend agent completion)
+      (enchiridion.kernel:record-spend agent completion)
+      (ok (= 2 (length (enchiridion.kernel:spend-since agent before)))
+          "an index taken before a cut still names the turn's own rows"))))

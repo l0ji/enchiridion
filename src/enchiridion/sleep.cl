@@ -279,9 +279,17 @@ queue is cheaper than the confusion. Compaction overwrites this."
 (declaim (ftype (function (t) integer) store-total))
 
 (defun store-total (store)
-  "Return every token row the store holds, summed, or zero."
+  "Return the tokens unattended work has spent, summed over every row the
+sleep channel wrote, or zero.
+
+Only the sleep channel's rows count. The tick's spend is the difference in this
+number across the tick, and an operator turn answered on another channel while
+the tick runs is the operator's spend, not the tick's: counting it let a busy
+webhook use up the tick cap and stop the sleep agent."
   (if store
-      (handler-case (getf (enchiridion.memory.store:usage-total-since store 0) :total)
+      (handler-case (getf (enchiridion.memory.store:usage-total-since
+                           store 0 :channel :sleep)
+                          :total)
         (error () 0))
       0))
 
@@ -409,7 +417,7 @@ session block."
   (let* ((store (enchiridion.supervisor:supervisor-store supervisor))
          (agent (enchiridion.supervisor:supervisor-agent supervisor))
          (directory (enchiridion.supervisor:supervisor-directory supervisor))
-         (tick-index (if agent (length (spend agent)) 0))
+         (tick-index (if agent (spend-count agent) 0))
          (start-total (store-total store))
          (notes '())
          (ok-p t))

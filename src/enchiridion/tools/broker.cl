@@ -45,10 +45,19 @@ socket, or NIL. WAIT-FOR-CONNECTION calls it about once a second.")
   (server-thread nil :type t)
   (child nil :type t)
   (running-p nil :type boolean)
+  (broken-p nil :type boolean)
+  (call-timeout 660 :type (or null real))
+  (last-load nil :type list)
   (call-lock nil :type t))
 
+(defparameter +broker-call-timeout+ 660
+  "Seconds one broker call may take before the child is restarted. Longer than
+the shell tool's own ceiling, so a command that honours its timeout is never
+cut short here: this is the limit for a tool that hangs.")
+
 (defun make-broker (&key (socket #p"/run/enchiridion/broker.sock")
-                           (uid 1000) (gid 1000) (timeout 30) (log nil))
+                           (uid 1000) (gid 1000) (timeout 30) (log nil)
+                           (call-timeout +broker-call-timeout+))
   "Return a BROKER descriptor. Nothing starts until BROKER-START.
 
 The descriptor carries a lock because it carries one socket. A request is a
@@ -58,9 +67,13 @@ and the reload poll could already collide; a second channel and the heartbeat
 make it certain.
 
 LOG is a file for the child's standard output and error, or NIL to discard
-them. A child that dies before it binds the socket explains why there."
+them. A child that dies before it binds the socket explains why there.
+
+TIMEOUT is how long the child may take to start. CALL-TIMEOUT is how long one
+call may take, or NIL for no limit."
   (%make-broker :socket (pathname socket) :uid uid :gid gid :timeout timeout
                 :log (and log (pathname log))
+                :call-timeout call-timeout
                 :call-lock (bordeaux-threads:make-lock "enchiridion broker call")))
 
 (defun json-object (&rest pairs)
@@ -192,15 +205,21 @@ second call into a race with the accept loop."
                                             "detail" ""))))))))
 
 (defun accept-loop (server)
-  "Accept connections until SERVER is closed."
-  (handler-case
-      (loop
-        (let ((connection (usocket:socket-accept server
-                                                 :element-type '(unsigned-byte 8))))
-          (unwind-protect
-               (serve-connection (usocket:socket-stream connection))
-            (usocket:socket-close connection))))
-    (error () nil)))
+  "Accept connections until SERVER is closed.
+
+A connection that fails ends that connection and not the loop. The supervisor
+drops its connection when a call is interrupted, and the reply to that call is
+then written to a closed socket; if that error ended the loop, the reconnect
+that follows would find nothing listening."
+  (loop
+    (let ((connection (handler-case
+                          (usocket:socket-accept server
+                                                 :element-type '(unsigned-byte 8))
+                        (error () (return nil)))))
+      (unwind-protect
+           (handler-case (serve-connection (usocket:socket-stream connection))
+             (error () nil))
+        (ignore-errors (usocket:socket-close connection))))))
 
 (defun serve-broker (socket &key (uid nil) (gid nil))
   "Bind SOCKET and serve requests. This is the child entry point.
@@ -272,10 +291,15 @@ crosses the boundary in either direction."
 (defun broker-load-generation (broker directory &key generation)
   "Ask BROKER's child to load GENERATION from DIRECTORY and return the child's
 report, a hash table with the keys ok, generation and report."
-  (broker-call broker "load-generation"
-               (list :directory (namestring
-                                 (uiop:ensure-directory-pathname directory))
-                     :generation generation)))
+  (let* ((arguments (list :directory (namestring
+                                      (uiop:ensure-directory-pathname directory))
+                          :generation generation))
+         (reply (broker-call broker "load-generation" arguments)))
+    ;; Remembered so that a child restarted after a hang serves the same
+    ;; generation and not only the builtins.
+    (when (and (hash-table-p reply) (gethash "ok" reply))
+      (setf (broker-last-load broker) arguments))
+    reply))
 
 (defun log-tail (broker &optional (lines 20))
   "Return the last LINES lines of BROKER's log, or NIL when there are none."
@@ -379,10 +403,15 @@ Return BROKER."
     (ignore-errors (bordeaux-threads:destroy-thread (broker-server-thread broker)))
     (setf (broker-server-thread broker) nil))
   (when (broker-child broker)
-    (ignore-errors (enchiridion.compat:process-kill (broker-child broker) :sigterm))
+    ;; The group, so a tool the child started stops with it, and reaped, so
+    ;; the child does not stay a zombie for the life of the supervisor.
+    (ignore-errors (enchiridion.compat:process-kill (broker-child broker)
+                                                    :sigterm :process-group))
+    (ignore-errors (enchiridion.compat:process-reap (broker-child broker)))
     (setf (broker-child broker) nil))
   (ignore-errors (delete-file (broker-socket broker)))
-  (setf (broker-running-p broker) nil)
+  (setf (broker-running-p broker) nil
+        (broker-broken-p broker) nil)
   broker)
 
 (defun arguments-object (arguments)
@@ -399,43 +428,134 @@ parsed model call. Both become one object on the wire."
        table))
     (t arguments)))
 
+(defun mark-broker-broken (broker)
+  "Drop BROKER's connection after a call that did not finish its exchange.
+
+A call left between its request and its reply leaves the reply, or half a
+frame, in the socket, and the next call would read it as its own answer. The
+connection is closed instead, and the next call opens a fresh one."
+  (let ((stream (shiftf (broker-stream broker) nil)))
+    (when stream
+      (ignore-errors (close stream :abort t))))
+  (setf (broker-broken-p broker) t)
+  broker)
+
+(defun reconnect-broker (broker)
+  "Open a fresh connection to BROKER's socket and return BROKER.
+
+The child accepts one connection at a time, so this connect waits in the
+backlog until the child has finished the call that was abandoned. A child that
+has exited signals a transport error here, as it does at start."
+  (let ((connection (wait-for-connection broker (broker-child broker))))
+    (setf (broker-stream broker) (usocket:socket-stream connection)
+          (broker-broken-p broker) nil)
+    broker))
+
+(defun exchange (broker operation arguments limit)
+  "Write one request to BROKER and return the parsed reply, a hash table.
+
+LIMIT is seconds, or NIL. A call that outlasts it returns :TIMEOUT. Any way
+out between the first byte written and the last byte read, a Ctrl-C or the
+deadline included, leaves the stream out of step, so the connection is marked
+broken. The caller holds the call lock."
+  (let ((request (com.inuoe.jzon:stringify
+                  (json-object "op" (string operation)
+                               "arguments" (arguments-object arguments))))
+        (response nil)
+        (exchanged nil)
+        (outcome nil))
+    (unwind-protect
+         (setf outcome
+               (enchiridion.compat:with-deadline (limit :on-timeout :timeout)
+                 (let ((stream (broker-stream broker)))
+                   (write-frame stream request)
+                   (setf response (read-frame stream))
+                   (when response
+                     (setf exchanged t))
+                   :done)))
+      (unless exchanged
+        (mark-broker-broken broker)))
+    (cond
+      (exchanged (com.inuoe.jzon:parse response))
+      ((eq outcome :timeout) :timeout)
+      (t (error 'enchiridion.errors:transport-error
+                :detail "The broker closed without a response.")))))
+
+(defun restart-child (broker)
+  "Replace BROKER's child with a fresh one and return BROKER.
+
+The old child is killed with its whole process group, so a tool it started
+dies with it. The new child loads the generation the old one last loaded, so a
+restart costs the call that hung and not every agent tool. A reload that fails
+here is reported and leaves the builtins serving: the next `reload` fixes it."
+  (let ((child (broker-child broker)))
+    (when child
+      (ignore-errors (enchiridion.compat:process-kill child :sigkill :process-group))
+      (ignore-errors (enchiridion.compat:process-reap child))))
+  (mark-broker-broken broker)
+  (setf (broker-running-p broker) nil)
+  (start-child broker)
+  (setf (broker-broken-p broker) nil)
+  (let ((load (broker-last-load broker)))
+    (when load
+      (let ((reply (ignore-errors
+                    (exchange broker "load-generation" load (broker-call-timeout broker)))))
+        (unless (and (hash-table-p reply) (gethash "ok" reply))
+          (format *error-output*
+                  "~&enchiridion: the restarted broker did not reload generation ~A.~%"
+                  (getf load :generation))
+          (finish-output *error-output*)))))
+  broker)
+
+(defun recover-broker (broker)
+  "Make BROKER's connection usable again after a broken call.
+A child that is still alive gets a new connection. A child that has exited is
+replaced."
+  (let ((child (broker-child broker)))
+    (if (and child (enchiridion.compat:process-exit-code child))
+        (restart-child broker)
+        (reconnect-broker broker))))
+
 (defun broker-call (broker operation arguments &key timeout)
   "Send one operation to BROKER and return its result.
 
-TIMEOUT is accepted for the protocol but not yet enforced on the socket read;
-the caller can set the process deadline around it. The frame itself is capped
-at 16 MiB by READ-FRAME.
+TIMEOUT is seconds, and defaults to the broker's CALL-TIMEOUT. A call that
+outlasts it is a hung tool: the child is restarted, the call signals a
+transport error, and the agent lock is free for the next turn. The frame itself
+is capped at 16 MiB by READ-FRAME.
 
 The whole call holds the broker's lock. A request is one frame written and one
 frame read on one stream, so two callers at once would interleave their writes
 and one would read the other's answer, which is a wrong answer and not a
 visible error."
-  (declare (ignore timeout))
   (unless (broker-running-p broker)
     (error 'enchiridion.errors:configuration-error
            :key :broker
            :detail "The broker is not running."))
-  (let ((lock (broker-call-lock broker)))
+  (let ((lock (broker-call-lock broker))
+        (limit (or timeout (broker-call-timeout broker))))
     (when lock
       (bordeaux-threads:acquire-lock lock))
     (unwind-protect
-         (let ((stream (broker-stream broker)))
-           (write-frame stream
-                        (com.inuoe.jzon:stringify
-                         (json-object "op" (string operation)
-                                      "arguments" (arguments-object arguments))))
-           (let ((response (read-frame stream)))
-             (unless response
+         (progn
+           (when (broker-broken-p broker)
+             (recover-broker broker))
+           (let ((data (exchange broker operation arguments limit)))
+             (when (eq data :timeout)
+               ;; Only a child can be replaced. The in-process test broker
+               ;; reconnects on the next call instead.
+               (when (broker-child broker)
+                 (ignore-errors (restart-child broker)))
                (error 'enchiridion.errors:transport-error
-                      :detail "The broker closed without a response."))
-             (let ((data (com.inuoe.jzon:parse response)))
-               (if (gethash "ok" data)
-                   (gethash "result" data)
-                   (error 'enchiridion.errors:tool-error
-                          :tool operation
-                          :detail (or (gethash "detail" data)
-                                      (gethash "error" data)
-                                      "The broker reported an error."))))))
+                      :detail (format nil "The tool ~A did not answer within ~A seconds, so the broker was restarted."
+                                      operation limit)))
+             (if (gethash "ok" data)
+                 (gethash "result" data)
+                 (error 'enchiridion.errors:tool-error
+                        :tool operation
+                        :detail (or (gethash "detail" data)
+                                    (gethash "error" data)
+                                    "The broker reported an error.")))))
       (when lock
         (bordeaux-threads:release-lock lock)))))
 

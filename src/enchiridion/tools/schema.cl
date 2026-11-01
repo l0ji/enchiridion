@@ -40,6 +40,11 @@ with the wrong argument and reports success."
         (let ((table (make-hash-table :test #'equal)))
           (setf (gethash "type" table) "object")
           (setf (gethash "additionalProperties" table) nil)
+          ;; Always present, even empty. An object schema with no properties
+          ;; and additionalProperties false is what a plugin with no tool
+          ;; form gets, and without the key the validator reads NIL where it
+          ;; wants a table and every call to the tool fails.
+          (setf (gethash "properties" table) (make-hash-table :test #'equal))
           (loop for (key value) on (rest schema) by #'cddr
                 do (case key
                      (:required
@@ -48,13 +53,12 @@ with the wrong argument and reports success."
                                       (string-downcase (symbol-name name)))
                                     (coerce value 'list))))
                      (:properties
-                      (when value
-                        (let ((properties (make-hash-table :test #'equal)))
-                          (dolist (pair value)
-                            (setf (gethash (string-downcase (symbol-name (first pair)))
-                                           properties)
-                                  (schema-to-json (second pair))))
-                          (setf (gethash "properties" table) properties))))
+                      (let ((properties (make-hash-table :test #'equal)))
+                        (dolist (pair value)
+                          (setf (gethash (string-downcase (symbol-name (first pair)))
+                                         properties)
+                                (schema-to-json (second pair))))
+                        (setf (gethash "properties" table) properties)))
                      (otherwise
                       (error 'enchiridion.errors:schema-error
                              :detail (format nil "Unknown object schema key ~S." key)))))
@@ -113,6 +117,20 @@ call holds and is passed through."
 CL-JSCHEMA signals INVALID-JSON with one or more INVALID-JSON-VALUE children;
 the children carry the JSON pointer and the reason, and both go into the detail
 so the model can correct the call instead of guessing."
+  ;; cl-jschema signals a type error, NIL is not a HASH-TABLE, on an object
+  ;; schema with no properties, whether the key is absent or empty. Such a
+  ;; schema takes no arguments, since additionalProperties is false, and that
+  ;; is checked here rather than handed to the validator.
+  (when (and (consp schema)
+             (eq (first schema) :object)
+             (null (getf (rest schema) :properties))
+             (null (getf (rest schema) :required)))
+    (let ((value (arguments-to-json arguments)))
+      (unless (zerop (hash-table-count value))
+        (error 'enchiridion.errors:schema-error
+               :detail (format nil "This tool takes no arguments, but it was given ~{~A~^, ~}."
+                               (loop for key being the hash-keys of value collect key))))
+      (return-from validate-arguments t)))
   (let ((parsed-schema (cl-jschema:parse (schema-json-string schema)))
         (value (arguments-to-json arguments)))
     (handler-case

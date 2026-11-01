@@ -60,3 +60,79 @@
       (enchiridion.tools.broker:broker-stop broker)
       (ng (enchiridion.tools.broker:broker-running-p broker))
       (enchiridion.tools:clear-registry))))
+
+(deftest an-abandoned-call-does-not-answer-the-next-one ()
+  ;; A call left between its request and its reply, as a Ctrl-C leaves it,
+  ;; used to leave the reply in the socket for the next call to read.
+  (enchiridion.tools:clear-registry)
+  (enchiridion.tools:register-tool
+   (enchiridion.tools:make-tool
+    :name "slow"
+    :description "Answer after a pause."
+    :schema '(:object :properties ((:text :string)))
+    :handler (lambda (arguments)
+               (declare (ignore arguments))
+               (sleep 0.5)
+               "slow answer")))
+  (enchiridion.tools:register-tool
+   (enchiridion.tools:make-tool
+    :name "echo"
+    :description "Echo one string."
+    :schema '(:object :required (:text) :properties ((:text :string)))
+    :handler (lambda (arguments) (gethash "text" arguments))))
+  (let ((broker (enchiridion.tools.broker:make-broker
+                 :socket (scratch-socket)
+                 :timeout 5)))
+    (unwind-protect
+         (progn
+           (enchiridion.tools.broker:broker-start broker :in-process t)
+           (let ((caller (bordeaux-threads:make-thread
+                          (lambda ()
+                            (catch 'abandon
+                              (enchiridion.tools.broker:broker-call
+                               broker "slow" (list :text "x")))))))
+             (sleep 0.1)
+             (bordeaux-threads:interrupt-thread
+              caller (lambda () (throw 'abandon :abandoned)))
+             (bordeaux-threads:join-thread caller))
+           (ok (string= "hello"
+                        (enchiridion.tools.broker:broker-call
+                         broker "echo" (list :text "hello")))
+               "the next call reads its own answer")
+           (ok (enchiridion.tools.broker:broker-health broker)))
+      (enchiridion.tools.broker:broker-stop broker)
+      (enchiridion.tools:clear-registry))))
+
+(deftest a-call-past-its-deadline-fails-and-frees-the-broker ()
+  (enchiridion.tools:clear-registry)
+  (enchiridion.tools:register-tool
+   (enchiridion.tools:make-tool
+    :name "slow"
+    :description "Answer after a pause."
+    :schema '(:object :properties ())
+    :handler (lambda (arguments)
+               (declare (ignore arguments))
+               (sleep 1)
+               "slow answer")))
+  (enchiridion.tools:register-tool
+   (enchiridion.tools:make-tool
+    :name "echo"
+    :description "Echo one string."
+    :schema '(:object :required (:text) :properties ((:text :string)))
+    :handler (lambda (arguments) (gethash "text" arguments))))
+  (let ((broker (enchiridion.tools.broker:make-broker
+                 :socket (scratch-socket)
+                 :timeout 5)))
+    (unwind-protect
+         (progn
+           (enchiridion.tools.broker:broker-start broker :in-process t)
+           (ok (signals (enchiridion.tools.broker:broker-call
+                         broker "slow" nil :timeout 0.2)
+                        'enchiridion.errors:transport-error)
+               "a call past its deadline is an error, not a hang")
+           (ok (string= "hello"
+                        (enchiridion.tools.broker:broker-call
+                         broker "echo" (list :text "hello")))
+               "and the next call reads its own answer"))
+      (enchiridion.tools.broker:broker-stop broker)
+      (enchiridion.tools:clear-registry))))

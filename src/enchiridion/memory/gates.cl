@@ -706,3 +706,124 @@ is how the operator lifts a precision freeze, and return the watermark."
   "Return the seconds between T2 passes: the frozen interval while the
 quarantine rate is over its ceiling, the ordinary one otherwise."
   (if (quarantine-frozen-p store) *t2-frozen-interval-seconds* *t2-interval-seconds*))
+
+;;;; ------------------------------------------------------------------
+;;;; 11. The T2 schedule and the pass
+;;;; ------------------------------------------------------------------
+
+(defun last-t2-ts (store)
+  "Return the universal time the last T2 pass ended, or NIL before the first."
+  (ensure-generation-state store)
+  (enchiridion.memory.store:field
+   (first (enchiridion.memory.store:query-rows
+           store "SELECT last_t2_ts AS ts FROM memory_state WHERE id = 1"))
+   "ts"))
+
+(defun mark-t2-pass (store &key (now (get-universal-time)))
+  "Record that a T2 pass ended at NOW, whatever it decided, and return NOW."
+  (ensure-generation-state store)
+  (enchiridion.memory.store:exec
+   store "UPDATE memory_state SET last_t2_ts = ? WHERE id = 1" (list now))
+  now)
+
+(defun new-episode-count (store)
+  "Return how many episodes arrived after the furthest any finished build
+reached. Quarantined and held candidates count as reached: measuring from the
+live generation instead would leave the threshold crossed after every
+quarantine, and T2 would run on every tick."
+  (or (enchiridion.memory.store:field
+       (first (enchiridion.memory.store:query-rows
+               store
+               "SELECT COUNT(*) AS n FROM episodes
+                 WHERE id > (SELECT COALESCE(MAX(to_episode), 0) FROM generations
+                              WHERE status <> 'building')"))
+       "n")
+      0))
+
+(defun t2-due-p (store &key (now (get-universal-time)))
+  "Return T when a T2 pass should run on this tick.
+A building candidate always continues, because a pass spans as many ticks as
+its episodes need. Otherwise docs/design/memory.md: daily or after
+*T2-EPISODE-THRESHOLD* new episodes, whichever comes first. While the
+quarantine rate is over its ceiling the interval is weekly and the threshold
+is off, or a busy log would make weekly mean nothing."
+  (let ((last (last-t2-ts store)))
+    (or (and (current-building-generation store) t)
+        (null last)
+        (>= (- now last) (t2-interval store))
+        (and (not (quarantine-frozen-p store))
+             (>= (new-episode-count store) *t2-episode-threshold*)))))
+
+(defun t2-pass-spend (store &key (now (get-universal-time)))
+  "Return the tokens T2 has spent in the rolling twenty-four hours before NOW."
+  (getf (enchiridion.memory.store:usage-total-since store (- now 86400) :channel :t2)
+        :total))
+
+(defun t2-refusal (store &key (now (get-universal-time)))
+  "Return why no T2 pass may run on this tick, as a keyword, or NIL.
+A missing instrument is not a refusal here: the pass reports it with the list
+of what is missing, and spends nothing doing so."
+  (cond
+    ((or (not (enabled-p)) (not *t2-enabled-p*)) :disabled)
+    ((not (t2-due-p store :now now)) :not-due)
+    ;; Only the operator lifts a precision freeze, so a pass during one could
+    ;; only spend. A quarantine-rate freeze is not refused: held candidates
+    ;; are what lift it, and T2-INTERVAL already slows it to weekly.
+    ((precision-frozen-p store) :frozen-precision)
+    ((>= (t2-pass-spend store :now now) *t2-max-tokens-per-pass*) :pass-budget-spent)
+    (t nil)))
+
+(defun live-unchecked-p (store generation-id)
+  "Return T when GENERATION-ID is live and has had no post-promotion check."
+  (and (plusp generation-id)
+       (null (first-check-result store generation-id "post-canary"))))
+
+(defun run-t2-pass (store &key (canaries *memory-canaries*)
+                               (scorer #'answer-scorer)
+                               (limit *memory-t2-episodes-per-tick*)
+                               (now (get-universal-time)))
+  "Run one tick of a T2 pass and return a report plist whose :OUTCOME is one
+of :ROLLED-BACK, :INSTRUMENT-MISSING, :BUILDING, :PROMOTED, :QUARANTINED,
+:HELD, or :SKIPPED. The caller has already asked T2-REFUSAL.
+
+A pass that starts after a promotion first re-checks the live generation:
+docs/design/memory.md says a failed post-promotion check rolls back and
+freezes the next pass, so a rollback ends this pass with nothing built. A new
+candidate is started only when the preflight finds every instrument, so no
+tokens go to a candidate nobody could promote. LAST_T2_TS is written whenever
+a pass ends, and not while a candidate is still building."
+  (let ((live (live-generation-id store))
+        (building (current-building-generation store)))
+    (when (and (null building) (live-unchecked-p store live))
+      (let ((check (check-promoted store live :canaries canaries :scorer scorer)))
+        (unless (getf check :held)
+          (mark-t2-pass store :now now)
+          (return-from run-t2-pass
+            (list :outcome :rolled-back :generation-id live :failed (getf check :failed))))))
+    (unless building
+      (let ((preflight (t2-preflight store :canaries canaries)))
+        (unless (getf preflight :ready-p)
+          (mark-t2-pass store :now now)
+          (return-from run-t2-pass
+            (list :outcome :instrument-missing :missing (getf preflight :missing))))))
+    (let ((build (build-candidate store :limit limit)))
+      (cond
+        ((not (getf build :built))
+         (list :outcome :skipped :reason (getf build :reason)))
+        ((eq (getf build :status) :building)
+         (list :outcome :building
+               :generation-id (getf build :generation-id)
+               :remaining (getf build :remaining)))
+        (t
+         (let* ((generation-id (getf build :generation-id))
+                (gate (gate-candidate store generation-id
+                                      :canaries canaries :scorer scorer)))
+           (mark-t2-pass store :now now)
+           (list :outcome (cond ((getf gate :promoted) :promoted)
+                                ((eq (getf gate :reason) :held) :held)
+                                ((eq (getf gate :reason) :quarantined) :quarantined)
+                                (t :skipped))
+                 :generation-id generation-id
+                 :failed (getf gate :failed)
+                 :freeze (getf gate :freeze)
+                 :reason (getf gate :reason))))))))

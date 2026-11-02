@@ -416,3 +416,30 @@ countable from the test."
         (testing "and the day cap still closes on it"
           (ok (search "day cap"
                       (enchiridion.kernel::budget-refusal agent store start 0))))))))
+
+;;;; T2.
+
+(deftest the-first-t2-pass-reports-what-is-missing-and-then-waits ()
+  (with-scratch-world (store supervisor)
+    (let ((enchiridion.memory:*t2-enabled-p* t)
+          (enchiridion.memory:*t2-interval-seconds* 86400)
+          (enchiridion.memory:*assertion-deriver* nil))
+      (let ((first (getf (enchiridion.kernel:heartbeat supervisor) :report)))
+        (ok (search "T2 skipped: instruments missing (deriver" first))
+        (ok (zerop (calls-made supervisor))))
+      (testing "a pass that is not due says nothing"
+        (ng (search "T2" (getf (enchiridion.kernel:heartbeat supervisor) :report)))))))
+
+(deftest t2-switched-off-says-nothing ()
+  (with-scratch-world (store supervisor)
+    (let ((enchiridion.memory:*t2-enabled-p* nil))
+      (ng (search "T2" (getf (enchiridion.kernel:heartbeat supervisor) :report))))))
+
+(deftest a-spent-day-cap-skips-t2-too ()
+  (with-scratch-world (store supervisor)
+    (setf (enchiridion.kernel:agent-budget (agent-of supervisor))
+          '(:max-tokens-per-tick 10 :max-tokens-per-day 20))
+    (enchiridion.memory.store:record-usage store :model "counting" :input 15 :output 15)
+    (let ((enchiridion.memory:*t2-enabled-p* t))
+      (ok (search "T2 skipped: the day cap is spent"
+                  (getf (enchiridion.kernel:heartbeat supervisor) :report))))))

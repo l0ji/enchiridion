@@ -731,3 +731,140 @@ subject from the question before it, the way the model deriver is asked to."
       (ok (zerop (enchiridion.memory:live-generation-id store)))
       (testing "and it counts toward the rate as a pass"
         (ok (= 5/6 (getf (enchiridion.memory:quarantine-rate store) :rate)))))))
+
+;;;; The T2 schedule and pass.
+
+(defmacro with-t2-world ((store directory) &body body)
+  "The gate world's five answered questions, not yet built, with T2 on and its
+shipped schedule."
+  `(with-store (,store ,directory)
+     (let ((enchiridion.memory:*assertion-deriver* #'test-deriver)
+           (enchiridion.memory:*canary-min-families* 4)
+           (enchiridion.memory::*memory-gate-min-n* 5)
+           (enchiridion.memory:*tail-min-n* 1)
+           (enchiridion.memory:*tail-rarity-fraction* 1.0)
+           (enchiridion.memory:*t2-enabled-p* t)
+           (enchiridion.memory:*t2-interval-seconds* 86400)
+           (enchiridion.memory:*t2-frozen-interval-seconds* 604800)
+           (enchiridion.memory:*t2-episode-threshold* 200)
+           (enchiridion.memory:*t2-max-tokens-per-pass* 30000))
+       (dotimes (i 5)
+         (say ,store "user" (format nil "question ~D: alpha is beta" i))
+         (say ,store "assistant" (format nil "answer ~D" i)))
+       (enchiridion.memory.store:exec ,store "UPDATE episodes SET derived_ts = 1")
+       ,@body)))
+
+(defun generation-count (store)
+  (enchiridion.memory.store:field
+   (first (enchiridion.memory.store:query-rows store "SELECT COUNT(*) AS n FROM generations"))
+   "n"))
+
+(defun finish-t2-pass (store &key (canaries (passing-canaries)) (limit 2))
+  "Run T2 ticks until the pass ends, and return the last report."
+  (loop repeat 50
+        for report = (enchiridion.memory:run-t2-pass store :canaries canaries
+                                                           :scorer #'assertion-scorer
+                                                           :limit limit)
+        unless (eq :building (getf report :outcome))
+          return report))
+
+(deftest a-pass-missing-an-instrument-builds-nothing-and-spends-nothing ()
+  (with-t2-world (store directory)
+    (let ((report (enchiridion.memory:run-t2-pass store :canaries '())))
+      (ok (eq :instrument-missing (getf report :outcome)))
+      (ok (member :canary-coverage (getf report :missing)))
+      (ok (zerop (generation-count store)))
+      (ok (zerop (enchiridion.memory:t2-pass-spend store)))
+      (testing "and it counts as a pass, so the next one waits for the interval"
+        (ok (enchiridion.memory:last-t2-ts store))
+        (ng (enchiridion.memory:t2-due-p store))))))
+
+(deftest a-pass-is-due-daily-or-after-enough-new-episodes ()
+  (with-store (store directory)
+    (let ((enchiridion.memory:*t2-interval-seconds* 86400)
+          (enchiridion.memory:*t2-frozen-interval-seconds* 604800)
+          (enchiridion.memory:*t2-episode-threshold* 3))
+      (testing "the first pass is due at once"
+        (ok (enchiridion.memory:t2-due-p store :now 1000)))
+      (enchiridion.memory:mark-t2-pass store :now 1000)
+      (testing "then not until the interval has passed"
+        (ng (enchiridion.memory:t2-due-p store :now 2000))
+        (ok (enchiridion.memory:t2-due-p store :now (+ 1000 86400))))
+      (dotimes (i 3) (write-body store (format nil "note ~D" i)))
+      (testing "or the episode threshold is reached"
+        (ok (enchiridion.memory:t2-due-p store :now 2000)))
+      (dotimes (i 5) (gated-generation store "quarantined"))
+      (testing "while quarantine-frozen the threshold is off and the interval is weekly"
+        (ng (enchiridion.memory:t2-due-p store :now 2000))
+        (ng (enchiridion.memory:t2-due-p store :now (+ 1000 86400)))
+        (ok (enchiridion.memory:t2-due-p store :now (+ 1000 604800)))))))
+
+(deftest a-quarantined-pass-does-not-leave-the-threshold-crossed ()
+  (with-store (store directory)
+    (let ((enchiridion.memory:*t2-episode-threshold* 3))
+      (dotimes (i 3) (write-body store (format nil "note ~D" i)))
+      (ok (= 3 (enchiridion.memory:new-episode-count store)))
+      (let ((generation (gated-generation store "quarantined")))
+        (enchiridion.memory.store:exec
+         store "UPDATE generations SET to_episode = (SELECT MAX(id) FROM episodes) WHERE id = ?"
+         (list generation)))
+      (ok (zerop (enchiridion.memory:new-episode-count store))))))
+
+(deftest a-pass-resumes-across-ticks-and-gates-what-it-built ()
+  (with-t2-world (store directory)
+    (let ((first (enchiridion.memory:run-t2-pass store :canaries (passing-canaries)
+                                                       :scorer #'assertion-scorer
+                                                       :limit 2)))
+      (ok (eq :building (getf first :outcome)))
+      (ok (plusp (getf first :remaining)))
+      (testing "a building candidate is due whatever the clock says"
+        (enchiridion.memory:mark-t2-pass store)
+        (ok (enchiridion.memory:t2-due-p store)))
+      (let ((last (finish-t2-pass store)))
+        (ok (eq :promoted (getf last :outcome)))
+        (ok (= (getf first :generation-id) (getf last :generation-id)))
+        (ok (= (getf last :generation-id) (enchiridion.memory:live-generation-id store)))))))
+
+(deftest the-pass-after-a-promotion-checks-it-first ()
+  (testing "a failed check rolls back and builds nothing"
+    (with-t2-world (store directory)
+      (let* ((promoted (getf (finish-t2-pass store) :generation-id))
+             (before (generation-count store))
+             (report (enchiridion.memory:run-t2-pass
+                      store :canaries (cons (canary "safety" :name "leak" :cue "alpha"
+                                                             :expect "alpha")
+                                            (passing-canaries))
+                            :scorer #'assertion-scorer)))
+        (ok (eq :rolled-back (getf report :outcome)))
+        (ok (= promoted (getf report :generation-id)))
+        (ok (zerop (enchiridion.memory:live-generation-id store)))
+        (ok (= before (generation-count store))))))
+  (testing "a check that holds lets the same pass build"
+    (with-t2-world (store directory)
+      (let* ((promoted (getf (finish-t2-pass store) :generation-id))
+             (report (finish-t2-pass store)))
+        (ok (not (eq :rolled-back (getf report :outcome))))
+        (ok (equal "pass" (enchiridion.memory::first-check-result store promoted "post-canary")))
+        (ok (> (getf report :generation-id) promoted))))))
+
+(deftest t2-refuses-when-off-frozen-or-over-its-pass-budget ()
+  (with-t2-world (store directory)
+    (testing "the first pass may run"
+      (ok (null (enchiridion.memory:t2-refusal store))))
+    (testing "switched off"
+      (let ((enchiridion.memory:*t2-enabled-p* nil))
+        (ok (eq :disabled (enchiridion.memory:t2-refusal store)))))
+    (testing "the day's T2 spend reached the pass cap"
+      (enchiridion.memory.store:record-usage store :model "m" :input 20000 :output 10000
+                                                   :channel :t2)
+      (ok (eq :pass-budget-spent (enchiridion.memory:t2-refusal store))))
+    (testing "spend older than a day no longer counts"
+      (enchiridion.memory.store:exec store "UPDATE usage SET ts = ts - 90000")
+      (ok (null (enchiridion.memory:t2-refusal store))))
+    (testing "a quarantine-rate freeze slows T2 but does not refuse it"
+      (dotimes (i 5) (gated-generation store "quarantined"))
+      (ok (null (enchiridion.memory:t2-refusal store))))
+    (testing "a precision freeze refuses"
+      (dotimes (i 5)
+        (post-check store (gated-generation store "promoted" :promoted t) "fail" "fail"))
+      (ok (eq :frozen-precision (enchiridion.memory:t2-refusal store))))))

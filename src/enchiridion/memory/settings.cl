@@ -124,6 +124,20 @@ check, below which promotion freezes until the operator resets it.")
       "The most share of recently gated candidates that may be quarantined,
 above which promotion freezes and T2 runs at the frozen interval.")
 
+(defvar *t2-enabled-p*)
+(setf (documentation '*t2-enabled-p* 'variable)
+      "True when the heartbeat runs T2 passes on their schedule.")
+
+(defvar *t2-episode-threshold*)
+(setf (documentation '*t2-episode-threshold* 'variable)
+      "New episodes since the last pass that make a T2 pass due before its
+interval has elapsed. Ignored while the quarantine rate is over its ceiling.")
+
+(defvar *t2-max-tokens-per-pass*)
+(setf (documentation '*t2-max-tokens-per-pass* 'variable)
+      "Most tokens T2 may spend in any rolling twenty-four hours. A candidate
+that reaches it pauses and resumes once the window has room.")
+
 (defvar *t2-interval-seconds*)
 (defvar *t2-frozen-interval-seconds*)
 (setf (documentation '*t2-frozen-interval-seconds* 'variable)
@@ -199,6 +213,9 @@ key by key to the shipped defaults. Return NIL."
           *quarantine-max* (setting :quarantine-max)
           *quarantine-window* (setting :quarantine-window)
           *quarantine-min-candidates* (setting :quarantine-min-candidates)
+          *t2-enabled-p* (not (null (setting :t2-enabled)))
+          *t2-episode-threshold* (setting :t2-episode-threshold)
+          *t2-max-tokens-per-pass* (setting :t2-max-tokens-per-pass)
           *t2-interval-seconds* (setting :t2-interval-seconds)
           *t2-frozen-interval-seconds* (setting :t2-frozen-interval-seconds)
           *compaction-rebase-every* (setting :compaction-rebase-every)

@@ -357,11 +357,11 @@ webhook use up the tick cap and stop the sleep agent."
         (error () 0))
       0))
 
-(declaim (ftype (function (agent t integer integer &key (:reserve integer))
+(declaim (ftype (function (agent t integer integer &key (:reserve integer) (:day-only t))
                           (or null string))
                 budget-refusal))
 
-(defun budget-refusal (agent store start-total tick-index &key (reserve 0))
+(defun budget-refusal (agent store start-total tick-index &key (reserve 0) (day-only nil))
   "Return why no model call may start, or NIL. RESERVE is what the call is
 expected to cost, so a large pass is refused before it can overrun the tick
 cap rather than after.
@@ -379,8 +379,9 @@ cap that resets at midnight is a cap that can be spent twice in a minute.
 The day window counts every channel, T2 derivation on :t2 included, so the day
 cap bounds the process's spend as a whole. The tick window counts :sleep alone,
 because a T2 pass is held to its own pass and promotion caps and is designed to
-be larger than one tick."
-  (let ((tick-cap (getf (agent-budget agent) :max-tokens-per-tick))
+be larger than one tick. DAY-ONLY asks the day window alone, which is how the
+T2 phase asks."
+  (let ((tick-cap (and (not day-only) (getf (agent-budget agent) :max-tokens-per-tick)))
         (day-cap (getf (agent-budget agent) :max-tokens-per-day)))
     (labels ((tick-spend ()
                (if store
@@ -479,6 +480,38 @@ turns once, which is harmless and bounded."
               (rebase-p "the session block was rebuilt from raw turns")
               (t "the session block was compacted"))))))
 
+(defun t2-report-line (report)
+  "Return the heartbeat's sentence for one T2 pass REPORT."
+  (let ((id (getf report :generation-id)))
+    (ecase (getf report :outcome)
+      (:building (format nil "T2 building generation ~D (~D episode~:P remaining)"
+                         id (getf report :remaining)))
+      (:promoted (format nil "T2 generation ~D promoted" id))
+      (:quarantined (format nil "T2 generation ~D quarantined at the ~A gate"
+                            id (getf report :failed)))
+      (:held (format nil "T2 generation ~D held: promotion is frozen (~(~A~))"
+                     id (getf report :freeze)))
+      (:rolled-back (format nil "T2 rolled back generation ~D: its ~A check failed"
+                            id (getf report :failed)))
+      (:instrument-missing (format nil "T2 skipped: instruments missing (~{~(~A~)~^, ~})"
+                                   (getf report :missing)))
+      (:skipped (format nil "T2 skipped: ~(~A~)" (getf report :reason))))))
+
+(defun run-t2-phase (store agent start-total tick-index)
+  "Run one tick of T2 when it is due and allowed, and return the report line,
+or NIL when T2 is off or the pass is not due. Neither says anything, because
+otherwise every tick between two passes, or every tick of an agent whose
+operator switched T2 off, would say so."
+  (let ((refusal (or (enchiridion.memory:t2-refusal store)
+                     (let ((budget (budget-refusal agent store start-total tick-index
+                                                   :day-only t)))
+                       (and budget (list budget))))))
+    (cond
+      ((member refusal '(:not-due :disabled)) nil)
+      ((consp refusal) (format nil "T2 skipped: ~A" (first refusal)))
+      (refusal (format nil "T2 skipped: ~(~A~)" refusal))
+      (t (t2-report-line (enchiridion.memory:run-t2-pass store))))))
+
 (declaim (ftype (function (enchiridion.supervisor:supervisor) list) heartbeat))
 
 (defun heartbeat (supervisor)
@@ -490,7 +523,9 @@ should not also stop the queue. Nothing here signals, for the reason
 SUPERVISOR-TICK gives.
 
 Phase order is the design. Recovery first, so a task a dead process left
-running is failed before anything looks at the queue. Then the ledger, so the
+running is failed before anything looks at the queue. Then memory
+maintenance and embedding, then T2, which reads the rarity maintenance just
+wrote and may build or gate a candidate. Then the ledger, so the
 sleep agent's own prompt carries the spend of the pass before it. Then the
 sleep agent. Then compaction, which is the only phase that may rewrite the
 session block."
@@ -545,6 +580,12 @@ session block."
                    (let ((written (enchiridion.memory:embed-pending store)))
                      (when (plusp written)
                        (format nil "~D episode~:P embedded" written))))))
+      (when (and store agent)
+        ;; T2: after maintenance, so the tail sample reads fresh rarity, and
+        ;; before the sleep agent. Its spend counts toward the day cap but not
+        ;; the tick cap, because a pass has its own caps.
+        (attempt "memory T2"
+                 (lambda () (run-t2-phase store agent start-total tick-index))))
       (when store
         (attempt "the harness blocks"
                  (lambda ()

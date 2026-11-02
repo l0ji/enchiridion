@@ -107,6 +107,24 @@ The heartbeat runs a model-free maintenance phase before the sleep agent and bef
 It derives rarity and lexical co-occurrence links for episodes that have not been derived, in batches.
 The phase is reported as `N episodes derived` when it writes, and adds no note when there is nothing to do.
 
+## The T2 pass
+
+T2 runs in the heartbeat after maintenance, so the tail sample reads fresh rarity, and before the sleep agent.
+A pass is due daily, or once `:t2-episode-threshold` episodes have arrived past the furthest any finished build reached, whichever comes first.
+A candidate that is still building is always due: a pass derives `:t2-max-episodes-per-tick` episodes per tick and spans as many ticks as it needs.
+
+Each pass runs in this order:
+
+1. If a generation was promoted and has not been checked since, the canary and utility checks run on it first. A failure rolls it back and ends the pass with nothing built.
+2. A new candidate starts only when the preflight finds every instrument. Otherwise the pass is reported as `T2 skipped: instruments missing (...)` and spends nothing.
+3. When the candidate has derived every new episode, it goes through the gates and is promoted, quarantined, or held.
+
+The pass ends, and the next interval starts, at step 1's rollback, step 2's skip, or step 3's decision.
+
+T2 is refused, with a note, while promotion precision is frozen, once T2 has spent `:t2-max-tokens-per-pass` in the last twenty-four hours, or when the day cap is spent.
+A quarantine-rate freeze does not refuse T2: the interval becomes `:t2-frozen-interval-seconds` and the episode threshold is ignored, because held candidates are what lift it.
+T2 spend counts toward the day cap, not the tick cap.
+
 ## Configuration
 
 The `:memory` section of `config.cl` controls the integration.

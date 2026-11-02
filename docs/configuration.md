@@ -248,11 +248,11 @@ The `/proc` hidepid remount happens in the container entry point before Lisp sta
 | `:tail-margin` | real | `0.02` | How far the candidate's recall on rare answers may fall below retention-only. |
 | `:utility-max-tasks` | integer | `400` | Most question-and-answer pairs one utility run scores, newest first. |
 | `:parameters` | plist or `nil` | `nil` | Overrides merged over the shipped memory parameter defaults. |
-| `:t2-enabled` | boolean | `t` | Not read: there is no T2 schedule yet. |
-| `:t2-interval-seconds` | integer | `86400` | Seconds between T2 passes. The heartbeat schedule that reads it is not built yet; `t2-interval` already answers with it. |
+| `:t2-enabled` | boolean | `t` | Run T2 passes from the heartbeat on their schedule. Off, the heartbeat skips T2 without a note. |
+| `:t2-interval-seconds` | integer | `86400` | Seconds between T2 passes. A pass is due when this has elapsed since the last one ended, or earlier at `:t2-episode-threshold`. |
 | `:t2-frozen-interval-seconds` | integer | `604800` | Seconds between T2 passes while the quarantine rate is over `:quarantine-max`. |
-| `:t2-episode-threshold` | integer | `200` | Not read: there is no T2 schedule yet. |
-| `:t2-max-tokens-per-pass` | integer | `30000` | Not read: there is no T2 pass budget yet. |
+| `:t2-episode-threshold` | integer | `200` | New episodes, past the furthest any finished build reached, that make a T2 pass due before its interval. Ignored while the quarantine rate is over `:quarantine-max`. |
+| `:t2-max-tokens-per-pass` | integer | `30000` | Most tokens T2 may spend in any rolling twenty-four hours. A candidate that reaches it pauses and resumes when the window has room; `:t2-max-tokens-per-promotion` still caps its total. |
 | `:canaries` | list or `nil` | `nil` | Operator-authored behavioural checks, each a plist of `:name`, `:family`, `:cue`, `:expect`, and `:stale` for the update family. |
 | `:canary-min-families` | integer | `4` | Canary families that must be covered before a T2 pass can run. |
 | `:tail-rarity-fraction` | real | `0.10` | Share of episodes, rarest first, that the tail sample treats as rare. |
@@ -269,11 +269,11 @@ The `/proc` hidepid remount happens in the container entry point before Lisp sta
 The store path can also be a pathname object.
 The default is under the agent directory, which is on the state volume in the container.
 An operator who writes `(:block-limits (:persona 8000))` keeps the shipped limits for the other labels.
-The keys marked "Not read" belong to features that are designed but not built; they are in the shipped defaults so their values are recorded in one place.
 Raising a limit raises the fixed token cost of every prompt (see [Memory](memory.md)).
 
 The log and the cue pack are on.
-Push, T2 promotion, the canaries, and the utility task set are designed but not wired into a turn yet; see [Episodic memory](episodic-memory.md) and the [design record](design/memory.md).
+Push is off.
+T2 runs from the heartbeat, but builds nothing until a deriver, a four-family canary suite, the utility task set and the tail sample are all present; see [Episodic memory](episodic-memory.md) and the [design record](design/memory.md).
 Changing `:parameters` changes the retrieval score, so a change is a new configuration hash and a new measurement run.
 
 ## The :sleep section

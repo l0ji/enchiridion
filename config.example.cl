@@ -163,10 +163,10 @@
     (:agent-uid 1000)
     (:agent-gid 1000)
 
-    ;;; Mount /proc with hidepid=2 so the sandbox cannot read the
-    ;;; supervisor's environment or memory. This is an entrypoint setting
-    ;;; (ENCHIRIDION_HIDEPID), not a Lisp configuration key: no code reads
-    ;;; :proc-hidepid, so it is not written here.
+    ;;; /proc is mounted with hidepid=2 so the sandbox cannot read the
+    ;;; supervisor's environment or memory. The container entrypoint does
+    ;;; that remount before Lisp starts, so it is set by ENCHIRIDION_HIDEPID
+    ;;; on the run line, not here.
 
    :memory
     ;;; The store path. NIL puts memory.db beside the agent files, which is on

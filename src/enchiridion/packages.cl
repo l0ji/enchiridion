@@ -286,7 +286,8 @@ did not think of."))
    #:close-superseded #:assertion-from-row
    #:judgement-of-learning #:isotonic-fit #:isotonic-predict
    #:recalibrate #:search-externally-p #:record-outcome
-   #:candidates-for #:graph-for #:assertions-for #:episode-from-row
+   #:candidates-for #:assertion-candidates-for #:graph-for #:assertions-for
+   #:episode-from-row
    #:episode-candidate #:item-terms
    #:*assertion-deriver* #:*procedure-inducer*
    #:make-model-assertion-deriver #:parse-assertion-json

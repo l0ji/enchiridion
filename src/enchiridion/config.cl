@@ -186,7 +186,6 @@ store path. The model defaults match the shipped adapter defaults."
     :sandbox
     (:agent-uid 1000)
     (:agent-gid 1000)
-    (:proc-hidepid 2)
 
     :memory
     (:db nil)

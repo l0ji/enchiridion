@@ -195,3 +195,32 @@
                          (enchiridion.memory:assertion-object assertion)))
             (ok (= 0 (enchiridion.memory:assertion-span-start assertion)))
             (ok (= 13 (enchiridion.memory:assertion-span-end assertion)))))))))
+
+(defun assertion-hits (store cue generation)
+  "Return the assertion rows a retrieval for CUE ranks, reading GENERATION."
+  (remove-if-not (lambda (row) (string= "assertion" (getf (getf row :item) :kind)))
+                 (enchiridion.memory:retrieve-rows-for-turn
+                  store cue :generation generation :top-k nil)))
+
+(deftest a-retrieval-reads-only-the-generation-it-names ()
+  ;; The utility and tail gates compare a candidate arm with a retention-only
+  ;; arm, and a turn reads the live layer. All three are one function with a
+  ;; different generation, so they cannot drift apart.
+  (with-store (store directory)
+    (let ((enchiridion.memory:*assertion-deriver* #'test-deriver))
+      (write-body store "alpha is beta")
+      (let ((generation (getf (enchiridion.memory:build-candidate store :limit 10)
+                              :generation-id)))
+        (testing "the candidate arm sees the candidate's assertion"
+          (let ((hits (assertion-hits store "alpha" generation)))
+            (ok (= 1 (length hits)))
+            (ok (string= "alpha is beta" (getf (getf (first hits) :item) :body)))))
+        (testing "a turn does not, before promotion"
+          (ok (null (assertion-hits store "alpha" :live))))
+        (testing "the retention-only arm never does"
+          (ok (null (assertion-hits store "alpha" nil))))
+        (enchiridion.memory:promote-generation store generation)
+        (testing "a turn does once the candidate is live"
+          (ok (= 1 (length (assertion-hits store "alpha" :live)))))
+        (testing "and the retention-only arm still does not"
+          (ok (null (assertion-hits store "alpha" nil))))))))

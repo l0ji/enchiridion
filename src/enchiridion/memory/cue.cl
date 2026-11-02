@@ -172,8 +172,10 @@ null).  No model is called: the check is set containment over upcased strings."
         while end))
 
 (defun learned-state-block (store &key (limit 12) (char-budget 1200)
-                                      (now (get-universal-time)))
-  "Return the compiled learned-state block: the highest-importance live assertions.
+                                      (now (get-universal-time))
+                                      (generation (live-generation-id store)))
+  "Return the compiled learned-state block: the highest-importance assertions
+of GENERATION, the live one by default, so a candidate never reaches a turn.
 
 This is structurally the harness's operator blocks, except its content is
 derived from the log rather than written by the operator, which is what makes
@@ -191,10 +193,11 @@ Returns a string, possibly empty.  It never signals."
                    "SELECT a.subject, a.relation, a.object, a.polarity
                       FROM assertions a
                       JOIN activation v ON v.kind = 'assertion' AND v.id = a.id
-                     WHERE a.valid_to IS NULL OR a.valid_to > ?
+                     WHERE a.generation_id = ?
+                       AND (a.valid_to IS NULL OR a.valid_to > ?)
                      ORDER BY v.imp DESC, a.valid_from DESC
                      LIMIT ?"
-                   (list now limit))
+                   (list generation now limit))
                 (error () nil))))
     (with-output-to-string (s)
       (let ((used 0))

@@ -264,13 +264,26 @@ not a report. OBSERVED stays NULL until an external signal arrives."
 (defun retrieve-rows-for-turn (store text &key (session "default") (channel :cli)
                                                (now (get-universal-time))
                                                (top-k (parameter :top-k
-                                                                 *memory-parameters*)))
+                                                                 *memory-parameters*))
+                                               (generation :live))
   "Return the scored rows RETRIEVE ranks for TEXT, best first, or NIL.
 TOP-K NIL returns every candidate. This reads the store and writes nothing, so
 the benchmark can score the ranking the turn path uses without logging it.
-A cue with no searchable term returns NIL; a query error signals."
+A cue with no searchable term returns NIL; a query error signals.
+
+GENERATION names the semantic layer whose assertions compete with the episodes:
+:LIVE, the default, is the live generation, which is what a turn reads; an id
+is that generation, which is the candidate arm a gate measures; NIL is the log
+alone, the retention-only arm."
   (when (and store (tokenise text))
-    (let ((candidates (hybrid-candidates store text :limit 200 :now now)))
+    (let ((candidates
+            (append (hybrid-candidates store text :limit 200 :now now)
+                    (assertion-candidates-for
+                     store text
+                     :generation (if (eq generation :live)
+                                     (live-generation-id store)
+                                     generation)
+                     :limit 200 :now now))))
       (when candidates
         (retrieve candidates text
                   (list "" session (string-downcase (string channel)))
@@ -388,14 +401,6 @@ Never signal: the heartbeat reports a failure."
           (list :derived derived))
       (error (c)
         (list :failed (enchiridion.errors:condition-report-line c))))))
-
-(defun live-generation-id (store)
-  "Return the live generation id, or 0 when none has been promoted."
-  (when store
-    (let ((row (first (enchiridion.memory.store:query-rows
-                       store
-                       "SELECT live_generation_id FROM memory_state WHERE id = 1"))))
-      (or (and row (enchiridion.memory.store:field row "live_generation_id")) 0))))
 
 (defun memory-status (store)
   "Return a plist describing the log and the live layer.

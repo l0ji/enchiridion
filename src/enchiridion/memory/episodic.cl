@@ -849,6 +849,24 @@ measures as failing."
 ;;;; ---------------------------------------------------------------------
 ;;;; 10. Candidate generation.  The only part that touches SQLite.
 
+(defun live-generation-id (store)
+  "Return the live generation id, or 0 when none has been promoted."
+  (when store
+    (let ((row (first (enchiridion.memory.store:query-rows
+                       store
+                       "SELECT live_generation_id FROM memory_state WHERE id = 1"))))
+      (or (and row (enchiridion.memory.store:field row "live_generation_id")) 0))))
+
+(defun cue-match (cue)
+  "Return the FTS5 MATCH expression for CUE: any of its distinct terms.
+A cue with no searchable term signals SCHEMA-ERROR, which is FTS-QUERY's
+behaviour."
+  (let ((terms (remove-duplicates (tokenise cue) :test #'string=)))
+    (if terms
+        (format nil "~{~A~^ OR ~}"
+                (mapcar (function enchiridion.memory.store:fts-query) terms))
+        (enchiridion.memory.store:fts-query cue))))
+
 (defun candidates-for (store cue &key (limit 200) (now (get-universal-time)))
   "Return episode candidates for CUE from the FTS5 index.
 
@@ -857,12 +875,7 @@ re-scored by RETRIEVE.  The activation summary is joined in the same query, so
 scoring a candidate costs no second round trip.  A cue with no searchable term
 signals SCHEMA-ERROR, which is the existing FTS-QUERY behaviour and is not
 changed."
-  (let* ((terms (remove-duplicates (tokenise cue) :test #'string=))
-         (match (if terms
-                    (format nil "~{~A~^ OR ~}"
-                            (mapcar (function enchiridion.memory.store:fts-query)
-                                    terms))
-                    (enchiridion.memory.store:fts-query cue))))
+  (let ((match (cue-match cue)))
     (loop for row in (enchiridion.memory.store:query-rows
                       store
                       "SELECT e.id, e.body, e.session, e.channel, e.cue_type,
@@ -917,20 +930,28 @@ changed."
            :distinctness (or (enchiridion.memory.store:field row "distinctness")
                              0.0)))))
 
-(defun assertion-candidates-for (store cue &key (limit 200)
+(defun assertion-text (subject relation object polarity)
+  "Return one assertion as the line a pack shows: the claim, not its episode."
+  (format nil "~A ~:[not ~;~]~A ~A" subject (not (eql polarity 0)) relation object))
+
+(defun assertion-candidates-for (store cue &key generation (limit 200)
                                               (now (get-universal-time)))
-  "Return assertion candidates for CUE, reached through their supporting episode.
+  "Return GENERATION's assertion candidates for CUE, reached through their
+supporting episode, or NIL when GENERATION is NIL or 0.
 
 An assertion has no body of its own, so the lexical pass runs over the episode
-that carries it and the assertion inherits the span's terms.  This is what
-keeps the span requirement load-bearing: an assertion with no episode is
-unreachable by the lexical channel, which is the intended consequence."
-  (let ((match (enchiridion.memory.store:fts-query cue)))
+that carries it and the assertion inherits the span's terms and BM25 score, on
+the same scale as the episode candidates it competes with.  This is what keeps
+the span requirement load-bearing: an assertion with no episode is unreachable
+by the lexical channel, which is the intended consequence.  Only the named
+generation is read, so a candidate is invisible to a read of the live layer."
+  (when (and generation (plusp generation))
     (loop for row in (enchiridion.memory.store:query-rows
                       store
                       "SELECT a.id, a.subject, a.relation, a.object, a.polarity,
-                              a.valid_from, a.valid_to, a.cue_type,
-                              a.tx_to, e.body, e.session, e.context_key,
+                              a.valid_from, a.valid_to, a.cue_type, a.episode_id,
+                              a.tx_to, e.session, e.context_key, e.ts,
+                              bm25(episodes_fts) AS lexical,
                               act.n_enc, act.last_enc, act.n_ret, act.last_ret,
                               act.created_ts, act.supp, act.supp_ts, act.imp,
                               act.distinctness
@@ -940,15 +961,24 @@ unreachable by the lexical channel, which is the intended consequence."
                          LEFT JOIN activation act
                                 ON act.kind = 'assertion' AND act.id = a.id
                         WHERE episodes_fts MATCH ? AND a.tx_to IS NULL
+                          AND a.generation_id = ?
                         ORDER BY rank
                         LIMIT ?"
-                      (list match limit))
+                      (list (cue-match cue) generation limit))
           collect (let ((created (enchiridion.memory.store:field row "created_ts"))
                         (id (enchiridion.memory.store:field row "id")))
                     (list :kind "assertion"
                           :id id
-                          :body (enchiridion.memory.store:field row "body")
-                          :session (enchiridion.memory.store:field row "session")
+                          :body (assertion-text
+                                 (enchiridion.memory.store:field row "subject")
+                                 (enchiridion.memory.store:field row "relation")
+                                 (enchiridion.memory.store:field row "object")
+                                 (enchiridion.memory.store:field row "polarity"))
+                          :episode-id (enchiridion.memory.store:field row "episode_id")
+                          :ts (enchiridion.memory.store:field row "ts")
+                          :lexical (let ((bm25 (enchiridion.memory.store:field
+                                                row "lexical")))
+                                     (if bm25 (- (float bm25)) 0.0))
                           :context (split-context-key
                                     (enchiridion.memory.store:field row
                                                                      "context_key"))

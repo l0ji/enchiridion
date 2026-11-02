@@ -211,13 +211,12 @@ A file that omits a budget key gets the shipped cap, as with every other section
 | --------------- | ------- | ------- | ---------------------------------------------------- |
 | `:agent-uid`    | integer | `1000`  | User identifier for agent code and the broker in the container or a root-started checkout. |
 | `:agent-gid`    | integer | `1000`  | Group identifier for the same processes.             |
-| `:proc-hidepid` | integer | `2`     | Not read. The container entry point takes `ENCHIRIDION_HIDEPID` instead. |
 
 The supervisor runs as root in the container deployment and in a checkout started as root, and it holds the secrets.
 The broker, the reload verification, and `--verify-plugin` use `:agent-uid` and `:agent-gid`.
 A checkout started as the operator has no uid split: the supervisor, the broker child, and agent code run as that user.
 [Deployment](deployment.md) covers the root setup.
-No Lisp path reads `:proc-hidepid`, and the container entry point reads `ENCHIRIDION_HIDEPID` instead (see [Deployment](deployment.md)).
+The `/proc` hidepid remount happens in the container entry point before Lisp starts, so it is set by `ENCHIRIDION_HIDEPID`, not by this section (see [Deployment](deployment.md)).
 
 ## The :memory section
 

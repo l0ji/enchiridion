@@ -1673,6 +1673,12 @@ present, and that it signals no condition a caller has to distinguish."
                 :horizon (or (enchiridion.memory.store:field row "horizon")
                              2592000)))
 
+(defvar *derivation-tokens* nil
+  "NIL, or the tokens the deriver has spent in the build batch that bound it.
+BUILD-CANDIDATE binds it to 0 and adds the total to the candidate's
+TOKENS_USED, which is what the cost gate reads; a deriver that makes a model
+call adds what the provider billed.")
+
 (defparameter *assertion-deriver* nil
   "A function of (STORE EPISODE) returning (values ASSERTIONS CHANGE-EVENTS).
 NIL means no derivation is installed: the builder must not watermark an

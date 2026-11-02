@@ -165,7 +165,9 @@
                     store (getf report :generation-id))))))))
 
 (defstruct (json-backend (:constructor make-json-backend))
-  (text "[]" :type string))
+  (text "[]" :type string)
+  (input-tokens 0 :type integer)
+  (output-tokens 0 :type integer))
 
 (defmethod enchiridion.llm:complete ((backend json-backend) messages
                                      &key model tools budget)
@@ -173,8 +175,8 @@
   (enchiridion.llm::%make-completion
    :text (json-backend-text backend)
    :model "json-fake"
-   :input-tokens 0
-   :output-tokens 0))
+   :input-tokens (json-backend-input-tokens backend)
+   :output-tokens (json-backend-output-tokens backend)))
 
 (deftest the-model-deriver-parses-a-json-array ()
   (with-store (store directory)
@@ -247,3 +249,26 @@
             (ok (= first (enchiridion.memory:live-generation-id store)))
             (ok (string= "live" (generation-status-of store first)))
             (ok (string= "rolled-back" (generation-status-of store second)))))))))
+
+(deftest a-model-derivation-is-billed-to-the-ledger-and-the-candidate ()
+  ;; The deriver used to call the model with nothing recorded, so a T2 pass
+  ;; had no cost the budget or the cost gate could see.
+  (with-store (store directory)
+    (let ((enchiridion.memory:*assertion-deriver*
+            (enchiridion.memory:make-model-assertion-deriver
+             (make-json-backend :input-tokens 30 :output-tokens 12))))
+      (write-body store "alpha is beta")
+      (write-body store "gamma is delta")
+      (let* ((report (enchiridion.memory:build-candidate store :limit 10))
+             (row (first (enchiridion.memory.store:query-rows
+                          store "SELECT tokens_used FROM generations WHERE id = ?"
+                          (list (getf report :generation-id))))))
+        (testing "the batch reports what it spent"
+          (ok (= 84 (getf report :tokens))))
+        (testing "the candidate carries its cost"
+          (ok (= 84 (enchiridion.memory.store:field row "tokens_used"))))
+        (testing "the ledger has the spend on the t2 channel"
+          (let ((usage (enchiridion.memory.store:usage-total-since
+                        store 0 :channel :t2)))
+            (ok (= 60 (getf usage :input)))
+            (ok (= 24 (getf usage :output)))))))))

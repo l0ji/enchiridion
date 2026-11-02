@@ -307,14 +307,17 @@ the next call continues the same generation."
                                                 :config-hash config-hash)))
             (episodes (candidate-episodes store generation-id limit))
             (now (get-universal-time))
-            (accepted 0) (rejected 0) (conflicts 0) (closed 0))
-       (dolist (episode episodes)
-         (let ((report (derive-episode store episode generation-id
-                                       parser-version now)))
-           (incf accepted (getf report :assertions))
-           (incf rejected (getf report :rejected))
-           (incf conflicts (getf report :conflicts))
-           (incf closed (getf report :closed))))
+            (accepted 0) (rejected 0) (conflicts 0) (closed 0)
+            (tokens 0))
+       (let ((*derivation-tokens* 0))
+         (dolist (episode episodes)
+           (let ((report (derive-episode store episode generation-id
+                                         parser-version now)))
+             (incf accepted (getf report :assertions))
+             (incf rejected (getf report :rejected))
+             (incf conflicts (getf report :conflicts))
+             (incf closed (getf report :closed))))
+         (setf tokens *derivation-tokens*))
        (let ((remaining (unprocessed-episode-count store generation-id)))
          (when (zerop remaining)
            (set-generation-status store generation-id "candidate"))
@@ -324,9 +327,11 @@ the next call continues the same generation."
               store
               "UPDATE generations
                   SET to_episode = MAX(to_episode, ?),
-                      writes = writes + ?
+                      writes = writes + ?,
+                      tokens_used = tokens_used + ?
                 WHERE id = ?"
-              (list last-episode (+ accepted conflicts closed) generation-id))))
+              (list last-episode (+ accepted conflicts closed) tokens
+                    generation-id))))
          (list :built t
                :generation-id generation-id
                :processed (length episodes)
@@ -335,6 +340,7 @@ the next call continues the same generation."
                :rejected rejected
                :conflicts conflicts
                :closed closed
+               :tokens tokens
                :status (if (zerop remaining) :candidate :building)))))))
 
 (defun promote-generation (store generation-id)

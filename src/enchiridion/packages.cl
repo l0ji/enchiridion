@@ -289,7 +289,7 @@ did not think of."))
    #:candidates-for #:assertion-candidates-for #:graph-for
    #:episode-from-row
    #:episode-candidate #:item-terms
-   #:*assertion-deriver*
+   #:*assertion-deriver* #:*derivation-tokens*
    #:make-model-assertion-deriver #:parse-assertion-json
    #:assertions-from-model-text
    ;; Extension layer.

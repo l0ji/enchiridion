@@ -115,9 +115,12 @@ span is not an assertion."
 (defun make-model-assertion-deriver (backend &key model)
   "Return a deriver that asks BACKEND to turn one episode into assertions.
 The call is off the interactive path. A malformed response yields no
-assertions, not a signal, so one bad answer cannot take the builder down."
+assertions, not a signal, so one bad answer cannot take the builder down.
+
+The call is billed like any other: its usage goes to STORE's token ledger on
+the :t2 channel, and into *DERIVATION-TOKENS* when a build has bound it, so a
+T2 pass has a cost the gates and the usage report can both see."
   (lambda (store episode)
-    (declare (ignore store))
     (let* ((body (episode-body episode))
            (messages (list (enchiridion.llm:system-message
                             +assertion-parser-brief+)
@@ -128,6 +131,23 @@ assertions, not a signal, so one bad answer cannot take the builder down."
                                     (episode-channel episode)
                                     body))))
            (completion (enchiridion.llm:complete backend messages :model model)))
+      (when *derivation-tokens*
+        (incf *derivation-tokens*
+              (enchiridion.llm:completion-total-tokens completion)))
+      (when store
+        (handler-case
+            (enchiridion.memory.store:record-usage
+             store
+             :session (episode-session episode)
+             :model (enchiridion.llm:completion-model completion)
+             :input (enchiridion.llm:completion-input-tokens completion)
+             :output (enchiridion.llm:completion-output-tokens completion)
+             :cache-read (enchiridion.llm:completion-cache-read-tokens completion)
+             :cache-write (enchiridion.llm:completion-cache-write-tokens completion)
+             :channel :t2)
+          (error (condition)
+            (format *error-output* "~&enchiridion: could not write the T2 usage row: ~A~%"
+                    condition))))
       (values (assertions-from-model-text
                (enchiridion.llm:completion-text completion)
                episode)

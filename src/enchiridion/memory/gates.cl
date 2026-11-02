@@ -197,7 +197,8 @@ given, keeps only those tasks."
 
 (defun utility-gate (store generation-id &key (margin *memory-gate-margin*)
                                               (min-n *memory-gate-min-n*)
-                                              (alpha *memory-gate-alpha*))
+                                              (alpha *memory-gate-alpha*)
+                                              (task-hashes nil))
   "Return two values: T when GENERATION-ID beats retention-only, and a report.
 
 docs/design/memory.md: candidate versus retention-only on paired tasks at
@@ -206,7 +207,7 @@ pairs, and a one-sided sign test below ALPHA.  The pairs are read from the
 gate log, which COMPARE-ARMS writes: the step that decides is not the step
 that measures.  Too little evidence is a failure, which is the correct
 default: an unmeasured candidate is not promoted."
-  (let* ((pairs (paired-outcomes store generation-id))
+  (let* ((pairs (paired-outcomes store generation-id :task-hashes task-hashes))
          ;; Exact arithmetic, and the configured margin read as the decimal
          ;; it was written as: a mean of exactly 0.05 meets a margin of 0.05,
          ;; which a single-float 0.05 compared with a double would not.
@@ -467,6 +468,17 @@ record, so its recall is measured on the questions whose answers are rare."
     (remove-if-not (lambda (task) (gethash (getf task :expect-episode) rare))
                    tasks)))
 
+(defun tail-sample (store)
+  "Return the tasks with a rare answer from every question and answer in the
+log, not only the newest :UTILITY-MAX-TASKS.
+
+The utility set is the newest pairs because it bounds a run's size. The tail
+is not: the rare records are wherever the log put them, and on an imported log
+of 1,094 pairs the newest 400 held 6 rare answers where the whole log held
+111, so a tail drawn from the utility set kept the tail sampler missing for
+good. Scoring the tail is retrieval only and calls no model."
+  (tail-tasks store (utility-tasks store :limit most-positive-fixnum)))
+
 ;;;; ------------------------------------------------------------------
 ;;;; 8. The T2 preflight
 ;;;; ------------------------------------------------------------------
@@ -480,7 +492,7 @@ utility task set, or tail sampler is a reported no-op with reason
 promote. :MISSING names each absent instrument, so the report says what the
 operator has to supply rather than only that something is wrong."
   (let* ((tasks (utility-tasks store))
-         (tail (tail-tasks store tasks)))
+         (tail (tail-sample store)))
     (multiple-value-bind (families covered-p) (canary-coverage canaries)
       (let ((missing
               (append
@@ -569,11 +581,18 @@ or uncovered suite fails, because it freezes promotion."
                     :failed (getf result :failed) :failures (getf result :failures))))))
 
 (defun measure-candidate (store generation-id scorer)
-  "Score the utility tasks under both arms for GENERATION-ID and return the
-hashes of the tail tasks among them."
-  (let ((tasks (utility-tasks store)))
-    (compare-arms store generation-id tasks scorer)
-    (mapcar #'task-hash (tail-tasks store tasks))))
+  "Score the utility tasks and the tail sample under both arms for
+GENERATION-ID, and return two values: the tail tasks' hashes and the utility
+tasks' hashes, so each gate reads only its own pairs."
+  (let* ((tasks (utility-tasks store))
+         (tail (tail-sample store))
+         (utility-hashes (mapcar #'task-hash tasks))
+         (scored (append tasks (remove-if (lambda (task)
+                                            (member (task-hash task) utility-hashes
+                                                    :test #'string=))
+                                          tail))))
+    (compare-arms store generation-id scored scorer)
+    (values (mapcar #'task-hash tail) utility-hashes)))
 
 (defun set-promotion-result (store generation-id result &key (reason "")
                                                             (now (get-universal-time)))
@@ -601,7 +620,7 @@ one transaction."
       (return-from gate-candidate
         (list :promoted nil :reason :not-a-candidate
               :status (and row (enchiridion.memory.store:field row "status"))))))
-  (let ((tail-hashes nil))
+  (let ((tail-hashes nil) (utility-hashes nil))
     (flet ((gate (kind thunk)
              (multiple-value-bind (pass-p report) (funcall thunk)
                (record-check store generation-id kind pass-p report)
@@ -612,8 +631,9 @@ one transaction."
       (gate "provenance" (lambda () (provenance-gate store generation-id)))
       (gate "canary" (lambda () (canary-step store generation-id canaries)))
       (gate "utility" (lambda ()
-                        (setf tail-hashes (measure-candidate store generation-id scorer))
-                        (utility-gate store generation-id)))
+                        (setf (values tail-hashes utility-hashes)
+                              (measure-candidate store generation-id scorer))
+                        (utility-gate store generation-id :task-hashes utility-hashes)))
       (gate "tail" (lambda () (tail-gate store generation-id tail-hashes)))
       (gate "cost" (lambda () (cost-gate store generation-id)))
       ;; Every gate passed. A freeze still holds the candidate back, and a held
@@ -643,8 +663,9 @@ post-check rows are what the freeze and promotion precision read."
     (record-check store generation-id "post-canary" canary-ok canary-report)
     (let ((utility-ok
             (and canary-ok
-                 (progn (measure-candidate store generation-id scorer)
-                        (multiple-value-bind (ok report) (utility-gate store generation-id)
+                 (let ((utility-hashes (nth-value 1 (measure-candidate store generation-id scorer))))
+                        (multiple-value-bind (ok report)
+                            (utility-gate store generation-id :task-hashes utility-hashes)
                           (record-check store generation-id "post-utility" ok report))))))
       (if (and canary-ok utility-ok)
           (list :held t :generation-id generation-id)

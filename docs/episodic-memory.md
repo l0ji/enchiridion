@@ -40,7 +40,7 @@ A T2 pass runs only when four instruments exist, and `t2-preflight` names each o
 | Deriver | an assertion deriver is installed, which `serve` does when a backend exists | `:deriver` |
 | Canary coverage | the valid `:canaries` cover `:canary-min-families` of the four families | `:canary-coverage` |
 | Utility task set | the log holds `:gate-min-n` question-and-answer pairs | `:utility-task-set` |
-| Tail sampler | `:tail-min-n` of those pairs have an answer among the rarest `:tail-rarity-fraction` of episodes | `:tail-sampler` |
+| Tail sampler | `:tail-min-n` of all the log's pairs, not only the newest `:utility-max-tasks`, have an answer among the rarest `:tail-rarity-fraction` of episodes | `:tail-sampler` |
 
 A utility task is a user turn and the assistant turn that answered it, in the same session.
 Both arms are scored on the same questions, in a pack of `:gate-pack-chars`, a quarter of the turn's pack.

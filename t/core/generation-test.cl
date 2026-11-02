@@ -1056,3 +1056,23 @@ shipped schedule."
     (ok (null (enchiridion.memory:last-t2-ts store)))
     (enchiridion.memory.store:exec store "UPDATE episodes SET derived_ts = 1")
     (ok (null (enchiridion.memory:t2-refusal store)))))
+
+(deftest the-tail-sample-reaches-past-the-newest-utility-tasks ()
+  ;; On an imported log the newest 400 pairs held 6 rare answers and the whole
+  ;; log held 111: a tail drawn from the utility set never filled.
+  (with-store (store directory)
+    (let ((enchiridion.memory::*utility-max-tasks* 2)
+          (enchiridion.memory:*tail-min-n* 2)
+          (enchiridion.memory:*tail-rarity-fraction* 0.25))
+      (dotimes (i 4)
+        (say store "user" (format nil "question ~D" i))
+        (say store "assistant" (format nil "answer ~D" i)))
+      (enchiridion.memory.store:exec store "UPDATE episodes SET derived_ts = 1, rarity_raw = 0.1")
+      ;; The two oldest answers are the rare ones.
+      (enchiridion.memory.store:exec
+       store "UPDATE episodes SET rarity_raw = 0.9
+               WHERE id IN (SELECT id FROM episodes WHERE role = 'assistant' ORDER BY id LIMIT 2)")
+      (ok (zerop (length (enchiridion.memory:tail-tasks
+                          store (enchiridion.memory:utility-tasks store)))))
+      (ok (= 2 (length (enchiridion.memory::tail-sample store))))
+      (ok (= 2 (getf (enchiridion.memory:t2-preflight store) :tail-tasks))))))

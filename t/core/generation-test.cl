@@ -1131,3 +1131,22 @@ shipped schedule."
             (write-body store body))
           (enchiridion.memory:build-candidate store :limit 10)
           (ok (= 1 (conflict-count store))))))))
+
+(deftest an-outage-stops-the-batch-after-a-few-failures ()
+  ;; An outage once ground through 384 episodes of timeouts for 85 minutes.
+  (with-store (store directory)
+    (let* ((calls 0)
+           (lock (bordeaux-threads:make-lock))
+           (enchiridion.memory:*t2-deriver-concurrency* 2)
+           (enchiridion.memory:*assertion-deriver*
+             (lambda (store episode)
+               (declare (ignore store episode))
+               (bordeaux-threads:with-lock-held (lock) (incf calls))
+               (error 'enchiridion.errors:transport-error :detail "provider down"))))
+      (dotimes (i 40) (write-body store (format nil "record ~D" i)))
+      (let ((report (enchiridion.memory:build-candidate store :limit 40)))
+        (testing "a handful of calls, not two for each of 40 episodes"
+          (ok (<= calls 8)))
+        (ok (zerop (getf report :processed)))
+        (ok (= 40 (getf report :remaining)))
+        (ok (getf report :failed))))))

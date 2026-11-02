@@ -391,6 +391,12 @@ The retry is in the pool and not a second round after it: a round waits for
 its slowest call, so a batch with a retry round idled through two tails, which
 on the trial was three minutes in a row with no call in flight.
 
+Twice CONCURRENCY failures in a row, with no success between them, stop the
+pool taking new episodes: the provider is down, not the episodes, and on the
+trial an outage ground through a 384-episode batch for 85 minutes of calls
+timing out one after another. The episodes not tried come back NIL, which the
+caller reads as failures and leaves for the next tick.
+
 A deriver call is almost all waiting on the provider, and one episode's call
 does not depend on another's result: the deriver reads the raw log, never the
 candidate. So the calls overlap, and every store access inside them takes the
@@ -403,16 +409,20 @@ that dies without a result leaves NIL, which the caller reads as a failure."
          (tries (make-array n :initial-element 0))
          (spent (make-array n :initial-element 0))
          (queue (loop for i below n collect i))
+         (streak 0)
+         (breaker (* 2 (max 1 concurrency)))
          (lock (bordeaux-threads:make-lock "t2-deriver-queue")))
     (flet ((work ()
              (loop
-               (let ((i (bordeaux-threads:with-lock-held (lock) (pop queue))))
+               (let ((i (bordeaux-threads:with-lock-held (lock)
+                          (unless (>= streak breaker) (pop queue)))))
                  (unless i (return))
                  (let ((result (derive-one store deriver (aref items i))))
                    (bordeaux-threads:with-lock-held (lock)
                      (incf (aref tries i))
                      (incf (aref spent i) (or (getf result :tokens) 0))
                      (setf (aref results i) result)
+                     (if (getf result :error) (incf streak) (setf streak 0))
                      ;; The worker that puts it back is still looping, so the
                      ;; retry is picked up even when every other worker is done.
                      (when (and (getf result :error) (< (aref tries i) attempts))

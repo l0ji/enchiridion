@@ -484,8 +484,10 @@ turns once, which is harmless and bounded."
   "Return the heartbeat's sentence for one T2 pass REPORT."
   (let ((id (getf report :generation-id)))
     (ecase (getf report :outcome)
-      (:building (format nil "T2 building generation ~D (~D episode~:P remaining~@[; a deriver call failed: ~A~])"
-                         id (getf report :remaining) (getf report :failed)))
+      (:building (format nil "T2 building generation ~D (~D episode~:P remaining~@[; ~D skipped after two failed calls~]~@[; a deriver call failed: ~A~])"
+                         id (getf report :remaining)
+                         (let ((skipped (getf report :skipped))) (and skipped (plusp skipped) skipped))
+                         (getf report :failed)))
       (:promoted (format nil "T2 generation ~D promoted" id))
       (:quarantined (format nil "T2 generation ~D quarantined at the ~A gate"
                             id (getf report :failed)))

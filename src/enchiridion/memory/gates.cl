@@ -903,6 +903,7 @@ a pass ends, and not while a candidate is still building."
          (list :outcome :building
                :generation-id (getf build :generation-id)
                :remaining (getf build :remaining)
+               :skipped (getf build :skipped)
                :failed (getf build :failed)))
         (t
          (let* ((generation-id (getf build :generation-id))

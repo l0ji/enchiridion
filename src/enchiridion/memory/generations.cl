@@ -448,31 +448,57 @@ effect on a build already under way."
             (episodes (candidate-episodes store generation-id limit))
             (now (get-universal-time))
             (accepted 0) (rejected 0) (conflicts 0) (closed 0)
-            (tokens 0) (derived '()) (failure nil))
+            (tokens 0) (derived '()) (failure nil) (failure-note nil) (skipped 0))
        ;; A failed deriver call ends the batch, and the counters below still
        ;; record the episodes derived before it: they have their rows and their
        ;; marks, and a gate that read counters without them would undercount.
        ;; The failed episode is not marked, so the next tick tries it again.
        ;; The model calls run concurrently; the results are applied here, in
-       ;; episode order. Every call's tokens count, the ones after a failure
-       ;; included: they were spent, and their episodes are derived again.
-       (loop for episode in episodes
-             for result in (derive-concurrently store episodes)
-             do (incf tokens (or (getf result :tokens) 0))
-                (cond
-                  (failure)
-                  ((or (null result) (getf result :error))
-                   (setf failure (or (getf result :error) "the deriver returned nothing")))
-                  (t
-                   (let ((report (apply-derivation store episode generation-id
-                                                   parser-version now
-                                                   (getf result :assertions)
-                                                   (getf result :events))))
-                     (push episode derived)
-                     (incf accepted (getf report :assertions))
-                     (incf rejected (getf report :rejected))
-                     (incf conflicts (getf report :conflicts))
-                     (incf closed (getf report :closed))))))
+       ;; episode order, and every call's tokens count. A failed call is tried
+       ;; once more. An episode that fails twice is marked derived with nothing
+       ;; written, so it stays an episode and the batch goes on: stopping at
+       ;; the first failure threw away every paid result after it, which on a
+       ;; trial batch of 96 was 98 of 105 calls, and an episode that always
+       ;; fails would stop every batch at the same place. When most of a batch
+       ;; fails the provider is the problem and not the episodes, so nothing
+       ;; past the first failure is applied or marked, and the next tick tries.
+       (let* ((results (derive-concurrently store episodes))
+              (failed (loop for episode in episodes for result in results
+                            when (or (null result) (getf result :error)) collect episode)))
+         (dolist (result results) (incf tokens (or (getf result :tokens) 0)))
+         (when failed
+           (let ((retried (derive-concurrently store failed)))
+             (dolist (result retried) (incf tokens (or (getf result :tokens) 0)))
+             (setf results
+                   (loop for episode in episodes for result in results
+                         collect (if (or (null result) (getf result :error))
+                                     (nth (position episode failed) retried)
+                                     result)))))
+         (let ((outage (> (* 2 (count-if (lambda (r) (or (null r) (getf r :error))) results))
+                          (length results))))
+           (loop for episode in episodes
+                 for result in results
+                 for error = (or (null result) (getf result :error))
+                 do (cond
+                      (failure)
+                      ((and error outage)
+                       (setf failure (or (getf result :error) "the deriver returned nothing")))
+                      (error
+                       (unless failure-note
+                         (setf failure-note (or (getf result :error) "the deriver returned nothing")))
+                       (incf skipped)
+                       (push episode derived)
+                       (apply-derivation store episode generation-id parser-version now nil nil))
+                      (t
+                       (let ((report (apply-derivation store episode generation-id
+                                                       parser-version now
+                                                       (getf result :assertions)
+                                                       (getf result :events))))
+                         (push episode derived)
+                         (incf accepted (getf report :assertions))
+                         (incf rejected (getf report :rejected))
+                         (incf conflicts (getf report :conflicts))
+                         (incf closed (getf report :closed))))))))
        (setf derived (nreverse derived))
        (let ((remaining (unprocessed-episode-count store generation-id)))
          (when (zerop remaining)
@@ -494,7 +520,8 @@ effect on a build already under way."
          (list :built t
                :generation-id generation-id
                :processed (length derived)
-               :failed failure
+               :failed (or failure failure-note)
+               :skipped skipped
                :remaining remaining
                :assertions accepted
                :rejected rejected

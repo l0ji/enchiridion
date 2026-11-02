@@ -1,0 +1,12 @@
+when:
+  - event: ["push"]
+    branch: ["main"]
+  - event: ["pull_request"]
+    branch: ["main"]
+
+engine: microvm
+image: nixos
+
+steps:
+  - name: "Test"
+    command: nix run --print-build-logs .#test

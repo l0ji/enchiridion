@@ -65,6 +65,20 @@ fallback, so a one-line config still reads the way it looks."
 
 (declaim (ftype (function (t keyword keyword &optional t) t) config-section-value))
 
+(declaim (ftype (function (t keyword t) list) config-with-llm-value))
+
+(defun config-with-llm-value (config key value)
+  "Return a copy of CONFIG whose :LLM option KEY is VALUE, leaving CONFIG as it
+was. The entry goes first in the section, and CONFIG-VALUE reads the first, so
+one backend can be resolved with a cap of its own from the same configuration."
+  (if (sectioned-config-p config)
+      (if (member :llm config :test #'eq)
+          (loop for head in config
+                collect head
+                when (eq head :llm) collect (list key value))
+          (list* :llm (list key value) config))
+      (list* key value config)))
+
 (defun config-section-value (config section key &optional default)
   "Return KEY from SECTION of CONFIG, or DEFAULT.
 
@@ -218,6 +232,10 @@ store path. The model defaults match the shipped adapter defaults."
     (:t2-episode-threshold 200)
     (:t2-max-episodes-per-tick 20)
     (:t2-max-tokens-per-pass 30000)
+    ;; The reply cap of one T2 deriver call, apart from the :llm section's
+    ;; :max-tokens: a reasoning model spends its cap thinking, and at 4096 it
+    ;; was cut off before it answered on most records.
+    (:t2-deriver-max-tokens 16384)
     (:t2-max-tokens-per-promotion 75000)
     (:t2-write-cap 400)
     (:canaries nil)

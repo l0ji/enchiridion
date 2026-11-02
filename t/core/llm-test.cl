@@ -443,3 +443,22 @@ previous values are always put back."
                   (list (enchiridion.llm:user-message "hi")))
                  'enchiridion.errors:transport-error))
     (ok (= 1 calls))))
+
+(deftest a-request-that-never-finishes-is-stopped-and-not-repeated ()
+  ;; A deriver call once waited twenty-eight minutes: each read had its
+  ;; timeout, and the whole request had none.
+  (let ((calls 0)
+        (enchiridion.llm::*request-deadline-factor* 1)
+        (enchiridion.llm::*retry-delay* 0)
+        (start (get-internal-real-time)))
+    (ok (handler-case
+            (progn (enchiridion.llm::post-with-retries
+                    (lambda (request) (declare (ignore request)) (incf calls) (sleep 30) "late")
+                    (enchiridion.llm::make-http-request :url "http://example.invalid/" :timeout 1)
+                    2)
+                   nil)
+          (enchiridion.errors:transport-error (condition)
+            (search "no reply within 1 seconds"
+                    (enchiridion.errors:error-detail condition)))))
+    (ok (= 1 calls))
+    (ok (< (/ (- (get-internal-real-time) start) internal-time-units-per-second) 10))))

@@ -536,6 +536,8 @@ A request is a value.
 
 A handler builds the request, applies its credential, and hands it to `post-with-retries`.
 `post-with-retries` repeats 429 and every status at or above 500, up to the connection's `retries` extra attempts.
+Each attempt also has a wall-clock deadline of `*request-deadline-factor*` (5) times the request timeout, because the read timeout bounds each read and not the whole reply: a stream that stays open without finishing passes it.
+An attempt that reaches the deadline signals `transport-error` with "no reply within N seconds" and is not retried.
 Attempt n waits n times `*retry-delay*`, which is 2, so the default waits are 2 and 4 seconds.
 Every other 4xx is reported at once.
 

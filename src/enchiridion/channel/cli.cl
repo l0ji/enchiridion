@@ -1026,7 +1026,10 @@ name one here."
         ;; The marker follows SUPPORTED-P and not the handler id: a row can
         ;; name a handler this build does not have, and the field that knows
         ;; that is the one the listing computes.
-        (say "~A~@[ (~A)~] ~:[unsupported~;~A~]~@[ ~(~A~)~] ~A ~A ~:[no key~;key ~A~] (~(~A~))"
+        ;; The variable is the column before, so the key column says only
+        ;; whether it is loaded. Naming it again here consumed the source's
+        ;; argument, and every provider with a key failed to print.
+        (say "~A~@[ (~A)~] ~:[unsupported~;~A~]~@[ ~(~A~)~] ~A ~A ~:[no key~;key~] (~(~A~))"
              (getf row :id)
              (getf row :name)
              (getf row :supported-p)
@@ -1034,8 +1037,7 @@ name one here."
              (getf row :profile)
              (or (getf row :base-url) "no endpoint")
              (or (getf row :api-key-env) "no variable")
-             (when (getf row :key-present-p)
-               (getf row :api-key-env))
+             (getf row :key-present-p)
              (getf row :source)))
       (say "No providers are known. Run `~A` to load the models.dev catalog."
            (command-label "providers"))))

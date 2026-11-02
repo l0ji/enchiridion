@@ -464,11 +464,17 @@ sentence above says no socket rather than no network."
                  :broker broker)))
     ;; The T2 parser is installed on the context. The heartbeat's T2 phase
     ;; calls it through BUILD-CANDIDATE once every instrument is present, and
-    ;; `memory build` runs one bounded build by hand.
+    ;; `memory build` runs one bounded build by hand. It has a backend of its
+    ;; own, resolved with :T2-DERIVER-MAX-TOKENS as the reply cap: a reasoning
+    ;; model spent the turn's 4096 thinking and returned no text at all.
     (setf enchiridion.memory:*assertion-deriver*
           (when backend
             (enchiridion.memory:make-model-assertion-deriver
-             backend :model (enchiridion:model-for :cheap))))
+             (enchiridion.llm:resolve-backend
+              :config (enchiridion:config-with-llm-value
+                       config :max-tokens enchiridion.memory:*t2-deriver-max-tokens*)
+              :api-key key)
+             :model (enchiridion:model-for :cheap))))
     ;; Dense retrieval has its own endpoint and key, so a store can use an
     ;; embeddings provider other than the chat one.
     (let ((settings enchiridion.memory::*memory-embed-settings*))

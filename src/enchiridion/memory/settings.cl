@@ -144,6 +144,11 @@ interval has elapsed. Ignored while the quarantine rate is over its ceiling.")
       "Most tokens T2 may spend in any rolling twenty-four hours. A candidate
 that reaches it pauses and resumes once the window has room.")
 
+(defvar *t2-deriver-max-tokens*)
+(setf (documentation '*t2-deriver-max-tokens* 'variable)
+      "The reply cap of one T2 deriver call. The deriver gets a backend of its
+own with this cap, so the chat path keeps the :llm section's :max-tokens.")
+
 (defvar *t2-interval-seconds*)
 (defvar *t2-frozen-interval-seconds*)
 (setf (documentation '*t2-frozen-interval-seconds* 'variable)
@@ -223,6 +228,7 @@ key by key to the shipped defaults. Return NIL."
           *t2-enabled-p* (not (null (setting :t2-enabled)))
           *t2-episode-threshold* (setting :t2-episode-threshold)
           *t2-max-tokens-per-pass* (setting :t2-max-tokens-per-pass)
+          *t2-deriver-max-tokens* (setting :t2-deriver-max-tokens)
           *t2-interval-seconds* (setting :t2-interval-seconds)
           *t2-frozen-interval-seconds* (setting :t2-frozen-interval-seconds)
           *compaction-rebase-every* (setting :compaction-rebase-every)

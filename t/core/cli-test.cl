@@ -513,3 +513,19 @@ here the way the operator would see it."
                    (ok (eql 2 status))
                    (ok (search "pending, running, done or failed" text))))))
         (ignore-errors (enchiridion.memory.store:close-store store))))))
+
+(deftest a-provider-with-a-key-is-listed ()
+  ;; Every provider with a loaded key used to fail to print: the key column
+  ;; named the variable again and took the source's argument.
+  (let ((text (with-output-to-string (*standard-output*)
+                (enchiridion.channel.cli::print-provider-list
+                 (list (list :id "opencode" :name "OpenCode Go" :supported-p t
+                             :api "openai-chat" :profile "openai"
+                             :base-url "https://example.invalid/v1" :api-key-env "OPENCODE_API_KEY"
+                             :key-present-p t :source :shipped)
+                       (list :id "openai" :name "OpenAI" :supported-p t
+                             :api "openai-chat" :profile "openai"
+                             :base-url "https://api.openai.com/v1/" :api-key-env "OPENAI_API_KEY"
+                             :key-present-p nil :source :shipped))))))
+    (ok (search "OPENCODE_API_KEY key (shipped)" text))
+    (ok (search "OPENAI_API_KEY no key (shipped)" text))))

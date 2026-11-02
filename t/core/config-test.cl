@@ -159,3 +159,19 @@
                                             :sleep :enabled))))
     (testing "a key with no shipped default signals"
       (ok (signals (enchiridion:config-setting config :budget :not-a-setting))))))
+
+(deftest one-llm-option-can-be-overridden-in-a-copy ()
+  (let* ((config '(:llm (:max-tokens 4096) (:model-cheap "m") :memory (:enabled t)))
+         (copy (enchiridion:config-with-llm-value config :max-tokens 16384)))
+    (ok (= 16384 (enchiridion:config-value copy :max-tokens)))
+    (ok (equal "m" (enchiridion:config-value copy :model-cheap)))
+    (ok (enchiridion:config-section-value copy :memory :enabled))
+    (testing "the original is untouched"
+      (ok (= 4096 (enchiridion:config-value config :max-tokens)))))
+  (testing "a config with no :llm section, and a flat one"
+    (ok (= 9 (enchiridion:config-value
+              (enchiridion:config-with-llm-value '(:memory (:enabled t)) :max-tokens 9)
+              :max-tokens)))
+    (ok (= 9 (enchiridion:config-value
+              (enchiridion:config-with-llm-value '(:max-tokens 1) :max-tokens 9)
+              :max-tokens)))))

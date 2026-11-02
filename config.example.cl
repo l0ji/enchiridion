@@ -202,6 +202,7 @@
     (:t2-episode-threshold 200)
     (:t2-max-episodes-per-tick 20)
     (:t2-max-tokens-per-pass 30000)
+    (:t2-deriver-max-tokens 16384)
     (:t2-max-tokens-per-promotion 75000)
     (:t2-write-cap 400)
     ;;; Operator-authored behavioural canaries, the memory's only external

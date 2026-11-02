@@ -165,6 +165,13 @@ front of the provider answers HTML."
           (t (string-right-trim '(#\Space #\Newline #\Return) (or payload "")))))
     (error () "the provider replied with something that is not JSON")))
 
+(defparameter *request-deadline-factor* 5
+  "How many times a request's TIMEOUT one whole request may take, wall clock.
+TIMEOUT bounds each read and each connect; a reply that keeps a TLS stream
+open without finishing passes both, and a deriver call was seen to wait
+twenty-eight minutes that way. The deadline is the bound the reads cannot give,
+and it is a multiple because a long reply is legitimately slower than one read.")
+
 (declaim (ftype (function (function http-request (integer 0 *)) string)
                 post-with-retries))
 
@@ -180,11 +187,22 @@ model does not become right by being repeated.
 There is no loop inside the handler. The handler returns after it sleeps, the
 body of the outer loop ends, and the outer loop runs again. An inner (loop)
 would be a new infinite loop and a 429 would hang the process instead of
-retrying the request."
-  (let ((attempt 0))
+retrying the request.
+
+Each attempt has a wall-clock deadline of *REQUEST-DEADLINE-FACTOR* times the
+request's timeout. A request that reaches it is reported as a transport error
+and not repeated: one that hung once is a wait, and three of them are a
+longer wait that a heartbeat tick spends blocked."
+  (let ((attempt 0)
+        (deadline (* *request-deadline-factor* (http-request-timeout request))))
     (loop
       (handler-case
-          (return (funcall transport request))
+          (return (enchiridion.compat:with-deadline
+                      (deadline :on-timeout
+                                (error 'enchiridion.errors:transport-error
+                                       :detail (format nil "no reply within ~D seconds"
+                                                       deadline)))
+                    (funcall transport request)))
         (dexador.error:http-request-failed (failure)
           (let ((status (dexador.error:response-status failure)))
             (if (and (integerp status)

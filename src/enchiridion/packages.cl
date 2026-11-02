@@ -26,6 +26,7 @@
    #:agent-directory #:run-directory #:load-config #:config-digest
    #:control-path #:status-path #:project-root
    #:sectioned-config-p #:config-section #:config-value #:config-section-value
+   #:config-with-llm-value
    #:config-setting
    ;; CONFIG-LOOKUP is the reader that answers from the active configuration
    ;; first and the shipped defaults second, which is what the provider table
@@ -307,7 +308,7 @@ did not think of."))
    #:*precision-min* #:*precision-window* #:*precision-min-checked* #:*quarantine-max*
    #:*quarantine-window* #:*quarantine-min-candidates* #:*t2-interval-seconds*
    #:*t2-frozen-interval-seconds* #:*t2-enabled-p* #:*t2-episode-threshold*
-   #:*t2-max-tokens-per-pass*
+   #:*t2-max-tokens-per-pass* #:*t2-deriver-max-tokens*
    #:last-t2-ts #:mark-t2-pass #:new-episode-count #:t2-due-p #:t2-pass-spend
    #:t2-refusal #:run-t2-pass
    #:*memory-gate-alpha* #:*memory-tail-margin* #:*t2-max-tokens-per-promotion*

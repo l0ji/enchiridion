@@ -850,7 +850,8 @@ a pass ends, and not while a candidate is still building."
         ((eq (getf build :status) :building)
          (list :outcome :building
                :generation-id (getf build :generation-id)
-               :remaining (getf build :remaining)))
+               :remaining (getf build :remaining)
+               :failed (getf build :failed)))
         (t
          (let* ((generation-id (getf build :generation-id))
                 (gate (gate-candidate store generation-id

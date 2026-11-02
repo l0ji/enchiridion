@@ -944,3 +944,30 @@ shipped schedule."
           (testing "the copied layer is not counted as work this build did"
             (ok (= 1 (enchiridion.memory.store:field
                       (enchiridion.memory::generation-row store second) "episodes_derived")))))))))
+
+(deftest a-failed-deriver-call-ends-the-batch-and-keeps-what-it-did ()
+  (with-store (store directory)
+    (let* ((calls 0)
+           (enchiridion.memory:*assertion-deriver*
+             (lambda (store episode)
+               (incf calls)
+               (if (= calls 2)
+                   (error 'enchiridion.errors:transport-error :detail "no reply")
+                   (test-deriver store episode)))))
+      (write-body store "alpha is beta")
+      (write-body store "nothing to see")
+      (write-body store "more of nothing")
+      (let* ((report (enchiridion.memory:build-candidate store :limit 10))
+             (generation (getf report :generation-id))
+             (row (enchiridion.memory::generation-row store generation)))
+        (ok (= 1 (getf report :processed)))
+        (ok (getf report :failed))
+        (ok (eq :building (getf report :status)))
+        (testing "the episode derived before the failure is counted"
+          (ok (= 1 (enchiridion.memory.store:field row "episodes_derived")))
+          (ok (= 1 (enchiridion.memory.store:field row "writes"))))
+        (testing "and the next build resumes at the episode that failed"
+          (let ((next (enchiridion.memory:build-candidate store :limit 10)))
+            (ok (= generation (getf next :generation-id)))
+            (ok (= 2 (getf next :processed)))
+            (ok (eq :candidate (getf next :status)))))))))

@@ -409,20 +409,31 @@ effect on a build already under way."
             (episodes (candidate-episodes store generation-id limit))
             (now (get-universal-time))
             (accepted 0) (rejected 0) (conflicts 0) (closed 0)
-            (tokens 0))
+            (tokens 0) (derived '()) (failure nil))
+       ;; A failed deriver call ends the batch, and the counters below still
+       ;; record the episodes derived before it: they have their rows and their
+       ;; marks, and a gate that read counters without them would undercount.
+       ;; The failed episode is not marked, so the next tick tries it again.
        (let ((*derivation-tokens* 0))
          (dolist (episode episodes)
-           (let ((report (derive-episode store episode generation-id
-                                         parser-version now)))
+           (let ((report (handler-case (derive-episode store episode generation-id
+                                                       parser-version now)
+                           (error (condition)
+                             (setf failure (enchiridion.errors:condition-report-line
+                                            condition))
+                             nil))))
+             (unless report (return))
+             (push episode derived)
              (incf accepted (getf report :assertions))
              (incf rejected (getf report :rejected))
              (incf conflicts (getf report :conflicts))
              (incf closed (getf report :closed))))
-         (setf tokens *derivation-tokens*))
+         (setf tokens *derivation-tokens*
+               derived (nreverse derived)))
        (let ((remaining (unprocessed-episode-count store generation-id)))
          (when (zerop remaining)
            (set-generation-status store generation-id "candidate"))
-         (let ((last-episode (and episodes (episode-id (car (last episodes))))))
+         (let ((last-episode (and derived (episode-id (car (last derived))))))
            (when last-episode
              (enchiridion.memory.store:exec
               store
@@ -432,11 +443,12 @@ effect on a build already under way."
                       episodes_derived = episodes_derived + ?,
                       tokens_used = tokens_used + ?
                 WHERE id = ?"
-              (list last-episode (+ accepted conflicts closed) (length episodes) tokens
+              (list last-episode (+ accepted conflicts closed) (length derived) tokens
                     generation-id))))
          (list :built t
                :generation-id generation-id
-               :processed (length episodes)
+               :processed (length derived)
+               :failed failure
                :remaining remaining
                :assertions accepted
                :rejected rejected

@@ -15,12 +15,18 @@
 (defstruct (counting-backend (:constructor make-counting-backend))
   (calls 0 :type integer)
   (reply "done" :type string)
-  (fail-p nil :type boolean))
+  (fail-p nil :type boolean)
+  (last-prompt "" :type string))
 
 (defmethod enchiridion.llm:complete ((backend counting-backend) messages
                                      &key model tools budget)
-  (declare (ignore messages model tools budget))
+  (declare (ignore model tools budget))
   (incf (counting-backend-calls backend))
+  (let ((user (find "user" messages :key #'enchiridion.llm:message-role
+                                    :test #'string= :from-end t)))
+    (when user
+      (setf (counting-backend-last-prompt backend)
+            (enchiridion.llm:message-content user))))
   (when (counting-backend-fail-p backend)
     (error 'enchiridion.errors:backend-error :backend "counting"))
   (enchiridion.llm::%make-completion
@@ -385,3 +391,12 @@ countable from the test."
         (ok (search "cannot cover"
                     (enchiridion.kernel::budget-refusal agent store 0 0
                                                         :reserve (1+ cap))))))))
+
+(deftest a-compaction-prompt-reads-oldest-first ()
+  (with-scratch-world (store supervisor)
+    (dolist (body '("first turn" "second turn" "third turn" "fourth turn"))
+      (enchiridion.memory.store:record-turn
+       store :session "operator" :role "user" :body body))
+    (ok (enchiridion.kernel::compact-when-due supervisor store (agent-of supervisor)))
+    (let ((prompt (counting-backend-last-prompt (backend-of supervisor))))
+      (ok (< (search "first turn" prompt) (search "fourth turn" prompt))))))

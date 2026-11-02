@@ -234,7 +234,9 @@ nothing and is reported instead. A pass that lands records a projections row."
                                          (enchiridion.memory.store:turn-row-role row)
                                          (shorten (enchiridion.memory.store:turn-row-body row)
                                                   +recent-turn-limit+)))
-                               recent)))
+                               ;; RECENT-TURNS is newest first; a transcript
+                               ;; reads oldest first.
+                               (reverse recent))))
          (session (make-session :agent agent)))
     (unwind-protect
          (let* ((completion (run-turn agent user

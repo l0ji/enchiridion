@@ -273,9 +273,12 @@ and remove the directory. A failing test must not leave a thread behind."
            (enchiridion.supervisor:supervisor-start supervisor)
            (ok (not (enchiridion.supervisor:supervisor-heartbeat-due-p supervisor)))
            (testing "and a request still ticks at once"
+             ;; The heartbeat thread is running, so it is the one that answers
+             ;; the request; ticking by hand here races it on a slow host.
              (setf (enchiridion.supervisor:supervisor-tick-requested-p supervisor) t)
-             (ok (enchiridion.supervisor:supervisor-heartbeat-due-p supervisor))
-             (enchiridion.supervisor:supervisor-tick supervisor)
+             (loop repeat 100
+                   until (plusp (enchiridion.supervisor:supervisor-ticks supervisor))
+                   do (sleep 0.05))
              (ok (= 1 (enchiridion.supervisor:supervisor-ticks supervisor)))))
       (ignore-errors (enchiridion.supervisor:supervisor-stop supervisor))
       (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
@@ -310,7 +313,8 @@ and remove the directory. A failing test must not leave a thread behind."
 (deftest a-tick-request-during-a-tick-is-queued ()
   ;; The operator asked. Dropping the request makes the command that said
   ;; "requested" a lie, and the tick it wanted never happens.
-  (let* ((directory (scratch-directory))
+  (let* ((released nil)
+         (directory (scratch-directory))
          (run (merge-pathnames "run/" directory))
          (supervisor (enchiridion.supervisor:make-supervisor
                       :directory (namestring directory)
@@ -318,17 +322,33 @@ and remove the directory. A failing test must not leave a thread behind."
                       :heartbeat-p t
                       :tick-function (lambda (supervisor)
                                        (declare (ignore supervisor))
+                                       ;; Hold the first tick open so the
+                                       ;; heartbeat thread is busy, not idle and
+                                       ;; free to take the request itself.
+                                       (loop repeat 200 until released
+                                             do (sleep 0.05))
                                        (list :ok-p t :report "ticked")))))
     (unwind-protect
          (progn
            (enchiridion.supervisor:supervisor-start supervisor)
-           (setf (enchiridion.supervisor:supervisor-tick-running-p supervisor) t)
+           (setf (enchiridion.supervisor:supervisor-tick-requested-p supervisor) t)
+           (loop repeat 100
+                 until (enchiridion.supervisor:supervisor-tick-running-p supervisor)
+                 do (sleep 0.05))
+           (ok (enchiridion.supervisor:supervisor-tick-running-p supervisor))
            (enchiridion.supervisor:queue-control "heartbeat run" :run run)
            (ok (= 1 (enchiridion.supervisor:supervisor-poll-control supervisor)))
            (ok (enchiridion.supervisor:supervisor-tick-requested-p supervisor))
            (let ((status (enchiridion.supervisor:read-status run)))
              (ok (enchiridion.supervisor:status-report-ok-p status))
-             (ok (search "queued" (enchiridion.supervisor:status-report status)))))
+             (ok (search "queued" (enchiridion.supervisor:status-report status))))
+           (testing "and the queued request runs once the tick ends"
+             (setf released t)
+             (loop repeat 100
+                   until (= 2 (enchiridion.supervisor:supervisor-ticks supervisor))
+                   do (sleep 0.05))
+             (ok (= 2 (enchiridion.supervisor:supervisor-ticks supervisor)))))
+      (setf released t)
       (ignore-errors (enchiridion.supervisor:supervisor-stop supervisor))
       (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 

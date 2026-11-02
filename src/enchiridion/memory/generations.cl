@@ -369,9 +369,16 @@ dynamic bindings do not reach."
               :tokens *derivation-tokens*)))))
 
 (defun derive-concurrently (store episodes &key (deriver *assertion-deriver*)
-                                                (concurrency *t2-deriver-concurrency*))
+                                                (concurrency *t2-deriver-concurrency*)
+                                                (attempts 2))
   "Return DERIVE-ONE's plist for each of EPISODES, in their order, with up to
-CONCURRENCY model calls in flight at once.
+CONCURRENCY model calls in flight at once. A failed call goes back on the
+queue until it has had ATTEMPTS tries, and its result carries the tokens of
+every try.
+
+The retry is in the pool and not a second round after it: a round waits for
+its slowest call, so a batch with a retry round idled through two tails, which
+on the trial was three minutes in a row with no call in flight.
 
 A deriver call is almost all waiting on the provider, and one episode's call
 does not depend on another's result: the deriver reads the raw log, never the
@@ -382,20 +389,32 @@ that dies without a result leaves NIL, which the caller reads as a failure."
   (let* ((items (coerce episodes 'vector))
          (n (length items))
          (results (make-array n :initial-element nil))
-         (next 0)
+         (tries (make-array n :initial-element 0))
+         (spent (make-array n :initial-element 0))
+         (queue (loop for i below n collect i))
          (lock (bordeaux-threads:make-lock "t2-deriver-queue")))
     (flet ((work ()
              (loop
-               (let ((i (bordeaux-threads:with-lock-held (lock)
-                          (when (< next n) (prog1 next (incf next))))))
+               (let ((i (bordeaux-threads:with-lock-held (lock) (pop queue))))
                  (unless i (return))
-                 (setf (aref results i) (derive-one store deriver (aref items i)))))))
+                 (let ((result (derive-one store deriver (aref items i))))
+                   (bordeaux-threads:with-lock-held (lock)
+                     (incf (aref tries i))
+                     (incf (aref spent i) (or (getf result :tokens) 0))
+                     (setf (aref results i) result)
+                     ;; The worker that puts it back is still looping, so the
+                     ;; retry is picked up even when every other worker is done.
+                     (when (and (getf result :error) (< (aref tries i) attempts))
+                       (setf queue (append queue (list i))))))))))
       (if (or (<= concurrency 1) (<= n 1))
           (work)
           (mapc #'bordeaux-threads:join-thread
                 (loop repeat (min concurrency n)
                       collect (bordeaux-threads:make-thread #'work :name "t2-deriver")))))
-    (coerce results 'list)))
+    (loop for i below n
+          for result = (aref results i)
+          collect (and result (list* :tokens (aref spent i)
+                                     (alexandria:remove-from-plist result :tokens))))))
 
 (defun apply-derivation (store episode generation-id parser-version now assertions events)
   "Write one episode's derived ASSERTIONS and EVENTS into GENERATION-ID, mark
@@ -462,18 +481,8 @@ effect on a build already under way."
        ;; fails would stop every batch at the same place. When most of a batch
        ;; fails the provider is the problem and not the episodes, so nothing
        ;; past the first failure is applied or marked, and the next tick tries.
-       (let* ((results (derive-concurrently store episodes))
-              (failed (loop for episode in episodes for result in results
-                            when (or (null result) (getf result :error)) collect episode)))
+       (let ((results (derive-concurrently store episodes)))
          (dolist (result results) (incf tokens (or (getf result :tokens) 0)))
-         (when failed
-           (let ((retried (derive-concurrently store failed)))
-             (dolist (result retried) (incf tokens (or (getf result :tokens) 0)))
-             (setf results
-                   (loop for episode in episodes for result in results
-                         collect (if (or (null result) (getf result :error))
-                                     (nth (position episode failed) retried)
-                                     result)))))
          (let ((outage (> (* 2 (count-if (lambda (r) (or (null r) (getf r :error))) results))
                           (length results))))
            (loop for episode in episodes

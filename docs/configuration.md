@@ -242,18 +242,19 @@ The `/proc` hidepid remount happens in the container entry point before Lisp sta
 | `:t2-max-episodes-per-tick` | integer | `20` | Episodes one T2 candidate build may parse in one tick. |
 | `:t2-write-cap` | integer | `400` | Most assertions one consolidation pass may write (the volume gate). |
 | `:gate-margin` | real | `0.05` | Utility-gate minimum outcome delta. |
-| `:gate-min-n` | integer | `100` | Utility-gate minimum rows per arm. |
+| `:gate-min-n` | integer | `100` | Utility-gate minimum rows per arm, and the fewest utility tasks a T2 pass needs. |
+| `:utility-max-tasks` | integer | `400` | Most question-and-answer pairs one utility run scores, newest first. |
 | `:parameters` | plist or `nil` | `nil` | Overrides merged over the shipped memory parameter defaults. |
 | `:t2-enabled` | boolean | `t` | Not read: there is no T2 schedule yet. |
 | `:t2-interval-seconds` | integer | `86400` | Not read: there is no T2 schedule yet. |
 | `:t2-episode-threshold` | integer | `200` | Not read: there is no T2 schedule yet. |
 | `:t2-max-tokens-per-pass` | integer | `30000` | Not read: there is no T2 pass budget yet. |
 | `:t2-max-tokens-per-promotion` | integer | `75000` | Not read: there is no promotion budget yet. |
-| `:canaries` | list or `nil` | `nil` | Not read: canaries are registered through the store, not loaded from here. |
-| `:canary-min-families` | integer | `4` | Not read: the canary gate does not count families yet. |
+| `:canaries` | list or `nil` | `nil` | Operator-authored behavioural checks, each a plist of `:name`, `:family`, `:cue`, `:expect`, and `:stale` for the update family. |
+| `:canary-min-families` | integer | `4` | Canary families that must be covered before a T2 pass can run. |
 | `:gate-alpha` | real | `0.05` | Not read: the utility gate has no significance test yet. |
-| `:tail-rarity-fraction` | real | `0.10` | Not read: there is no tail gate yet. |
-| `:tail-min-n` | integer | `50` | Not read: there is no tail gate yet. |
+| `:tail-rarity-fraction` | real | `0.10` | Share of episodes, rarest first, that the tail sample treats as rare. |
+| `:tail-min-n` | integer | `50` | Fewest questions with a rare answer a T2 pass needs. |
 | `:tail-margin` | real | `0.02` | Not read: there is no tail gate yet. |
 | `:precision-min` | real | `0.8` | Not read: there is no promotion-precision gate yet. |
 | `:quarantine-max` | real | `0.5` | Not read: there is no quarantine-rate gate yet. |

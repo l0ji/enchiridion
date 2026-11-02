@@ -342,3 +342,131 @@
       (let ((report (enchiridion.memory:build-candidate store :limit 10 :rebuild t)))
         (ok (= 2 derived))
         (ok (= 1 (length (ids-of store "assertions" (getf report :generation-id)))))))))
+
+;;;; The T2 instruments.
+
+(defun say (store role body &key (session "s") (channel :cli))
+  (enchiridion.memory:episode-id
+   (enchiridion.memory:write-episode store :session session :role role :body body
+                                           :channel channel :derive-p nil)))
+
+(defun canary (family &rest keys &key (name family) (cue "deploy key") (expect "vault")
+                                      stale)
+  (declare (ignore keys))
+  (list :name name :family family :cue cue :expect expect :stale stale))
+
+(deftest canary-coverage-counts-only-valid-families ()
+  (let ((enchiridion.memory:*canary-min-families* 4))
+    (testing "the four families cover the suite"
+      (ok (nth-value 1 (enchiridion.memory:canary-coverage
+                        (list (canary "retrieval") (canary "update" :stale "old")
+                              (canary "safety") (canary "tail"))))))
+    (testing "an update canary with no stale value does not count"
+      (ng (nth-value 1 (enchiridion.memory:canary-coverage
+                        (list (canary "retrieval") (canary "update")
+                              (canary "safety") (canary "tail"))))))
+    (testing "a family that is not one of the four does not count"
+      (ng (enchiridion.memory:valid-canary-p (canary "vibes"))))))
+
+(deftest a-canary-checks-behaviour-in-the-generation-it-is-given ()
+  (with-store (store directory)
+    (say store "user" "the deploy key lives in vault under ops")
+    (testing "retrieval: the cue brings back the expected text"
+      (ok (enchiridion.memory:canary-behaviour-p store (canary "retrieval") nil))
+      (ng (enchiridion.memory:canary-behaviour-p
+           store (canary "retrieval" :expect "keychain") nil)))
+    (testing "safety: the forbidden text never reaches the pack"
+      (ok (enchiridion.memory:canary-behaviour-p
+           store (canary "safety" :expect "hunter2") nil))
+      (ng (enchiridion.memory:canary-behaviour-p store (canary "safety") nil)))
+    (testing "update: the new value is there and the stale one does not outrank it"
+      (ok (enchiridion.memory:canary-behaviour-p
+           store (canary "update" :stale "keychain") nil))
+      (ng (enchiridion.memory:canary-behaviour-p
+           store (canary "update" :expect "keychain" :stale "vault") nil)))))
+
+(deftest the-canary-table-follows-the-configuration ()
+  (with-store (store directory)
+    (enchiridion.memory:register-canary store "gone" "anything")
+    (ok (= 1 (enchiridion.memory:sync-canaries
+              store (list (canary "retrieval" :name "kept") (canary "vibes")))))
+    (let ((rows (enchiridion.memory.store:query-rows
+                 store "SELECT name, family FROM canary")))
+      (ok (= 1 (length rows)))
+      (ok (string= "kept" (enchiridion.memory.store:field (first rows) "name")))
+      (ok (string= "retrieval" (enchiridion.memory.store:field (first rows) "family"))))))
+
+(deftest utility-tasks-pair-each-question-with-its-answer ()
+  (with-store (store directory)
+    (let* ((q1 (say store "user" "where is the deploy key"))
+           (a1 (say store "assistant" "in vault under ops"))
+           (q2 (say store "user" "which port does the api use"))
+           (_ (say store "user" "a sleep pass" :channel :sleep))
+           (a2 (say store "assistant" "port 9090"))
+           (_2 (say store "user" "a question nobody answered"))
+           (tasks (enchiridion.memory:utility-tasks store)))
+      (declare (ignore _ _2))
+      (ok (= 2 (length tasks)))
+      (testing "newest first, each cue paired with the reply that followed it"
+        (ok (string= "which port does the api use" (getf (first tasks) :cue)))
+        (ok (= a2 (getf (first tasks) :expect-episode)))
+        (ok (= a1 (getf (second tasks) :expect-episode)))
+        (ok (search (princ-to-string q1) (getf (second tasks) :name)))
+        (ok (search (princ-to-string q2) (getf (first tasks) :name)))))))
+
+(deftest an-answer-counts-as-recalled-through-its-assertion ()
+  (let ((task (list :expect-episode 7)))
+    (ok (= 1.0 (enchiridion.memory:answer-scorer
+                nil task "" (list (list :item (list :kind "episode" :id 7))))))
+    (ok (= 1.0 (enchiridion.memory:answer-scorer
+                nil task "" (list (list :item (list :kind "assertion" :id 3
+                                                    :episode-id 7))))))
+    (ok (= 0.0 (enchiridion.memory:answer-scorer
+                nil task "" (list (list :item (list :kind "episode" :id 3))))))))
+
+(deftest the-tail-sample-is-the-questions-with-rare-answers ()
+  (with-store (store directory)
+    (let ((enchiridion.memory:*tail-rarity-fraction* 0.25)
+          (answers '()))
+      (dotimes (i 4)
+        (say store "user" (format nil "question ~D" i))
+        (push (say store "assistant" (format nil "answer ~D" i)) answers))
+      ;; Every episode derived; the last answer is the rarest of the eight.
+      (enchiridion.memory.store:exec
+       store "UPDATE episodes SET derived_ts = 1, rarity_raw = 0.1")
+      (enchiridion.memory.store:exec
+       store "UPDATE episodes SET rarity_raw = 0.9 WHERE id IN (?, ?)"
+       (list (first answers) (second answers)))
+      (let ((tail (enchiridion.memory:tail-tasks
+                   store (enchiridion.memory:utility-tasks store))))
+        (ok (= 2 (length tail)))
+        (ok (subsetp (mapcar (lambda (task) (getf task :expect-episode)) tail)
+                     (list (first answers) (second answers))))))))
+
+(deftest a-pass-without-its-instruments-is-told-what-is-missing ()
+  (with-store (store directory)
+    (testing "an empty store with no deriver lacks all four"
+      (let ((enchiridion.memory:*assertion-deriver* nil))
+        (let ((report (enchiridion.memory:t2-preflight store :canaries '())))
+          (ng (getf report :ready-p))
+          (ok (eq :instrument-missing (getf report :reason)))
+          (ok (equal '(:deriver :canary-coverage :utility-task-set :tail-sampler)
+                     (getf report :missing))))))
+    (testing "with every instrument present the pass is ready"
+      (let ((enchiridion.memory:*assertion-deriver* #'test-deriver)
+            (enchiridion.memory:*canary-min-families* 4)
+            (enchiridion.memory::*memory-gate-min-n* 2)
+            (enchiridion.memory:*tail-min-n* 1)
+            (enchiridion.memory:*tail-rarity-fraction* 0.5))
+        (dotimes (i 2)
+          (say store "user" (format nil "question ~D" i))
+          (say store "assistant" (format nil "answer ~D" i)))
+        (enchiridion.memory.store:exec
+         store "UPDATE episodes SET derived_ts = 1, rarity_raw = 0.1 WHERE role = 'user'")
+        (enchiridion.memory.store:exec
+         store "UPDATE episodes SET derived_ts = 1, rarity_raw = 0.9 WHERE role = 'assistant'")
+        (let ((report (enchiridion.memory:t2-preflight
+                       store :canaries (list (canary "retrieval") (canary "update" :stale "x")
+                                             (canary "safety") (canary "tail")))))
+          (ok (getf report :ready-p))
+          (ok (null (getf report :missing))))))))

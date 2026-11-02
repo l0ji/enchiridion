@@ -296,12 +296,17 @@ did not think of."))
    #:index-cue #:cue-index-for #:cue-index-many #:cue-index-size
    #:prune-cue-index #:push-pack #:precondition-surfacing
    #:learned-state-block #:fire-intentions #:assemble-pack
-   #:register-canary #:canary-check #:canary-report
+   #:register-canary #:canary-check #:canary-report #:+canary-families+
+   #:valid-canary-p #:canary-coverage #:sync-canaries #:canary-behaviour-p
+   #:canary-predicate #:utility-tasks #:answer-hit-p #:answer-scorer
+   #:rare-episode-ids #:tail-tasks #:t2-preflight
    #:utility-gate #:volume-gate
    #:run-arm #:compare-arms #:push-ab #:record-gate-row #:content-hash
    #:*push-max-fraction* #:*memory-pack-chars* #:*memory-graph-limit*
    #:*memory-gate-margin* #:*memory-gate-min-n* #:*memory-write-cap*
    #:apply-memory-settings #:*compaction-rebase-every* #:*compaction-rebase-turns*
+   #:*memory-canaries* #:*canary-min-families* #:*tail-rarity-fraction*
+   #:*tail-min-n* #:*utility-max-tasks*
    ;; Integration entry points. Defined in later files; exported here so the
    ;; kernel and the command table have one visible interface.
    #:retrieve-for-turn #:retrieve-rows-for-turn #:record-retrieval

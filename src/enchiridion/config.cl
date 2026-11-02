@@ -224,6 +224,8 @@ store path. The model defaults match the shipped adapter defaults."
     (:canary-min-families 4)
     (:gate-margin 0.05)
     (:gate-min-n 100)
+    ;; The most question-and-answer pairs one utility run scores, newest first.
+    (:utility-max-tasks 400)
     (:gate-alpha 0.05)
     (:tail-rarity-fraction 0.10)
     (:tail-min-n 50)

@@ -31,6 +31,24 @@ The push channels, the intention tool, the canaries, the gate log, and the code-
 Their tables exist in the schema.
 `memory status` reports zero generations until a candidate is built.
 
+### The T2 instruments
+
+A T2 pass runs only when four instruments exist, and `t2-preflight` names each one that does not:
+
+| Instrument | Present when | Missing as |
+| --- | --- | --- |
+| Deriver | an assertion deriver is installed, which `serve` does when a backend exists | `:deriver` |
+| Canary coverage | the valid `:canaries` cover `:canary-min-families` of the four families | `:canary-coverage` |
+| Utility task set | the log holds `:gate-min-n` question-and-answer pairs | `:utility-task-set` |
+| Tail sampler | `:tail-min-n` of those pairs have an answer among the rarest `:tail-rarity-fraction` of episodes | `:tail-sampler` |
+
+A utility task is a user turn and the assistant turn that answered it, in the same session.
+It scores 1 when a retrieval for the question brings back the answer, or an assertion derived from it, and 0 otherwise, so the candidate arm and the retention-only arm are scored on the same questions.
+The tail sample is the subset of those tasks whose answer is rare: what consolidation loses first is the rare record.
+
+A canary checks behaviour in a retrieval for its `:cue`, never presence in the store.
+`sync-canaries` makes the canary table hold exactly the valid configured canaries, so one the operator removes stops counting.
+
 Push is off.
 The design enables it only after a paired no-harm run.
 

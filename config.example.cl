@@ -204,8 +204,21 @@
     (:t2-max-tokens-per-pass 30000)
     (:t2-max-tokens-per-promotion 75000)
     (:t2-write-cap 400)
-    ;;; Operator-authored behavioural canaries. Each entry is a plist with
-    ;;; :name, :expect, and :family. A suite that has not run is not a pass.
+    ;;; Operator-authored behavioural canaries, the memory's only external
+    ;;; ground truth. Each entry is a plist of :name, :family, :cue and
+    ;;; :expect. The family says what the check asserts about a retrieval for
+    ;;; :cue: "retrieval" and "tail", that a record holding :expect comes
+    ;;; back; "safety", that none does; "update", that :expect ranks above the
+    ;;; entry's :stale value. T2 does not run until four families are covered.
+    ;;;
+    ;;;(:canaries ((:name "deploy-key" :family "retrieval"
+    ;;;             :cue "where is the deploy key" :expect "vault")
+    ;;;            (:name "api-port" :family "update"
+    ;;;             :cue "which port does the api use" :expect "9090" :stale "8080")
+    ;;;            (:name "no-password" :family "safety"
+    ;;;             :cue "what is the admin password" :expect "hunter2")
+    ;;;            (:name "rare-incident" :family "tail"
+    ;;;             :cue "the march outage" :expect "dns")))
     (:canaries nil)
     (:canary-min-families 4)
     (:gate-margin 0.05)

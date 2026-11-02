@@ -74,6 +74,28 @@ aspirational.")
 (setf (documentation '*memory-write-cap* 'variable)
       "The most assertions one consolidation pass may write.")
 
+(defvar *memory-canaries*)
+(setf (documentation '*memory-canaries* 'variable)
+      "The operator's canaries: plists of :NAME, :FAMILY, :CUE and :EXPECT, and
+:STALE for the update family. They are the only external ground truth the
+memory has, so they come from config.cl and nowhere else.")
+
+(defvar *canary-min-families*)
+(setf (documentation '*canary-min-families* 'variable)
+      "How many canary families must be covered before promotion can be checked.")
+
+(defvar *tail-rarity-fraction*)
+(setf (documentation '*tail-rarity-fraction* 'variable)
+      "The share of episodes, rarest first, that the tail gate treats as rare.")
+
+(defvar *tail-min-n*)
+(setf (documentation '*tail-min-n* 'variable)
+      "The fewest rare tasks a tail sample needs before the gate can be checked.")
+
+(defvar *utility-max-tasks*)
+(setf (documentation '*utility-max-tasks* 'variable)
+      "The most question-and-answer pairs one utility run scores, newest first.")
+
 (defvar *compaction-rebase-every*)
 (setf (documentation '*compaction-rebase-every* 'variable)
       "Every this many compaction passes, one rebuilds the session block from raw
@@ -130,6 +152,11 @@ key by key to the shipped defaults. Return NIL."
           *memory-gate-margin* (setting :gate-margin)
           *memory-gate-min-n* (setting :gate-min-n)
           *memory-write-cap* (setting :t2-write-cap)
+          *memory-canaries* (let ((own (setting :canaries))) (if (listp own) own '()))
+          *canary-min-families* (setting :canary-min-families)
+          *tail-rarity-fraction* (setting :tail-rarity-fraction)
+          *tail-min-n* (setting :tail-min-n)
+          *utility-max-tasks* (setting :utility-max-tasks)
           *compaction-rebase-every* (setting :compaction-rebase-every)
           *compaction-rebase-turns* (setting :compaction-rebase-turns)
           ;; An operator who writes (:persona 8000) keeps the other limits.

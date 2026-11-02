@@ -474,7 +474,8 @@ sentence above says no socket rather than no network."
               :config (enchiridion:config-with-llm-value
                        config :max-tokens enchiridion.memory:*t2-deriver-max-tokens*)
               :api-key key)
-             :model (enchiridion:model-for :cheap))))
+             :model (or enchiridion.memory:*t2-deriver-model*
+                        (enchiridion:model-for :cheap)))))
     ;; Dense retrieval has its own endpoint and key, so a store can use an
     ;; embeddings provider other than the chat one.
     (let ((settings enchiridion.memory::*memory-embed-settings*))

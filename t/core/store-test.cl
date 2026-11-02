@@ -672,12 +672,13 @@ itself is what proves the trigger ran."
            (dolist (statement '("DROP TRIGGER assertions_ai" "DROP TRIGGER assertions_ad"
                                 "DROP TRIGGER assertions_au" "DROP TABLE assertions_fts"
                                 "ALTER TABLE memory_state DROP COLUMN precision_reset_generation"
-                                "ALTER TABLE memory_state DROP COLUMN last_t2_episode"))
+                                "ALTER TABLE memory_state DROP COLUMN last_t2_episode"
+                                "ALTER TABLE generations DROP COLUMN episodes_derived"))
              (enchiridion.memory.store::exec store statement))
            (enchiridion.memory.store::set-schema-version store 3)
            (enchiridion.memory.store:close-store store)
            (setf store (enchiridion.memory.store:open-store :path path))
-           (ok (= 5 (enchiridion.memory.store::schema-version store)))
+           (ok (= 6 (enchiridion.memory.store::schema-version store)))
            (testing "the existing claim is indexed"
              (ok (= 1 (length (enchiridion.memory.store::query-rows
                                store "SELECT rowid FROM assertions_fts
@@ -687,6 +688,9 @@ itself is what proves the trigger ran."
                   store "memory_state" "precision_reset_generation")))
            (testing "and so does the T2 episode watermark"
              (ok (enchiridion.memory.store::column-exists-p
-                  store "memory_state" "last_t2_episode"))))
+                  store "memory_state" "last_t2_episode")))
+           (testing "and the derived-episode count the volume gate reads"
+             (ok (enchiridion.memory.store::column-exists-p
+                  store "generations" "episodes_derived"))))
       (ignore-errors (enchiridion.memory.store:close-store store))
       (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))

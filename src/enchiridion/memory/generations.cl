@@ -429,9 +429,10 @@ effect on a build already under way."
               "UPDATE generations
                   SET to_episode = MAX(to_episode, ?),
                       writes = writes + ?,
+                      episodes_derived = episodes_derived + ?,
                       tokens_used = tokens_used + ?
                 WHERE id = ?"
-              (list last-episode (+ accepted conflicts closed) tokens
+              (list last-episode (+ accepted conflicts closed) (length episodes) tokens
                     generation-id))))
          (list :built t
                :generation-id generation-id

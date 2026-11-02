@@ -90,9 +90,11 @@ retention-only before the tail gate fails.")
       "The most tokens the candidates built since the last promotion may have
 cost, together, for the next one to be promoted.")
 
-(defvar *memory-write-cap*)
-(setf (documentation '*memory-write-cap* 'variable)
-      "The most assertions one consolidation pass may write.")
+(defvar *memory-writes-per-episode*)
+(setf (documentation '*memory-writes-per-episode* 'variable)
+      "The most semantic rows a candidate may write per episode it derived:
+the volume gate's allowance grows with the work the build did, so ordinary
+output passes and a deriver that writes far more than usual does not.")
 
 (defvar *memory-canaries*)
 (setf (documentation '*memory-canaries* 'variable)
@@ -148,6 +150,12 @@ that reaches it pauses and resumes once the window has room.")
 (setf (documentation '*t2-deriver-max-tokens* 'variable)
       "The reply cap of one T2 deriver call. The deriver gets a backend of its
 own with this cap, so the chat path keeps the :llm section's :max-tokens.")
+
+(defvar *t2-deriver-model*)
+(setf (documentation '*t2-deriver-model* 'variable)
+      "The model the T2 deriver calls, or NIL for the cheap tier's model. A
+deriver wants a model that answers in JSON without a long reasoning pass,
+which is not always the model a turn wants.")
 
 (defvar *t2-interval-seconds*)
 (defvar *t2-frozen-interval-seconds*)
@@ -209,7 +217,7 @@ key by key to the shipped defaults. Return NIL."
           *memory-graph-limit* (setting :graph-limit)
           *memory-gate-margin* (setting :gate-margin)
           *memory-gate-min-n* (setting :gate-min-n)
-          *memory-write-cap* (setting :t2-write-cap)
+          *memory-writes-per-episode* (setting :t2-writes-per-episode)
           *memory-gate-alpha* (setting :gate-alpha)
           *memory-tail-margin* (setting :tail-margin)
           *gate-pack-chars* (setting :gate-pack-chars)
@@ -229,6 +237,8 @@ key by key to the shipped defaults. Return NIL."
           *t2-episode-threshold* (setting :t2-episode-threshold)
           *t2-max-tokens-per-pass* (setting :t2-max-tokens-per-pass)
           *t2-deriver-max-tokens* (setting :t2-deriver-max-tokens)
+          *t2-deriver-model* (let ((own (setting :t2-deriver-model)))
+                               (and (stringp own) (plusp (length own)) own))
           *t2-interval-seconds* (setting :t2-interval-seconds)
           *t2-frozen-interval-seconds* (setting :t2-frozen-interval-seconds)
           *compaction-rebase-every* (setting :compaction-rebase-every)

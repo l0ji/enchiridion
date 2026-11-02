@@ -240,7 +240,7 @@ The `/proc` hidepid remount happens in the container entry point before Lisp sta
 | `:embed-key-env` | string | `"OPENAI_API_KEY"` | Environment variable that holds the embedding key. Always collected as a secret name. |
 | `:rerank` | boolean | `nil` | Install the cheap-model reranker. |
 | `:t2-max-episodes-per-tick` | integer | `20` | Episodes one T2 candidate build may parse in one tick. |
-| `:t2-write-cap` | integer | `400` | Most semantic rows one candidate may write (the volume half of the cost gate). |
+| `:t2-writes-per-episode` | integer | `8` | Most semantic rows a candidate may write per episode it derived itself (the volume half of the cost gate). A measured deriver writes about 5. |
 | `:t2-max-tokens-per-promotion` | integer | `75000` | Most tokens the candidates built since the last promotion may cost together (the cost half of the cost gate). |
 | `:gate-margin` | real | `0.05` | Utility-gate minimum mean outcome delta, candidate over retention-only. |
 | `:gate-min-n` | integer | `100` | Utility-gate minimum non-tied pairs, and the fewest utility tasks a T2 pass needs. |

@@ -374,10 +374,19 @@
   (with-store (store)
     (enchiridion.memory.store:exec
      store
-     "INSERT INTO generations (number, status, created_ts, writes) VALUES (1, 'candidate', 0, 401)")
+     "INSERT INTO generations (number, status, created_ts, writes, episodes_derived)
+        VALUES (1, 'candidate', 0, 401, 50)")
     (let ((id (enchiridion.memory.store:last-row-id store)))
-      (ng (enchiridion.memory:volume-gate store id :max-writes 400))
-      (ok (enchiridion.memory:volume-gate store id :max-writes 401)))
+      (testing "the allowance is per episode derived: 50 episodes at 8 is 400"
+        (ng (enchiridion.memory:volume-gate store id :per-episode 8))
+        (ok (enchiridion.memory:volume-gate store id :per-episode 9))))
+    (enchiridion.memory.store:exec
+     store
+     "INSERT INTO generations (number, status, created_ts, writes, episodes_derived)
+        VALUES (2, 'candidate', 0, 1, 0)")
+    (testing "a build that derived nothing may write nothing"
+      (ng (enchiridion.memory:volume-gate store (enchiridion.memory.store:last-row-id store)
+                                          :per-episode 8)))
     (testing "a generation that does not exist does not pass"
       (ng (enchiridion.memory:volume-gate store 999)))))
 

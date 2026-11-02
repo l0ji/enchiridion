@@ -257,20 +257,27 @@ promoted."
                  0)))
     (values (zerop bad) (list :unsourced bad))))
 
-(defun volume-gate (store generation-id &key (max-writes *memory-write-cap*))
-  "Return T when GENERATION-ID's build wrote at most MAX-WRITES semantic rows.
+(defun volume-gate (store generation-id &key (per-episode *memory-writes-per-episode*))
+  "Return T when GENERATION-ID's build wrote at most PER-EPISODE semantic rows
+for each episode it derived itself.
 
 The cap exists because interference is constantly present: what a system
 writes between encoding a record and retrieving it determines whether the
 record survives, with no deletion policy in play.  High-volume passive
 learning therefore degrades older records by competition alone.  The count is
 the generation's own WRITES column, which BUILD-CANDIDATE keeps, so the gate
-measures the candidate it is asked about and not a run that never happened."
+measures the candidate it is asked about and not a run that never happened.
+
+The allowance is per episode and not one number per candidate, because a
+measured deriver writes about five rows an episode: a fixed 400 quarantined
+every candidate of the 200 episodes that make a pass due. Copied rows are in
+neither count, since WRITES and EPISODES_DERIVED both count this build alone."
   (let ((row (first (enchiridion.memory.store:query-rows
-                     store "SELECT writes FROM generations WHERE id = ?"
+                     store "SELECT writes, episodes_derived FROM generations WHERE id = ?"
                      (list generation-id)))))
     (and row
-         (<= (or (enchiridion.memory.store:field row "writes") 0) max-writes))))
+         (<= (or (enchiridion.memory.store:field row "writes") 0)
+             (* per-episode (or (enchiridion.memory.store:field row "episodes_derived") 0))))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; 6. Measurement
@@ -505,18 +512,20 @@ attempts included."
        "n")
       0))
 
-(defun cost-gate (store generation-id &key (max-writes *memory-write-cap*)
+(defun cost-gate (store generation-id &key (per-episode *memory-writes-per-episode*)
                                            (max-tokens *t2-max-tokens-per-promotion*))
-  "Return two values: T when GENERATION-ID wrote at most MAX-WRITES rows and
+  "Return two values: T when GENERATION-ID wrote at most PER-EPISODE rows for
+each episode it derived and
 the generations since the last promotion cost at most MAX-TOKENS, and a
 report.  A pass that never promotes is pure cost, so the cost is counted per
 promotion, not per candidate."
   (let ((tokens (promotion-tokens store generation-id)))
-    (values (and (volume-gate store generation-id :max-writes max-writes)
+    (values (and (volume-gate store generation-id :per-episode per-episode)
                  (<= tokens max-tokens))
-            (list :tokens tokens
-                  :writes (enchiridion.memory.store:field
-                           (generation-row store generation-id) "writes")))))
+            (let ((row (generation-row store generation-id)))
+              (list :tokens tokens
+                    :writes (enchiridion.memory.store:field row "writes")
+                    :episodes (enchiridion.memory.store:field row "episodes_derived"))))))
 
 (defun record-check (store generation-id kind pass-p report &key (now (get-universal-time)))
   "Write one generation_checks row for KIND and return PASS-P."

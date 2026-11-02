@@ -929,3 +929,18 @@ shipped schedule."
           (ok (every (lambda (row)
                        (= 1.0 (enchiridion.memory::terms-cue-type (getf row :terms))))
                      rows)))))))
+
+(deftest a-candidate-counts-only-the-episodes-it-derived-itself ()
+  (with-store (store directory)
+    (let ((enchiridion.memory:*assertion-deriver* #'test-deriver))
+      (write-body store "alpha is beta")
+      (write-body store "nothing to see")
+      (let ((first (getf (enchiridion.memory:build-candidate store :limit 10) :generation-id)))
+        (ok (= 2 (enchiridion.memory.store:field
+                  (enchiridion.memory::generation-row store first) "episodes_derived")))
+        (enchiridion.memory:promote-generation store first)
+        (write-body store "alpha is gamma")
+        (let ((second (getf (enchiridion.memory:build-candidate store :limit 10) :generation-id)))
+          (testing "the copied layer is not counted as work this build did"
+            (ok (= 1 (enchiridion.memory.store:field
+                      (enchiridion.memory::generation-row store second) "episodes_derived")))))))))

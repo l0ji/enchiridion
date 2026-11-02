@@ -138,7 +138,7 @@
            (enchiridion.memory:configure-memory
             '(:memory (:block-limits (:persona 9000)) (:graph-limit 7)
                       (:push-max-fraction 0.25) (:gate-margin 0.3)
-                      (:gate-min-n 3) (:t2-write-cap 9)))
+                      (:gate-min-n 3) (:t2-writes-per-episode 9)))
            (testing "a block limit the operator sets is the one a block gets"
              (ok (= 9000 (enchiridion.memory:default-block-limit :persona)))
              (ok (= 9000 (enchiridion.memory:block-limit
@@ -153,7 +153,7 @@
              (ok (= 0.25 enchiridion.memory:*push-max-fraction*))
              (ok (= 0.3 enchiridion.memory:*memory-gate-margin*))
              (ok (= 3 enchiridion.memory:*memory-gate-min-n*))
-             (ok (= 9 enchiridion.memory:*memory-write-cap*)))
+             (ok (= 9 enchiridion.memory:*memory-writes-per-episode*)))
            (enchiridion.memory:configure-memory
             '(:memory (:enabled t) (:push t)))
            (testing "push needs the master switch and its own flag"

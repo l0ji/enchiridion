@@ -308,7 +308,7 @@ did not think of."))
    #:*precision-min* #:*precision-window* #:*precision-min-checked* #:*quarantine-max*
    #:*quarantine-window* #:*quarantine-min-candidates* #:*t2-interval-seconds*
    #:*t2-frozen-interval-seconds* #:*t2-enabled-p* #:*t2-episode-threshold*
-   #:*t2-max-tokens-per-pass* #:*t2-deriver-max-tokens*
+   #:*t2-max-tokens-per-pass* #:*t2-deriver-max-tokens* #:*t2-deriver-model*
    #:last-t2-ts #:mark-t2-pass #:new-episode-count #:t2-due-p #:t2-pass-spend
    #:t2-refusal #:run-t2-pass
    #:*memory-gate-alpha* #:*memory-tail-margin* #:*t2-max-tokens-per-promotion*
@@ -316,7 +316,7 @@ did not think of."))
    #:utility-gate #:volume-gate
    #:run-arm #:compare-arms #:push-ab #:record-gate-row #:content-hash
    #:*push-max-fraction* #:*memory-pack-chars* #:*memory-graph-limit*
-   #:*memory-gate-margin* #:*memory-gate-min-n* #:*memory-write-cap*
+   #:*memory-gate-margin* #:*memory-gate-min-n* #:*memory-writes-per-episode*
    #:apply-memory-settings #:*compaction-rebase-every* #:*compaction-rebase-turns*
    #:*memory-canaries* #:*canary-min-families* #:*tail-rarity-fraction*
    #:*tail-min-n* #:*utility-max-tasks*

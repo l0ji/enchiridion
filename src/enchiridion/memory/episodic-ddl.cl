@@ -206,6 +206,7 @@ references.")
       config_hash   TEXT    NOT NULL DEFAULT '',
       tokens_used   INTEGER NOT NULL DEFAULT 0,
       writes        INTEGER NOT NULL DEFAULT 0,
+      episodes_derived INTEGER NOT NULL DEFAULT 0,
       promotion_result TEXT NOT NULL DEFAULT '',
       promotion_checked_ts INTEGER,
       quarantine_reason TEXT NOT NULL DEFAULT '',

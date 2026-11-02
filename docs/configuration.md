@@ -239,9 +239,9 @@ The `/proc` hidepid remount happens in the container entry point before Lisp sta
 | `:embed-base-url` | string | `"https://api.openai.com/v1/"` | Embedding endpoint. |
 | `:embed-key-env` | string | `"OPENAI_API_KEY"` | Environment variable that holds the embedding key. Always collected as a secret name. |
 | `:rerank` | boolean | `nil` | Install the cheap-model reranker. |
-| `:t2-max-episodes-per-tick` | integer | `20` | Episodes one T2 candidate build may parse in one tick. |
+| `:t2-max-episodes-per-tick` | integer | `5` | Episodes one T2 candidate build may derive in one tick. A measured call takes about 50 seconds, so 5 keeps a tick to about 4 minutes. |
 | `:t2-writes-per-episode` | integer | `8` | Most semantic rows a candidate may write per episode it derived itself (the volume half of the cost gate). A measured deriver writes about 5. |
-| `:t2-max-tokens-per-promotion` | integer | `75000` | Most tokens the candidates built since the last promotion may cost together (the cost half of the cost gate). |
+| `:t2-max-tokens-per-promotion` | integer | `600000` | Most tokens the candidates built since the last promotion may cost together (the cost half of the cost gate): about two 200-episode candidates at a measured 1,500 tokens an episode. |
 | `:gate-margin` | real | `0.05` | Utility-gate minimum mean outcome delta, candidate over retention-only. |
 | `:gate-min-n` | integer | `100` | Utility-gate minimum non-tied pairs, and the fewest utility tasks a T2 pass needs. |
 | `:gate-alpha` | real | `0.05` | Utility-gate significance level for the one-sided sign test. |
@@ -253,8 +253,9 @@ The `/proc` hidepid remount happens in the container entry point before Lisp sta
 | `:t2-interval-seconds` | integer | `86400` | Seconds between T2 passes. A pass is due when this has elapsed since the last one ended, or earlier at `:t2-episode-threshold`. |
 | `:t2-frozen-interval-seconds` | integer | `604800` | Seconds between T2 passes while the quarantine rate is over `:quarantine-max`. |
 | `:t2-episode-threshold` | integer | `200` | New episodes since the last T2 pass ended that make a pass due before its interval. Ignored while the quarantine rate is over `:quarantine-max`. |
-| `:t2-max-tokens-per-pass` | integer | `30000` | Most tokens T2 may spend in any rolling twenty-four hours. A candidate that reaches it pauses and resumes when the window has room; `:t2-max-tokens-per-promotion` still caps its total. |
+| `:t2-max-tokens-per-pass` | integer | `200000` | Most tokens T2 may spend in any rolling twenty-four hours: half the shipped day cap. A candidate that reaches it pauses and resumes when the window has room; `:t2-max-tokens-per-promotion` still caps its total. |
 | `:t2-deriver-max-tokens` | integer | `16384` | Reply cap of one T2 deriver call. The deriver gets a backend of its own with this cap, so chat keeps the `:llm` section's `:max-tokens`; a reasoning model spends the cap thinking before it answers. |
+| `:t2-deriver-model` | string or `nil` | `nil` | Model the T2 deriver calls; `nil` is `:model-cheap`. Pick one that answers in JSON without a long reasoning pass: on one gateway a reasoning model cost about 8,100 tokens an episode and a non-reasoning one about 1,500. |
 | `:canaries` | list or `nil` | `nil` | Operator-authored behavioural checks, each a plist of `:name`, `:family`, `:cue`, `:expect`, and `:stale` for the update family. |
 | `:canary-min-families` | integer | `4` | Canary families that must be covered before a T2 pass can run. |
 | `:tail-rarity-fraction` | real | `0.10` | Share of episodes, rarest first, that the tail sample treats as rare. |

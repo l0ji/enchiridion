@@ -230,15 +230,18 @@ store path. The model defaults match the shipped adapter defaults."
     (:t2-enabled t)
     (:t2-interval-seconds 86400)
     (:t2-episode-threshold 200)
-    (:t2-max-episodes-per-tick 20)
-    (:t2-max-tokens-per-pass 30000)
+    (:t2-max-episodes-per-tick 5)
+    ;; Sized from 20 measured episodes at about 1,500 tokens each: half of the
+    ;; shared day cap, so a 200-episode pass spans about a day and a half and
+    ;; chat keeps the other half.
+    (:t2-max-tokens-per-pass 200000)
     ;; The reply cap of one T2 deriver call, apart from the :llm section's
     ;; :max-tokens: a reasoning model spends its cap thinking, and at 4096 it
     ;; was cut off before it answered on most records.
     (:t2-deriver-max-tokens 16384)
     ;; The model the T2 deriver calls; NIL is the :llm section's :model-cheap.
     (:t2-deriver-model nil)
-    (:t2-max-tokens-per-promotion 75000)
+    (:t2-max-tokens-per-promotion 600000)
     (:t2-writes-per-episode 8)
     (:canaries nil)
     (:canary-min-families 4)

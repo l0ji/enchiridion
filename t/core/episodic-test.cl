@@ -189,35 +189,40 @@
            (not (getf r :ok-p))
            (equal (getf r :failures) '("bad"))))))
 
+(defun record-pair (store generation hash retention candidate)
+  "Record one task scored under both arms for GENERATION."
+  (enchiridion.memory:record-gate-row store "retention" "outcome" retention
+                                      :generation-id generation :task-hash hash)
+  (enchiridion.memory:record-gate-row store "candidate" "outcome" candidate
+                                      :generation-id generation :task-hash hash))
+
 (defun utility-gate-defaults-closed ()
   "With no evidence, the utility gate is closed."
   (with-store (store)
-    (not (enchiridion.memory:utility-gate store))))
+    (not (enchiridion.memory:utility-gate store 1))))
 
 (defun utility-gate-needs-both-arms ()
-  "One arm alone is not evidence."
+  "One arm alone is not evidence: nothing pairs."
   (with-store (store)
     (dotimes (i 30)
-      (enchiridion.memory:record-gate-row store "consolidate" "outcome" 1.0))
-    (not (enchiridion.memory:utility-gate store :min-n 20))))
+      (enchiridion.memory:record-gate-row store "candidate" "outcome" 1.0
+                                          :generation-id 1
+                                          :task-hash (format nil "t~D" i)))
+    (not (enchiridion.memory:utility-gate store 1 :min-n 20))))
 
 (defun utility-gate-opens-on-evidence ()
-  "Consolidation beating retention by more than the margin opens the gate."
+  "A candidate that wins every paired task opens the gate."
   (with-store (store)
     (dotimes (i 30)
-      (enchiridion.memory:record-gate-row store "retention" "outcome" 0.50))
-    (dotimes (i 30)
-      (enchiridion.memory:record-gate-row store "consolidate" "outcome" 0.60))
-    (enchiridion.memory:utility-gate store :margin 0.02 :min-n 20)))
+      (record-pair store 1 (format nil "t~D" i) 0.0 1.0))
+    (enchiridion.memory:utility-gate store 1 :margin 0.05 :min-n 20)))
 
 (defun utility-gate-blocks-on-parity ()
-  "Parity does not open the gate."
+  "Ties are not wins, and parity does not open the gate."
   (with-store (store)
     (dotimes (i 30)
-      (enchiridion.memory:record-gate-row store "retention" "outcome" 0.50))
-    (dotimes (i 30)
-      (enchiridion.memory:record-gate-row store "consolidate" "outcome" 0.50))
-    (not (enchiridion.memory:utility-gate store :margin 0.02 :min-n 20))))
+      (record-pair store 1 (format nil "t~D" i) 1.0 1.0))
+    (not (enchiridion.memory:utility-gate store 1 :margin 0.0 :min-n 0))))
 
 (defun push-ab-measures-outcome ()
   "push-ab reports a delta and a verdict against its margin."
@@ -375,3 +380,37 @@
       (ok (enchiridion.memory:volume-gate store id :max-writes 401)))
     (testing "a generation that does not exist does not pass"
       (ng (enchiridion.memory:volume-gate store 999)))))
+
+(deftest the-sign-test-is-the-exact-binomial-tail ()
+  (ok (= 11/1024 (enchiridion.memory:sign-test-p 9 10)))
+  (ok (= 638/1024 (enchiridion.memory:sign-test-p 5 10)))
+  (ok (= 1 (enchiridion.memory:sign-test-p 0 0))))
+
+(deftest a-margin-without-significance-does-not-open-the-utility-gate ()
+  ;; Four wins and one loss among twenty tasks clear a 0.05 mean delta three
+  ;; times over, but four of five non-tied pairs has p = 6/32.
+  (with-store (store)
+    (dotimes (i 15) (record-pair store 1 (format nil "tie~D" i) 1.0 1.0))
+    (dotimes (i 4) (record-pair store 1 (format nil "win~D" i) 0.0 1.0))
+    (dotimes (i 1) (record-pair store 1 (format nil "loss~D" i) 1.0 0.0))
+    (multiple-value-bind (pass report)
+        (enchiridion.memory:utility-gate store 1 :margin 0.05 :min-n 5 :alpha 0.05)
+      (ng pass)
+      (ok (= 5 (getf report :non-tied)))
+      (ok (>= (getf report :mean-delta) 0.05))
+      (ok (> (getf report :p) 0.05)))))
+
+(deftest the-gate-reads-the-latest-measurement-of-each-task ()
+  (with-store (store)
+    (record-pair store 1 "t" 1.0 0.0)
+    (record-pair store 1 "t" 0.0 1.0)
+    (let ((pairs (enchiridion.memory:paired-outcomes store 1)))
+      (ok (equal '((0.0d0 . 1.0d0)) pairs)))))
+
+(deftest a-mean-delta-of-exactly-the-margin-meets-it ()
+  ;; "At least 0.05": one win among twenty tasks is a delta of exactly 1/20.
+  (with-store (store)
+    (dotimes (i 19) (record-pair store 1 (format nil "tie~D" i) 1.0 1.0))
+    (record-pair store 1 "win" 0.0 1.0)
+    (ok (enchiridion.memory:utility-gate store 1 :margin 0.05 :min-n 1 :alpha 1.0))
+    (ng (enchiridion.memory:utility-gate store 1 :margin 0.06 :min-n 1 :alpha 1.0))))

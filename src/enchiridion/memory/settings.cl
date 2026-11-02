@@ -70,6 +70,20 @@ aspirational.")
 (setf (documentation '*memory-gate-min-n* 'variable)
       "The fewest outcome rows each arm needs before the utility gate can open.")
 
+(defvar *memory-gate-alpha*)
+(setf (documentation '*memory-gate-alpha* 'variable)
+      "The one-sided sign test's significance level for the utility gate.")
+
+(defvar *memory-tail-margin*)
+(setf (documentation '*memory-tail-margin* 'variable)
+      "How far the candidate's recall on rare answers may fall below
+retention-only before the tail gate fails.")
+
+(defvar *t2-max-tokens-per-promotion*)
+(setf (documentation '*t2-max-tokens-per-promotion* 'variable)
+      "The most tokens the candidates built since the last promotion may have
+cost, together, for the next one to be promoted.")
+
 (defvar *memory-write-cap*)
 (setf (documentation '*memory-write-cap* 'variable)
       "The most assertions one consolidation pass may write.")
@@ -152,6 +166,9 @@ key by key to the shipped defaults. Return NIL."
           *memory-gate-margin* (setting :gate-margin)
           *memory-gate-min-n* (setting :gate-min-n)
           *memory-write-cap* (setting :t2-write-cap)
+          *memory-gate-alpha* (setting :gate-alpha)
+          *memory-tail-margin* (setting :tail-margin)
+          *t2-max-tokens-per-promotion* (setting :t2-max-tokens-per-promotion)
           *memory-canaries* (let ((own (setting :canaries))) (if (listp own) own '()))
           *canary-min-families* (setting :canary-min-families)
           *tail-rarity-fraction* (setting :tail-rarity-fraction)

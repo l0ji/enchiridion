@@ -26,7 +26,7 @@ The model-facing `memory` tool writes a memory episode.
 ## What is not on yet
 
 The generation lifecycle is implemented and tested: a candidate starts as a copy of the live semantic layer and derives only the episodes the live generation never saw, it is invisible until promoted, promotion swaps the live pointer, and rollback returns it.
-It is not on the heartbeat yet, and promotion is not exposed on the command line until the four gates land.
+Promotion goes through the gates below. They are not on the heartbeat or the command line yet.
 The push channels, the intention tool, the canaries, the gate log, and the code-change proposal queue are designed and scheduled but are not wired into a turn.
 Their tables exist in the schema.
 `memory status` reports zero generations until a candidate is built.
@@ -48,6 +48,24 @@ The tail sample is the subset of those tasks whose answer is rare: what consolid
 
 A canary checks behaviour in a retrieval for its `:cue`, never presence in the store.
 `sync-canaries` makes the canary table hold exactly the valid configured canaries, so one the operator removes stops counting.
+
+### The promotion gates
+
+`gate-candidate` runs a candidate through five gates in the design record's order and stops at the first that fails:
+
+| Gate | Passes when |
+| --- | --- |
+| Provenance | every assertion names a span inside an episode still in the log |
+| Canary | the configured canaries cover `:canary-min-families` and every one holds in a retrieval reading the candidate |
+| Utility | over the utility tasks scored under both arms, the mean delta is at least `:gate-margin`, at least `:gate-min-n` pairs are not tied, and the one-sided sign test is below `:gate-alpha` |
+| Tail | on the tasks with rare answers, the candidate's recall is no more than `:tail-margin` below retention-only's |
+| Cost | the candidate wrote at most `:t2-write-cap` rows and the candidates since the last promotion cost at most `:t2-max-tokens-per-promotion` tokens |
+
+Each gate writes a `generation_checks` row.
+A failure sets the candidate to `quarantined` with the gate's name as `quarantine_reason`, and the live layer is untouched.
+A candidate that passes all five is promoted in one transaction.
+`check-promoted` re-runs the canary and utility checks on a live generation and rolls it back to its parent when either fails.
+The thresholds are compared exactly, so a mean delta of 0.05 meets a margin of 0.05.
 
 Push is off.
 The design enables it only after a paired no-harm run.

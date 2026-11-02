@@ -148,35 +148,109 @@ That is the same failure the measured presence-check result identifies."
 ;;;; 5. The gates
 ;;;; ------------------------------------------------------------------
 
-(defun utility-gate (store &key (margin *memory-gate-margin*)
-                                     (min-n *memory-gate-min-n*))
-  "Return T when consolidation beats retention-only by at least MARGIN.
+(defun binomial (n k)
+  "Return N choose K, exactly."
+  (if (or (< k 0) (> k n))
+      0
+      (let ((k (min k (- n k))) (result 1))
+        (loop for i from 1 to k
+              do (setf result (/ (* result (- n (- k i))) i)))
+        result)))
 
-Reads the gate log, which RUN-ARM writes.  Returns NIL when there is not
-enough evidence, which is the correct default: an unmeasured consolidation
-does not run.
+(defun sign-test-p (wins n)
+  "Return the one-sided sign test's p for WINS of N non-tied pairs: the chance
+of at least WINS heads in N fair coin flips, as an exact rational."
+  (if (zerop n)
+      1
+      (/ (loop for i from wins to n sum (binomial n i))
+         (expt 2 n))))
 
-The comparison is against a retention-only baseline at matched difficulty and
-budget, not against nothing.  That is the harder test the adverse result
-demands."
-  (let ((rows (enchiridion.memory.store:query-rows
-               store
-               "SELECT arm, AVG(value) AS mean, COUNT(*) AS n
-                  FROM gate_log
-                 WHERE metric = 'outcome'
-                 GROUP BY arm")))
-    (let ((cons (find "consolidate" rows
-                      :key (lambda (r) (enchiridion.memory.store:field r "arm"))
-                      :test #'string=))
-          (ret (find "retention" rows
-                     :key (lambda (r) (enchiridion.memory.store:field r "arm"))
-                     :test #'string=)))
-      (and cons ret
-           (>= (or (enchiridion.memory.store:field cons "n") 0) min-n)
-           (>= (or (enchiridion.memory.store:field ret "n") 0) min-n)
-           (>= (- (or (enchiridion.memory.store:field cons "mean") 0.0)
-                  (or (enchiridion.memory.store:field ret "mean") 0.0))
-               margin)))))
+(defun paired-outcomes (store generation-id &key task-hashes)
+  "Return GENERATION-ID's outcome pairs as a list of (RETENTION . CANDIDATE),
+one per task both arms scored, from the latest row of each.
+
+The rows are the ones RUN-ARM wrote under the candidate's id and each task's
+hash, so a pair is the same question asked of the two arms. TASK-HASHES, when
+given, keeps only those tasks."
+  (let ((by-task (make-hash-table :test #'equal)))
+    (dolist (row (enchiridion.memory.store:query-rows
+                  store
+                  "SELECT g.task_hash, g.arm, g.value
+                     FROM gate_log g
+                     JOIN (SELECT MAX(id) AS id FROM gate_log
+                            WHERE generation_id = ? AND metric = 'outcome'
+                              AND arm IN ('retention', 'candidate')
+                              AND task_hash <> ''
+                            GROUP BY task_hash, arm) latest
+                       ON latest.id = g.id"
+                  (list generation-id)))
+      (let ((hash (enchiridion.memory.store:field row "task_hash")))
+        (when (or (null task-hashes) (member hash task-hashes :test #'string=))
+          (let ((pair (or (gethash hash by-task) (cons nil nil)))
+                (value (enchiridion.memory.store:field row "value")))
+            (if (string= (enchiridion.memory.store:field row "arm") "retention")
+                (setf (car pair) value)
+                (setf (cdr pair) value))
+            (setf (gethash hash by-task) pair)))))
+    (loop for pair being the hash-values of by-task
+          when (and (car pair) (cdr pair)) collect pair)))
+
+(defun utility-gate (store generation-id &key (margin *memory-gate-margin*)
+                                              (min-n *memory-gate-min-n*)
+                                              (alpha *memory-gate-alpha*))
+  "Return two values: T when GENERATION-ID beats retention-only, and a report.
+
+docs/design/memory.md: candidate versus retention-only on paired tasks at
+matched budget, a mean delta of at least MARGIN, at least MIN-N non-tied
+pairs, and a one-sided sign test below ALPHA.  The pairs are read from the
+gate log, which COMPARE-ARMS writes: the step that decides is not the step
+that measures.  Too little evidence is a failure, which is the correct
+default: an unmeasured candidate is not promoted."
+  (let* ((pairs (paired-outcomes store generation-id))
+         ;; Exact arithmetic, and the configured margin read as the decimal
+         ;; it was written as: a mean of exactly 0.05 meets a margin of 0.05,
+         ;; which a single-float 0.05 compared with a double would not.
+         (deltas (mapcar (lambda (pair) (- (rational (cdr pair)) (rational (car pair))))
+                         pairs))
+         (non-tied (count-if-not #'zerop deltas))
+         (wins (count-if #'plusp deltas))
+         (mean (if deltas (/ (reduce #'+ deltas) (length deltas)) 0.0))
+         (p (sign-test-p wins non-tied)))
+    (values (and (>= non-tied min-n) (>= mean (rationalize margin)) (< p (rationalize alpha)))
+            (list :pairs (length pairs) :non-tied non-tied :wins wins
+                  :mean-delta (float mean) :p (float p)))))
+
+(defun tail-gate (store generation-id task-hashes &key (margin *memory-tail-margin*)
+                                                       (min-n *tail-min-n*))
+  "Return two values: T when GENERATION-ID's recall on TASK-HASHES, the tasks
+with rare answers, is no more than MARGIN below retention-only's, and a report.
+Fewer than MIN-N scored tail tasks is a failure: a tail nobody measured is not
+a tail that survived."
+  (let* ((pairs (paired-outcomes store generation-id :task-hashes task-hashes))
+         (n (length pairs))
+         (retention (if pairs (/ (reduce #'+ pairs :key (lambda (p) (rational (car p)))) n) 0))
+         (candidate (if pairs (/ (reduce #'+ pairs :key (lambda (p) (rational (cdr p)))) n) 0)))
+    (values (and (>= n min-n) (>= candidate (- retention (rationalize margin))))
+            (list :n n :retention (float retention) :candidate (float candidate)))))
+
+(defun provenance-gate (store generation-id)
+  "Return two values: T when every assertion GENERATION-ID holds names a span
+of an episode still in the log, and a report.  A semantic item with no
+surviving source cannot be checked against what was said, so it cannot be
+promoted."
+  (let ((bad (or (enchiridion.memory.store:field
+                  (first (enchiridion.memory.store:query-rows
+                          store
+                          "SELECT COUNT(*) AS n FROM assertions a
+                             LEFT JOIN episodes e ON e.id = a.episode_id
+                            WHERE a.generation_id = ?
+                              AND (e.id IS NULL OR a.span_start < 0
+                                   OR a.span_end <= a.span_start
+                                   OR a.span_end > length(e.body))"
+                          (list generation-id)))
+                  "n")
+                 0)))
+    (values (zerop bad) (list :unsourced bad))))
 
 (defun volume-gate (store generation-id &key (max-writes *memory-write-cap*))
   "Return T when GENERATION-ID's build wrote at most MAX-WRITES semantic rows.
@@ -391,3 +465,133 @@ operator has to supply rather than only that something is wrong."
               :families families
               :utility-tasks (length tasks)
               :tail-tasks (length tail))))))
+
+;;;; ------------------------------------------------------------------
+;;;; 9. The gate pipeline
+;;;; ------------------------------------------------------------------
+
+(defun promotion-tokens (store generation-id)
+  "Return the tokens every generation built since the live one has cost, up to
+and including GENERATION-ID: the cost of reaching this promotion, quarantined
+attempts included."
+  (or (enchiridion.memory.store:field
+       (first (enchiridion.memory.store:query-rows
+               store
+               "SELECT COALESCE(SUM(tokens_used), 0) AS n FROM generations
+                 WHERE id > ? AND id <= ?"
+               (list (live-generation-id store) generation-id)))
+       "n")
+      0))
+
+(defun cost-gate (store generation-id &key (max-writes *memory-write-cap*)
+                                           (max-tokens *t2-max-tokens-per-promotion*))
+  "Return two values: T when GENERATION-ID wrote at most MAX-WRITES rows and
+the generations since the last promotion cost at most MAX-TOKENS, and a
+report.  A pass that never promotes is pure cost, so the cost is counted per
+promotion, not per candidate."
+  (let ((tokens (promotion-tokens store generation-id)))
+    (values (and (volume-gate store generation-id :max-writes max-writes)
+                 (<= tokens max-tokens))
+            (list :tokens tokens
+                  :writes (enchiridion.memory.store:field
+                           (generation-row store generation-id) "writes")))))
+
+(defun record-check (store generation-id kind pass-p report &key (now (get-universal-time)))
+  "Write one generation_checks row for KIND and return PASS-P."
+  (enchiridion.memory.store:exec
+   store
+   "INSERT INTO generation_checks (generation_id, kind, result, value, detail, ts)
+      VALUES (?, ?, ?, ?, ?, ?)"
+   (list generation-id kind (if pass-p "pass" "fail")
+         (let ((value (or (getf report :p) (getf report :candidate)
+                          (getf report :tokens) (getf report :passed))))
+           (and (realp value) (coerce value 'double-float)))
+         (prin1-to-string report) now))
+  pass-p)
+
+(defun canary-step (store generation-id canaries)
+  "Run the canary check for GENERATION-ID and return two values: whether the
+suite covered its families and every canary held, and a report.  An unchecked
+or uncovered suite fails, because it freezes promotion."
+  (sync-canaries store canaries)
+  (multiple-value-bind (families covered-p) (canary-coverage canaries)
+    (let ((result (canary-check store
+                                :predicate (canary-predicate store canaries generation-id))))
+      (values (and covered-p (getf result :ok-p) (plusp (getf result :total)))
+              (list :families families :passed (getf result :passed)
+                    :failed (getf result :failed) :failures (getf result :failures))))))
+
+(defun measure-candidate (store generation-id scorer)
+  "Score the utility tasks under both arms for GENERATION-ID and return the
+hashes of the tail tasks among them."
+  (let ((tasks (utility-tasks store)))
+    (compare-arms store generation-id tasks scorer)
+    (mapcar #'task-hash (tail-tasks store tasks))))
+
+(defun set-promotion-result (store generation-id result &key (reason "")
+                                                            (now (get-universal-time)))
+  "Record what the gates decided for GENERATION-ID."
+  (enchiridion.memory.store:exec
+   store
+   "UPDATE generations
+       SET promotion_result = ?, promotion_checked_ts = ?,
+           quarantine_reason = ?,
+           status = CASE WHEN ? = 'quarantined' THEN 'quarantined' ELSE status END
+     WHERE id = ?"
+   (list result now reason result generation-id)))
+
+(defun gate-candidate (store generation-id &key (canaries *memory-canaries*)
+                                               (scorer #'answer-scorer))
+  "Run GENERATION-ID through the promotion gates in order and return a report.
+
+docs/design/memory.md fixes the order: provenance, canary, utility, tail, then
+volume and cost.  Every gate writes a generation_checks row, and the first
+that fails quarantines the candidate with its name as the reason and leaves
+the live layer as it was.  A candidate that passes all five is promoted in
+one transaction."
+  (let ((row (generation-row store generation-id)))
+    (unless (and row (string= (enchiridion.memory.store:field row "status") "candidate"))
+      (return-from gate-candidate
+        (list :promoted nil :reason :not-a-candidate
+              :status (and row (enchiridion.memory.store:field row "status"))))))
+  (let ((tail-hashes nil))
+    (flet ((gate (kind thunk)
+             (multiple-value-bind (pass-p report) (funcall thunk)
+               (record-check store generation-id kind pass-p report)
+               (unless pass-p
+                 (set-promotion-result store generation-id "quarantined" :reason kind)
+                 (return-from gate-candidate
+                   (list :promoted nil :reason :quarantined :failed kind :report report))))))
+      (gate "provenance" (lambda () (provenance-gate store generation-id)))
+      (gate "canary" (lambda () (canary-step store generation-id canaries)))
+      (gate "utility" (lambda ()
+                        (setf tail-hashes (measure-candidate store generation-id scorer))
+                        (utility-gate store generation-id)))
+      (gate "tail" (lambda () (tail-gate store generation-id tail-hashes)))
+      (gate "cost" (lambda () (cost-gate store generation-id)))
+      (promote-generation store generation-id)
+      (set-promotion-result store generation-id "promoted")
+      (list :promoted t :generation-id generation-id))))
+
+(defun check-promoted (store generation-id &key (canaries *memory-canaries*)
+                                               (scorer #'answer-scorer))
+  "Re-run the canary and utility checks on GENERATION-ID, now live, and return
+a report.  A failure rolls it back to its parent: docs/design/memory.md says a
+failed post-promotion check rolls back and freezes the next pass, and the
+post-check rows are what the freeze and promotion precision read."
+  (let ((row (generation-row store generation-id)))
+    (unless (and row (string= (enchiridion.memory.store:field row "status") "live"))
+      (return-from check-promoted (list :held nil :reason :not-live))))
+  (multiple-value-bind (canary-ok canary-report) (canary-step store generation-id canaries)
+    (record-check store generation-id "post-canary" canary-ok canary-report)
+    (let ((utility-ok
+            (and canary-ok
+                 (progn (measure-candidate store generation-id scorer)
+                        (multiple-value-bind (ok report) (utility-gate store generation-id)
+                          (record-check store generation-id "post-utility" ok report))))))
+      (if (and canary-ok utility-ok)
+          (list :held t :generation-id generation-id)
+          (progn
+            (rollback-generation store generation-id)
+            (list :held nil :reason :rolled-back
+                  :failed (if canary-ok "post-utility" "post-canary")))))))

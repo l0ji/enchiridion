@@ -383,7 +383,7 @@ canaries: 0
 
 `build` runs one bounded T2 candidate build.
 With no assertion deriver installed it reports `no candidate built: no-deriver.` and exits 1.
-A build never changes the live layer; promotion is not exposed until the gates land.
+A build never changes the live layer; promotion goes only through the gates, which are not on the command line yet.
 The exit status is 0 with a store and 1 without one.
 The command is also on the [Episodic memory page](episodic-memory.md).
 

@@ -300,6 +300,9 @@ did not think of."))
    #:valid-canary-p #:canary-coverage #:sync-canaries #:canary-behaviour-p
    #:canary-predicate #:utility-tasks #:answer-hit-p #:answer-scorer
    #:rare-episode-ids #:tail-tasks #:t2-preflight
+   #:sign-test-p #:paired-outcomes #:tail-gate #:provenance-gate #:cost-gate
+   #:promotion-tokens #:gate-candidate #:check-promoted
+   #:*memory-gate-alpha* #:*memory-tail-margin* #:*t2-max-tokens-per-promotion*
    #:utility-gate #:volume-gate
    #:run-arm #:compare-arms #:push-ab #:record-gate-row #:content-hash
    #:*push-max-fraction* #:*memory-pack-chars* #:*memory-graph-limit*

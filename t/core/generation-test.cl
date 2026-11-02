@@ -470,3 +470,104 @@
                                              (canary "safety") (canary "tail")))))
           (ok (getf report :ready-p))
           (ok (null (getf report :missing))))))))
+
+;;;; The promotion gates.
+
+(defun check-rows (store generation)
+  (mapcar (lambda (row) (list (enchiridion.memory.store:field row "kind")
+                              (enchiridion.memory.store:field row "result")))
+          (enchiridion.memory.store:query-rows
+           store "SELECT kind, result FROM generation_checks WHERE generation_id = ?
+                   ORDER BY id"
+           (list generation))))
+
+(defun status-of (store generation)
+  (enchiridion.memory.store:field
+   (first (enchiridion.memory.store:query-rows
+           store "SELECT status, quarantine_reason FROM generations WHERE id = ?"
+           (list generation)))
+   "status"))
+
+(defun passing-canaries ()
+  (list (canary "retrieval" :cue "alpha" :expect "alpha")
+        (canary "update" :cue "alpha" :expect "beta" :stale "zzz")
+        (canary "safety" :cue "alpha" :expect "hunter2")
+        (canary "tail" :cue "alpha" :expect "beta")))
+
+(defun assertion-scorer (store task pushed rows)
+  "Score 1 when the retrieval brought back an assertion: only the candidate
+arm can, so the candidate wins every pair."
+  (declare (ignore store task pushed))
+  (if (some (lambda (row) (equal "assertion" (getf (getf row :item) :kind))) rows)
+      1.0 0.0))
+
+(defmacro with-gate-world ((store directory generation) &body body)
+  "Five answered questions whose wording the test deriver turns into an
+assertion, built into one candidate, with the gate thresholds small enough
+for five tasks."
+  `(with-store (,store ,directory)
+     (let ((enchiridion.memory:*assertion-deriver* #'test-deriver)
+           (enchiridion.memory:*canary-min-families* 4)
+           (enchiridion.memory::*memory-gate-min-n* 5)
+           (enchiridion.memory:*tail-min-n* 1)
+           (enchiridion.memory:*tail-rarity-fraction* 1.0))
+       (dotimes (i 5)
+         (say ,store "user" (format nil "question ~D: alpha is beta" i))
+         (say ,store "assistant" (format nil "answer ~D" i)))
+       (enchiridion.memory.store:exec ,store "UPDATE episodes SET derived_ts = 1")
+       (let ((,generation (getf (enchiridion.memory:build-candidate ,store :limit 100)
+                                :generation-id)))
+         ,@body))))
+
+(deftest an-unsourced-assertion-is-quarantined-at-provenance ()
+  (with-gate-world (store directory generation)
+    (enchiridion.memory.store:exec
+     store "UPDATE assertions SET span_end = 9999 WHERE generation_id = ?" (list generation))
+    (let ((report (enchiridion.memory:gate-candidate
+                   store generation :canaries (passing-canaries) :scorer #'assertion-scorer)))
+      (ng (getf report :promoted))
+      (ok (string= "provenance" (getf report :failed)))
+      (ok (string= "quarantined" (status-of store generation)))
+      (ok (zerop (enchiridion.memory:live-generation-id store)))
+      (ok (equal '(("provenance" "fail")) (check-rows store generation))))))
+
+(deftest an-unchecked-canary-suite-stops-the-gates-before-anything-is-measured ()
+  (with-gate-world (store directory generation)
+    (let ((report (enchiridion.memory:gate-candidate
+                   store generation :canaries '() :scorer #'assertion-scorer)))
+      (ok (string= "canary" (getf report :failed)))
+      (ok (equal '(("provenance" "pass") ("canary" "fail")) (check-rows store generation)))
+      (testing "the utility arms never ran"
+        (ok (null (enchiridion.memory:paired-outcomes store generation)))))))
+
+(deftest a-candidate-that-passes-every-gate-is-promoted ()
+  (with-gate-world (store directory generation)
+    (let ((report (enchiridion.memory:gate-candidate
+                   store generation :canaries (passing-canaries) :scorer #'assertion-scorer)))
+      (ok (getf report :promoted))
+      (ok (= generation (enchiridion.memory:live-generation-id store)))
+      (ok (string= "live" (status-of store generation)))
+      (ok (equal '(("provenance" "pass") ("canary" "pass") ("utility" "pass")
+                   ("tail" "pass") ("cost" "pass"))
+                 (check-rows store generation)))
+      (testing "a generation is gated once"
+        (ok (eq :not-a-candidate
+                (getf (enchiridion.memory:gate-candidate store generation) :reason)))))))
+
+(deftest a-failed-post-promotion-check-rolls-the-promotion-back ()
+  (with-gate-world (store directory generation)
+    (enchiridion.memory:gate-candidate
+     store generation :canaries (passing-canaries) :scorer #'assertion-scorer)
+    (testing "a check that still holds keeps it live"
+      (ok (getf (enchiridion.memory:check-promoted
+                 store generation :canaries (passing-canaries) :scorer #'assertion-scorer)
+                :held)))
+    (let ((report (enchiridion.memory:check-promoted
+                   store generation
+                   :canaries (cons (canary "safety" :name "leak" :cue "alpha" :expect "alpha")
+                                   (passing-canaries))
+                   :scorer #'assertion-scorer)))
+      (ng (getf report :held))
+      (ok (string= "post-canary" (getf report :failed)))
+      (ok (zerop (enchiridion.memory:live-generation-id store)))
+      (ok (string= "rolled-back" (status-of store generation))))))

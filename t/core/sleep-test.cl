@@ -400,3 +400,19 @@ countable from the test."
     (ok (enchiridion.kernel::compact-when-due supervisor store (agent-of supervisor)))
     (let ((prompt (counting-backend-last-prompt (backend-of supervisor))))
       (ok (< (search "first turn" prompt) (search "fourth turn" prompt))))))
+
+(deftest t2-spend-counts-toward-the-day-cap-but-not-the-tick-cap ()
+  ;; A T2 pass is held to its own caps and is larger than a tick by design,
+  ;; but unattended work as a whole stays under the day cap.
+  (with-scratch-world (store supervisor)
+    (let ((agent (agent-of supervisor)))
+      (setf (enchiridion.kernel:agent-budget agent)
+            '(:max-tokens-per-tick 100 :max-tokens-per-day 1000))
+      (let ((start (enchiridion.kernel::store-total store)))
+        (enchiridion.memory.store:record-usage store :input 500 :output 0 :channel :t2)
+        (testing "five times the tick cap on :t2 leaves the tick open"
+          (ok (null (enchiridion.kernel::budget-refusal agent store start 0))))
+        (enchiridion.memory.store:record-usage store :input 500 :output 0 :channel :t2)
+        (testing "and the day cap still closes on it"
+          (ok (search "day cap"
+                      (enchiridion.kernel::budget-refusal agent store start 0))))))))

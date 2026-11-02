@@ -374,7 +374,12 @@ unattended spend: with the shipped cap, a busy second disabled the sleep agent.
 TICK-INDEX is the same idea for the in-memory ledger, which is the fallback
 when no store is open. Both windows are this tick and not the life of the
 process. The day window is the rolling twenty-four hours either way, because a
-cap that resets at midnight is a cap that can be spent twice in a minute."
+cap that resets at midnight is a cap that can be spent twice in a minute.
+
+The day window counts every channel, T2 derivation on :t2 included, so the day
+cap bounds the process's spend as a whole. The tick window counts :sleep alone,
+because a T2 pass is held to its own pass and promotion caps and is designed to
+be larger than one tick."
   (let ((tick-cap (getf (agent-budget agent) :max-tokens-per-tick))
         (day-cap (getf (agent-budget agent) :max-tokens-per-day)))
     (labels ((tick-spend ()

@@ -311,7 +311,10 @@ alone, the retention-only arm."
                   :graph (graph-for store :limit *memory-graph-limit*)
                   :now now
                   :query-time now
-                  :cue-type "episodic"
+                  ;; A turn does not classify its cue. Naming one would
+                  ;; score every semantic claim 0 on this term, which kept a
+                  ;; live generation's claims out of every pack.
+                  :cue-type nil
                   :top-k top-k)))))
 
 (defun retrieve-for-turn (store text &key (session "default") (channel :cli)

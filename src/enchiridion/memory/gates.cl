@@ -225,13 +225,18 @@ default: an unmeasured candidate is not promoted."
   "Return two values: T when GENERATION-ID's recall on TASK-HASHES, the tasks
 with rare answers, is no more than MARGIN below retention-only's, and a report.
 Fewer than MIN-N scored tail tasks is a failure: a tail nobody measured is not
-a tail that survived."
-  (let* ((pairs (paired-outcomes store generation-id :task-hashes task-hashes))
-         (n (length pairs))
-         (retention (if pairs (/ (reduce #'+ pairs :key (lambda (p) (rational (car p)))) n) 0))
-         (candidate (if pairs (/ (reduce #'+ pairs :key (lambda (p) (rational (cdr p)))) n) 0)))
-    (values (and (>= n min-n) (>= candidate (- retention (rationalize margin))))
-            (list :n n :retention (float retention) :candidate (float candidate)))))
+a tail that survived.
+
+docs/design/memory.md states the tail as recall, so an outcome counts as one
+when the answer reached the pack at all, whatever its position: the utility
+outcomes are graded, and a rare answer moved down the pack is still recalled."
+  (flet ((recall (outcome) (if (plusp outcome) 1 0)))
+    (let* ((pairs (paired-outcomes store generation-id :task-hashes task-hashes))
+           (n (length pairs))
+           (retention (if pairs (/ (reduce #'+ pairs :key (lambda (p) (recall (car p)))) n) 0))
+           (candidate (if pairs (/ (reduce #'+ pairs :key (lambda (p) (recall (cdr p)))) n) 0)))
+      (values (and (>= n min-n) (>= candidate (- retention (rationalize margin))))
+              (list :n n :retention (float retention) :candidate (float candidate))))))
 
 (defun provenance-gate (store generation-id)
   "Return two values: T when every assertion GENERATION-ID holds names a span
@@ -399,10 +404,27 @@ from it: either way the answer reached the pack."
                 (eql (getf item :id) episode-id))))
         rows))
 
+(defun pack-position (store rows cue episode-id &key (budget *gate-pack-chars*))
+  "Return where EPISODE-ID's answer sits in the pack ROWS render at BUDGET
+characters, counting from 0, or NIL when it did not fit. The pack is built the
+way a turn builds it, through SELECT-PACK-ROWS and RENDER-PACK, so the gate
+measures what a model would be shown and not the ranking behind it."
+  (let ((included (nth-value 1 (render-pack (select-pack-rows store cue rows)
+                                            :budget budget :cue cue))))
+    (position-if (lambda (row) (answer-hit-p (list row) episode-id)) included)))
+
 (defun answer-scorer (store task pushed rows)
-  "Score TASK 1 when its answer reached ROWS and 0 when it did not."
-  (declare (ignore store pushed))
-  (if (answer-hit-p rows (getf task :expect-episode)) 1.0 0.0))
+  "Score TASK by where its answer reached the gate's pack: 1 first, 1/2
+second, 1/N at position N, and 0 when it did not fit in *GATE-PACK-CHARS*.
+
+A graded score and not hit or miss, because a log already brings back most
+answers to its own questions: scored as hits, nearly every pair ties and the
+sign test has nothing to count. The small pack is the matched budget, and it
+is what lets a short claim beat a long answer that no longer fits."
+  (declare (ignore pushed))
+  (let ((position (pack-position store rows (task-cue-text (getf task :cue))
+                                 (getf task :expect-episode))))
+    (if position (/ 1.0 (+ 1 position)) 0.0)))
 
 (defun rare-episode-ids (store &key (fraction *tail-rarity-fraction*))
   "Return the ids of the rarest FRACTION of the derived episodes, as a hash

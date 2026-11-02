@@ -224,6 +224,7 @@
     (:gate-margin 0.05)
     (:gate-min-n 100)
     (:gate-alpha 0.05)
+    (:gate-pack-chars 1100)
     (:tail-rarity-fraction 0.10)
     (:tail-min-n 50)
     (:tail-margin 0.02)

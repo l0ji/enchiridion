@@ -227,6 +227,9 @@ store path. The model defaults match the shipped adapter defaults."
     ;; The most question-and-answer pairs one utility run scores, newest first.
     (:utility-max-tasks 400)
     (:gate-alpha 0.05)
+    ;; The pack both utility arms are scored in: a quarter of :pack-chars, so a
+    ;; short claim can win where a long answer no longer fits.
+    (:gate-pack-chars 1100)
     (:tail-rarity-fraction 0.10)
     (:tail-min-n 50)
     (:tail-margin 0.02)

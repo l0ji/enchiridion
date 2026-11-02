@@ -245,6 +245,7 @@ The `/proc` hidepid remount happens in the container entry point before Lisp sta
 | `:gate-margin` | real | `0.05` | Utility-gate minimum mean outcome delta, candidate over retention-only. |
 | `:gate-min-n` | integer | `100` | Utility-gate minimum non-tied pairs, and the fewest utility tasks a T2 pass needs. |
 | `:gate-alpha` | real | `0.05` | Utility-gate significance level for the one-sided sign test. |
+| `:gate-pack-chars` | integer | `1100` | Pack budget, in characters, both utility arms are scored in. A task scores 1/N for an answer Nth in that pack and 0 for one that does not fit. |
 | `:tail-margin` | real | `0.02` | How far the candidate's recall on rare answers may fall below retention-only. |
 | `:utility-max-tasks` | integer | `400` | Most question-and-answer pairs one utility run scores, newest first. |
 | `:parameters` | plist or `nil` | `nil` | Overrides merged over the shipped memory parameter defaults. |

@@ -43,11 +43,15 @@ A T2 pass runs only when four instruments exist, and `t2-preflight` names each o
 | Tail sampler | `:tail-min-n` of those pairs have an answer among the rarest `:tail-rarity-fraction` of episodes | `:tail-sampler` |
 
 A utility task is a user turn and the assistant turn that answered it, in the same session.
-It scores 1 when a retrieval for the question brings back the answer, or an assertion derived from it, and 0 otherwise, so the candidate arm and the retention-only arm are scored on the same questions.
+Both arms are scored on the same questions, in a pack of `:gate-pack-chars`, a quarter of the turn's pack.
+A task scores 1/N when the answer, or an assertion derived from it, is the Nth record in that pack, and 0 when it does not fit.
+The score is graded rather than hit or miss, because a log already recalls most answers to its own questions, and scored as hits nearly every pair ties.
+The small pack is the matched budget: a short claim can win where a long answer no longer fits.
 The tail sample is the subset of those tasks whose answer is rare: what consolidation loses first is the rare record.
 
 The deriver is shown the turn before each record, so an answer such as "in vault under ops" can become a claim about what the question asked; every span must still point into the record.
 An assertion is indexed by its claim, so the candidate arm can recall an answer whose own words never matched the question, which is the only recall the semantic layer can add over the log.
+A turn does not classify its cue, so the cue-type term gives assertions and episodes the same value: naming the cue episodic would score every claim 0 on that term and keep it out of the pack.
 
 A canary checks behaviour in a retrieval for its `:cue`, never presence in the store.
 `sync-canaries` makes the canary table hold exactly the valid configured canaries, so one the operator removes stops counting.
@@ -61,7 +65,7 @@ A canary checks behaviour in a retrieval for its `:cue`, never presence in the s
 | Provenance | every assertion names a span inside an episode still in the log |
 | Canary | the configured canaries cover `:canary-min-families` and every one holds in a retrieval reading the candidate |
 | Utility | over the utility tasks scored under both arms, the mean delta is at least `:gate-margin`, at least `:gate-min-n` pairs are not tied, and the one-sided sign test is below `:gate-alpha` |
-| Tail | on the tasks with rare answers, the candidate's recall is no more than `:tail-margin` below retention-only's |
+| Tail | on the tasks with rare answers, the candidate's recall, an answer anywhere in the gate's pack, is no more than `:tail-margin` below retention-only's |
 | Cost | the candidate wrote at most `:t2-write-cap` rows and the candidates since the last promotion cost at most `:t2-max-tokens-per-promotion` tokens |
 
 Each gate writes a `generation_checks` row.

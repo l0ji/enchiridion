@@ -778,8 +778,12 @@ score is computed here from stored fields; none is inferred."
      :temporal (temporal-match (getf item :valid-from) (getf item :valid-to)
                                query-time)
      :importance (/ (float (or (activation-imp record) 5)) 10.0)
-     :cue-type (cue-type-match (or (getf item :cue-type) "episodic")
-                               (or (getf item :cue-type-implied) "episodic"))
+     ;; An implied cue type of NIL is an unclassified cue: it favours no
+     ;; kind of record, so every candidate gets the same term.
+     :cue-type (let ((implied (getf item :cue-type-implied)))
+                 (if implied
+                     (cue-type-match (or (getf item :cue-type) "episodic") implied)
+                     1.0))
      :context (context-match (getf item :context) context)
      :inhibition (decay-inhibition record now :parameters parameters)
      :distinct (distinctiveness graph key candidate-keys max-fan)
@@ -798,6 +802,10 @@ its activation summary.  The cue tokens seed the spread at weight
 coverage/|sources|, which is the proposal's W_kj = 1/|sources| applied to the
 terms the cue actually matched.  Each result is a plist of :ITEM, :TERMS,
 :SCORE, :PROBABILITY, :LATENCY and :CONFLICT.
+
+CUE-TYPE is the kind of retrieval the cue implies.  NIL says the cue was not
+classified, and the cue-type term then gives every candidate the same value
+instead of ranking one kind of record over another.
 
 This function reads nothing and writes nothing.  A candidate that participates
 in an unresolved conflict is NOT penalised: the pack is required to include the

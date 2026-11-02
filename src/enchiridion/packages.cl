@@ -311,6 +311,7 @@ did not think of."))
    #:last-t2-ts #:mark-t2-pass #:new-episode-count #:t2-due-p #:t2-pass-spend
    #:t2-refusal #:run-t2-pass
    #:*memory-gate-alpha* #:*memory-tail-margin* #:*t2-max-tokens-per-promotion*
+   #:*gate-pack-chars* #:pack-position
    #:utility-gate #:volume-gate
    #:run-arm #:compare-arms #:push-ab #:record-gate-row #:content-hash
    #:*push-max-fraction* #:*memory-pack-chars* #:*memory-graph-limit*

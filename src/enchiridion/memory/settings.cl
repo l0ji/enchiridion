@@ -74,6 +74,12 @@ aspirational.")
 (setf (documentation '*memory-gate-alpha* 'variable)
       "The one-sided sign test's significance level for the utility gate.")
 
+(defvar *gate-pack-chars*)
+(setf (documentation '*gate-pack-chars* 'variable)
+      "The pack budget, in characters, that both utility arms are scored in.
+Smaller than the turn's pack, so the gate rewards a semantic layer that says
+the same thing in less room.")
+
 (defvar *memory-tail-margin*)
 (setf (documentation '*memory-tail-margin* 'variable)
       "How far the candidate's recall on rare answers may fall below
@@ -201,6 +207,7 @@ key by key to the shipped defaults. Return NIL."
           *memory-write-cap* (setting :t2-write-cap)
           *memory-gate-alpha* (setting :gate-alpha)
           *memory-tail-margin* (setting :tail-margin)
+          *gate-pack-chars* (setting :gate-pack-chars)
           *t2-max-tokens-per-promotion* (setting :t2-max-tokens-per-promotion)
           *memory-canaries* (let ((own (setting :canaries))) (if (listp own) own '()))
           *canary-min-families* (setting :canary-min-families)

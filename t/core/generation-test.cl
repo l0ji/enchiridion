@@ -872,3 +872,60 @@ shipped schedule."
       (dotimes (i 5)
         (post-check store (gated-generation store "promoted" :promoted t) "fail" "fail"))
       (ok (eq :frozen-precision (enchiridion.memory:t2-refusal store))))))
+
+;;;; Scoring the utility arms.
+
+(defun pack-row (kind id body &optional episode-id)
+  (list :item (list :kind kind :id id :body body :episode-id episode-id)))
+
+(deftest the-answer-scorer-grades-by-place-in-the-gate-pack ()
+  (with-store (store directory)
+    (let ((rows (list (pack-row "episode" 1 "an unrelated record")
+                      (pack-row "episode" 2 "the answer itself")
+                      (pack-row "episode" 3 "another record")))
+          (task (list :cue "the question" :expect-episode 2)))
+      (let ((enchiridion.memory:*gate-pack-chars* 4000))
+        (testing "second in the pack scores a half"
+          (ok (= 0.5 (enchiridion.memory:answer-scorer store task "" rows))))
+        (testing "a claim derived from the answer counts at its own place"
+          (ok (= 1.0 (enchiridion.memory:answer-scorer
+                      store task ""
+                      (cons (pack-row "assertion" 9 "question answered by answer" 2) rows))))))
+      (testing "an answer that does not fit in the gate pack scores 0"
+        (let ((enchiridion.memory:*gate-pack-chars* 110))
+          (ok (= 0 (length (remove nil (list (enchiridion.memory:pack-position
+                                              store rows "the question" 2))))))
+          (ok (= 0.0 (enchiridion.memory:answer-scorer store task "" rows))))))))
+
+(deftest the-tail-gate-counts-a-graded-outcome-as-recall ()
+  (with-store (store directory)
+    (flet ((pair (hash retention candidate)
+             (enchiridion.memory:record-gate-row store "retention" "outcome" retention
+                                                 :generation-id 7 :task-hash hash)
+             (enchiridion.memory:record-gate-row store "candidate" "outcome" candidate
+                                                 :generation-id 7 :task-hash hash)))
+      (pair "a" 1.0 0.25)
+      (pair "b" 0.5 1.0)
+      (testing "an answer moved down the pack is still recalled"
+        (ok (enchiridion.memory:tail-gate store 7 '("a" "b") :margin 0.02 :min-n 2)))
+      (pair "c" 1.0 0.0)
+      (testing "an answer pushed out of the pack is not"
+        (ng (enchiridion.memory:tail-gate store 7 '("a" "b" "c") :margin 0.02 :min-n 3))))))
+
+(deftest a-claim-competes-with-the-episodes-a-turn-also-finds ()
+  ;; Found on a real log: a turn named its cue type episodic, which scored
+  ;; every claim 0 on that term, so the best match ranked about fortieth.
+  (with-store (store directory)
+    (let ((enchiridion.memory:*assertion-deriver* #'context-deriver))
+      (dotimes (i 4)
+        (say store "user" (format nil "where does service~D keep its secret" i))
+        (say store "assistant" (format nil "the service~D secret is in vault~D under ops" i i)))
+      (let* ((generation (getf (enchiridion.memory:build-candidate store :limit 100)
+                               :generation-id))
+             (rows (enchiridion.memory:retrieve-rows-for-turn
+                    store "where does service2 keep its secret" :generation generation)))
+        (ok (equal "assertion" (getf (getf (first rows) :item) :kind)))
+        (testing "the cue-type term no longer separates the two kinds"
+          (ok (every (lambda (row)
+                       (= 1.0 (enchiridion.memory::terms-cue-type (getf row :terms))))
+                     rows)))))))

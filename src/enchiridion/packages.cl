@@ -277,19 +277,19 @@ did not think of."))
    #:base-level #:base-level-exact #:base-level-approx #:base-level-forms
    #:associative-strength #:fan #:edge-weight #:decayed-edge-weight
    #:spread-activation #:retrieve #:decay-update #:decay-sweep
-   #:inhibition-after-loss #:decay-inhibition #:consolidate
+   #:inhibition-after-loss #:decay-inhibition
    ;; Supporting mechanisms.
    #:encoding-filter #:capture-p #:promotion-condition
    #:write-episode #:tokenise #:term-coverage #:jaccard #:context-match
    #:cue-type-match #:temporal-match #:conflict-kind-for #:detect-conflicts
    #:resolve-conflict #:update-conditions-hold-p #:admission-rule
-   #:close-superseded #:assertion-from-row
+   #:assertion-from-row
    #:judgement-of-learning #:isotonic-fit #:isotonic-predict
    #:recalibrate #:search-externally-p #:record-outcome
-   #:candidates-for #:assertion-candidates-for #:graph-for #:assertions-for
+   #:candidates-for #:assertion-candidates-for #:graph-for
    #:episode-from-row
    #:episode-candidate #:item-terms
-   #:*assertion-deriver* #:*procedure-inducer*
+   #:*assertion-deriver*
    #:make-model-assertion-deriver #:parse-assertion-json
    #:assertions-from-model-text
    ;; Extension layer.
@@ -297,8 +297,8 @@ did not think of."))
    #:prune-cue-index #:push-pack #:precondition-surfacing
    #:learned-state-block #:fire-intentions #:assemble-pack
    #:register-canary #:canary-check #:canary-report
-   #:retention-first-p #:utility-gate #:volume-gate #:consolidate-if-gated
-   #:run-arm #:compare-arms #:push-ab #:record-gate-row
+   #:utility-gate #:volume-gate
+   #:run-arm #:compare-arms #:push-ab #:record-gate-row #:content-hash
    #:*push-max-fraction* #:*memory-pack-chars* #:*memory-graph-limit*
    #:*memory-gate-margin* #:*memory-gate-min-n* #:*memory-write-cap*
    #:apply-memory-settings
@@ -312,7 +312,7 @@ did not think of."))
    #:rebuild-derived #:graph-terms-on-p #:resolve-conflict-at-action #:forget-session
    #:add-intention #:list-intentions #:cancel-intention
    #:propose-change #:memory-status
-   #:live-generation-id #:with-generation #:render-pack #:pack-rows #:select-pack-rows
+   #:live-generation-id #:render-pack #:pack-rows #:select-pack-rows
    #:*memory-reranker* #:make-model-reranker #:rerank-rows #:parse-rerank-reply
    #:*memory-embedder* #:*memory-embed-model* #:make-backend-embedder
    #:embed-pending #:hybrid-candidates #:dense-ranking

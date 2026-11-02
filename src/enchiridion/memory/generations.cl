@@ -377,8 +377,9 @@ the gate path is a later phase and calls this function only after it passes."
 
 (defun rollback-generation (store generation-id)
   "Roll GENERATION-ID back and return a report plist.
-If it is live, the pointer returns to its parent. If it is a candidate, its
-status becomes rolled-back and the live layer is untouched."
+If it is live, the pointer returns to its parent and the parent is live again.
+If it is a candidate, its status becomes rolled-back and the live layer is
+untouched."
   (ensure-generation-state store)
   (let ((row (generation-row store generation-id)))
     (cond
@@ -397,7 +398,16 @@ status becomes rolled-back and the live layer is untouched."
                (enchiridion.memory.store:exec
                 store
                 "UPDATE memory_state SET live_generation_id = ? WHERE id = 1"
-                (list (or parent 0))))
+                (list (or parent 0)))
+               ;; The pointer swap and the parent's status are one fact: a
+               ;; live pointer at a generation marked retired is a store that
+               ;; contradicts itself.
+               (when parent
+                 (enchiridion.memory.store:exec
+                  store
+                  "UPDATE generations SET status = 'live', retired_ts = NULL
+                    WHERE id = ?"
+                  (list parent))))
              (set-generation-status store generation-id "rolled-back"
                                     :detail "operator rollback"))
          (list :rolled-back t :generation-id generation-id

@@ -11,7 +11,7 @@
 
 (defpackage #:enchiridion-episodic-test
   (:use #:cl)
-  (:import-from #:rove #:deftest #:ok #:testing)
+  (:import-from #:rove #:deftest #:ok #:ng #:testing)
   (:export #:run))
 
 (in-package #:enchiridion-episodic-test)
@@ -219,27 +219,6 @@
       (enchiridion.memory:record-gate-row store "consolidate" "outcome" 0.50))
     (not (enchiridion.memory:utility-gate store :margin 0.02 :min-n 20))))
 
-(defun gate-order-canary-first ()
-  "A failing canary freezes consolidation before utility is consulted."
-  (with-store (store)
-    (enchiridion.memory:register-canary store "bad" "never holds")
-    (dotimes (i 30)
-      (enchiridion.memory:record-gate-row store "retention" "outcome" 0.50))
-    (dotimes (i 30)
-      (enchiridion.memory:record-gate-row store "consolidate" "outcome" 0.90))
-    (let ((r (enchiridion.memory:consolidate-if-gated
-              store
-              :canary-predicate (lambda (name expect)
-                                  (declare (ignore name expect)) nil)
-              :min-n 20)))
-      (and (not (getf r :ran))
-           (eq (getf r :reason) :canary-frozen)))))
-
-(defun retention-first-is-the-default ()
-  "The default is retention-first."
-  (and (enchiridion.memory:retention-first-p)
-       (enchiridion.memory:retention-first-p :override t)))
-
 (defun push-ab-measures-outcome ()
   "push-ab reports a delta and a verdict against its margin."
   (with-store (store)
@@ -247,8 +226,8 @@
     (enchiridion.memory:index-cue store '("probe") :episode 1 :used t)
     (let* ((tasks (list (list :name "t1" :cue '("probe"))
                         (list :name "t2" :cue '("probe"))))
-           (scorer (lambda (store cue pushed)
-                     (declare (ignore store cue))
+           (scorer (lambda (store cue pushed rows)
+                     (declare (ignore store cue rows))
                      (if (plusp (length pushed)) 1.0 0.0)))
            (r (enchiridion.memory:push-ab store tasks scorer)))
       (and (= (getf (getf r :off) :n) 2)
@@ -257,16 +236,22 @@
            (getf r :passes)))))
 
 (defun compare-arms-records-evidence ()
-  "compare-arms leaves gate_log evidence behind."
+  "compare-arms leaves paired gate_log evidence behind, under its candidate."
   (with-store (store)
     (seed-episodes store 1)
     (let* ((tasks (list (list :name "t" :cue '("x"))))
-           (scorer (lambda (store cue pushed)
-                     (declare (ignore store cue pushed)) 0.5)))
-      (enchiridion.memory:compare-arms store tasks scorer)
-      (let ((row (first (enchiridion.memory.store:query-rows
-                         store "SELECT COUNT(*) AS n FROM gate_log"))))
-        (>= (enchiridion.memory.store:field row "n") 2)))))
+           (scorer (lambda (store cue pushed rows)
+                     (declare (ignore store cue pushed rows)) 0.5)))
+      (enchiridion.memory:compare-arms store 7 tasks scorer)
+      (let ((rows (enchiridion.memory.store:query-rows
+                   store "SELECT arm, task_hash FROM gate_log WHERE generation_id = 7
+                           ORDER BY arm")))
+        (and (= 2 (length rows))
+             (equal '("candidate" "retention")
+                    (mapcar (lambda (r) (enchiridion.memory.store:field r "arm")) rows))
+             ;; One task, so both arms carry the same hash and pair.
+             (string= (enchiridion.memory.store:field (first rows) "task_hash")
+                      (enchiridion.memory.store:field (second rows) "task_hash")))))))
 
 (defun base-level-decreases-with-age ()
   "Base-level activation falls as a record ages with no new references."
@@ -360,12 +345,6 @@
 (deftest utility-gate-blocks-on-parity ()
   (ok (utility-gate-blocks-on-parity)))
 
-(deftest canary-gate-precedes-utility-gate ()
-  (ok (gate-order-canary-first)))
-
-(deftest retention-first-is-the-default ()
-  (ok (retention-first-is-the-default)))
-
 (deftest push-ab-measures-outcome ()
   (ok (push-ab-measures-outcome)))
 
@@ -383,3 +362,16 @@
 
 (deftest associative-strength-clamps-at-zero ()
   (ok (sparse-clamps-negative-strength)))
+
+(deftest the-volume-gate-counts-the-candidate-it-is-asked-about ()
+  ;; It once counted rows under run id -1, which is always zero, so it passed
+  ;; every candidate whatever it wrote.
+  (with-store (store)
+    (enchiridion.memory.store:exec
+     store
+     "INSERT INTO generations (number, status, created_ts, writes) VALUES (1, 'candidate', 0, 401)")
+    (let ((id (enchiridion.memory.store:last-row-id store)))
+      (ng (enchiridion.memory:volume-gate store id :max-writes 400))
+      (ok (enchiridion.memory:volume-gate store id :max-writes 401)))
+    (testing "a generation that does not exist does not pass"
+      (ng (enchiridion.memory:volume-gate store 999)))))

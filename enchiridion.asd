@@ -103,6 +103,7 @@
          (:file "cue")
          (:file "episodic-hooks")
          (:file "generations")
+         (:file "gates")
          (:file "derive")
          (:file "seed")
          (:file "state")))

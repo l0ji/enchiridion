@@ -224,3 +224,26 @@
           (ok (= 1 (length (assertion-hits store "alpha" :live)))))
         (testing "and the retention-only arm still does not"
           (ok (null (assertion-hits store "alpha" nil))))))))
+
+(defun generation-status-of (store id)
+  (enchiridion.memory.store:field
+   (first (enchiridion.memory.store:query-rows
+           store "SELECT status FROM generations WHERE id = ?" (list id)))
+   "status"))
+
+(deftest rolling-back-a-live-generation-makes-its-parent-live-again ()
+  (with-store (store directory)
+    (let ((enchiridion.memory:*assertion-deriver* #'test-deriver))
+      (write-body store "alpha is beta")
+      (let ((first (getf (enchiridion.memory:build-candidate store :limit 10)
+                         :generation-id)))
+        (enchiridion.memory:promote-generation store first)
+        (let ((second (getf (enchiridion.memory:build-candidate store :limit 10)
+                            :generation-id)))
+          (enchiridion.memory:promote-generation store second)
+          (ok (string= "retired" (generation-status-of store first)))
+          (enchiridion.memory:rollback-generation store second)
+          (testing "the pointer and the parent's status agree"
+            (ok (= first (enchiridion.memory:live-generation-id store)))
+            (ok (string= "live" (generation-status-of store first)))
+            (ok (string= "rolled-back" (generation-status-of store second)))))))))

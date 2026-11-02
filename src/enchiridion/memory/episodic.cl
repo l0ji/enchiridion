@@ -857,6 +857,16 @@ measures as failing."
                        "SELECT live_generation_id FROM memory_state WHERE id = 1"))))
       (or (and row (enchiridion.memory.store:field row "live_generation_id")) 0))))
 
+(defun content-hash (text)
+  "Return a stable 16-character hex digest of TEXT, for naming a task or a
+projection by its content across processes. SXHASH is not stable across
+images, so it cannot pair rows written by two runs."
+  (subseq (ironclad:byte-array-to-hex-string
+           (ironclad:digest-sequence
+            :sha256 (sb-ext:string-to-octets (princ-to-string text)
+                                             :external-format :utf-8)))
+          0 16))
+
 (defun cue-match (cue)
   "Return the FTS5 MATCH expression for CUE: any of its distinct terms.
 A cue with no searchable term signals SCHEMA-ERROR, which is FTS-QUERY's
@@ -1645,19 +1655,6 @@ present, and that it signals no condition a caller has to distinguish."
 ;;;; carries the run id, and the uniqueness constraints make a second pass
 ;;;; over the same range a no-op.
 
-(defun unindexed-episodes (store &key (limit 400))
-  "Return episodes that no derivation run has indexed yet, oldest first."
-  (enchiridion.memory.store:query-rows
-   store
-   "SELECT id, session, role, body, ts, event_ts, channel, provenance, origin,
-           authority, cue_type, depth, span, rarity_raw, arousal_raw,
-           context_key, scene_trace, horizon
-      FROM episodes
-     WHERE run_id IS NULL
-     ORDER BY id ASC
-     LIMIT ?"
-   (list limit)))
-
 (defun episode-from-row (row)
   "Return ROW, one episodes row as a plist, as an EPISODE."
   (make-episode :id (enchiridion.memory.store:field row "id")
@@ -1682,11 +1679,6 @@ NIL means no derivation is installed: the builder must not watermark an
 episode it cannot derive. The production deriver is a model call; tests bind a
 deterministic function.")
 
-(defparameter *procedure-inducer* nil
-  "A function of (STORE EPISODES RUN-ID) returning admitted procedures, or NIL.
-NIL means procedure induction is off. It is a separate hook because the gate
-and the inducer are different mechanisms.")
-
 (defun assertions-for-episode (store episode)
   "Return the ASSERTIONs derived from EPISODE, and the change events.
 The production deriver is installed in *ASSERTION-DERIVER*. A NIL deriver
@@ -1698,29 +1690,6 @@ makes a second pass over the same episode insert nothing."
   (if *assertion-deriver*
       (funcall *assertion-deriver* store episode)
       (values nil nil)))
-
-(defun assertions-for (store episode-ids)
-  "Return every live assertion whose supporting episode is in EPISODE-IDS.
-
-One query for the whole batch: a per-episode query inside the loop is how a
-consolidation pass becomes quadratic in the size of the log."
-  (if (null episode-ids)
-      '()
-      (let ((placeholders (format nil "~{~A~^,~}"
-                                  (make-list (length episode-ids)
-                                             :initial-element "?"))))
-        (mapcar #'assertion-from-row
-                (enchiridion.memory.store:query-rows
-                 store
-                 (format nil "SELECT id, subject, relation, object, polarity,
-                                     episode_id, span_start, span_end, valid_from,
-                                     valid_to, tx_from, tx_to, authority,
-                                     authority_basis, provenance, cue_type,
-                                     schema_id, run_id
-                                FROM assertions
-                               WHERE tx_to IS NULL AND episode_id IN (~A)"
-                         placeholders)
-                 episode-ids)))))
 
 (defun assertion-from-row (row)
   "Return ROW, one assertions row as a plist, as an ASSERTION."
@@ -1741,162 +1710,10 @@ consolidation pass becomes quadratic in the size of the log."
    :schema-id (enchiridion.memory.store:field row "schema_id")
    :run-id (enchiridion.memory.store:field row "run_id")))
 
-(defun compile-procedures (store episodes run-id)
-  "Return the number of procedures this run admitted.
-
-STUB.  The second step that needs a model call.  A stub is used rather than an
-invented induction algorithm because the design's claim is about the *gate* and
-not about the inducer: whatever produces a candidate, the candidate is admitted
-only after demonstrated reuse on distinct task classes, and the gate
-ADMISSION-RULE is implemented.  The contract: candidates are derived from
-repeated subtask sequences with recorded outcomes; a derived precondition
-predicate must be true on every successful execution and false on at least one
-failure; and no procedure is admitted in the run that derived it."
-  (if *procedure-inducer*
-      (or (funcall *procedure-inducer* store episodes run-id) 0)
-      0))
-
-(defun store-conflicts (store conflicts run-id)
-  "Write CONFLICTS under RUN-ID and return how many rows were inserted."
-  (let ((written 0))
-    (dolist (conflict conflicts written)
-      (enchiridion.memory.store:exec
-       store
-       "INSERT INTO conflicts
-          (kind, left_id, right_id, detected_ts, basis, resolution_state,
-           resolution, resolved_ts, resolver, acting_query, run_id)
-          VALUES (?, ?, ?, ?, ?, 'unresolved', NULL, NULL, NULL, '', ?)"
-       (list (conflict-kind conflict) (conflict-left-id conflict)
-             (conflict-right-id conflict) (conflict-detected-ts conflict)
-             (conflict-basis conflict) run-id))
-      (incf written))))
-
-(defun close-superseded (store superseded new-tx-from)
-  "Close the validity of each superseded assertion by setting TX-TO.
-
-An update is represented as an interval closure and never as a deletion: the
-old row keeps its content and gains the transaction time at which it stopped
-being the live view.  The record of what the agent used to believe is what
-makes a knowledge-update question answerable at all."
-  (dolist (old superseded)
-    (enchiridion.memory.store:exec
-     store "UPDATE assertions SET tx_to = ? WHERE id = ?"
-     (list new-tx-from (assertion-id old))))
-  (length superseded))
-
-(defun start-run (store from to parser-version idempotent-key now)
-  "Insert a LOG_RUNS row and return its id, or NIL when the key already exists.
-
-The unique idempotent key is what makes a re-run of an already-completed range
-a no-op rather than a second derivation.  The key is a hash of the range, the
-parser version and the configuration hash, so a changed parser produces a new
-run rather than silently reusing the old one."
-  (let ((existing (enchiridion.memory.store:query-rows
-                   store "SELECT id FROM log_runs WHERE idempotent_key = ?"
-                   (list idempotent-key))))
-    (if existing
-        nil
-        (progn
-          (enchiridion.memory.store:exec
-           store
-           "INSERT INTO log_runs (started_ts, finished_ts, from_episode,
-                                  to_episode, parser_version, idempotent_key,
-                                  status)
-              VALUES (?, NULL, ?, ?, ?, ?, 'running')"
-           (list now from to parser-version idempotent-key))
-          (enchiridion.memory.store:last-row-id store)))))
-
-(defun finish-run (store run-id status now)
-  "Mark a run finished and return STATUS."
-  (enchiridion.memory.store:exec
-   store "UPDATE log_runs SET finished_ts = ?, status = ? WHERE id = ?"
-   (list now status run-id))
-  status)
-
-(defun mark-indexed (store episode-ids run-id)
-  "Stamp EPISODE-IDS with RUN-ID and return how many rows changed."
-  (if (null episode-ids)
-      0
-      (let ((placeholders (format nil "~{~A~^,~}"
-                                  (make-list (length episode-ids)
-                                             :initial-element "?"))))
-        (enchiridion.memory.store:exec
-         store
-         (format nil "UPDATE episodes SET run_id = ? WHERE id IN (~A)"
-                 placeholders)
-         (cons run-id episode-ids)))))
-
-(defun consolidate (store &key (now (get-universal-time)) (run-id nil)
-                              (batch 400) (dry-run nil)
-                              (parser-version "episodic-1")
-                              (config-hash "")
-                              (parameters *memory-parameters*))
-  "Run one consolidation pass over STORE and return a report plist.
-
-The six stages: (1) replay the unindexed tail of the log, (2) derive
-assertions, (3) merge duplicates and detect contradictions, (4) admit
-procedures, (5) decay and prune, (6) stamp the watermark and close the run.
-Stages 2 and 4 are stubs in this sketch; the other four are implemented.
-
-Nothing here runs inside a turn.  The triggers are a session end, an episode
-count above the threshold, an idle window, a due review anchor, or an operator
-invocation; the schedule is the harness's existing sleep interval, and the
-phase boundary is treated as a real design parameter rather than an
-implementation detail.  With DRY-RUN true every write is skipped and the
-report says what would have happened, which is what makes the pass testable
-against a fixture."
-  (let* ((rows (unindexed-episodes store :limit batch))
-         (episodes (mapcar #'episode-from-row rows))
-         (ids (mapcar #'episode-id episodes))
-         (from (if ids (reduce #'min ids) 0))
-         (to (if ids (reduce #'max ids) 0))
-         (key (format nil "~A:~A:~A:~A" from to parser-version config-hash)))
-    (if dry-run
-        (list :dry-run t :from from :to to
-              :replayed (length episodes)
-              :idempotent-key key)
-        (let ((run (or run-id (start-run store from to parser-version key now))))
-          (if (null run)
-              (list :dry-run nil :skipped t :reason "this range was already derived"
-                    :from from :to to :replayed 0 :idempotent-key key)
-              (let* ((derived (loop for episode in episodes
-                                    append (assertions-for-episode store episode)))
-                     (candidates (append derived (assertions-for store ids)))
-                     (conflicts '())
-                     (superseded '()))
-                ;; Detection runs over the whole candidate set, not the new
-                ;; rows alone: a new assertion can contradict an old one, and
-                ;; two old ones can contradict each other once both are in
-                ;; view.  Detection needs no model call.
-                (loop for (left . rest) on candidates
-                      do (dolist (right rest)
-                           (multiple-value-bind (opened closed)
-                               (detect-conflicts left (list right) :now now)
-                             (setf conflicts (append opened conflicts))
-                             (setf superseded (append closed superseded)))))
-                (let ((stored (store-conflicts store conflicts run))
-                      (closed (close-superseded store superseded now))
-                      (procedures (compile-procedures store episodes run))
-                      (sweep (decay-sweep store now :parameters parameters)))
-                  (mark-indexed store ids run)
-                  (finish-run store run "ok" now)
-                  (list :dry-run nil
-                        :run-id run
-                        :from from :to to
-                        :replayed (length episodes)
-                        :derived (length derived)
-                        :conflicts (length conflicts)
-                        :stored stored
-                        :superseded closed
-                        :procedures procedures
-                        :decay sweep
-                        :idempotent-key key))))))))
-
 ;;;; ---------------------------------------------------------------------
 ;;;; 17. End of the sketch.
 ;;;;
-;;;; Stubs, and only these: ASSERTIONS-FOR-EPISODE, COMPILE-PROCEDURES and
-;;;; PROCEDURE-ELIGIBLE-P.  Each needs something this document does not
-;;;; specify -- a model call in the first two cases, an evaluation sandbox in
-;;;; the third -- and each is marked STUB at its definition.  Every other
-;;;; function in this file is an implementation.
+;;;; One stub remains: PROCEDURE-ELIGIBLE-P, which needs an evaluation sandbox
+;;;; this document does not specify.  The sketch's single-pass CONSOLIDATE is
+;;;; gone: derivation runs through candidate generations (generations.cl), and
+;;;; only the gates in cue.cl can make one live.

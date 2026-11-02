@@ -110,6 +110,25 @@ memory has, so they come from config.cl and nowhere else.")
 (setf (documentation '*utility-max-tasks* 'variable)
       "The most question-and-answer pairs one utility run scores, newest first.")
 
+(defvar *precision-min*)
+(defvar *precision-window*)
+(defvar *precision-min-checked*)
+(setf (documentation '*precision-min* 'variable)
+      "The least share of recent promotions that must pass their post-promotion
+check, below which promotion freezes until the operator resets it.")
+
+(defvar *quarantine-max*)
+(defvar *quarantine-window*)
+(defvar *quarantine-min-candidates*)
+(setf (documentation '*quarantine-max* 'variable)
+      "The most share of recently gated candidates that may be quarantined,
+above which promotion freezes and T2 runs at the frozen interval.")
+
+(defvar *t2-interval-seconds*)
+(defvar *t2-frozen-interval-seconds*)
+(setf (documentation '*t2-frozen-interval-seconds* 'variable)
+      "The T2 interval while the quarantine rate is over its ceiling.")
+
 (defvar *compaction-rebase-every*)
 (setf (documentation '*compaction-rebase-every* 'variable)
       "Every this many compaction passes, one rebuilds the session block from raw
@@ -174,6 +193,14 @@ key by key to the shipped defaults. Return NIL."
           *tail-rarity-fraction* (setting :tail-rarity-fraction)
           *tail-min-n* (setting :tail-min-n)
           *utility-max-tasks* (setting :utility-max-tasks)
+          *precision-min* (setting :precision-min)
+          *precision-window* (setting :precision-window)
+          *precision-min-checked* (setting :precision-min-checked)
+          *quarantine-max* (setting :quarantine-max)
+          *quarantine-window* (setting :quarantine-window)
+          *quarantine-min-candidates* (setting :quarantine-min-candidates)
+          *t2-interval-seconds* (setting :t2-interval-seconds)
+          *t2-frozen-interval-seconds* (setting :t2-frozen-interval-seconds)
           *compaction-rebase-every* (setting :compaction-rebase-every)
           *compaction-rebase-turns* (setting :compaction-rebase-turns)
           ;; An operator who writes (:persona 8000) keeps the other limits.

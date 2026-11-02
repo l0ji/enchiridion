@@ -663,3 +663,71 @@ subject from the question before it, the way the model deriver is asked to."
           (ok pass)
           (ok (= 6 (getf utility :wins))))
         (ok (= generation (enchiridion.memory:live-generation-id store)))))))
+
+;;;; The autonomy controls.
+
+(defun gated-generation (store result &key (promoted nil))
+  "Insert a generation the gates decided RESULT for, and return its id."
+  (enchiridion.memory.store:exec
+   store
+   "INSERT INTO generations (number, status, created_ts, promotion_result,
+                             promotion_checked_ts, promoted_ts)
+      VALUES ((SELECT COALESCE(MAX(number), 0) + 1 FROM generations), ?, 0, ?, 0, ?)"
+   (list (if promoted "retired" result) result (and promoted 1)))
+  (enchiridion.memory.store:last-row-id store))
+
+(defun post-check (store generation canary utility)
+  (dolist (pair (list (cons "post-canary" canary) (cons "post-utility" utility)))
+    (when (cdr pair)
+      (enchiridion.memory.store:exec
+       store "INSERT INTO generation_checks (generation_id, kind, result, ts)
+                VALUES (?, ?, ?, 0)"
+       (list generation (car pair) (cdr pair))))))
+
+(deftest the-quarantine-freeze-waits-for-enough-candidates ()
+  (with-store (store directory)
+    (dotimes (i 4) (gated-generation store "quarantined"))
+    (testing "four quarantines are not yet a rate"
+      (ng (enchiridion.memory:quarantine-frozen-p store))
+      (ok (= enchiridion.memory:*t2-interval-seconds*
+             (enchiridion.memory:t2-interval store))))
+    (gated-generation store "quarantined")
+    (testing "the fifth freezes promotion and slows T2 to the frozen interval"
+      (ok (eq :quarantine-rate (enchiridion.memory:promotion-freeze store)))
+      (ok (= enchiridion.memory:*t2-frozen-interval-seconds*
+             (enchiridion.memory:t2-interval store))))
+    (dotimes (i 6) (gated-generation store "held"))
+    (testing "held candidates passed every gate, so they bring the rate down"
+      (ok (= 5/11 (getf (enchiridion.memory:quarantine-rate store) :rate)))
+      (ng (enchiridion.memory:promotion-freeze store)))))
+
+(deftest a-precision-freeze-holds-until-the-operator-resets-it ()
+  (with-store (store directory)
+    (dotimes (i 5)
+      (post-check store (gated-generation store "promoted" :promoted t)
+                  "pass" (if (< i 3) "pass" "fail")))
+    (let ((unchecked (gated-generation store "promoted" :promoted t)))
+      (declare (ignore unchecked)))
+    (testing "three of five checked promotions held: 0.6 is under 0.8"
+      (let ((report (enchiridion.memory:promotion-precision store)))
+        (ok (= 5 (getf report :checked)))
+        (ok (= 3/5 (getf report :precision))))
+      (ok (eq :precision (enchiridion.memory:promotion-freeze store))))
+    (enchiridion.memory:reset-promotion-precision store)
+    (testing "the reset starts the count afresh"
+      (ok (zerop (getf (enchiridion.memory:promotion-precision store) :checked)))
+      (ng (enchiridion.memory:promotion-freeze store)))))
+
+(deftest a-candidate-that-passes-during-a-freeze-is-held ()
+  (with-gate-world (store directory generation)
+    (dotimes (i 5) (gated-generation store "quarantined"))
+    (let ((report (enchiridion.memory:gate-candidate
+                   store generation :canaries (passing-canaries)
+                                    :scorer #'assertion-scorer)))
+      (ng (getf report :promoted))
+      (ok (eq :held (getf report :reason)))
+      (ok (eq :quarantine-rate (getf report :freeze)))
+      (ok (string= "held" (status-of store generation)))
+      (ok (zerop (enchiridion.memory:live-generation-id store)))
+      (testing "and it counts toward the rate as a pass"
+        (ok (= 5/6 (getf (enchiridion.memory:quarantine-rate store) :rate)))))))

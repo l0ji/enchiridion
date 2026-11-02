@@ -302,6 +302,11 @@ did not think of."))
    #:rare-episode-ids #:tail-tasks #:t2-preflight
    #:sign-test-p #:paired-outcomes #:tail-gate #:provenance-gate #:cost-gate
    #:promotion-tokens #:gate-candidate #:check-promoted
+   #:promotion-precision #:quarantine-rate #:precision-frozen-p #:quarantine-frozen-p
+   #:promotion-freeze #:reset-promotion-precision #:t2-interval
+   #:*precision-min* #:*precision-window* #:*precision-min-checked* #:*quarantine-max*
+   #:*quarantine-window* #:*quarantine-min-candidates* #:*t2-interval-seconds*
+   #:*t2-frozen-interval-seconds*
    #:*memory-gate-alpha* #:*memory-tail-margin* #:*t2-max-tokens-per-promotion*
    #:utility-gate #:volume-gate
    #:run-arm #:compare-arms #:push-ab #:record-gate-row #:content-hash

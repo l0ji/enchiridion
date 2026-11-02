@@ -536,9 +536,9 @@ hashes of the tail tasks among them."
    "UPDATE generations
        SET promotion_result = ?, promotion_checked_ts = ?,
            quarantine_reason = ?,
-           status = CASE WHEN ? = 'quarantined' THEN 'quarantined' ELSE status END
+           status = CASE WHEN ? IN ('quarantined', 'held') THEN ? ELSE status END
      WHERE id = ?"
-   (list result now reason result generation-id)))
+   (list result now reason result result generation-id)))
 
 (defun gate-candidate (store generation-id &key (canaries *memory-canaries*)
                                                (scorer #'answer-scorer))
@@ -569,9 +569,19 @@ one transaction."
                         (utility-gate store generation-id)))
       (gate "tail" (lambda () (tail-gate store generation-id tail-hashes)))
       (gate "cost" (lambda () (cost-gate store generation-id)))
-      (promote-generation store generation-id)
-      (set-promotion-result store generation-id "promoted")
-      (list :promoted t :generation-id generation-id))))
+      ;; Every gate passed. A freeze still holds the candidate back, and a held
+      ;; candidate is not a quarantined one: it is what lowers the quarantine
+      ;; rate and lifts that freeze.
+      (let ((freeze (promotion-freeze store)))
+        (if freeze
+            (progn
+              (set-promotion-result store generation-id "held"
+                                    :reason (string-downcase (symbol-name freeze)))
+              (list :promoted nil :reason :held :freeze freeze))
+            (progn
+              (promote-generation store generation-id)
+              (set-promotion-result store generation-id "promoted")
+              (list :promoted t :generation-id generation-id)))))))
 
 (defun check-promoted (store generation-id &key (canaries *memory-canaries*)
                                                (scorer #'answer-scorer))
@@ -595,3 +605,104 @@ post-check rows are what the freeze and promotion precision read."
             (rollback-generation store generation-id)
             (list :held nil :reason :rolled-back
                   :failed (if canary-ok "post-utility" "post-canary")))))))
+
+;;;; ------------------------------------------------------------------
+;;;; 10. The autonomy controls
+;;;; ------------------------------------------------------------------
+
+(defun first-check-result (store generation-id kind)
+  "Return the result of GENERATION-ID's first KIND check, or NIL."
+  (enchiridion.memory.store:field
+   (first (enchiridion.memory.store:query-rows
+           store "SELECT result FROM generation_checks
+                   WHERE generation_id = ? AND kind = ? ORDER BY id LIMIT 1"
+           (list generation-id kind)))
+   "result"))
+
+(defun precision-reset-generation (store)
+  "Return the generation id the operator last reset promotion precision at."
+  (ensure-generation-state store)
+  (or (enchiridion.memory.store:field
+       (first (enchiridion.memory.store:query-rows
+               store "SELECT precision_reset_generation AS g FROM memory_state WHERE id = 1"))
+       "g")
+      0))
+
+(defun promotion-precision (store &key (window *precision-window*))
+  "Return a plist of the last WINDOW promotions since the operator's reset:
+:CHECKED, those that have had their post-promotion check, :PASSED, those
+whose first canary and utility runs after promotion both passed, and
+:PRECISION, PASSED over CHECKED or NIL when none is checked.
+docs/design/memory.md: precision is the share that pass the next canary and
+utility run, so a promotion's first post-check is the one that counts."
+  (let ((checked 0) (passed 0))
+    (dolist (row (enchiridion.memory.store:query-rows
+                  store
+                  "SELECT id FROM generations
+                    WHERE promoted_ts IS NOT NULL AND id > ?
+                    ORDER BY id DESC LIMIT ?"
+                  (list (precision-reset-generation store) window)))
+      (let* ((id (enchiridion.memory.store:field row "id"))
+             (canary (first-check-result store id "post-canary")))
+        (when canary
+          (incf checked)
+          (when (and (string= canary "pass")
+                     (equal (first-check-result store id "post-utility") "pass"))
+            (incf passed)))))
+    (list :checked checked :passed passed
+          :precision (and (plusp checked) (/ passed checked)))))
+
+(defun quarantine-rate (store &key (window *quarantine-window*))
+  "Return a plist of the last WINDOW candidates the gates decided on: :N, how
+many, :QUARANTINED, how many were, and :RATE, or NIL when none was gated.
+A held candidate passed every gate, so it counts as gated and not quarantined."
+  (let* ((rows (enchiridion.memory.store:query-rows
+                store
+                "SELECT promotion_result FROM generations
+                  WHERE promotion_result IN ('promoted', 'quarantined', 'held')
+                  ORDER BY promotion_checked_ts DESC, id DESC LIMIT ?"
+                (list window)))
+         (n (length rows))
+         (quarantined (count "quarantined" rows
+                             :key (lambda (r) (enchiridion.memory.store:field
+                                               r "promotion_result"))
+                             :test #'string=)))
+    (list :n n :quarantined quarantined :rate (and (plusp n) (/ quarantined n)))))
+
+(defun precision-frozen-p (store)
+  "Return T when enough promotions have been checked and too few held up."
+  (let ((report (promotion-precision store)))
+    (and (>= (getf report :checked) *precision-min-checked*)
+         (< (getf report :precision) (rationalize *precision-min*)))))
+
+(defun quarantine-frozen-p (store)
+  "Return T when enough candidates have been gated and too many quarantined."
+  (let ((report (quarantine-rate store)))
+    (and (>= (getf report :n) *quarantine-min-candidates*)
+         (> (getf report :rate) (rationalize *quarantine-max*)))))
+
+(defun promotion-freeze (store)
+  "Return why promotion is frozen, :PRECISION or :QUARANTINE-RATE, or NIL.
+A precision freeze holds until the operator resets it; a quarantine-rate
+freeze lifts once held candidates bring the rate back under its ceiling."
+  (cond ((precision-frozen-p store) :precision)
+        ((quarantine-frozen-p store) :quarantine-rate)))
+
+(defun reset-promotion-precision (store)
+  "Start promotion precision afresh from the generations that come next, which
+is how the operator lifts a precision freeze, and return the watermark."
+  (ensure-generation-state store)
+  (let ((watermark (or (enchiridion.memory.store:field
+                        (first (enchiridion.memory.store:query-rows
+                                store "SELECT COALESCE(MAX(id), 0) AS g FROM generations"))
+                        "g")
+                       0)))
+    (enchiridion.memory.store:exec
+     store "UPDATE memory_state SET precision_reset_generation = ? WHERE id = 1"
+     (list watermark))
+    watermark))
+
+(defun t2-interval (store)
+  "Return the seconds between T2 passes: the frozen interval while the
+quarantine rate is over its ceiling, the ordinary one otherwise."
+  (if (quarantine-frozen-p store) *t2-frozen-interval-seconds* *t2-interval-seconds*))

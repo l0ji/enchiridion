@@ -70,6 +70,18 @@ A candidate that passes all five is promoted in one transaction.
 `check-promoted` re-runs the canary and utility checks on a live generation and rolls it back to its parent when either fails.
 The thresholds are compared exactly, so a mean delta of 0.05 meets a margin of 0.05.
 
+### The autonomy controls
+
+Two controls can freeze promotion even for a candidate that passes every gate:
+
+| Control | Freezes when | Lifts when |
+| --- | --- | --- |
+| Promotion precision | at least `:precision-min-checked` of the last `:precision-window` promotions have had their first post-promotion check, and under `:precision-min` of them passed both its canary and utility run | the operator resets precision with `reset-promotion-precision`, which starts the count from the generations that come next |
+| Quarantine rate | at least `:quarantine-min-candidates` of the last `:quarantine-window` gated candidates exist, and over `:quarantine-max` of them were quarantined; T2 also slows to `:t2-frozen-interval-seconds` | held candidates bring the rate back under the ceiling |
+
+A candidate that passes every gate while promotion is frozen is `held`, not promoted.
+It counts as gated and not quarantined, so good candidates are what lift a quarantine-rate freeze.
+
 Push is off.
 The design enables it only after a paired no-harm run.
 

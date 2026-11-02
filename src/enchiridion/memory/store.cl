@@ -399,11 +399,11 @@ schema creates the new one, and the index is rebuilt from EPISODES.
 
 Version 4 indexes assertions by their claim, in ASSERTIONS_FTS with its
 triggers and a backfill, all in +SCHEMA+; drops LOG_RUNS, in
-MIGRATE-LEGACY-MEMORY; and adds MEMORY_STATE.PRECISION_RESET_TS, the
+MIGRATE-LEGACY-MEMORY; and adds MEMORY_STATE.PRECISION_RESET_GENERATION, the
 operator's reset of the promotion-precision freeze, in ADD-MISSING-COLUMNS.")
 
 (defparameter +added-columns+
-  '(("memory_state" "precision_reset_ts" "INTEGER"))
+  '(("memory_state" "precision_reset_generation" "INTEGER"))
   "Columns added to an existing table after it shipped: table, column, type.
 CREATE TABLE IF NOT EXISTS never adds one to a table that exists, so
 ADD-MISSING-COLUMNS does.")

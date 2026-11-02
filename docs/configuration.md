@@ -249,15 +249,20 @@ The `/proc` hidepid remount happens in the container entry point before Lisp sta
 | `:utility-max-tasks` | integer | `400` | Most question-and-answer pairs one utility run scores, newest first. |
 | `:parameters` | plist or `nil` | `nil` | Overrides merged over the shipped memory parameter defaults. |
 | `:t2-enabled` | boolean | `t` | Not read: there is no T2 schedule yet. |
-| `:t2-interval-seconds` | integer | `86400` | Not read: there is no T2 schedule yet. |
+| `:t2-interval-seconds` | integer | `86400` | Seconds between T2 passes. The heartbeat schedule that reads it is not built yet; `t2-interval` already answers with it. |
+| `:t2-frozen-interval-seconds` | integer | `604800` | Seconds between T2 passes while the quarantine rate is over `:quarantine-max`. |
 | `:t2-episode-threshold` | integer | `200` | Not read: there is no T2 schedule yet. |
 | `:t2-max-tokens-per-pass` | integer | `30000` | Not read: there is no T2 pass budget yet. |
 | `:canaries` | list or `nil` | `nil` | Operator-authored behavioural checks, each a plist of `:name`, `:family`, `:cue`, `:expect`, and `:stale` for the update family. |
 | `:canary-min-families` | integer | `4` | Canary families that must be covered before a T2 pass can run. |
 | `:tail-rarity-fraction` | real | `0.10` | Share of episodes, rarest first, that the tail sample treats as rare. |
 | `:tail-min-n` | integer | `50` | Fewest questions with a rare answer a T2 pass needs. |
-| `:precision-min` | real | `0.8` | Not read: there is no promotion-precision gate yet. |
-| `:quarantine-max` | real | `0.5` | Not read: there is no quarantine-rate gate yet. |
+| `:precision-min` | real | `0.8` | Least share of recent promotions that must pass their first post-promotion check. Below it promotion freezes until the operator resets precision. |
+| `:precision-window` | integer | `20` | Promotions promotion precision reads, newest first. |
+| `:precision-min-checked` | integer | `5` | Checked promotions needed before precision can freeze. |
+| `:quarantine-max` | real | `0.5` | Most share of recently gated candidates that may be quarantined. Above it promotion freezes and T2 runs at the frozen interval, until held candidates bring the rate back down. |
+| `:quarantine-window` | integer | `20` | Gated candidates the quarantine rate reads, newest first. |
+| `:quarantine-min-candidates` | integer | `5` | Gated candidates needed before the rate can freeze. |
 | `:compaction-rebase-every` | integer | `8` | Every this many compaction passes, one rebuilds the session block from raw turns. |
 | `:compaction-rebase-turns` | integer | `24` | Raw turns a rebase pass reads. |
 

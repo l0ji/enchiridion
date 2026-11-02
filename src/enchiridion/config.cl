@@ -231,7 +231,16 @@ store path. The model defaults match the shipped adapter defaults."
     (:tail-min-n 50)
     (:tail-margin 0.02)
     (:precision-min 0.8)
+    ;; Promotion precision is read over the last 20 promotions and only once
+    ;; 5 have had their post-promotion check.
+    (:precision-window 20)
+    (:precision-min-checked 5)
     (:quarantine-max 0.5)
+    ;; The quarantine rate is read over the last 20 gated candidates and only
+    ;; once 5 have been gated; above :quarantine-max, T2 runs weekly.
+    (:quarantine-window 20)
+    (:quarantine-min-candidates 5)
+    (:t2-frozen-interval-seconds 604800)
     (:compaction-rebase-every 8)
     (:compaction-rebase-turns 24)
     (:parameters nil)

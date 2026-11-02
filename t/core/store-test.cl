@@ -671,7 +671,7 @@ itself is what proves the trigger ran."
            ;; What a version-3 store looked like.
            (dolist (statement '("DROP TRIGGER assertions_ai" "DROP TRIGGER assertions_ad"
                                 "DROP TRIGGER assertions_au" "DROP TABLE assertions_fts"
-                                "ALTER TABLE memory_state DROP COLUMN precision_reset_ts"))
+                                "ALTER TABLE memory_state DROP COLUMN precision_reset_generation"))
              (enchiridion.memory.store::exec store statement))
            (enchiridion.memory.store::set-schema-version store 3)
            (enchiridion.memory.store:close-store store)
@@ -683,6 +683,6 @@ itself is what proves the trigger ran."
                                        WHERE assertions_fts MATCH 'deploy'")))))
            (testing "the reset column exists"
              (ok (enchiridion.memory.store::column-exists-p
-                  store "memory_state" "precision_reset_ts"))))
+                  store "memory_state" "precision_reset_generation"))))
       (ignore-errors (enchiridion.memory.store:close-store store))
       (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))

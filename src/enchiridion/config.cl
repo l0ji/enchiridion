@@ -172,7 +172,7 @@ store path. The model defaults match the shipped adapter defaults."
 
     :memory
     (:db nil)
-    (:block-limits (:persona 1200 :operator 800 :world 1500 :session 400 :ledger 250))
+    (:block-limits (:persona 6000 :operator 1600 :world 3000 :session 400 :ledger 250))
     ;; The episodic log and pull retrieval are on; push and promotion wait for
     ;; measured instruments. T2 runs on schedule, but a pass with no deriver,
     ;; canaries, utility task set, or tail sampler is a reported no-op rather

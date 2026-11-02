@@ -80,7 +80,7 @@ Otherwise the outcome is null.
 
 ## Working set and prompt
 
-The five resident blocks are persona 1,200, operator 800, world 1,500, session 400, and ledger 250 characters, 4,150 in total.
+The five resident blocks are persona 6,000, operator 1,600, world 3,000, session 400, and ledger 250 characters, 11,250 in total.
 The cue pack has its own 4,450 character budget.
 The model's 4,450 figure is the pack budget, not the total.
 The bootstrap block is not resident.

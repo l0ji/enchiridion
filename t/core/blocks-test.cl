@@ -25,7 +25,7 @@
 
 (deftest a-block-with-no-limit-uses-the-default-for-its-label ()
   (let ((block (enchiridion.memory:make-block :label :world :text "")))
-    (ok (= 1500 (enchiridion.memory:block-limit block)))))
+    (ok (= 3000 (enchiridion.memory:block-limit block)))))
 
 (deftest a-write-over-the-limit-names-the-exact-shortfall ()
   (let* ((block (enchiridion.memory:make-block :label :persona :text "x" :limit 10))

@@ -17,7 +17,7 @@
 ;;;; Limits.
 
 (defparameter *default-block-limits*
-  '(:persona 1200 :operator 800 :world 1500 :session 400 :ledger 250 :bootstrap 300)
+  '(:persona 6000 :operator 1600 :world 3000 :session 400 :ledger 250 :bootstrap 300)
   "Character limits per block. Raising a limit raises
 the fixed token cost of every prompt, which is why they live in one place.
 The bootstrap block holds the status line, so it is small on purpose: it is

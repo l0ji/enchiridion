@@ -285,8 +285,8 @@ The built-in tools are registered for every command, and tools from the agent di
 `blocks` prints one line per block: label, character count, limit, and file.
 
 ```text
-soul 758/1200 /path/to/home/agents/default/SOUL.md
-persona 758/1200 /path/to/home/agents/default/SOUL.md
+soul 758/6000 /path/to/home/agents/default/SOUL.md
+persona 758/6000 /path/to/home/agents/default/SOUL.md
 ```
 
 `soul` and `persona` both use `SOUL.md`.

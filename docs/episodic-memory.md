@@ -161,6 +161,11 @@ The remaining keys in the example belong to the generation and gate path and are
 enchiridion memory status        # log counts, live generation, cue index, canaries
 enchiridion memory build         # run one bounded candidate build
 enchiridion memory import LOG    # add a JSON Lines conversation log to the episodes
+enchiridion memory candidates    # every generation and the gates' verdict
+enchiridion memory gates ID      # one generation's checks
+enchiridion memory promote ID    # run the gates now; never bypasses them
+enchiridion memory rollback ID   # back to the parent generation
+enchiridion memory canaries      # canary coverage by family
 enchiridion memory "open ports"  # search sessions, memories and episodes
 ```
 

@@ -703,7 +703,8 @@ file a block is backed by."
 
 (defun cmd-memory (arguments)
   "Search sessions, memories and episodes, or run a log action.
-The first argument selects an action when it is STATUS, BUILD or IMPORT.
+The first argument selects an action when it is STATUS, BUILD, IMPORT,
+CANDIDATES, GATES, PROMOTE, ROLLBACK or CANARIES.
 Anything else is a search query, so the common call keeps working."
   (let ((missing (require-store "memory")))
     (if missing
@@ -718,6 +719,68 @@ Anything else is a search query, so the common call keeps working."
                               :cue-index :canaries))
                  (say "~(~A~): ~A" key (getf status key))))
              0)
+            ((string= action "candidates")
+             (let ((rows (enchiridion.memory.store:query-rows
+                          store "SELECT id, status, episodes_derived, writes, tokens_used,
+                                        promotion_result, quarantine_reason
+                                   FROM generations ORDER BY id")))
+               (if (null rows)
+                   (say "no generations yet.")
+                   (dolist (row rows)
+                     (flet ((f (name) (enchiridion.memory.store:field row name)))
+                       (say "~D ~A: ~D episode~:P derived, ~D write~:P, ~D tokens~@[, ~A~]~@[ (~A)~]"
+                            (f "id") (f "status") (f "episodes_derived") (f "writes")
+                            (f "tokens_used")
+                            (let ((r (f "promotion_result"))) (and r (plusp (length r)) r))
+                            (let ((r (f "quarantine_reason"))) (and r (plusp (length r)) r))))))
+               0))
+            ((member action '("gates" "promote" "rollback") :test #'string=)
+             (let ((id (ignore-errors (parse-integer (or (second arguments) "")))))
+               (cond
+                 ((or (null id) (null (enchiridion.memory:generation-row store id)))
+                  (say "memory ~A takes the id of a generation; `memory candidates` lists them." action)
+                  2)
+                 ((string= action "gates")
+                  (let ((rows (enchiridion.memory.store:query-rows
+                               store "SELECT kind, result, value, detail FROM generation_checks
+                                       WHERE generation_id = ? ORDER BY id" (list id))))
+                    (if (null rows)
+                        (say "generation ~D has no checks yet." id)
+                        (dolist (row rows)
+                          (flet ((f (name) (enchiridion.memory.store:field row name)))
+                            (say "~A ~A~@[ ~,4F~]  ~A" (f "kind") (f "result") (f "value")
+                                 (let ((d (or (f "detail") "")))
+                                   (subseq d 0 (min 160 (length d))))))))
+                    0))
+                 ((string= action "promote")
+                  ;; Through the gates, never around them: this is the same
+                  ;; decision the heartbeat makes, asked for now.
+                  (let ((report (enchiridion.memory:gate-candidate store id)))
+                    (cond ((getf report :promoted) (say "generation ~D promoted." id) 0)
+                          (t (say "generation ~D not promoted: ~(~A~)~@[ at the ~A gate~]~@[ (~(~A~))~]."
+                                  id (getf report :reason) (getf report :failed)
+                                  (or (getf report :freeze) (getf report :status)))
+                             1))))
+                 (t
+                  (let ((report (enchiridion.memory:rollback-generation store id)))
+                    (if (getf report :rolled-back)
+                        (progn (say "generation ~D rolled back; live is now ~D." id
+                                    (enchiridion.memory:live-generation-id store))
+                               0)
+                        (progn (say "generation ~D not rolled back: ~(~A~)." id (getf report :reason))
+                               1)))))))
+            ((string= action "canaries")
+             (let ((canaries enchiridion.memory:*memory-canaries*))
+               (multiple-value-bind (families covered-p)
+                   (enchiridion.memory:canary-coverage canaries)
+                 (dolist (canary canaries)
+                   (say "~:[invalid~;~:*~A~] ~A: ~S"
+                        (and (enchiridion.memory:valid-canary-p canary)
+                             (string-downcase (getf canary :family)))
+                        (or (getf canary :name) "unnamed") (getf canary :cue)))
+                 (say "~D famil~:@P covered (~{~A~^, ~}), ~D needed: ~:[not enough for a T2 pass~;enough~]."
+                      (length families) families enchiridion.memory:*canary-min-families* covered-p))
+               0))
             ((string= action "import")
              (let ((path (second arguments)))
                (cond

@@ -529,3 +529,39 @@ here the way the operator would see it."
                              :key-present-p nil :source :shipped))))))
     (ok (search "OPENCODE_API_KEY key (shipped)" text))
     (ok (search "OPENAI_API_KEY no key (shipped)" text))))
+
+(deftest the-memory-commands-show-and-steer-t2 ()
+  (with-scratch-directory (directory)
+    (let ((store (enchiridion.memory.store:open-store
+                  :path (merge-pathnames "memory.db" directory))))
+      (unwind-protect
+           (let ((enchiridion.channel.cli:*command-context*
+                   (enchiridion.channel.cli:make-command-context :store store)))
+             (testing "an empty store has no generations"
+               (ok (search "no generations yet" (captured-run "memory" '("candidates")))))
+             (enchiridion.memory.store:exec
+              store "INSERT INTO generations (number, status, created_ts, episodes_derived, writes,
+                                              tokens_used, promotion_result, quarantine_reason)
+                       VALUES (1, 'quarantined', 0, 40, 180, 61000, 'quarantined', 'utility')")
+             (enchiridion.memory.store:exec
+              store "INSERT INTO generation_checks (generation_id, kind, result, value, detail, ts)
+                       VALUES (1, 'utility', 'fail', 0.4, '(:PAIRS 120)', 0)")
+             (testing "candidates lists each generation with its verdict"
+               (let ((text (captured-run "memory" '("candidates"))))
+                 (ok (search "1 quarantined: 40 episodes derived, 180 writes, 61000 tokens" text))
+                 (ok (search "(utility)" text))))
+             (testing "gates shows its checks"
+               (ok (search "utility fail" (captured-run "memory" '("gates" "1")))))
+             (testing "an unknown generation is refused with a pointer"
+               (multiple-value-bind (text status) (captured-run "memory" '("gates" "99"))
+                 (ok (eql 2 status))
+                 (ok (search "memory candidates" text))))
+             (testing "promote goes through the gates, so a quarantined one is refused"
+               (multiple-value-bind (text status) (captured-run "memory" '("promote" "1"))
+                 (ok (eql 1 status))
+                 (ok (search "not-a-candidate" text))))
+             (testing "canaries reports coverage by family"
+               (let ((enchiridion.memory:*memory-canaries*
+                       (list (list :name "r" :family "retrieval" :cue "deploy key" :expect "vault"))))
+                 (ok (search "1 family covered (retrieval)" (captured-run "memory" '("canaries")))))))
+        (ignore-errors (enchiridion.memory.store:close-store store))))))

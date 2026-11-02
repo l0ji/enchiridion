@@ -366,7 +366,18 @@ The first argument may also be an action on the episodic log:
 enchiridion memory status
 enchiridion memory build
 enchiridion memory import FILE.jsonl
+enchiridion memory candidates
+enchiridion memory gates ID
+enchiridion memory promote ID
+enchiridion memory rollback ID
+enchiridion memory canaries
 ```
+
+`candidates` lists every generation: status, episodes derived, writes, tokens, and the gates' verdict with the gate that failed.
+`gates ID` prints that generation's checks in order, each with its result, its number, and the start of its report.
+`promote ID` runs the generation through the gates, exactly as the heartbeat would; it never bypasses one, and it exits 1 when the candidate is quarantined, held, or not a candidate.
+`rollback ID` rolls a live generation back to its parent, or marks a candidate rolled back.
+`canaries` lists the configured canaries and says whether their families cover `:canary-min-families`.
 
 `import` reads a conversation log as JSON Lines, one turn per line, oldest first:
 

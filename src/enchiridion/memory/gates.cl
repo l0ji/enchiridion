@@ -258,31 +258,36 @@ promoted."
                  0)))
     (values (zerop bad) (list :unsourced bad))))
 
+(defun build-assertion-count (store generation-id)
+  "Return the assertions GENERATION-ID's own build wrote: its rows whose run is
+itself, so the rows it copied from its parent are not counted."
+  (or (enchiridion.memory.store:field
+       (first (enchiridion.memory.store:query-rows
+               store "SELECT COUNT(*) AS n FROM assertions WHERE generation_id = ? AND run_id = ?"
+               (list generation-id generation-id)))
+       "n")
+      0))
+
 (defun volume-gate (store generation-id &key (per-episode *memory-writes-per-episode*))
-  "Return T when GENERATION-ID's build wrote at most PER-EPISODE semantic rows
-for each episode it derived itself.
+  "Return T when GENERATION-ID's build wrote at most PER-EPISODE assertions for
+each episode it derived itself.
 
 The cap exists because interference is constantly present: what a system
 writes between encoding a record and retrieving it determines whether the
 record survives, with no deletion policy in play.  High-volume passive
-learning therefore degrades older records by competition alone.  The count is
-the generation's own WRITES column, which BUILD-CANDIDATE keeps, so the gate
-measures the candidate it is asked about and not a run that never happened.
+learning therefore degrades older records by competition alone.
 
-The allowance is per episode and not one number per candidate, because a
-measured deriver writes about five rows an episode: a fixed 400 quarantined
-every candidate of the 200 episodes that make a pass due. Copied rows are in
-neither count, since WRITES and EPISODES_DERIVED both count this build alone."
+It counts claims, the build's own assertion rows, and not conflict rows or
+closed intervals: those are bookkeeping about claims, and on the trial log one
+list-valued relation alone opened 1,806 conflict rows, which would have
+quarantined a candidate writing 4.2 claims an episode.  The allowance is per
+episode derived, because a measured deriver writes about five an episode."
   (let ((row (first (enchiridion.memory.store:query-rows
-                     store "SELECT writes, episodes_derived FROM generations WHERE id = ?"
+                     store "SELECT episodes_derived FROM generations WHERE id = ?"
                      (list generation-id)))))
     (and row
-         (<= (or (enchiridion.memory.store:field row "writes") 0)
+         (<= (build-assertion-count store generation-id)
              (* per-episode (or (enchiridion.memory.store:field row "episodes_derived") 0))))))
-
-;;;; ------------------------------------------------------------------
-;;;; 6. Measurement
-;;;; ------------------------------------------------------------------
 
 (defun record-gate-row (store arm metric value &key (n 0) (detail "")
                                                  (generation-id 0) (task-hash "")
@@ -553,6 +558,7 @@ much each episode's semantics may cost, so a wasteful deriver still fails."
               (list :tokens tokens
                     :episodes-since-promotion episodes
                     :writes (enchiridion.memory.store:field row "writes")
+                    :assertions (build-assertion-count store generation-id)
                     :episodes (enchiridion.memory.store:field row "episodes_derived"))))))
 
 (defun record-check (store generation-id kind pass-p report &key (now (get-universal-time)))

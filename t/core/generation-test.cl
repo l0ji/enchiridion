@@ -1100,3 +1100,34 @@ shipped schedule."
                           store (enchiridion.memory:utility-tasks store)))))
       (ok (= 2 (length (enchiridion.memory::tail-sample store))))
       (ok (= 2 (getf (enchiridion.memory:t2-preflight store) :tail-tasks))))))
+
+(deftest a-relation-with-many-values-is-a-set-and-not-a-pile-of-conflicts ()
+  ;; One list-valued relation opened 1,806 conflict rows on the trial log:
+  ;; every new object conflicted with every earlier one.
+  (flet ((conflict-count (store)
+           (enchiridion.memory.store:field
+            (first (enchiridion.memory.store:query-rows
+                    store "SELECT COUNT(*) AS n FROM conflicts")) "n")))
+    (testing "objects listed in one record do not conflict"
+      (with-store (store directory)
+        (let ((enchiridion.memory:*assertion-deriver*
+                (lambda (store episode)
+                  (declare (ignore store))
+                  (values (loop for object in '("tahini" "lemon" "garlic")
+                                collect (simple-assertion episode "hummus" "has ingredient" object))
+                          nil))))
+          (write-body store "hummus: tahini, lemon, garlic")
+          (enchiridion.memory:build-candidate store :limit 10)
+          (ok (zerop (conflict-count store))))))
+    (testing "across records, a one-valued relation conflicts once and a set stops there"
+      (with-store (store directory)
+        (let ((enchiridion.memory:*assertion-deriver*
+                (lambda (store episode)
+                  (declare (ignore store))
+                  (values (list (simple-assertion episode "brand" "associated concept"
+                                                  (enchiridion.memory:episode-body episode)))
+                          nil))))
+          (dolist (body '("comfort" "fit" "fabric" "price" "style"))
+            (write-body store body))
+          (enchiridion.memory:build-candidate store :limit 10)
+          (ok (= 1 (conflict-count store))))))))

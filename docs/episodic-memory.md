@@ -54,6 +54,8 @@ An assertion is indexed by its claim, so the candidate arm can recall an answer 
 A turn does not classify its cue, so the cue-type term gives assertions and episodes the same value: naming the cue episodic would score every claim 0 on that term and keep it out of the pack.
 
 A canary checks behaviour in a retrieval for its `:cue`, never presence in the store.
+
+A candidate opens a conflict when a new assertion gives a subject and relation a different object, except in two cases: assertions from the same episode, since one record listing several values is not contradicting itself, and a subject and relation that already hold two live objects, which is a set and not a contradiction. A one-valued relation still conflicts on its second object.
 `sync-canaries` makes the canary table hold exactly the valid configured canaries, so one the operator removes stops counting.
 
 ### The promotion gates
@@ -66,7 +68,7 @@ A canary checks behaviour in a retrieval for its `:cue`, never presence in the s
 | Canary | the configured canaries cover `:canary-min-families` and every one holds in a retrieval reading the candidate |
 | Utility | over the utility tasks scored under both arms, the mean delta is at least `:gate-margin`, at least `:gate-min-n` pairs are not tied, and the one-sided sign test is below `:gate-alpha` |
 | Tail | on the tasks with rare answers, the candidate's recall, an answer anywhere in the gate's pack, is no more than `:tail-margin` below retention-only's |
-| Cost | the candidate wrote at most `:t2-writes-per-episode` rows per episode it derived and the candidates since the last promotion cost at most `:t2-max-tokens-per-episode` tokens per episode they derived |
+| Cost | the candidate's own build wrote at most `:t2-writes-per-episode` assertions per episode it derived and the candidates since the last promotion cost at most `:t2-max-tokens-per-episode` tokens per episode they derived |
 
 Each gate writes a `generation_checks` row.
 A failure sets the candidate to `quarantined` with the gate's name as `quarantine_reason`, and the live layer is untouched.

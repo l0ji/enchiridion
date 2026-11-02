@@ -370,23 +370,27 @@
 
 (deftest the-volume-gate-counts-the-candidate-it-is-asked-about ()
   ;; It once counted rows under run id -1, which is always zero, so it passed
-  ;; every candidate whatever it wrote.
+  ;; every candidate whatever it wrote. It counts the build's own claims now,
+  ;; and neither the rows it copied nor its conflict bookkeeping.
   (with-store (store)
-    (enchiridion.memory.store:exec
-     store
-     "INSERT INTO generations (number, status, created_ts, writes, episodes_derived)
-        VALUES (1, 'candidate', 0, 401, 50)")
-    (let ((id (enchiridion.memory.store:last-row-id store)))
-      (testing "the allowance is per episode derived: 50 episodes at 8 is 400"
-        (ng (enchiridion.memory:volume-gate store id :per-episode 8))
-        (ok (enchiridion.memory:volume-gate store id :per-episode 9))))
-    (enchiridion.memory.store:exec
-     store
-     "INSERT INTO generations (number, status, created_ts, writes, episodes_derived)
-        VALUES (2, 'candidate', 0, 1, 0)")
-    (testing "a build that derived nothing may write nothing"
-      (ng (enchiridion.memory:volume-gate store (enchiridion.memory.store:last-row-id store)
-                                          :per-episode 8)))
+    (let ((episode (enchiridion.memory:episode-id
+                    (enchiridion.memory:write-episode store :session "s" :role "user"
+                                                            :body "a record" :derive-p nil))))
+      (enchiridion.memory.store:exec
+       store "INSERT INTO generations (number, status, created_ts, writes, episodes_derived)
+                VALUES (1, 'candidate', 0, 999, 1)")
+      (let ((id (enchiridion.memory.store:last-row-id store)))
+        (flet ((claim (n run)
+                 (enchiridion.memory.store:exec
+                  store "INSERT INTO assertions (generation_id, subject, relation, object,
+                                                 episode_id, span_start, span_end, tx_from, run_id)
+                           VALUES (?, 's', 'r', ?, ?, 0, 1, 0, ?)"
+                  (list id (format nil "o~D-~D" run n) episode run))))
+          (dotimes (n 9) (claim n id))
+          (dotimes (n 5) (claim n 77)))
+        (testing "nine own claims for one episode: within 9 each, over 8 each"
+          (ok (enchiridion.memory:volume-gate store id :per-episode 9))
+          (ng (enchiridion.memory:volume-gate store id :per-episode 8)))))
     (testing "a generation that does not exist does not pass"
       (ng (enchiridion.memory:volume-gate store 999)))))
 

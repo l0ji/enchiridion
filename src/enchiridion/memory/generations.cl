@@ -333,20 +333,31 @@ The table's unique pair key makes a duplicate detection a no-op."
 (defun detect-candidate-conflicts (store generation-id assertion now)
   "Detect ASSERTION's conflicts in GENERATION-ID and return a plist of counts.
 An update closes the old interval; every other pair becomes a conflict row.
-The change-event test is a SQL query over the candidate, not a model call."
-  (let ((existing (candidate-existing-assertions store generation-id assertion))
-        (conflicts 0)
-        (closed 0))
-    (when existing
+The change-event test is a SQL query over the candidate, not a model call.
+
+Two pairs are not conflicts. An assertion from the same episode: one record
+that lists several values for a relation is not contradicting itself. And any
+pair once the subject and relation already hold two live objects: the relation
+has many values, a hummus and its ingredients, and every new object opening a
+conflict with every earlier one was quadratic, 1,806 rows for one relation on
+the trial log. A one-valued relation still conflicts on its second object."
+  (let* ((existing (candidate-existing-assertions store generation-id assertion))
+         (set-p (>= (length existing) 2))
+         (others (remove (assertion-episode-id assertion) existing
+                         :key #'assertion-episode-id))
+         (conflicts 0)
+         (closed 0))
+    (when others
       (multiple-value-bind (new-conflicts superseded)
-          (detect-conflicts assertion existing
+          (detect-conflicts assertion others
                             :now now
                             :change-event-p (change-event-present-p
                                              store generation-id assertion)
                             :continuing-evidence-p nil)
-        (dolist (conflict new-conflicts)
-          (when (plusp (insert-conflict store conflict generation-id generation-id))
-            (incf conflicts)))
+        (unless set-p
+          (dolist (conflict new-conflicts)
+            (when (plusp (insert-conflict store conflict generation-id generation-id))
+              (incf conflicts))))
         (dolist (old superseded)
           (enchiridion.memory.store:exec
            store

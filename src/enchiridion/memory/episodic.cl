@@ -944,83 +944,98 @@ changed."
   "Return one assertion as the line a pack shows: the claim, not its episode."
   (format nil "~A ~:[not ~;~]~A ~A" subject (not (eql polarity 0)) relation object))
 
+(defparameter +assertion-candidate-columns+
+  "a.id, a.subject, a.relation, a.object, a.polarity, a.valid_from, a.valid_to,
+   a.cue_type, a.episode_id, a.tx_to, e.session, e.context_key, e.ts,
+   act.n_enc, act.last_enc, act.n_ret, act.last_ret, act.created_ts, act.supp,
+   act.supp_ts, act.imp, act.distinctness"
+  "The columns both routes to an assertion select.")
+
+(defun assertion-candidate (row now)
+  "Return ROW, one assertion and its supporting episode, as a candidate plist."
+  (let ((created (enchiridion.memory.store:field row "created_ts"))
+        (id (enchiridion.memory.store:field row "id")))
+    (list :kind "assertion"
+          :id id
+          :body (assertion-text
+                 (enchiridion.memory.store:field row "subject")
+                 (enchiridion.memory.store:field row "relation")
+                 (enchiridion.memory.store:field row "object")
+                 (enchiridion.memory.store:field row "polarity"))
+          :episode-id (enchiridion.memory.store:field row "episode_id")
+          :ts (enchiridion.memory.store:field row "ts")
+          :lexical (let ((bm25 (enchiridion.memory.store:field row "lexical")))
+                     (if bm25 (- (float bm25)) 0.0))
+          :route-ranks '()
+          :context (split-context-key
+                    (enchiridion.memory.store:field row "context_key"))
+          :cue-type (enchiridion.memory.store:field row "cue_type")
+          :valid-from (enchiridion.memory.store:field row "valid_from")
+          :valid-to (enchiridion.memory.store:field row "valid_to")
+          :assertion (list :subject (enchiridion.memory.store:field row "subject")
+                           :relation (enchiridion.memory.store:field row "relation")
+                           :object (enchiridion.memory.store:field row "object"))
+          :activation
+          (make-activation
+           :kind "assertion" :id id
+           :n-enc (or (enchiridion.memory.store:field row "n_enc") 1)
+           :last-enc (enchiridion.memory.store:field row "last_enc")
+           :n-ret (or (enchiridion.memory.store:field row "n_ret") 0)
+           :last-ret (enchiridion.memory.store:field row "last_ret")
+           :created-ts (or created now)
+           :supp (or (enchiridion.memory.store:field row "supp") 0.0)
+           :supp-ts (enchiridion.memory.store:field row "supp_ts")
+           :imp (or (enchiridion.memory.store:field row "imp") 5)
+           :distinctness (or (enchiridion.memory.store:field row "distinctness")
+                             0.0)))))
+
 (defun assertion-candidates-for (store cue &key generation (limit 200)
                                               (now (get-universal-time)))
-  "Return GENERATION's assertion candidates for CUE, reached through their
-supporting episode, or NIL when GENERATION is NIL or 0.
+  "Return GENERATION's assertion candidates for CUE, or NIL when GENERATION is
+NIL or 0.
 
-An assertion has no body of its own, so the lexical pass runs over the episode
-that carries it and the assertion inherits the span's terms and BM25 score, on
-the same scale as the episode candidates it competes with.  This is what keeps
-the span requirement load-bearing: an assertion with no episode is unreachable
-by the lexical channel, which is the intended consequence.  Only the named
-generation is read, so a candidate is invisible to a read of the live layer."
+Two routes reach an assertion.  The claim route matches the cue against the
+assertion's own words, so a claim is found by a term its source episode never
+used: that is the recall the semantic layer can add.  The support route
+matches the episode the claim came from, so a claim is never harder to find
+than its evidence.  A candidate found by both appears once, and :ROUTE-RANKS
+holds its rank in each route, which RETRIEVE-ROWS-FOR-TURN fuses with the
+episode ranking: BM25 from two indexes is not on one scale, ranks are.  Only
+the named generation is read, so a candidate is invisible to the live layer."
   (when (and generation (plusp generation))
-    (loop for row in (enchiridion.memory.store:query-rows
-                      store
-                      "SELECT a.id, a.subject, a.relation, a.object, a.polarity,
-                              a.valid_from, a.valid_to, a.cue_type, a.episode_id,
-                              a.tx_to, e.session, e.context_key, e.ts,
-                              bm25(episodes_fts) AS lexical,
-                              act.n_enc, act.last_enc, act.n_ret, act.last_ret,
-                              act.created_ts, act.supp, act.supp_ts, act.imp,
-                              act.distinctness
-                         FROM episodes_fts
-                         JOIN episodes e ON e.id = episodes_fts.rowid
-                         JOIN assertions a ON a.episode_id = e.id
-                         LEFT JOIN activation act
-                                ON act.kind = 'assertion' AND act.id = a.id
-                        WHERE episodes_fts MATCH ? AND a.tx_to IS NULL
-                          AND a.generation_id = ?
-                        ORDER BY rank
-                        LIMIT ?"
-                      (list (cue-match cue) generation limit))
-          collect (let ((created (enchiridion.memory.store:field row "created_ts"))
-                        (id (enchiridion.memory.store:field row "id")))
-                    (list :kind "assertion"
-                          :id id
-                          :body (assertion-text
-                                 (enchiridion.memory.store:field row "subject")
-                                 (enchiridion.memory.store:field row "relation")
-                                 (enchiridion.memory.store:field row "object")
-                                 (enchiridion.memory.store:field row "polarity"))
-                          :episode-id (enchiridion.memory.store:field row "episode_id")
-                          :ts (enchiridion.memory.store:field row "ts")
-                          :lexical (let ((bm25 (enchiridion.memory.store:field
-                                                row "lexical")))
-                                     (if bm25 (- (float bm25)) 0.0))
-                          :context (split-context-key
-                                    (enchiridion.memory.store:field row
-                                                                     "context_key"))
-                          :cue-type (enchiridion.memory.store:field row "cue_type")
-                          :valid-from (enchiridion.memory.store:field row
-                                                                       "valid_from")
-                          :valid-to (enchiridion.memory.store:field row "valid_to")
-                          :assertion (list :subject (enchiridion.memory.store:field
-                                                     row "subject")
-                                           :relation (enchiridion.memory.store:field
-                                                      row "relation")
-                                           :object (enchiridion.memory.store:field
-                                                    row "object"))
-                          :activation
-                          (make-activation
-                           :kind "assertion" :id id
-                           :n-enc (or (enchiridion.memory.store:field row "n_enc")
-                                      1)
-                           :last-enc (enchiridion.memory.store:field row
-                                                                       "last_enc")
-                           :n-ret (or (enchiridion.memory.store:field row "n_ret")
-                                      0)
-                           :last-ret (enchiridion.memory.store:field row
-                                                                       "last_ret")
-                           :created-ts (or created now)
-                           :supp (or (enchiridion.memory.store:field row "supp")
-                                     0.0)
-                           :supp-ts (enchiridion.memory.store:field row "supp_ts")
-                           :imp (or (enchiridion.memory.store:field row "imp") 5)
-                           :distinctness (or (enchiridion.memory.store:field row
-                                                                            "distinctness")
-                                             0.0)))))))
+    (let ((match (cue-match cue))
+          (by-id (make-hash-table))
+          (order '()))
+      (flet ((route (statement)
+               (loop for row in (enchiridion.memory.store:query-rows
+                                 store statement (list match generation limit))
+                     for rank from 0
+                     for id = (enchiridion.memory.store:field row "id")
+                     do (unless (gethash id by-id)
+                          (push id order)
+                          (setf (gethash id by-id) (assertion-candidate row now)))
+                        (push rank (getf (gethash id by-id) :route-ranks)))))
+        (route (format nil "SELECT ~A, bm25(assertions_fts) AS lexical
+                              FROM assertions_fts
+                              JOIN assertions a ON a.id = assertions_fts.rowid
+                              JOIN episodes e ON e.id = a.episode_id
+                              LEFT JOIN activation act
+                                     ON act.kind = 'assertion' AND act.id = a.id
+                             WHERE assertions_fts MATCH ? AND a.tx_to IS NULL
+                               AND a.generation_id = ?
+                             ORDER BY rank LIMIT ?"
+                       +assertion-candidate-columns+))
+        (route (format nil "SELECT ~A, bm25(episodes_fts) AS lexical
+                              FROM episodes_fts
+                              JOIN episodes e ON e.id = episodes_fts.rowid
+                              JOIN assertions a ON a.episode_id = e.id
+                              LEFT JOIN activation act
+                                     ON act.kind = 'assertion' AND act.id = a.id
+                             WHERE episodes_fts MATCH ? AND a.tx_to IS NULL
+                               AND a.generation_id = ?
+                             ORDER BY rank LIMIT ?"
+                       +assertion-candidate-columns+)))
+      (mapcar (lambda (id) (gethash id by-id)) (nreverse order)))))
 
 (defun graph-for (store &key (limit *memory-graph-limit*) (kinds '("episode" "assertion")))
   "Return the link graph RETRIEVE walks: a hash table of node to out-links."

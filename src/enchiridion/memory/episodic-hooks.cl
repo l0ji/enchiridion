@@ -261,6 +261,26 @@ not a report. OBSERVED stays NULL until an external signal arrives."
    (list ts predicted cue (or cue-terms "") (or pack-refs "") generation-id))
   (enchiridion.memory.store:last-row-id store))
 
+(defun fuse-semantic-candidates (episodes assertions)
+  "Return EPISODES and ASSERTIONS as one candidate list on one lexical scale.
+
+With no ASSERTIONS the episodes are returned untouched, so a turn with no
+live generation, and the retention-only arm, rank exactly as they always have.
+Otherwise each candidate's :LEXICAL becomes the reciprocal-rank fusion of its
+ranks: an episode's in the episode ranking, an assertion's in each route that
+found it.  BM25 from the episode index and the claim index is not on one
+scale, so the ranks are what is compared."
+  (if (null assertions)
+      episodes
+      (let ((k (parameter :rrf-k *memory-parameters*))
+            (ranked (stable-sort (copy-list episodes) #'>
+                                 :key (lambda (item) (or (getf item :lexical) 0.0)))))
+        (loop for item in ranked for rank from 0
+              do (setf (getf item :lexical) (rrf (list rank) k)))
+        (dolist (item assertions)
+          (setf (getf item :lexical) (rrf (getf item :route-ranks) k)))
+        (append episodes assertions))))
+
 (defun retrieve-rows-for-turn (store text &key (session "default") (channel :cli)
                                                (now (get-universal-time))
                                                (top-k (parameter :top-k
@@ -277,13 +297,14 @@ is that generation, which is the candidate arm a gate measures; NIL is the log
 alone, the retention-only arm."
   (when (and store (tokenise text))
     (let ((candidates
-            (append (hybrid-candidates store text :limit 200 :now now)
-                    (assertion-candidates-for
-                     store text
-                     :generation (if (eq generation :live)
-                                     (live-generation-id store)
-                                     generation)
-                     :limit 200 :now now))))
+            (fuse-semantic-candidates
+             (hybrid-candidates store text :limit 200 :now now)
+             (assertion-candidates-for
+              store text
+              :generation (if (eq generation :live)
+                              (live-generation-id store)
+                              generation)
+              :limit 200 :now now))))
       (when candidates
         (retrieve candidates text
                   (list "" session (string-downcase (string channel)))

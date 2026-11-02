@@ -46,6 +46,9 @@ A utility task is a user turn and the assistant turn that answered it, in the sa
 It scores 1 when a retrieval for the question brings back the answer, or an assertion derived from it, and 0 otherwise, so the candidate arm and the retention-only arm are scored on the same questions.
 The tail sample is the subset of those tasks whose answer is rare: what consolidation loses first is the rare record.
 
+The deriver is shown the turn before each record, so an answer such as "in vault under ops" can become a claim about what the question asked; every span must still point into the record.
+An assertion is indexed by its claim, so the candidate arm can recall an answer whose own words never matched the question, which is the only recall the semantic layer can add over the log.
+
 A canary checks behaviour in a retrieval for its `:cue`, never presence in the store.
 `sync-canaries` makes the canary table hold exactly the valid configured canaries, so one the operator removes stops counting.
 
@@ -74,8 +77,8 @@ The design enables it only after a paired no-harm run.
 
 1. Scrub the operator's text.
 2. Tokenise the text into a cue and store the cue with the retrieval prediction.
-3. Ask the full-text index for candidate episodes.
-4. Rank the candidates with the score, which is BM25 relevance under the shipped weights.
+3. Ask the full-text index for candidate episodes, and, when a generation is live, its assertions: by their own claim (`assertions_fts`) and through the episode each came from.
+4. Rank the candidates with the score, which is BM25 relevance under the shipped weights. When assertions are among them, every candidate's lexical term is the reciprocal-rank fusion of its ranks, because BM25 from two indexes is not on one scale. With no live generation the ranking is exactly the episode ranking.
 5. Render up to twelve records into a pack of at most four thousand four hundred and fifty characters. Each record shows the four hundred characters of its body that hold the most cue terms, with an ellipsis where it was cut.
 6. Put the pack at the head of the user message, with a data-only header and a `[ref ...]` tag per record.
 7. Persist the original text as one episode; the turns view exposes it.

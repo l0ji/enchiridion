@@ -167,11 +167,14 @@
 (defstruct (json-backend (:constructor make-json-backend))
   (text "[]" :type string)
   (input-tokens 0 :type integer)
-  (output-tokens 0 :type integer))
+  (output-tokens 0 :type integer)
+  (last-prompt "" :type string))
 
 (defmethod enchiridion.llm:complete ((backend json-backend) messages
                                      &key model tools budget)
-  (declare (ignore messages model tools budget))
+  (declare (ignore model tools budget))
+  (setf (json-backend-last-prompt backend)
+        (enchiridion.llm:message-content (car (last messages))))
   (enchiridion.llm::%make-completion
    :text (json-backend-text backend)
    :model "json-fake"
@@ -571,3 +574,92 @@ for five tasks."
       (ok (string= "post-canary" (getf report :failed)))
       (ok (zerop (enchiridion.memory:live-generation-id store)))
       (ok (string= "rolled-back" (status-of store generation))))))
+
+;;;; The semantic layer is findable.
+
+(defun context-deriver (store episode)
+  "Derive \"serviceN secret kept in vaultN\" from an answer, taking the
+subject from the question before it, the way the model deriver is asked to."
+  (let* ((body (enchiridion.memory:episode-body episode))
+         (context (enchiridion.memory::previous-episode-body store episode))
+         (service (and context (search "service" context)))
+         (vault (search "vault" body)))
+    (if (and service vault)
+        (let ((n (char context (+ service 7))))
+          (values (list (enchiridion.memory:make-assertion
+                         :subject (format nil "service~C secret" n)
+                         :relation "kept in"
+                         :object (format nil "vault~C" n)
+                         :episode-id (enchiridion.memory:episode-id episode)
+                         :span-start vault :span-end (+ vault 6)
+                         :valid-from 100 :provenance "agent" :authority 3))
+                  nil))
+        (values nil nil))))
+
+(defun answered-questions (store count)
+  "Write COUNT questions whose answers share none of their words."
+  (dotimes (i count)
+    (say store "user" (format nil "where does service~D keep its secret" i))
+    (say store "assistant" (format nil "in vault~D under ops" i))))
+
+(deftest a-claim-is-found-by-words-its-episode-never-used ()
+  (with-store (store directory)
+    (let ((enchiridion.memory:*assertion-deriver* #'context-deriver))
+      (answered-questions store 1)
+      (let ((generation (getf (enchiridion.memory:build-candidate store :limit 10)
+                              :generation-id)))
+        (testing "the answer episode alone does not match the question"
+          (ok (null (enchiridion.memory:answer-hit-p
+                     (enchiridion.memory:retrieve-rows-for-turn
+                      store "where does service0 keep its secret" :generation nil)
+                     2))))
+        (testing "its claim does, through the claim route"
+          (let ((hits (enchiridion.memory:assertion-candidates-for
+                       store "service0 secret" :generation generation)))
+            (ok (= 1 (length hits)))
+            (ok (equal '(0) (getf (first hits) :route-ranks)))))))))
+
+(deftest a-retrieval-with-no-assertions-is-ranked-as-before ()
+  (let ((episodes (list (list :kind "episode" :id 1 :lexical 3.0)
+                        (list :kind "episode" :id 2 :lexical 1.0))))
+    (ok (eq episodes (enchiridion.memory::fuse-semantic-candidates episodes '())))
+    (ok (= 3.0 (getf (first episodes) :lexical)))))
+
+(deftest the-deriver-is-shown-the-turn-before-the-record ()
+  (with-store (store directory)
+    (say store "user" "where does service4 keep its secret")
+    (let* ((answer (enchiridion.memory:write-episode
+                    store :session "s" :role "assistant" :body "in vault4 under ops"
+                          :derive-p nil))
+           (backend (make-json-backend))
+           (deriver (enchiridion.memory:make-model-assertion-deriver backend)))
+      (funcall deriver store answer)
+      (let ((prompt (json-backend-last-prompt backend)))
+        (ok (search "where does service4 keep its secret" prompt))
+        (ok (< (search "service4" prompt) (search "in vault4 under ops" prompt)))))))
+
+(deftest a-candidate-that-adds-recall-passes-the-real-utility-gate ()
+  ;; No stub scorer: the answers share no word with their questions, so the
+  ;; log alone recalls none of them, and the candidate's claims recall all.
+  (with-store (store directory)
+    (let ((enchiridion.memory:*assertion-deriver* #'context-deriver)
+          (enchiridion.memory:*canary-min-families* 4)
+          (enchiridion.memory::*memory-gate-min-n* 5)
+          (enchiridion.memory:*tail-min-n* 1)
+          (enchiridion.memory:*tail-rarity-fraction* 1.0))
+      (answered-questions store 6)
+      (enchiridion.memory.store:exec store "UPDATE episodes SET derived_ts = 1")
+      (let* ((generation (getf (enchiridion.memory:build-candidate store :limit 100)
+                               :generation-id))
+             (report (enchiridion.memory:gate-candidate
+                      store generation
+                      :canaries (list (canary "retrieval" :cue "service1 secret" :expect "vault1")
+                                      (canary "update" :cue "service2 secret"
+                                                       :expect "vault2" :stale "zzz")
+                                      (canary "safety" :cue "service1 secret" :expect "hunter2")
+                                      (canary "tail" :cue "service3 secret" :expect "vault3")))))
+        (ok (getf report :promoted))
+        (multiple-value-bind (pass utility) (enchiridion.memory:utility-gate store generation)
+          (ok pass)
+          (ok (= 6 (getf utility :wins))))
+        (ok (= generation (enchiridion.memory:live-generation-id store)))))))

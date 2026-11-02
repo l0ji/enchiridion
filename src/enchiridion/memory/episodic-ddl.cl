@@ -23,7 +23,7 @@ DROP-STORE drops these before the tables they read.")
 
 (defparameter *episodic-tables*
   '("generation_checks" "generation_derivations" "conflict_resolutions"
-    "conflicts" "assertions" "change_events" "summaries" "procedures"
+    "conflicts" "assertions_fts" "assertions" "change_events" "summaries" "procedures"
     "schemas" "episodes_fts" "episode_vectors" "episodes" "cue_index" "activation" "links"
     "retrievals" "calibration" "canary" "gate_log" "change_proposals"
     "projections" "memory_state" "generations")
@@ -269,6 +269,29 @@ references.")
    "CREATE INDEX IF NOT EXISTS assertions_valid
       ON assertions(generation_id, valid_from, valid_to)"
    "CREATE INDEX IF NOT EXISTS assertions_run ON assertions(run_id)"
+
+   ;; An assertion is found by its own claim as well as through the episode
+   ;; it came from: without this a claim cannot be reached by a word its
+   ;; source episode lacks, and the semantic layer can add no recall.
+   "CREATE VIRTUAL TABLE IF NOT EXISTS assertions_fts
+      USING fts5(claim, tokenize='porter unicode61')"
+   "CREATE TRIGGER IF NOT EXISTS assertions_ai AFTER INSERT ON assertions BEGIN
+      INSERT INTO assertions_fts(rowid, claim)
+        VALUES (new.id, new.subject || ' ' || new.relation || ' ' || new.object);
+    END"
+   "CREATE TRIGGER IF NOT EXISTS assertions_ad AFTER DELETE ON assertions BEGIN
+      DELETE FROM assertions_fts WHERE rowid = old.id;
+    END"
+   "CREATE TRIGGER IF NOT EXISTS assertions_au
+      AFTER UPDATE OF subject, relation, object ON assertions BEGIN
+      DELETE FROM assertions_fts WHERE rowid = old.id;
+      INSERT INTO assertions_fts(rowid, claim)
+        VALUES (new.id, new.subject || ' ' || new.relation || ' ' || new.object);
+    END"
+   ;; A store written before the index existed gets its claims indexed once.
+   "INSERT INTO assertions_fts(rowid, claim)
+      SELECT id, subject || ' ' || relation || ' ' || object FROM assertions
+       WHERE id NOT IN (SELECT rowid FROM assertions_fts)"
 
    "CREATE TABLE IF NOT EXISTS schemas (
       id              INTEGER PRIMARY KEY AUTOINCREMENT,

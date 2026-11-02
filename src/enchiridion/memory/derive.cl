@@ -13,7 +13,7 @@
 (in-package #:enchiridion.memory)
 
 (defparameter +assertion-parser-brief+
-  "You extract factual assertions from one episodic record. Answer with a JSON array only. Each element has subject, relation, object, polarity (1 or 0), span_start, span_end, valid_from and valid_to. The span is a character range in the record that contains the evidence for the assertion. Use null for an unknown valid_from or valid_to. If the record contains no factual assertion, answer []."
+  "You extract factual assertions from one episodic record. Answer with a JSON array only. Each element has subject, relation, object, polarity (1 or 0), span_start, span_end, valid_from and valid_to. The span is a character range in the record that contains the evidence for the assertion. Use null for an unknown valid_from or valid_to. If the record contains no factual assertion, answer []. You may also be given the turn before the record: use it only to understand what the record refers to, for example to name the subject an answer is about. Every span must point into the record, never into the earlier turn."
   "The parser's only persona. It is a data task, not a conversation.")
 
 (defun json-object-field (object key &optional default)
@@ -112,6 +112,29 @@ span is not an assertion."
           for assertion = (assertion-from-json object episode)
           when assertion collect assertion)))
 
+(defparameter +deriver-context-limit+ 600
+  "How much of the turn before a record reaches the deriver's prompt.")
+
+(defun previous-episode-body (store episode)
+  "Return the body of the turn before EPISODE in its session, or NIL.
+An answer is about the question before it, and a claim like \"the deploy key
+is in vault\" can only be derived from \"in vault under ops\" with that
+question in view. The sleep channel's own turns and memory rows are not part
+of the conversation and are skipped."
+  (when store
+    (let ((row (first (enchiridion.memory.store:query-rows
+                       store
+                       "SELECT body FROM episodes
+                         WHERE session = ? AND id < ?
+                           AND channel <> 'sleep' AND role <> 'memory'
+                         ORDER BY id DESC LIMIT 1"
+                       (list (episode-session episode) (episode-id episode))))))
+      (when row
+        (let ((body (enchiridion.memory.store:field row "body")))
+          (if (> (length body) +deriver-context-limit+)
+              (subseq body 0 +deriver-context-limit+)
+              body))))))
+
 (defun make-model-assertion-deriver (backend &key model)
   "Return a deriver that asks BACKEND to turn one episode into assertions.
 The call is off the interactive path. A malformed response yields no
@@ -122,10 +145,12 @@ the :t2 channel, and into *DERIVATION-TOKENS* when a build has bound it, so a
 T2 pass has a cost the gates and the usage report can both see."
   (lambda (store episode)
     (let* ((body (episode-body episode))
+           (context (previous-episode-body store episode))
            (messages (list (enchiridion.llm:system-message
                             +assertion-parser-brief+)
                            (enchiridion.llm:user-message
-                            (format nil "Session ~A, role ~A, channel ~A.~%~A"
+                            (format nil "~@[Earlier turn, for context only:~%~A~%~%~]Record. Session ~A, role ~A, channel ~A.~%~A"
+                                    context
                                     (episode-session episode)
                                     (episode-role episode)
                                     (episode-channel episode)

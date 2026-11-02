@@ -23,6 +23,14 @@
     (ok (= 11 (enchiridion.memory:block-slack block)))
     (ng (enchiridion.memory:block-full-p block))))
 
+(deftest an-alias-reports-the-limit-of-its-block ()
+  ;; The block tool and the blocks command both accept "soul" for SOUL.md, and
+  ;; a write through the alias must be checked against the persona's limit.
+  (ok (= (enchiridion.memory:default-block-limit :persona)
+         (enchiridion.memory:default-block-limit :soul)))
+  (ok (= (enchiridion.memory:default-block-limit :persona)
+         (enchiridion.memory:default-block-limit "soul"))))
+
 (deftest a-block-with-no-limit-uses-the-default-for-its-label ()
   (let ((block (enchiridion.memory:make-block :label :world :text "")))
     (ok (= 3000 (enchiridion.memory:block-limit block)))))

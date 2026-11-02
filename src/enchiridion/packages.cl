@@ -227,7 +227,7 @@ did not think of."))
    ;; Blocks.
    #:block #:make-block #:block-label #:block-text #:block-limit
    #:block-file #:block-writable-p #:block-bytes #:block-full-p #:block-slack
-   #:default-block-limit #:scan-block-text
+   #:default-block-limit #:canonical-block-label #:scan-block-text
    #:set-block-text #:compile-blocks #:block-summary #:block-descriptions
    #:*block-limits* #:*unlisted-block-limit*
    ;; The bootstrap state machine.

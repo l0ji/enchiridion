@@ -22,12 +22,26 @@
 ;; the status line, so its limit is small on purpose: it is resident in every
 ;; prompt until the first steps are done.
 
+(defparameter +block-label-aliases+ '((:soul . :persona))
+  "Labels the tools and commands accept as another name for a block. SOUL.md
+is the persona block, and an operator may call it either; a limit looked up
+under the alias would be the unlisted one, not the persona's.")
+
+(declaim (ftype (function (t) keyword) canonical-block-label))
+
+(defun canonical-block-label (label)
+  "Return the keyword LABEL names, with an alias resolved to its block."
+  (let ((label (if (keywordp label)
+                   label
+                   (intern (string-upcase (string label)) :keyword))))
+    (or (cdr (assoc label +block-label-aliases+ :test #'eq)) label)))
+
 (declaim (ftype (function (t) (integer 1 *)) default-block-limit))
 
 (defun default-block-limit (label)
   "Return the configured limit for LABEL, or the unlisted limit for a label
-the configuration does not name."
-  (or (getf *block-limits* label) *unlisted-block-limit*))
+the configuration does not name. An alias reports its block's limit."
+  (or (getf *block-limits* (canonical-block-label label)) *unlisted-block-limit*))
 
 ;;;; The scan.
 

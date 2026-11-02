@@ -499,31 +499,47 @@ operator has to supply rather than only that something is wrong."
 ;;;; 9. The gate pipeline
 ;;;; ------------------------------------------------------------------
 
-(defun promotion-tokens (store generation-id)
-  "Return the tokens every generation built since the live one has cost, up to
-and including GENERATION-ID: the cost of reaching this promotion, quarantined
+(defun promotion-sum (store generation-id column)
+  "Return COLUMN summed over every generation built since the live one, up to
+and including GENERATION-ID: what reaching this promotion took, quarantined
 attempts included."
   (or (enchiridion.memory.store:field
        (first (enchiridion.memory.store:query-rows
                store
-               "SELECT COALESCE(SUM(tokens_used), 0) AS n FROM generations
-                 WHERE id > ? AND id <= ?"
+               (format nil "SELECT COALESCE(SUM(~A), 0) AS n FROM generations
+                             WHERE id > ? AND id <= ?" column)
                (list (live-generation-id store) generation-id)))
        "n")
       0))
 
+(defun promotion-tokens (store generation-id)
+  "Return the tokens the generations since the live one have cost, up to and
+including GENERATION-ID."
+  (promotion-sum store generation-id "tokens_used"))
+
+(defun promotion-episodes (store generation-id)
+  "Return the episodes the generations since the live one derived themselves,
+up to and including GENERATION-ID."
+  (promotion-sum store generation-id "episodes_derived"))
+
 (defun cost-gate (store generation-id &key (per-episode *memory-writes-per-episode*)
-                                           (max-tokens *t2-max-tokens-per-promotion*))
+                                           (tokens-per-episode *t2-max-tokens-per-episode*))
   "Return two values: T when GENERATION-ID wrote at most PER-EPISODE rows for
-each episode it derived and
-the generations since the last promotion cost at most MAX-TOKENS, and a
-report.  A pass that never promotes is pure cost, so the cost is counted per
-promotion, not per candidate."
-  (let ((tokens (promotion-tokens store generation-id)))
+each episode it derived, and the generations since the last promotion cost at
+most TOKENS-PER-EPISODE for each episode they derived; and a report.
+
+The cost is per episode and not one number per promotion, because a first
+build derives the whole log: a fixed 600,000 quarantined the first build of
+any log over about 400 episodes after its tokens were already spent. What
+bounds the money is the rolling day cap on T2 spend; this gate bounds how
+much each episode's semantics may cost, so a wasteful deriver still fails."
+  (let ((tokens (promotion-tokens store generation-id))
+        (episodes (promotion-episodes store generation-id)))
     (values (and (volume-gate store generation-id :per-episode per-episode)
-                 (<= tokens max-tokens))
+                 (<= tokens (* tokens-per-episode episodes)))
             (let ((row (generation-row store generation-id)))
               (list :tokens tokens
+                    :episodes-since-promotion episodes
                     :writes (enchiridion.memory.store:field row "writes")
                     :episodes (enchiridion.memory.store:field row "episodes_derived"))))))
 

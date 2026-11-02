@@ -55,7 +55,7 @@ The promotion gates, in order:
 2. Canary. Operator-authored behavioural checks pass. Four families are required: retrieval, update/conflict, safety, degradation/tail. An unchecked suite freezes promotion.
 3. Utility. Candidate versus retention-only on paired tasks at matched budget. Margin 0.05, at least 100 non-tied pairs, one-sided sign test p < 0.05.
 4. Tail. Rare episodes are the top 10 per cent by rarity, minimum 50. Candidate retrieval recall must not fall more than 0.02 below retention-only.
-5. Volume and cost. At most 8 semantic writes per episode a candidate derived, 200,000 tokens of T2 spend in any 24 hours, 600,000 per promotion. These replace 400 writes, 30,000 and 75,000, which a measured deriver (about 1,500 tokens and 4.7 assertions an episode) could not fit one 200-episode pass inside.
+5. Volume and cost. At most 8 semantic writes per episode a candidate derived, 200,000 tokens of T2 spend in any 24 hours, 3,000 tokens per episode derived since the last promotion. These replace 400 writes, 30,000 and 75,000 per promotion, which a measured deriver (about 1,500 tokens and 4.7 assertions an episode) could not fit one 200-episode pass inside.
 
 Two controls bound autonomy.
 Promotion precision is the share of the last 20 promotions that pass the next canary and utility run, with at least 5 checked promotions; below 0.8 freezes promotion.

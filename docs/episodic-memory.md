@@ -66,7 +66,7 @@ A canary checks behaviour in a retrieval for its `:cue`, never presence in the s
 | Canary | the configured canaries cover `:canary-min-families` and every one holds in a retrieval reading the candidate |
 | Utility | over the utility tasks scored under both arms, the mean delta is at least `:gate-margin`, at least `:gate-min-n` pairs are not tied, and the one-sided sign test is below `:gate-alpha` |
 | Tail | on the tasks with rare answers, the candidate's recall, an answer anywhere in the gate's pack, is no more than `:tail-margin` below retention-only's |
-| Cost | the candidate wrote at most `:t2-writes-per-episode` rows per episode it derived and the candidates since the last promotion cost at most `:t2-max-tokens-per-promotion` tokens |
+| Cost | the candidate wrote at most `:t2-writes-per-episode` rows per episode it derived and the candidates since the last promotion cost at most `:t2-max-tokens-per-episode` tokens per episode they derived |
 
 Each gate writes a `generation_checks` row.
 A failure sets the candidate to `quarantined` with the gate's name as `quarantine_reason`, and the live layer is untouched.

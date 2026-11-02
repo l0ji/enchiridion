@@ -239,9 +239,12 @@ store path. The model defaults match the shipped adapter defaults."
     ;; :max-tokens: a reasoning model spends its cap thinking, and at 4096 it
     ;; was cut off before it answered on most records.
     (:t2-deriver-max-tokens 16384)
+    (:t2-deriver-concurrency 4)
     ;; The model the T2 deriver calls; NIL is the :llm section's :model-cheap.
     (:t2-deriver-model nil)
-    (:t2-max-tokens-per-promotion 600000)
+    ;; Per episode derived since the last promotion: about twice a measured
+    ;; 1,500, and it scales to a first build of an imported log.
+    (:t2-max-tokens-per-episode 3000)
     (:t2-writes-per-episode 8)
     (:canaries nil)
     (:canary-min-families 4)

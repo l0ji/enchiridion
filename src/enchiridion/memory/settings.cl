@@ -85,10 +85,10 @@ the same thing in less room.")
       "How far the candidate's recall on rare answers may fall below
 retention-only before the tail gate fails.")
 
-(defvar *t2-max-tokens-per-promotion*)
-(setf (documentation '*t2-max-tokens-per-promotion* 'variable)
+(defvar *t2-max-tokens-per-episode*)
+(setf (documentation '*t2-max-tokens-per-episode* 'variable)
       "The most tokens the candidates built since the last promotion may have
-cost, together, for the next one to be promoted.")
+cost for each episode they derived, for the next one to be promoted.")
 
 (defvar *memory-writes-per-episode*)
 (setf (documentation '*memory-writes-per-episode* 'variable)
@@ -150,6 +150,12 @@ that reaches it pauses and resumes once the window has room.")
 (setf (documentation '*t2-deriver-max-tokens* 'variable)
       "The reply cap of one T2 deriver call. The deriver gets a backend of its
 own with this cap, so the chat path keeps the :llm section's :max-tokens.")
+
+(defvar *t2-deriver-concurrency*)
+(setf (documentation '*t2-deriver-concurrency* 'variable)
+      "How many T2 deriver calls may be in flight at once. A call is mostly
+waiting on the provider, so a batch takes about its slowest calls rather than
+the sum of them. 1 derives one episode at a time.")
 
 (defvar *t2-deriver-model*)
 (setf (documentation '*t2-deriver-model* 'variable)
@@ -221,7 +227,7 @@ key by key to the shipped defaults. Return NIL."
           *memory-gate-alpha* (setting :gate-alpha)
           *memory-tail-margin* (setting :tail-margin)
           *gate-pack-chars* (setting :gate-pack-chars)
-          *t2-max-tokens-per-promotion* (setting :t2-max-tokens-per-promotion)
+          *t2-max-tokens-per-episode* (setting :t2-max-tokens-per-episode)
           *memory-canaries* (let ((own (setting :canaries))) (if (listp own) own '()))
           *canary-min-families* (setting :canary-min-families)
           *tail-rarity-fraction* (setting :tail-rarity-fraction)
@@ -237,6 +243,7 @@ key by key to the shipped defaults. Return NIL."
           *t2-episode-threshold* (setting :t2-episode-threshold)
           *t2-max-tokens-per-pass* (setting :t2-max-tokens-per-pass)
           *t2-deriver-max-tokens* (setting :t2-deriver-max-tokens)
+          *t2-deriver-concurrency* (max 1 (setting :t2-deriver-concurrency))
           *t2-deriver-model* (let ((own (setting :t2-deriver-model)))
                                (and (stringp own) (plusp (length own)) own))
           *t2-interval-seconds* (setting :t2-interval-seconds)

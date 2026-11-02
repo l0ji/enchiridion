@@ -947,12 +947,14 @@ shipped schedule."
 
 (deftest a-failed-deriver-call-ends-the-batch-and-keeps-what-it-did ()
   (with-store (store directory)
-    (let* ((calls 0)
+    (let* ((failed-once nil)
            (enchiridion.memory:*assertion-deriver*
              (lambda (store episode)
-               (incf calls)
-               (if (= calls 2)
-                   (error 'enchiridion.errors:transport-error :detail "no reply")
+               ;; By episode and not by call count: the calls run concurrently.
+               (if (and (not failed-once)
+                        (string= "nothing to see" (enchiridion.memory:episode-body episode)))
+                   (progn (setf failed-once t)
+                          (error 'enchiridion.errors:transport-error :detail "no reply"))
                    (test-deriver store episode)))))
       (write-body store "alpha is beta")
       (write-body store "nothing to see")
@@ -971,3 +973,45 @@ shipped schedule."
             (ok (= generation (getf next :generation-id)))
             (ok (= 2 (getf next :processed)))
             (ok (eq :candidate (getf next :status)))))))))
+
+(deftest the-cost-gate-allows-a-fixed-cost-per-episode-derived ()
+  ;; A fixed 600,000 per promotion quarantined the first build of any log over
+  ;; about 400 episodes, after its tokens were spent.
+  (with-store (store directory)
+    (flet ((generation (tokens episodes)
+             (enchiridion.memory.store:exec
+              store
+              "INSERT INTO generations (number, status, created_ts, tokens_used, episodes_derived)
+                 VALUES ((SELECT COALESCE(MAX(number), 0) + 1 FROM generations),
+                         'candidate', 0, ?, ?)"
+              (list tokens episodes))
+             (enchiridion.memory.store:last-row-id store)))
+      (testing "a first build of 2,000 episodes at 1,500 tokens each passes"
+        (ok (enchiridion.memory:cost-gate store (generation 3000000 2000)
+                                          :tokens-per-episode 3000)))
+      (testing "the quarantined attempt before it counts on both sides"
+        (ok (= 4000 (enchiridion.memory:promotion-episodes
+                     store (generation 3000000 2000)))))
+      (testing "a deriver spending twice the allowance fails"
+        (ng (enchiridion.memory:cost-gate store (generation 30000000 2000)
+                                          :tokens-per-episode 3000))))))
+
+(deftest deriver-calls-overlap-and-their-results-apply-in-order ()
+  (with-store (store directory)
+    (let ((enchiridion.memory:*t2-deriver-concurrency* 8)
+          (enchiridion.memory:*assertion-deriver*
+            (lambda (store episode)
+              (sleep 1)
+              (test-deriver store episode))))
+      (dotimes (i 8) (write-body store (format nil "~D: alpha is ~:[beta~;gamma~]" i (oddp i))))
+      (let* ((start (get-internal-real-time))
+             (report (enchiridion.memory:build-candidate store :limit 8))
+             (seconds (/ (- (get-internal-real-time) start) internal-time-units-per-second)))
+        (ok (= 8 (getf report :processed)))
+        (testing "eight one-second calls took about one second, not eight"
+          (ok (< seconds 4)))
+        (testing "the assertions were written in episode order"
+          (let ((episodes (mapcar (lambda (row) (enchiridion.memory.store:field row "episode_id"))
+                                  (enchiridion.memory.store:query-rows
+                                   store "SELECT episode_id FROM assertions ORDER BY id"))))
+            (ok (equal episodes (sort (copy-list episodes) #'<)))))))))

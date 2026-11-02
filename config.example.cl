@@ -203,8 +203,9 @@
     (:t2-max-episodes-per-tick 5)
     (:t2-max-tokens-per-pass 200000)
     (:t2-deriver-max-tokens 16384)
+    (:t2-deriver-concurrency 4)
     (:t2-deriver-model nil)
-    (:t2-max-tokens-per-promotion 600000)
+    (:t2-max-tokens-per-episode 3000)
     (:t2-writes-per-episode 8)
     ;;; Operator-authored behavioural canaries, the memory's only external
     ;;; ground truth. Each entry is a plist of :name, :family, :cue and

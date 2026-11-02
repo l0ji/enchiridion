@@ -355,12 +355,51 @@ The change-event test is a SQL query over the candidate, not a model call."
           (incf closed))))
     (list :conflicts conflicts :closed closed)))
 
-(defun derive-episode (store episode generation-id parser-version now)
-  "Derive one episode into GENERATION-ID and return a report plist.
-The deriver returns assertions and change events. Invalid spans are rejected
-before insertion. Conflict detection runs after the new assertions exist."
-  (multiple-value-bind (assertions events)
-      (assertions-for-episode store episode)
+(defun derive-one (store deriver episode)
+  "Call DERIVER on EPISODE and return a plist: :ASSERTIONS and :EVENTS, or
+:ERROR with the report line, and :TOKENS either way. It binds the token count
+itself, so it gives the same answer in a worker thread, where the caller's
+dynamic bindings do not reach."
+  (let ((*derivation-tokens* 0))
+    (handler-case
+        (multiple-value-bind (assertions events) (funcall deriver store episode)
+          (list :assertions assertions :events events :tokens *derivation-tokens*))
+      (error (condition)
+        (list :error (enchiridion.errors:condition-report-line condition)
+              :tokens *derivation-tokens*)))))
+
+(defun derive-concurrently (store episodes &key (deriver *assertion-deriver*)
+                                                (concurrency *t2-deriver-concurrency*))
+  "Return DERIVE-ONE's plist for each of EPISODES, in their order, with up to
+CONCURRENCY model calls in flight at once.
+
+A deriver call is almost all waiting on the provider, and one episode's call
+does not depend on another's result: the deriver reads the raw log, never the
+candidate. So the calls overlap, and every store access inside them takes the
+store's lock. Applying the results stays in the caller, one at a time and in
+episode order, because conflict detection depends on that order. A worker
+that dies without a result leaves NIL, which the caller reads as a failure."
+  (let* ((items (coerce episodes 'vector))
+         (n (length items))
+         (results (make-array n :initial-element nil))
+         (next 0)
+         (lock (bordeaux-threads:make-lock "t2-deriver-queue")))
+    (flet ((work ()
+             (loop
+               (let ((i (bordeaux-threads:with-lock-held (lock)
+                          (when (< next n) (prog1 next (incf next))))))
+                 (unless i (return))
+                 (setf (aref results i) (derive-one store deriver (aref items i)))))))
+      (if (or (<= concurrency 1) (<= n 1))
+          (work)
+          (mapc #'bordeaux-threads:join-thread
+                (loop repeat (min concurrency n)
+                      collect (bordeaux-threads:make-thread #'work :name "t2-deriver")))))
+    (coerce results 'list)))
+
+(defun apply-derivation (store episode generation-id parser-version now assertions events)
+  "Write one episode's derived ASSERTIONS and EVENTS into GENERATION-ID, mark
+the episode derived, and return a report plist."
     (let ((accepted 0)
           (rejected 0)
           (conflicts 0)
@@ -383,7 +422,7 @@ before insertion. Conflict detection runs after the new assertions exist."
             (incf closed (getf report :closed)))))
       (mark-derived store generation-id (episode-id episode) parser-version)
       (list :assertions accepted :rejected rejected
-            :conflicts conflicts :closed closed))))
+            :conflicts conflicts :closed closed)))
 
 (defun build-candidate (store &key (limit *memory-t2-episodes-per-tick*)
                                   (parser-version *memory-parser-version*)
@@ -414,27 +453,34 @@ effect on a build already under way."
        ;; record the episodes derived before it: they have their rows and their
        ;; marks, and a gate that read counters without them would undercount.
        ;; The failed episode is not marked, so the next tick tries it again.
-       (let ((*derivation-tokens* 0))
-         (dolist (episode episodes)
-           (let ((report (handler-case (derive-episode store episode generation-id
-                                                       parser-version now)
-                           (error (condition)
-                             (setf failure (enchiridion.errors:condition-report-line
-                                            condition))
-                             nil))))
-             (unless report (return))
-             (push episode derived)
-             (incf accepted (getf report :assertions))
-             (incf rejected (getf report :rejected))
-             (incf conflicts (getf report :conflicts))
-             (incf closed (getf report :closed))))
-         (setf tokens *derivation-tokens*
-               derived (nreverse derived)))
+       ;; The model calls run concurrently; the results are applied here, in
+       ;; episode order. Every call's tokens count, the ones after a failure
+       ;; included: they were spent, and their episodes are derived again.
+       (loop for episode in episodes
+             for result in (derive-concurrently store episodes)
+             do (incf tokens (or (getf result :tokens) 0))
+                (cond
+                  (failure)
+                  ((or (null result) (getf result :error))
+                   (setf failure (or (getf result :error) "the deriver returned nothing")))
+                  (t
+                   (let ((report (apply-derivation store episode generation-id
+                                                   parser-version now
+                                                   (getf result :assertions)
+                                                   (getf result :events))))
+                     (push episode derived)
+                     (incf accepted (getf report :assertions))
+                     (incf rejected (getf report :rejected))
+                     (incf conflicts (getf report :conflicts))
+                     (incf closed (getf report :closed))))))
+       (setf derived (nreverse derived))
        (let ((remaining (unprocessed-episode-count store generation-id)))
          (when (zerop remaining)
            (set-generation-status store generation-id "candidate"))
          (let ((last-episode (and derived (episode-id (car (last derived))))))
-           (when last-episode
+           ;; Also when nothing was derived: a batch whose first call failed
+           ;; still spent what it spent.
+           (when (or last-episode (plusp tokens))
              (enchiridion.memory.store:exec
               store
               "UPDATE generations
@@ -443,7 +489,7 @@ effect on a build already under way."
                       episodes_derived = episodes_derived + ?,
                       tokens_used = tokens_used + ?
                 WHERE id = ?"
-              (list last-episode (+ accepted conflicts closed) (length derived) tokens
+              (list (or last-episode 0) (+ accepted conflicts closed) (length derived) tokens
                     generation-id))))
          (list :built t
                :generation-id generation-id

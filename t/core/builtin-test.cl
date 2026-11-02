@@ -233,7 +233,7 @@
     (write-text (merge-pathnames "notes.md" scratch) "needle here")
     (ensure-directories-exist (merge-pathnames "inner/" scratch))
     (enchiridion.compat:run-program-capture
-     "/bin/ln" (list "-s" (namestring scratch)
+     "ln" (list "-s" (namestring scratch)
                      (namestring (merge-pathnames "inner/back" scratch))))
     (ok (search "needle"
                 (enchiridion.tools.builtin::search-files-run

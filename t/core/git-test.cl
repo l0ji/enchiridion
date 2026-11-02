@@ -111,7 +111,7 @@
       (write-text path "two\n")
       (enchiridion.git:git-commit-all directory "Record two"
                                       :environment (environment))
-      (enchiridion.git:git-revert directory "HEAD")
+      (enchiridion.git:git-revert directory "HEAD" :environment (environment))
       (ok (string= "one\n" (read-text path))))))
 
 (deftest show-and-diff-answer-without-signalling ()

@@ -238,16 +238,20 @@ list may not hold &OPTIONAL and &KEY at the same time."
       (git-run directory (list "diff"))
     (if (eql 0 status) output "")))
 
-(declaim (ftype (function (t t) string) git-revert))
+(declaim (ftype (function (t t &key (:environment t)) string) git-revert))
 
-(defun git-revert (directory revision)
+(defun git-revert (directory revision &key (environment *commit-environment*))
   "Revert REVISION and return git's output.
+
+A revert is a commit, so it takes the same ENVIRONMENT GIT-COMMIT-ALL does;
+without one, a host with no identity refuses it.
 
 A conflict signals a tool error carrying git's own text: the tree is left
 mid-revert for the operator to resolve, and hiding that behind a boolean would
 be the wrong kind of quiet."
   (multiple-value-bind (output status)
-      (git-run directory (list "revert" "--no-edit" revision))
+      (git-run directory (list "revert" "--no-edit" revision)
+               :environment environment)
     (if (eql 0 status)
         output
         (error 'enchiridion.errors:tool-error :tool "git" :detail output))))

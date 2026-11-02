@@ -327,3 +327,61 @@ countable from the test."
       (testing "and the cursor stops it happening again"
         (ok (null (enchiridion.kernel::compact-when-due
                    supervisor store (agent-of supervisor))))))))
+
+(defun projection-rows (store)
+  (enchiridion.memory.store:query-rows
+   store "SELECT from_turn, to_turn, rebased_p FROM projections ORDER BY id"))
+
+(deftest every-nth-compaction-rebuilds-from-raw-turns ()
+  ;; A summary of a summary drifts. design/memory.md: every eighth compaction
+  ;; rebases from the last 24 raw turns; here every second, from six.
+  (with-scratch-world (store supervisor)
+    (let ((enchiridion.memory:*compaction-rebase-every* 2)
+          (enchiridion.memory:*compaction-rebase-turns* 6))
+      (flet ((add-turns (count)
+               (dotimes (index count)
+                 (enchiridion.memory.store:record-turn
+                  store :session "operator" :role "user"
+                  :body (format nil "turn ~D" index))))
+             (compact ()
+               (enchiridion.kernel::compact-when-due
+                supervisor store (agent-of supervisor)
+                :rebase-p (enchiridion.kernel::compaction-rebase-due-p store))))
+        (testing "a store with no passes is not due a rebase"
+          (ng (enchiridion.kernel::compaction-rebase-due-p store)))
+        (add-turns 4)
+        (ok (compact))
+        (testing "an ordinary pass records a projection over its four turns"
+          (let ((row (first (projection-rows store))))
+            (ok (= 1 (length (projection-rows store))))
+            (ok (= 0 (enchiridion.memory.store:field row "rebased_p")))
+            (ok (= 3 (- (enchiridion.memory.store:field row "to_turn")
+                        (enchiridion.memory.store:field row "from_turn")))))
+          (ok (enchiridion.kernel::compaction-rebase-due-p store)))
+        (add-turns 4)
+        (ok (search "raw turns" (compact)))
+        (testing "the second pass is a rebase over the last six raw turns"
+          ;; The first pass's own turns sit between the operator's, on the
+          ;; sleep channel, so the range is counted rather than subtracted.
+          (let ((row (second (projection-rows store))))
+            (ok (= 1 (enchiridion.memory.store:field row "rebased_p")))
+            (ok (= 6 (enchiridion.memory.store:field
+                      (first (enchiridion.memory.store:query-rows
+                              store
+                              "SELECT COUNT(*) AS n FROM turns
+                                WHERE id BETWEEN ? AND ? AND channel <> 'sleep'"
+                              (list (enchiridion.memory.store:field row "from_turn")
+                                    (enchiridion.memory.store:field row "to_turn"))))
+                      "n")))))
+        (testing "and the count starts again after it"
+          (ng (enchiridion.kernel::compaction-rebase-due-p store)))))))
+
+(deftest a-reserve-the-tick-cap-cannot-cover-is-refused ()
+  (with-scratch-world (store supervisor)
+    (let* ((agent (agent-of supervisor))
+           (cap (getf (enchiridion.kernel:agent-budget agent) :max-tokens-per-tick)))
+      (when cap
+        (ok (null (enchiridion.kernel::budget-refusal agent store 0 0 :reserve 1)))
+        (ok (search "cannot cover"
+                    (enchiridion.kernel::budget-refusal agent store 0 0
+                                                        :reserve (1+ cap))))))))

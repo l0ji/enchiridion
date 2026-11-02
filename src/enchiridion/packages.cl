@@ -301,7 +301,7 @@ did not think of."))
    #:run-arm #:compare-arms #:push-ab #:record-gate-row #:content-hash
    #:*push-max-fraction* #:*memory-pack-chars* #:*memory-graph-limit*
    #:*memory-gate-margin* #:*memory-gate-min-n* #:*memory-write-cap*
-   #:apply-memory-settings
+   #:apply-memory-settings #:*compaction-rebase-every* #:*compaction-rebase-turns*
    ;; Integration entry points. Defined in later files; exported here so the
    ;; kernel and the command table have one visible interface.
    #:retrieve-for-turn #:retrieve-rows-for-turn #:record-retrieval

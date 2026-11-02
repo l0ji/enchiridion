@@ -74,6 +74,16 @@ aspirational.")
 (setf (documentation '*memory-write-cap* 'variable)
       "The most assertions one consolidation pass may write.")
 
+(defvar *compaction-rebase-every*)
+(setf (documentation '*compaction-rebase-every* 'variable)
+      "Every this many compaction passes, one rebuilds the session block from raw
+turns instead of the previous summary, so the summary cannot drift by
+summarising itself.")
+
+(defvar *compaction-rebase-turns*)
+(setf (documentation '*compaction-rebase-turns* 'variable)
+      "How many raw turns a rebase pass reads.")
+
 (defvar *block-limits*)
 (setf (documentation '*block-limits* 'variable)
       "Character limits per block label, the shipped :block-limits with the
@@ -120,6 +130,8 @@ key by key to the shipped defaults. Return NIL."
           *memory-gate-margin* (setting :gate-margin)
           *memory-gate-min-n* (setting :gate-min-n)
           *memory-write-cap* (setting :t2-write-cap)
+          *compaction-rebase-every* (setting :compaction-rebase-every)
+          *compaction-rebase-turns* (setting :compaction-rebase-turns)
           ;; An operator who writes (:persona 8000) keeps the other limits.
           *block-limits* (merge-plist (shipped :block-limits)
                                       (let ((own (setting :block-limits)))

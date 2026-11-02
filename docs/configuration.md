@@ -257,8 +257,8 @@ The `/proc` hidepid remount happens in the container entry point before Lisp sta
 | `:tail-margin` | real | `0.02` | Not read: there is no tail gate yet. |
 | `:precision-min` | real | `0.8` | Not read: there is no promotion-precision gate yet. |
 | `:quarantine-max` | real | `0.5` | Not read: there is no quarantine-rate gate yet. |
-| `:compaction-rebase-every` | integer | `8` | Not read: compaction does not rebase yet. |
-| `:compaction-rebase-turns` | integer | `24` | Not read: compaction does not rebase yet. |
+| `:compaction-rebase-every` | integer | `8` | Every this many compaction passes, one rebuilds the session block from raw turns. |
+| `:compaction-rebase-turns` | integer | `24` | Raw turns a rebase pass reads. |
 
 The store path can also be a pathname object.
 The default is under the agent directory, which is on the state volume in the container.

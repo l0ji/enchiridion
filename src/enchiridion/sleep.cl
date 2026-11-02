@@ -38,6 +38,16 @@ a pass that spends tokens to churn the files.")
 blocks rather than adding to them: a summariser does not need to know who it
 is, and every block is tokens in every compaction call.")
 
+(defparameter +rebase-brief+
+  "You rebuild an agent's session memory from its recent transcript alone. You are given only the raw turns, not any earlier summary. Answer with the new session block only: plain prose, no headings, at most four hundred characters, about what the agent is doing and what it has learned."
+  "The brief a rebase pass runs under. It differs from the compaction brief in
+one fact: there is no previous summary, which is the point of a rebase.")
+
+(defparameter +characters-per-token+ 4
+  "The characters a token is estimated to hold, for sizing a rebase before it
+runs. A provider's own count is only known after the call, and a rebase is the
+one compaction pass large enough that the estimate decides whether it starts.")
+
 (defparameter +compaction-turns+ 4
   "How many new turns make compaction worth a model call.
 Fewer than this is the ordinary case after one exchange, and a summary of two
@@ -132,10 +142,10 @@ identity after handover and the operator's agent only reads it."
         (setf (enchiridion.memory:block-writable-p block) t)))
     agent))
 
-(declaim (ftype (function (agent) agent) compactor-agent))
+(declaim (ftype (function (agent &optional string) agent) compactor-agent))
 
-(defun compactor-agent (agent)
-  "Return an agent that only summarises: no personality, no tools.
+(defun compactor-agent (agent &optional (brief +compaction-brief+))
+  "Return an agent that only summarises under BRIEF: no personality, no tools.
 
 No tools because a summariser that can call tools can change the thing it is
 summarising, and the tool schemas are tokens paid on every compaction call for
@@ -144,7 +154,7 @@ a capability the pass does not use."
               :backend (agent-backend agent)
               :blocks (list (enchiridion.memory:make-block
                              :label :persona
-                             :text +compaction-brief+))
+                             :text brief))
               :tools-p nil
               :budget (agent-budget agent)))
 
@@ -195,22 +205,29 @@ turn under the channel that made it."
 
 ;;;; Compaction.
 
-(declaim (ftype (function (agent t &key (:model t)) (or null string))
+(declaim (ftype (function (agent t &key (:model t) (:rebase-p t)) (or null string))
                 compact-session))
 
-(defun compact-session (agent store &key (model (enchiridion:model-for :cheap)))
+(defun compact-session (agent store &key (model (enchiridion:model-for :cheap))
+                                         (rebase-p nil))
   "Rewrite the session block from the recent transcript and return it.
 
 The previous block is the summary so far and the last few turns are verbatim:
 that is the whole design, and it is why the prompt does not grow with the
-transcript. The answer is scrubbed, scanned and checked against the block limit
-by the store before it lands, so a model that answers with something oversized
-or injected changes nothing and is reported instead."
-  (let* ((previous (enchiridion.memory.store:session-block store))
-         (recent (enchiridion.memory.store:recent-turns store
-                                                        :limit +compaction-turns+
-                                                        :not-channel :sleep))
-         (user (format nil "Previous summary:~%~A~%~%Recent turns:~%~{~A~%~}"
+transcript. A REBASE-P pass reads the last *COMPACTION-REBASE-TURNS* turns and
+no previous summary, so a summary of a summary cannot drift forever. The answer
+is scrubbed, scanned and checked against the block limit by the store before it
+lands, so a model that answers with something oversized or injected changes
+nothing and is reported instead. A pass that lands records a projections row."
+  (let* ((previous (if rebase-p "" (enchiridion.memory.store:session-block store)))
+         (recent (enchiridion.memory.store:recent-turns
+                  store
+                  :limit (if rebase-p
+                             enchiridion.memory:*compaction-rebase-turns*
+                             +compaction-turns+)
+                  :not-channel :sleep))
+         (user (format nil "~:[Previous summary:~%~A~%~%~;~*~]Recent turns:~%~{~A~%~}"
+                       rebase-p
                        (if (plusp (length previous)) previous "(none)")
                        (mapcar (lambda (row)
                                  (format nil "~A: ~A"
@@ -229,8 +246,53 @@ or injected changes nothing and is reported instead."
                        (enchiridion.llm:completion-text completion))))
            (when (plusp (length text))
              (enchiridion.memory.store:set-session-block store text)
+             (when recent
+               (record-projection store
+                                  :from-turn (enchiridion.memory.store:turn-row-id
+                                              (car (last recent)))
+                                  :to-turn (enchiridion.memory.store:turn-row-id
+                                            (first recent))
+                                  :rebase-p rebase-p
+                                  :model (or (enchiridion.llm:completion-model completion)
+                                             "")
+                                  :text text))
              text))
       (ignore-errors (end-session session)))))
+
+(defun record-projection (store &key from-turn to-turn rebase-p model text
+                                     (now (get-universal-time)))
+  "Record that the session block was rebuilt from turns FROM-TURN..TO-TURN.
+The row is what counts compaction passes across a restart, and what lets an
+operator see whether the block was last rebuilt from raw turns."
+  (enchiridion.memory.store:exec
+   store
+   "INSERT INTO projections (block, from_turn, to_turn, rebased_p, model, hash, ts)
+      VALUES ('session', ?, ?, ?, ?, ?, ?)"
+   (list from-turn to-turn (if rebase-p 1 0) model
+         (enchiridion.memory:content-hash text) now)))
+
+(defun compaction-rebase-due-p (store)
+  "Return T when the next compaction pass should be a rebase: at least
+*COMPACTION-REBASE-EVERY* minus one ordinary passes have landed since the last
+rebase. The count is read from projections, so a restart keeps the cadence."
+  (let* ((every enchiridion.memory:*compaction-rebase-every*)
+         (row (first (enchiridion.memory.store:query-rows
+                      store
+                      "SELECT COUNT(*) AS n FROM projections
+                        WHERE block = 'session'
+                          AND id > COALESCE((SELECT MAX(id) FROM projections
+                                              WHERE block = 'session'
+                                                AND rebased_p = 1), 0)"))))
+    (and (integerp every) (plusp every)
+         (>= (or (enchiridion.memory.store:field row "n") 0) (1- every)))))
+
+(defun rebase-token-estimate ()
+  "Return the tokens a rebase pass is estimated to cost: its turns at their
+display limit, its brief, and a full session block of answer."
+  (ceiling (+ (* enchiridion.memory:*compaction-rebase-turns* +recent-turn-limit+)
+              (length +rebase-brief+)
+              (enchiridion.memory:default-block-limit :session))
+           +characters-per-token+))
 
 ;;;; The two harness blocks.
 
@@ -293,10 +355,14 @@ webhook use up the tick cap and stop the sleep agent."
         (error () 0))
       0))
 
-(declaim (ftype (function (agent t integer integer) (or null string)) budget-refusal))
+(declaim (ftype (function (agent t integer integer &key (:reserve integer))
+                          (or null string))
+                budget-refusal))
 
-(defun budget-refusal (agent store start-total tick-index)
-  "Return why no model call may start, or NIL.
+(defun budget-refusal (agent store start-total tick-index &key (reserve 0))
+  "Return why no model call may start, or NIL. RESERVE is what the call is
+expected to cost, so a large pass is refused before it can overrun the tick
+cap rather than after.
 
 START-TOTAL is the store's token total when this tick began, so what this tick
 has spent is the difference. Measuring from a timestamp instead put a one
@@ -323,6 +389,8 @@ cap that resets at midnight is a cap that can be spent twice in a minute."
                    (spend-total agent :window :day))))
       (cond
         ((and tick-cap (>= (tick-spend) tick-cap)) "the tick cap is spent")
+        ((and tick-cap (plusp reserve) (> (+ (tick-spend) reserve) tick-cap))
+         (format nil "the tick cap cannot cover a ~D token pass" reserve))
         ((and day-cap (>= (day-spend) day-cap)) "the day cap is spent")
         (t nil)))))
 
@@ -376,12 +444,13 @@ nothing, and the honest report for it is one word."
            (format nil "maintenance pass~@[ (~A)~]" (getf result :note))))
         (t "idle")))))
 
-(declaim (ftype (function (enchiridion.supervisor:supervisor t agent)
+(declaim (ftype (function (enchiridion.supervisor:supervisor t agent &key (:rebase-p t))
                           (or null string))
                 compact-when-due))
 
-(defun compact-when-due (supervisor store agent)
+(defun compact-when-due (supervisor store agent &key (rebase-p nil))
   "Rewrite the session block when enough new turns have arrived, else NIL.
+REBASE-P makes the pass a rebase from raw turns.
 
 The cursor lives on the supervisor rather than in a file: it is a position in
 this process's reading of the transcript, and a restart re-reads the last few
@@ -392,12 +461,16 @@ turns once, which is harmless and bounded."
                                                        :not-channel :sleep)))
     (when (and (= (length recent) +compaction-turns+)
                (> (enchiridion.memory.store:turn-row-id (first recent)) cursor))
-      (let ((compacted (compact-session (compactor-agent agent) store)))
+      (let ((compacted (compact-session (compactor-agent agent (if rebase-p
+                                                                     +rebase-brief+
+                                                                     +compaction-brief+))
+                                        store
+                                        :rebase-p rebase-p)))
         (setf (enchiridion.supervisor:supervisor-last-compacted-turn supervisor)
               (enchiridion.memory.store:turn-row-id (first recent)))
-        (if compacted
-            "the session block was compacted"
-            nil)))))
+        (cond ((null compacted) nil)
+              (rebase-p "the session block was rebuilt from raw turns")
+              (t "the session block was compacted"))))))
 
 (declaim (ftype (function (enchiridion.supervisor:supervisor) list) heartbeat))
 
@@ -488,15 +561,21 @@ session block."
             (attempt "the sleep agent"
                      (lambda () (run-sleep-phase supervisor store agent directory)))))
       (when (and store agent)
-        (let ((refusal (handler-case (budget-refusal agent store start-total
-                                                     tick-index)
-                         (error (condition)
-                           (format nil "the budget is unreadable: ~A"
-                                   (enchiridion.errors:condition-report-line
-                                    condition))))))
+        (let* ((rebase-p (handler-case (compaction-rebase-due-p store)
+                           (error () nil)))
+               (refusal (handler-case (budget-refusal agent store start-total
+                                                      tick-index
+                                                      :reserve (if rebase-p
+                                                                   (rebase-token-estimate)
+                                                                   0))
+                          (error (condition)
+                            (format nil "the budget is unreadable: ~A"
+                                    (enchiridion.errors:condition-report-line
+                                     condition))))))
           (if refusal
               (say "compaction skipped: ~A" refusal)
               (attempt "compaction"
-                       (lambda () (compact-when-due supervisor store agent))))))
+                       (lambda () (compact-when-due supervisor store agent
+                                                    :rebase-p rebase-p))))))
       (list :ok-p ok-p
             :report (if notes (format nil "~{~A~^; ~}" (nreverse notes)) "idle")))))

@@ -350,6 +350,18 @@ The cursor lives on the supervisor, and the pass excludes the `:sleep` channel, 
 
 `write-session-fallback` writes `Tick 12. 3 tasks waiting, 1 failed.` into an empty session block, and compaction overwrites it.
 
+### Rebase
+
+A summary of a summary drifts, so every `:compaction-rebase-every` (8) passes one is a rebase.
+A rebase sends the last `:compaction-rebase-turns` (24) raw turns and no previous summary, under `+rebase-brief+`, and its report reads `the session block was rebuilt from raw turns`.
+
+Every pass that lands writes a `projections` row: the block, the first and last turn id it read, whether it was a rebase, the model, a hash of the text, and the time.
+`compaction-rebase-due-p` counts the rows since the last rebase, so a restart keeps the cadence even though the turn cursor does not survive one.
+
+A rebase is the one compaction pass large enough to matter to the tick cap.
+The heartbeat estimates it at four characters a token over its turns, its brief, and a full session block, and passes that estimate to `budget-refusal` as `:reserve`.
+A tick whose remaining cap cannot cover it reports `compaction skipped: the tick cap cannot cover a N token pass`, writes no row, and tries the rebase again on the next tick.
+
 ## Troubleshooting
 
 | Symptom                                                              | Cause                                                        | Fix                                                                     |

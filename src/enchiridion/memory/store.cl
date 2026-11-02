@@ -381,7 +381,7 @@ that, because it is not text to a parser and NOT a term to match."
 
 ;;;; Opening and closing.
 
-(defparameter +schema-version+ 3
+(defparameter +schema-version+ 4
   "The schema version a store records in PRAGMA user_version once it is built.
 
 Every statement in +SCHEMA+ is CREATE ... IF NOT EXISTS, which adds a missing
@@ -395,7 +395,29 @@ in +SCHEMA+, so a version-1 store only has to run the schema once more.
 
 Version 3 indexes episodes with the porter stemmer. SQLite cannot change an
 FTS5 table's tokenizer, so DROP-UNSTEMMED-INDEX drops an older index, the
-schema creates the new one, and the index is rebuilt from EPISODES.")
+schema creates the new one, and the index is rebuilt from EPISODES.
+
+Version 4 indexes assertions by their claim, in ASSERTIONS_FTS with its
+triggers and a backfill, all in +SCHEMA+; drops LOG_RUNS, in
+MIGRATE-LEGACY-MEMORY; and adds MEMORY_STATE.PRECISION_RESET_TS, the
+operator's reset of the promotion-precision freeze, in ADD-MISSING-COLUMNS.")
+
+(defparameter +added-columns+
+  '(("memory_state" "precision_reset_ts" "INTEGER"))
+  "Columns added to an existing table after it shipped: table, column, type.
+CREATE TABLE IF NOT EXISTS never adds one to a table that exists, so
+ADD-MISSING-COLUMNS does.")
+
+(defun column-exists-p (store table column)
+  "Return T when TABLE in STORE has COLUMN."
+  (not (null (find column (query-rows store (format nil "PRAGMA table_info(~A)" table))
+                   :key (lambda (row) (field row "name")) :test #'string=))))
+
+(defun add-missing-columns (store)
+  "Add each of +ADDED-COLUMNS+ that STORE's tables lack. Idempotent."
+  (loop for (table column type) in +added-columns+
+        unless (column-exists-p store table column)
+          do (exec store (format nil "ALTER TABLE ~A ADD COLUMN ~A ~A" table column type))))
 
 (defun drop-unstemmed-index (store)
   "Drop EPISODES_FTS when it exists without the porter tokenizer and return T,
@@ -483,6 +505,7 @@ not an exposure."
               (let ((reindex (drop-unstemmed-index store)))
                 (dolist (statement +schema+)
                   (exec store statement))
+                (add-missing-columns store)
                 (when reindex
                   (exec store "INSERT INTO episodes_fts(episodes_fts) VALUES ('rebuild')"))))
           (error (condition)

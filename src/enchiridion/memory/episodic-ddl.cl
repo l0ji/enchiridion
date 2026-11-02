@@ -218,7 +218,8 @@ references.")
       last_t2_ts          INTEGER,
       last_t2_generation_id INTEGER,
       canary_hash         TEXT NOT NULL DEFAULT '',
-      config_hash         TEXT NOT NULL DEFAULT '')"
+      config_hash         TEXT NOT NULL DEFAULT '',
+      precision_reset_ts  INTEGER)"
 
    "CREATE TABLE IF NOT EXISTS generation_checks (
       id            INTEGER PRIMARY KEY AUTOINCREMENT,

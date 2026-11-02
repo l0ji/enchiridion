@@ -651,3 +651,38 @@ itself is what proves the trigger ran."
              (ok (= 2 (length (enchiridion.memory.store:search-sessions store "river"))))))
       (ignore-errors (enchiridion.memory.store:close-store store))
       (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(deftest a-version-three-store-is-brought-forward-to-four ()
+  ;; The claim index, its backfill, and the precision reset column all reach
+  ;; a store that was built before them, which skips the schema while it
+  ;; reports a current version.
+  (let* ((directory (scratch-directory))
+         (path (merge-pathnames "memory.db" directory))
+         (store (enchiridion.memory.store:open-store :path path)))
+    (unwind-protect
+         (progn
+           (enchiridion.memory.store:record-turn store :session "s" :body "in vault under ops")
+           (enchiridion.memory.store::exec
+            store "INSERT INTO generations (number, status, created_ts) VALUES (1, 'live', 0)")
+           (enchiridion.memory.store::exec
+            store "INSERT INTO assertions (generation_id, subject, relation, object,
+                                           episode_id, span_start, span_end, tx_from, run_id)
+                     VALUES (1, 'deploy key', 'kept in', 'vault', 1, 3, 8, 0, 1)")
+           ;; What a version-3 store looked like.
+           (dolist (statement '("DROP TRIGGER assertions_ai" "DROP TRIGGER assertions_ad"
+                                "DROP TRIGGER assertions_au" "DROP TABLE assertions_fts"
+                                "ALTER TABLE memory_state DROP COLUMN precision_reset_ts"))
+             (enchiridion.memory.store::exec store statement))
+           (enchiridion.memory.store::set-schema-version store 3)
+           (enchiridion.memory.store:close-store store)
+           (setf store (enchiridion.memory.store:open-store :path path))
+           (ok (= 4 (enchiridion.memory.store::schema-version store)))
+           (testing "the existing claim is indexed"
+             (ok (= 1 (length (enchiridion.memory.store::query-rows
+                               store "SELECT rowid FROM assertions_fts
+                                       WHERE assertions_fts MATCH 'deploy'")))))
+           (testing "the reset column exists"
+             (ok (enchiridion.memory.store::column-exists-p
+                  store "memory_state" "precision_reset_ts"))))
+      (ignore-errors (enchiridion.memory.store:close-store store))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))

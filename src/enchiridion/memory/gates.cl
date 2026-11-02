@@ -720,23 +720,29 @@ quarantine rate is over its ceiling, the ordinary one otherwise."
    "ts"))
 
 (defun mark-t2-pass (store &key (now (get-universal-time)))
-  "Record that a T2 pass ended at NOW, whatever it decided, and return NOW."
+  "Record that a T2 pass ended at NOW, whatever it decided, with the newest
+episode it ended at, and return NOW."
   (ensure-generation-state store)
   (enchiridion.memory.store:exec
-   store "UPDATE memory_state SET last_t2_ts = ? WHERE id = 1" (list now))
+   store "UPDATE memory_state
+             SET last_t2_ts = ?,
+                 last_t2_episode = (SELECT COALESCE(MAX(id), 0) FROM episodes)
+           WHERE id = 1"
+   (list now))
   now)
 
 (defun new-episode-count (store)
-  "Return how many episodes arrived after the furthest any finished build
-reached. Quarantined and held candidates count as reached: measuring from the
-live generation instead would leave the threshold crossed after every
-quarantine, and T2 would run on every tick."
+  "Return how many episodes arrived after the last T2 pass ended.
+It counts from the pass and not from what any build derived: a pass that built
+nothing, for a missing instrument, would otherwise leave the threshold crossed,
+and T2 would run on every tick."
+  (ensure-generation-state store)
   (or (enchiridion.memory.store:field
        (first (enchiridion.memory.store:query-rows
                store
                "SELECT COUNT(*) AS n FROM episodes
-                 WHERE id > (SELECT COALESCE(MAX(to_episode), 0) FROM generations
-                              WHERE status <> 'building')"))
+                 WHERE id > (SELECT COALESCE(last_t2_episode, 0) FROM memory_state
+                              WHERE id = 1)"))
        "n")
       0))
 

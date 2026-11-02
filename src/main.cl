@@ -462,10 +462,9 @@ sentence above says no socket rather than no network."
                  :budget (agent-budget-plist config)
                  :store store
                  :broker broker)))
-    ;; The T2 parser is installed on the context. Nothing calls it yet: the
-    ;; heartbeat has no gated T2 phase, and the CLI exposes only a manual
-    ;; candidate build. The build is what makes the seam usable before the
-    ;; promotion gates land.
+    ;; The T2 parser is installed on the context. The heartbeat's T2 phase
+    ;; calls it through BUILD-CANDIDATE once every instrument is present, and
+    ;; `memory build` runs one bounded build by hand.
     (setf enchiridion.memory:*assertion-deriver*
           (when backend
             (enchiridion.memory:make-model-assertion-deriver

@@ -381,7 +381,7 @@ that, because it is not text to a parser and NOT a term to match."
 
 ;;;; Opening and closing.
 
-(defparameter +schema-version+ 4
+(defparameter +schema-version+ 5
   "The schema version a store records in PRAGMA user_version once it is built.
 
 Every statement in +SCHEMA+ is CREATE ... IF NOT EXISTS, which adds a missing
@@ -400,10 +400,14 @@ schema creates the new one, and the index is rebuilt from EPISODES.
 Version 4 indexes assertions by their claim, in ASSERTIONS_FTS with its
 triggers and a backfill, all in +SCHEMA+; drops LOG_RUNS, in
 MIGRATE-LEGACY-MEMORY; and adds MEMORY_STATE.PRECISION_RESET_GENERATION, the
-operator's reset of the promotion-precision freeze, in ADD-MISSING-COLUMNS.")
+operator's reset of the promotion-precision freeze, in ADD-MISSING-COLUMNS.
+
+Version 5 adds MEMORY_STATE.LAST_T2_EPISODE, the newest episode when the last
+T2 pass ended, which the episode threshold counts from, in ADD-MISSING-COLUMNS.")
 
 (defparameter +added-columns+
-  '(("memory_state" "precision_reset_generation" "INTEGER"))
+  '(("memory_state" "precision_reset_generation" "INTEGER")
+    ("memory_state" "last_t2_episode" "INTEGER"))
   "Columns added to an existing table after it shipped: table, column, type.
 CREATE TABLE IF NOT EXISTS never adds one to a table that exists, so
 ADD-MISSING-COLUMNS does.")

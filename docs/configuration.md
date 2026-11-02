@@ -251,7 +251,7 @@ The `/proc` hidepid remount happens in the container entry point before Lisp sta
 | `:t2-enabled` | boolean | `t` | Run T2 passes from the heartbeat on their schedule. Off, the heartbeat skips T2 without a note. |
 | `:t2-interval-seconds` | integer | `86400` | Seconds between T2 passes. A pass is due when this has elapsed since the last one ended, or earlier at `:t2-episode-threshold`. |
 | `:t2-frozen-interval-seconds` | integer | `604800` | Seconds between T2 passes while the quarantine rate is over `:quarantine-max`. |
-| `:t2-episode-threshold` | integer | `200` | New episodes, past the furthest any finished build reached, that make a T2 pass due before its interval. Ignored while the quarantine rate is over `:quarantine-max`. |
+| `:t2-episode-threshold` | integer | `200` | New episodes since the last T2 pass ended that make a pass due before its interval. Ignored while the quarantine rate is over `:quarantine-max`. |
 | `:t2-max-tokens-per-pass` | integer | `30000` | Most tokens T2 may spend in any rolling twenty-four hours. A candidate that reaches it pauses and resumes when the window has room; `:t2-max-tokens-per-promotion` still caps its total. |
 | `:canaries` | list or `nil` | `nil` | Operator-authored behavioural checks, each a plist of `:name`, `:family`, `:cue`, `:expect`, and `:stale` for the update family. |
 | `:canary-min-families` | integer | `4` | Canary families that must be covered before a T2 pass can run. |

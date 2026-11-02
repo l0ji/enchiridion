@@ -110,7 +110,7 @@ The phase is reported as `N episodes derived` when it writes, and adds no note w
 ## The T2 pass
 
 T2 runs in the heartbeat after maintenance, so the tail sample reads fresh rarity, and before the sleep agent.
-A pass is due daily, or once `:t2-episode-threshold` episodes have arrived past the furthest any finished build reached, whichever comes first.
+A pass is due daily, or once `:t2-episode-threshold` episodes have arrived since the last pass ended, whichever comes first.
 A candidate that is still building is always due: a pass derives `:t2-max-episodes-per-tick` episodes per tick and spans as many ticks as it needs.
 
 Each pass runs in this order:

@@ -799,16 +799,20 @@ shipped schedule."
         (ng (enchiridion.memory:t2-due-p store :now (+ 1000 86400)))
         (ok (enchiridion.memory:t2-due-p store :now (+ 1000 604800)))))))
 
-(deftest a-quarantined-pass-does-not-leave-the-threshold-crossed ()
-  (with-store (store directory)
+(deftest a-pass-that-builds-nothing-does-not-leave-the-threshold-crossed ()
+  ;; Found driving the heartbeat over a real log: with more episodes than the
+  ;; threshold and an instrument missing, every tick ran the preflight.
+  (with-t2-world (store directory)
     (let ((enchiridion.memory:*t2-episode-threshold* 3))
+      (ok (= 10 (enchiridion.memory:new-episode-count store)))
+      (ok (eq :instrument-missing
+              (getf (enchiridion.memory:run-t2-pass store :canaries '()) :outcome)))
+      (ok (zerop (enchiridion.memory:new-episode-count store)))
+      (ng (enchiridion.memory:t2-due-p store))
       (dotimes (i 3) (write-body store (format nil "note ~D" i)))
-      (ok (= 3 (enchiridion.memory:new-episode-count store)))
-      (let ((generation (gated-generation store "quarantined")))
-        (enchiridion.memory.store:exec
-         store "UPDATE generations SET to_episode = (SELECT MAX(id) FROM episodes) WHERE id = ?"
-         (list generation)))
-      (ok (zerop (enchiridion.memory:new-episode-count store))))))
+      (testing "and new episodes after it count again"
+        (ok (= 3 (enchiridion.memory:new-episode-count store)))
+        (ok (enchiridion.memory:t2-due-p store))))))
 
 (deftest a-pass-resumes-across-ticks-and-gates-what-it-built ()
   (with-t2-world (store directory)

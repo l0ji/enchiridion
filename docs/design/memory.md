@@ -164,7 +164,7 @@ New tables, no changes to existing tables:
 | Global telemetry | `activation`, `cue_index`, lexical `links`, `retrievals`, `calibration` |
 | Generation semantic layer | `assertions`, `schemas`, `summaries`, text `procedures`, `conflicts`, `change_events`, semantic `links` |
 | Generation control | `generations`, `memory_state`, `generation_checks`, `generation_derivations` |
-| Operator and evidence | `change_proposals`, `conflict_resolutions`, `gate_log`, `log_runs`, `projections`, `canaries` |
+| Operator and evidence | `change_proposals`, `conflict_resolutions`, `gate_log`, `projections`, `canaries` |
 | Host projections | `blocks`, `tasks`; `turns` and `memories` are views over `episodes` |
 
 All new tables are `CREATE TABLE IF NOT EXISTS` and are created inside the store transaction.

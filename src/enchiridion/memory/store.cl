@@ -240,6 +240,9 @@ A new store has neither table and only gets the views. Return T."
         (exec store (format nil "DROP TRIGGER IF EXISTS ~A" trigger)))
       (exec store "DROP TABLE IF EXISTS memories_fts")
       (exec store "DROP TABLE IF EXISTS memories"))
+    ;; LOG_RUNS was the single-pass consolidation's run log. Generations
+    ;; record every pass now, so a store that still has the table loses it.
+    (exec store "DROP TABLE IF EXISTS log_runs")
     (exec store
           "CREATE VIEW IF NOT EXISTS turns AS
              SELECT id, session, role, body, model, channel, ts

@@ -26,7 +26,7 @@ DROP-STORE drops these before the tables they read.")
     "conflicts" "assertions" "change_events" "summaries" "procedures"
     "schemas" "episodes_fts" "episode_vectors" "episodes" "cue_index" "activation" "links"
     "retrievals" "calibration" "canary" "gate_log" "change_proposals"
-    "projections" "log_runs" "memory_state" "generations")
+    "projections" "memory_state" "generations")
   "What DROP-STORE removes, child table before parent table.
 
 The order matters because foreign keys are on. A virtual table is dropped
@@ -377,19 +377,6 @@ references.")
       generation_id INTEGER NOT NULL DEFAULT 0,
       task_hash     TEXT    NOT NULL DEFAULT '',
       config_hash   TEXT    NOT NULL DEFAULT '')"
-
-   "CREATE TABLE IF NOT EXISTS log_runs (
-      id             INTEGER PRIMARY KEY AUTOINCREMENT,
-      started_ts     INTEGER NOT NULL,
-      finished_ts    INTEGER,
-      from_episode   INTEGER NOT NULL,
-      to_episode     INTEGER NOT NULL,
-      parser_version TEXT    NOT NULL,
-      idempotent_key TEXT    NOT NULL UNIQUE,
-      status         TEXT    NOT NULL DEFAULT 'running',
-      kind           TEXT    NOT NULL DEFAULT 'consolidation',
-      config_hash    TEXT    NOT NULL DEFAULT '',
-      generation_id  INTEGER NOT NULL DEFAULT 0)"
 
    "CREATE TABLE IF NOT EXISTS projections (
       id         INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -21,8 +21,8 @@ Three blocks are backed by Markdown files, so personality change is a git diff, 
 | `:ledger`    | 250   | A `blocks` row | The heartbeat                                 |
 | `:bootstrap` | 300   | None           | No block is built                             |
 
-`*default-block-limits*` holds the six limits, and `default-block-limit` returns 1200 for a label the list does not name.
-The limits count characters, and the configuration's `:memory :block-limits` key is not read, so a limit change is a source change.
+`*block-limits*` holds the six limits, bound from the configuration's `:memory :block-limits` merged over the shipped list, and `default-block-limit` returns `:unlisted-block-limit` (1200) for a label the list does not name.
+The limits count characters.
 
 The kernel builds five blocks in `blocks-from-directory`.
 It reads the three Markdown files and falls back to the seed template, and it reads `:session` and `:ledger` from the store.
@@ -40,9 +40,9 @@ The next prompt gets the text on disk when the next agent is built, and the slee
 ## Blocks
 
 A block has five fields: `label` (keyword), `text` (string), `limit` (integer), `file` (pathname or `nil`), and `writable-p` (boolean).
-The defaults are `:persona`, `""`, 1200, `nil`, and true, and `writable-p` says whether this agent may replace the text.
+The defaults are `:persona`, `""`, the unlisted limit, `nil`, and true, and `writable-p` says whether this agent may replace the text.
 
-`make-block` scans the text, takes the limit from `*default-block-limits*` when the caller passes none, and keeps the file when one is given.
+`make-block` scans the text, takes the limit from `*block-limits*` when the caller passes none, and keeps the file when one is given.
 
 `set-block-text` replaces the text of a writable block and refuses four cases.
 

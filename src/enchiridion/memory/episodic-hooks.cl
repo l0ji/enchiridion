@@ -10,73 +10,25 @@
 
 (in-package #:enchiridion.memory)
 
-(defparameter *memory-enabled-p* t
-  "Master switch. NIL makes every integration hook a no-op.")
-
-(defparameter *memory-retrieve-p* t
-  "When true, a turn asks for a cue pack.")
-
-(defparameter *memory-push-p* nil
-  "When true, the four push channels compete for the pack. Off until measured.")
-
-(defparameter *memory-record-sleep-p* t
-  "When true, sleep and compaction turns are appended to the log. Off so a
-summary cannot feed the memory layer.")
-
-(defparameter *memory-maintenance-batch* 200
-  "Episodes one maintenance pass may derive links and rarity for.")
-
-(defparameter *memory-t2-episodes-per-tick* 20
-  "Episodes one T2 candidate build may parse in one tick. The build is
-resumable, so a large log is processed in bounded batches.")
-
 (defparameter *memory-t2-max-episodes-per-candidate* 200
   "Episodes one candidate generation may cover in this phase. A larger log is
 left for the next candidate; a later phase removes the bound.")
-
-(defparameter *memory-embed-settings* '(:enabled nil)
-  "The :memory section's embedding keys, as CONFIGURE-MEMORY read them. The
-harness builds the embedder from these; nothing here makes a connection.")
-
-(defparameter *memory-rerank-p* nil
-  "When true, the harness installs a cheap-model reranker. Off until measured.")
 
 (defvar *memory-reranker* nil
   "NIL, or a function of a cue and a list of bodies that returns the indices of
 the relevant ones, most relevant first. RERANK-ROWS, in derive.cl, calls it;
 MAKE-MODEL-RERANKER builds one, and it is installed only when :RERANK is on.")
 
-(defparameter *memory-pack-chars* 4450
-  "The cue pack budget in characters. The resident blocks are charged
-separately, so this is not the whole prompt.")
-
 (defun configure-memory (&optional (config (enchiridion:config)))
-  "Bind the memory switches from the :memory section of CONFIG.
-The parameter plist is merged, not replaced, so a key the operator omits keeps
-its shipped default. Return the effective plist."
-  (flet ((value (key default)
-           (enchiridion:config-section-value config :memory key default)))
-    (setf *memory-enabled-p* (not (null (value :enabled t)))
-          *memory-retrieve-p* (not (null (value :retrieve t)))
-          *memory-push-p* (not (null (value :push nil)))
-          *memory-rerank-p* (not (null (value :rerank nil)))
-          *memory-embed-settings* (list :enabled (not (null (value :embed nil)))
-                                        :model (value :embed-model "text-embedding-3-small")
-                                        :dimensions (value :embed-dimensions 512)
-                                        :base-url (value :embed-base-url
-                                                         "https://api.openai.com/v1/")
-                                        :key-env (value :embed-key-env "OPENAI_API_KEY"))
-          *memory-record-sleep-p* (not (null (value :record-sleep t)))
-          *memory-maintenance-batch* (or (value :maintenance-batch 200) 200)
-          *memory-t2-episodes-per-tick* (or (value :t2-max-episodes-per-tick 20) 20)
-          *memory-pack-chars* (or (value :pack-chars 4450) 4450))
-    (let ((overrides (value :parameters nil)))
-      (when (listp overrides)
-        (let ((parameters (copy-list *memory-parameters*)))
-          (loop for (key val) on overrides by #'cddr
-                do (setf (getf parameters key) val))
-          (setf *memory-parameters* parameters))))
-  *memory-parameters*))
+  "Bind the memory settings from the :memory section of CONFIG.
+Each key the operator omits keeps its shipped default from DEFAULT-CONFIG, and
+the parameter plist is merged, not replaced, for the same reason. Return the
+effective parameter plist."
+  (apply-memory-settings config)
+  (let ((overrides (enchiridion:config-setting config :memory :parameters)))
+    (when (listp overrides)
+      (setf *memory-parameters* (merge-plist *memory-parameters* overrides))))
+  *memory-parameters*)
 
 (defun enabled-p ()
   "Return T when the memory integration is on."
@@ -322,7 +274,7 @@ A cue with no searchable term returns NIL; a query error signals."
       (when candidates
         (retrieve candidates text
                   (list "" session (string-downcase (string channel)))
-                  :graph (graph-for store :limit 20000)
+                  :graph (graph-for store :limit *memory-graph-limit*)
                   :now now
                   :query-time now
                   :cue-type "episodic"

@@ -174,12 +174,9 @@
     (:db nil)
 
     ;;; Character limits per memory block. Raising these raises the fixed
-    ;;; token cost of every prompt. The limits live in *default-block-limits*
-    ;;; in the memory module; no code reads :block-limits, so the effective
-    ;;; values are recorded here as a comment.
-    ;;;
-    ;;; :persona 6000, :operator 1600, :world 3000, :session 400, :ledger 250,
-    ;;; and :bootstrap 300.
+    ;;; token cost of every prompt. A label left out keeps its shipped limit.
+    ;;;(:block-limits (:persona 6000 :operator 1600 :world 3000
+    ;;;                :session 400 :ledger 250 :bootstrap 300))
 
     ;;; The episodic log and cue retrieval are on. Push is off until a paired
     ;;; no-harm run says otherwise. Consolidation runs on its schedule, but a

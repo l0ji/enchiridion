@@ -5,7 +5,7 @@
 
 (defpackage #:enchiridion-config-test
   (:use #:cl)
-  (:import-from #:rove #:deftest #:ok #:testing)
+  (:import-from #:rove #:deftest #:ok #:testing #:signals)
   (:export #:run))
 
 (in-package #:enchiridion-config-test)
@@ -84,21 +84,22 @@
     ;; The shipped config names no LLM key variable: the provider table in the
     ;; LLM module decides that name, and main.cl unions provider-key-names in
     ;; before it loads anything. The two channel tokens are still shipped here,
-    ;; because no provider table can supply them.
-    (ok (equal '("FLUXER_BOT_TOKEN" "ENCHIRIDION_HTTP_TOKEN")
+    ;; because no provider table can supply them, and so is the dense
+    ;; retrieval key, which the embedder reads whenever :embed is turned on.
+    (ok (equal '("FLUXER_BOT_TOKEN" "ENCHIRIDION_HTTP_TOKEN" "OPENAI_API_KEY")
                (enchiridion:configured-secret-names (enchiridion:default-config)))))
   (testing "a configured name wins and the channels are still read"
     (let ((config '(:llm (:api-key-env "MY_LLM_KEY")
                     :channels (:http (:enabled t) (:token-env "MY_WEBHOOK_TOKEN"))
                                (:fluxer (:enabled t) (:token-env "MY_FLUXER_TOKEN")))))
-      (ok (equal '("MY_LLM_KEY" "MY_FLUXER_TOKEN" "MY_WEBHOOK_TOKEN")
+      (ok (equal '("MY_LLM_KEY" "MY_FLUXER_TOKEN" "MY_WEBHOOK_TOKEN" "OPENAI_API_KEY")
                  (enchiridion:configured-secret-names config)))))
   (testing "an empty name is skipped rather than turned back into a default"
     ;; The operator wrote the empty string, so it wins over the shipped name
     ;; the way every other explicit value does; there is simply nothing to
     ;; read. FLUXER_BOT_TOKEN is still collected because :fluxer was not
     ;; configured at all.
-    (ok (equal '("FLUXER_BOT_TOKEN")
+    (ok (equal '("FLUXER_BOT_TOKEN" "OPENAI_API_KEY")
                (enchiridion:configured-secret-names
                 '(:llm (:api-key-env "")
                   :channels (:http (:enabled t) (:token-env "")))))))
@@ -110,7 +111,7 @@
   (testing "a name repeated in two places is collected once"
     (let ((config '(:llm (:api-key-env "SAME_NAME")
                     :channels (:http (:enabled t) (:token-env "SAME_NAME")))))
-      (ok (equal '("SAME_NAME" "FLUXER_BOT_TOKEN")
+      (ok (equal '("SAME_NAME" "FLUXER_BOT_TOKEN" "OPENAI_API_KEY")
                  (enchiridion:configured-secret-names config))))))
 
 (deftest a-channel-entry-inherits-what-it-does-not-name ()
@@ -135,3 +136,26 @@
           (ok (eql 8787 (getf http :port)))
           (ok (string= "127.0.0.1" (getf http :bind)))
           (ok (null (getf http :enabled))))))))
+
+(deftest a-setting-falls-back-to-the-shipped-default ()
+  ;; A reader with its own fallback is how a setting comes to be hardcoded:
+  ;; config.cl leaves the key out and the reader's copy wins.
+  (let ((config '(:llm (:backend :openai)
+                  :budget (:max-tokens-per-tick 10))))
+    (testing "the operator's value wins"
+      (ok (eql 10 (enchiridion:config-setting config :budget :max-tokens-per-tick))))
+    (testing "a key the operator left out is the shipped one, not no value"
+      (ok (eql (enchiridion:config-section-value (enchiridion:default-config)
+                                                 :budget :max-tokens-per-day)
+               (enchiridion:config-setting config :budget :max-tokens-per-day))))
+    (testing "a flat config answers with the shipped default"
+      (ok (eql (enchiridion:config-section-value (enchiridion:default-config)
+                                                 :sleep :interval-seconds)
+               (enchiridion:config-setting '(:backend :openai)
+                                           :sleep :interval-seconds))))
+    (testing "an explicit NIL is a value, not a missing key"
+      (ok (null (enchiridion:config-setting '(:llm (:backend :openai)
+                                              :sleep (:enabled nil))
+                                            :sleep :enabled))))
+    (testing "a key with no shipped default signals"
+      (ok (signals (enchiridion:config-setting config :budget :not-a-setting))))))

@@ -982,7 +982,7 @@ unreachable by the lexical channel, which is the intended consequence."
                                                                             "distinctness")
                                              0.0)))))))
 
-(defun graph-for (store &key (limit 20000) (kinds '("episode" "assertion")))
+(defun graph-for (store &key (limit *memory-graph-limit*) (kinds '("episode" "assertion")))
   "Return the link graph RETRIEVE walks: a hash table of node to out-links."
   (let ((graph (make-hash-table :test #'equal)))
     (dolist (row (enchiridion.memory.store:query-rows

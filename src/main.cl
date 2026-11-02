@@ -157,15 +157,11 @@ the operator has to choose a provider and a state layout."
 
 (defun agent-uid (config)
   "Return the uid agent code runs as, from the :SANDBOX section."
-  (or (second (assoc :agent-uid (enchiridion:config-section config :sandbox)
-                     :test #'eq))
-      1000))
+  (enchiridion:config-setting config :sandbox :agent-uid))
 
 (defun agent-gid (config)
   "Return the gid agent code runs as, from the :SANDBOX section."
-  (or (second (assoc :agent-gid (enchiridion:config-section config :sandbox)
-                     :test #'eq))
-      1000))
+  (enchiridion:config-setting config :sandbox :agent-gid))
 
 (defun sandbox-home ()
   "Return the home directory that holds agents/ and run/."
@@ -377,18 +373,21 @@ The caps live outside the :LLM section, so CONFIG-SECTION-VALUE reads them.
 An agent built without them answers BUDGET-EXHAUSTED-P with NIL forever, which
 is how a configured cap becomes no cap at all."
   (list :max-tokens-per-tick
-        (enchiridion:config-section-value config :budget :max-tokens-per-tick)
+        (enchiridion:config-setting config :budget :max-tokens-per-tick)
         :max-tokens-per-day
-        (enchiridion:config-section-value config :budget :max-tokens-per-day)))
+        (enchiridion:config-setting config :budget :max-tokens-per-day)))
 
 (declaim (ftype (function (t) integer) heartbeat-interval))
 
 (defun heartbeat-interval (config)
   "Return the sleep interval in whole seconds from the :SLEEP section.
-Anything that is not a positive whole number of seconds is the shipped fifteen
-minutes: an interval of zero is a tick loop and a string is a mistyped key."
-  (let ((value (enchiridion:config-section-value config :sleep :interval-seconds 900)))
-    (if (and (integerp value) (plusp value)) value 900)))
+Anything that is not a positive whole number of seconds is the shipped
+interval: an interval of zero is a tick loop and a string is a mistyped key."
+  (let ((value (enchiridion:config-setting config :sleep :interval-seconds)))
+    (if (and (integerp value) (plusp value))
+        value
+        (enchiridion:config-setting (enchiridion:default-config)
+                                    :sleep :interval-seconds))))
 
 (declaim (ftype (function (t) null) refresh-provider-knowledge))
 
@@ -443,6 +442,8 @@ sentence above says no socket rather than no network."
          (_ (when (and refresh-models (plusp (length key)))
               (refresh-provider-knowledge config)))
          (_ (prepare-sandbox config))
+         ;; Before the agent: compiling its prompt reads the block limits.
+         (_ (enchiridion.memory:configure-memory config))
          (store (open-agent-store config))
          (backend (when (plusp (length key))
                     (enchiridion.llm:resolve-backend :config config :api-key key)))
@@ -461,7 +462,6 @@ sentence above says no socket rather than no network."
                  :budget (agent-budget-plist config)
                  :store store
                  :broker broker)))
-    (enchiridion.memory:configure-memory config)
     ;; The T2 parser is installed on the context. Nothing calls it yet: the
     ;; heartbeat has no gated T2 phase, and the CLI exposes only a manual
     ;; candidate build. The build is what makes the seam usable before the
@@ -1085,7 +1085,7 @@ heartbeat, and the kernel owns what a tick does."
      :agent (context-agent context)
      :session (context-session context)
      :generation (context-generation context)
-     :heartbeat-p (enchiridion:config-section-value config :sleep :enabled t)
+     :heartbeat-p (enchiridion:config-setting config :sleep :enabled)
      :heartbeat-interval (heartbeat-interval config)
      :tick-function #'enchiridion.kernel:heartbeat
      :bootstrap-line (bootstrap-line (context-directory context))

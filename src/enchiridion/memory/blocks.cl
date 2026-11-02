@@ -16,18 +16,18 @@
 
 ;;;; Limits.
 
-(defparameter *default-block-limits*
-  '(:persona 6000 :operator 1600 :world 3000 :session 400 :ledger 250 :bootstrap 300)
-  "Character limits per block. Raising a limit raises
-the fixed token cost of every prompt, which is why they live in one place.
-The bootstrap block holds the status line, so it is small on purpose: it is
-resident in every prompt until the first steps are done.")
+;; The limits are settings: *BLOCK-LIMITS* and *UNLISTED-BLOCK-LIMIT*, in
+;; settings.cl, bound from :block-limits and :unlisted-block-limit. Raising a
+;; limit raises the fixed token cost of every prompt. The bootstrap block holds
+;; the status line, so its limit is small on purpose: it is resident in every
+;; prompt until the first steps are done.
 
 (declaim (ftype (function (t) (integer 1 *)) default-block-limit))
 
 (defun default-block-limit (label)
-  "Return the configured limit for LABEL, or 1200 for a new label."
-  (or (getf *default-block-limits* label) 1200))
+  "Return the configured limit for LABEL, or the unlisted limit for a label
+the configuration does not name."
+  (or (getf *block-limits* label) *unlisted-block-limit*))
 
 ;;;; The scan.
 
@@ -97,7 +97,7 @@ not a generic validation failure."
 (defstruct (block (:constructor %make-block))
   (label :persona :type keyword)
   (text "" :type string)
-  (limit 1200 :type (integer 1 *))
+  (limit *unlisted-block-limit* :type (integer 1 *))
   (file nil :type (or null pathname))
   (writable-p t :type boolean))
 

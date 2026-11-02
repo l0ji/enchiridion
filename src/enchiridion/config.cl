@@ -78,6 +78,24 @@ than a value invented from a shape that does not carry one."
   (let ((entry (assoc key (config-section config section) :test #'eq)))
     (if entry (second entry) default)))
 
+(declaim (ftype (function (t keyword keyword) t) config-setting))
+
+(defun config-setting (config section key)
+  "Return KEY of SECTION from CONFIG when it sets it, and the shipped default
+from DEFAULT-CONFIG otherwise.
+
+Every setting has exactly one default, and it is written in DEFAULT-CONFIG. A
+reader that brings its own fallback is how a setting comes to be hardcoded: the
+two copies drift, and the one in the reader wins whenever config.cl leaves the
+key out. A key the shipped defaults do not carry therefore signals, so a new
+setting cannot be read before it has a default and a line in the docs."
+  (let ((shipped (assoc key (config-section (default-config) section) :test #'eq)))
+    (unless shipped
+      (error "~S is not a setting in the ~S section of the shipped configuration."
+             key section))
+    (second (or (assoc key (config-section config section) :test #'eq)
+                shipped))))
+
 ;;;; The active configuration.
 ;;;;
 ;;;; One plist is active for the life of the process, bound by READ-CONFIG.
@@ -172,7 +190,10 @@ store path. The model defaults match the shipped adapter defaults."
 
     :memory
     (:db nil)
-    (:block-limits (:persona 6000 :operator 1600 :world 3000 :session 400 :ledger 250))
+    (:block-limits (:persona 6000 :operator 1600 :world 3000 :session 400 :ledger 250
+                    :bootstrap 300))
+    ;; The limit for a block whose label :block-limits does not name.
+    (:unlisted-block-limit 1200)
     ;; The episodic log and pull retrieval are on; push and promotion wait for
     ;; measured instruments. T2 runs on schedule, but a pass with no deriver,
     ;; canaries, utility task set, or tail sampler is a reported no-op rather
@@ -184,6 +205,14 @@ store path. The model defaults match the shipped adapter defaults."
     (:pack-chars 4450)
     (:push-max-fraction 0.5)
     (:maintenance-batch 200)
+    ;; Dense candidates fused with BM25, and the model reranker. Both are off
+    ;; until the operator turns them on.
+    (:embed nil)
+    (:embed-model "text-embedding-3-small")
+    (:embed-dimensions 512)
+    (:embed-base-url "https://api.openai.com/v1/")
+    (:embed-key-env "OPENAI_API_KEY")
+    (:rerank nil)
     (:graph-limit 20000)
     (:t2-enabled t)
     (:t2-interval-seconds 86400)
@@ -317,7 +346,7 @@ one kind the shape filter cannot catch."
                         (getf (channel-config :http config) :token-env)
                         ;; Dense retrieval's key, which may belong to a
                         ;; provider other than the chat one.
-                        (config-section-value config :memory :embed-key-env nil)))
+                        (config-setting config :memory :embed-key-env)))
       (when (and (stringp name) (plusp (length name)))
         (pushnew name names :test #'string=)))
     (nreverse names)))

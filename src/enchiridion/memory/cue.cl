@@ -16,18 +16,12 @@
 ;;;; 0. Constants
 ;;;; ------------------------------------------------------------------
 
-(defparameter +working-set-budget+ 4450
-  "The cue pack budget in characters. The five resident blocks are charged
-separately (4,150 characters), so this is not the whole prompt. The figure is
-the amended specification's 4,450; the audit showed that number is the host's
-block sum, so this profile uses it as the pack budget and states the
-divergence in docs/design/memory.md. Push competes for half of it.")
-
-(defparameter +push-max-fraction+ 0.5
-  "The most of the working set that push may occupy.  INVENTED-DESIGN.  The
-justification is structural rather than measured: push must not be able to
-evict a retrieved record the cue ranked above it, and capping push at half the
-budget makes that guarantee enforceable rather than aspirational.")
+;; The pack budget and the push cap are settings: *MEMORY-PACK-CHARS* and
+;; *PUSH-MAX-FRACTION*, in settings.cl, bound from :pack-chars and
+;; :push-max-fraction. The pack budget is the amended specification's 4,450
+;; characters; the audit showed that number is the host's block sum, so this
+;; profile uses it as the pack budget and states the divergence in
+;; docs/design/memory.md.
 
 ;;;; ------------------------------------------------------------------
 ;;;; 1. Schema for the three new stores
@@ -291,7 +285,7 @@ No model call.  No retrieval of anything the agent did not ask for by cue."
       (dolist (line (nreverse lines))
         (write-string line s)))))
 
-(defun assemble-pack (retrieved pushed &key (char-budget +working-set-budget+))
+(defun assemble-pack (retrieved pushed &key (char-budget *memory-pack-chars*))
   "Assemble the final pack: retrieved first and whole, then push in what is left.
 
 The hard bound from model-unified.md §5.2 is that push may not evict a
@@ -302,9 +296,9 @@ bound forbids.  The test caught it, which is the argument for writing the test
 before believing the docstring.
 
 Retrieved material is therefore never truncated by push.  Push is capped at
-+PUSH-MAX-FRACTION+ of the budget and then further truncated to whatever
+*PUSH-MAX-FRACTION* of the budget and then further truncated to whatever
 remains, and if nothing remains, the pack is the retrieved material alone."
-  (let* ((push-cap (floor (* char-budget +push-max-fraction+)))
+  (let* ((push-cap (floor (* char-budget *push-max-fraction*)))
          (pushed (if (> (length pushed) push-cap)
                      (subseq pushed 0 push-cap)
                      pushed))
@@ -392,7 +386,8 @@ forced-consolidation counterparts.")
   "Return T when consolidation must pass the utility gate before running."
   (if (null override) *retention-first* override))
 
-(defun utility-gate (store &key (margin 0.02) (min-n 20))
+(defun utility-gate (store &key (margin *memory-gate-margin*)
+                                     (min-n *memory-gate-min-n*))
   "Return T when consolidation beats retention-only by at least MARGIN.
 
 Reads the gate log, which RUN-ARM writes.  Returns NIL when there is not
@@ -421,7 +416,7 @@ demands."
                   (or (enchiridion.memory.store:field ret "mean") 0.0))
                margin)))))
 
-(defun volume-gate (store &key (max-writes 400) (run-id nil))
+(defun volume-gate (store &key (max-writes *memory-write-cap*) (run-id nil))
   "Return T when the last consolidation pass stayed within the write cap.
 
 The cap exists because interference is constantly present: what a system
@@ -436,8 +431,10 @@ learning therefore degrades older records by competition alone."
     (<= (or (enchiridion.memory.store:field row "n") 0) max-writes)))
 
 (defun consolidate-if-gated (store &key (canary-predicate nil)
-                                       (margin 0.02) (min-n 20)
-                                       (max-writes 400) (now (get-universal-time)))
+                                       (margin *memory-gate-margin*)
+                                       (min-n *memory-gate-min-n*)
+                                       (max-writes *memory-write-cap*)
+                                       (now (get-universal-time)))
   "Run consolidation only if all three gates pass.  Return a report plist.
 
 The order is load-bearing.  The canary gate runs first, because a failing

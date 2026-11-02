@@ -71,7 +71,8 @@ A key that belongs outside `:llm` and is read through `config-value` returns the
 Write every key in the section that owns it.
 
 Unknown keys are ignored, and values are not type-checked at load.
-A reader that needs a number falls back to its default or refuses the value when it uses it.
+Every key has exactly one default, written in `default-config` in `src/enchiridion/config.cl`, and a key `config.cl` leaves out takes it from there.
+`config-setting` is the reader for the sections outside `:llm`; it signals for a key that has no shipped default, so a reader cannot carry a private fallback of its own.
 
 ## The :llm section
 
@@ -202,9 +203,7 @@ The channel is deny by default, and an empty or absent allowlist admits nobody (
 | `:max-tokens-per-day`  | integer | `400000` | Token cap for one day.            |
 
 The heartbeat starts no new phase once the spend reaches a cap, and a phase under way finishes.
-A sectioned file that omits a budget key leaves that cap unset.
-An unset cap is no cap, not a shipped default, because the reader takes the value it finds.
-Write both keys when the file has a `:budget` section (see [Supervisor and heartbeat](supervisor.md)).
+A file that omits a budget key gets the shipped cap, as with every other section (see [Supervisor and heartbeat](supervisor.md)).
 
 ## The :sandbox section
 
@@ -212,7 +211,7 @@ Write both keys when the file has a `:budget` section (see [Supervisor and heart
 | --------------- | ------- | ------- | ---------------------------------------------------- |
 | `:agent-uid`    | integer | `1000`  | User identifier for agent code and the broker in the container or a root-started checkout. |
 | `:agent-gid`    | integer | `1000`  | Group identifier for the same processes.             |
-| `:proc-hidepid` | integer | `2`     | Declared `/proc` hidepid value. No code reads it.    |
+| `:proc-hidepid` | integer | `2`     | Not read. The container entry point takes `ENCHIRIDION_HIDEPID` instead. |
 
 The supervisor runs as root in the container deployment and in a checkout started as root, and it holds the secrets.
 The broker, the reload verification, and `--verify-plugin` use `:agent-uid` and `:agent-gid`.
@@ -224,34 +223,48 @@ No Lisp path reads `:proc-hidepid`, and the container entry point reads `ENCHIRI
 
 | Key                        | Type                              | Default                                                                        | Meaning                                                           |
 | -------------------------- | --------------------------------- | ------------------------------------------------------------------------------ | ----------------------------------------------------------------- |
-| `:db`                      | string or `nil`                   | `nil`                                                                          | SQLite store path. `nil` selects `agents/default/memory.db`.      |
-| `:block-limits`            | property list of label to integer | `:persona 6000`, `:operator 1600`, `:world 3000`, `:session 400`, `:ledger 250` | Declared character limit for each memory block. No code reads it. |
-| `:enabled`                 | boolean                           | `t`                                                                            | Master switch for the episodic log and the cue pack.              |
-| `:retrieve`                | boolean                           | `t`                                                                            | Put a cue pack in the user message.                               |
-| `:push`                    | boolean                           | `nil`                                                                          | Enable the four push channels. Off until measured.                |
-| `:record-sleep`            | boolean                           | `t`                                                                            | Append sleep and compaction turns to the log.                     |
-| `:pack-chars`              | integer                           | `4450`                                                                         | Cue pack budget in characters.                                    |
-| `:push-max-fraction`       | real                              | `0.5`                                                                          | Push cap as a fraction of the pack.                               |
-| `:maintenance-batch`       | integer                           | `200`                                                                          | Episodes per maintenance batch.                                   |
-| `:graph-limit`             | integer                           | `20000`                                                                        | Link rows one retrieval may load.                                 |
-| `:t2-enabled`              | boolean                           | `t`                                                                            | Schedule T2. Promotion is gated and needs the gate tables.        |
-| `:canaries`                | list or `nil`                     | `nil`                                                                          | Operator-authored behavioural checks.                             |
-| `:gate-margin`             | real                              | `0.05`                                                                         | Utility-gate minimum outcome delta.                               |
-| `:gate-min-n`              | integer                           | `100`                                                                          | Utility-gate minimum non-tied pairs.                              |
-| `:gate-alpha`              | real                              | `0.05`                                                                         | One-sided significance level for the sign test.                   |
-| `:tail-rarity-fraction`    | real                              | `0.10`                                                                         | Top fraction of records treated as rare by the tail gate.         |
-| `:tail-min-n`              | integer                           | `50`                                                                           | Minimum rare records in a tail sample.                            |
-| `:tail-margin`             | real                              | `0.02`                                                                         | Allowed tail-retention shortfall.                                 |
-| `:precision-min`           | real                              | `0.8`                                                                          | Promotion-precision floor.                                        |
-| `:quarantine-max`          | real                              | `0.5`                                                                          | Quarantine-rate ceiling.                                          |
-| `:compaction-rebase-every` | integer                           | `8`                                                                            | Compaction passes between raw-turn rebases.                       |
-| `:compaction-rebase-turns` | integer                           | `24`                                                                           | Raw turns read by a rebase.                                       |
-| `:parameters`              | plist or `nil`                    | `nil`                                                                          | Overrides merged over the shipped memory parameter defaults.      |
+| `:db` | string or `nil` | `nil` | SQLite store path. `nil` selects `agents/default/memory.db`. |
+| `:block-limits` | plist of label to integer | `:persona 6000 :operator 1600 :world 3000 :session 400 :ledger 250 :bootstrap 300` | Character limit per memory block. Merged key by key over the shipped list. |
+| `:unlisted-block-limit` | integer | `1200` | Limit for a block whose label `:block-limits` does not name. |
+| `:enabled` | boolean | `t` | Master switch for the episodic log and the cue pack. |
+| `:retrieve` | boolean | `t` | Put a cue pack in the user message. |
+| `:push` | boolean | `nil` | Enable the four push channels. Off until measured. |
+| `:record-sleep` | boolean | `t` | Append sleep and compaction turns to the log. |
+| `:pack-chars` | integer | `4450` | Cue pack budget in characters. |
+| `:push-max-fraction` | real | `0.5` | Push cap as a fraction of the pack. |
+| `:maintenance-batch` | integer | `200` | Episodes per maintenance batch. |
+| `:graph-limit` | integer | `20000` | Link rows one retrieval may load. |
+| `:embed` | boolean | `nil` | Fuse dense candidates with BM25. |
+| `:embed-model` | string | `"text-embedding-3-small"` | Embedding model. |
+| `:embed-dimensions` | integer | `512` | Embedding dimensions. |
+| `:embed-base-url` | string | `"https://api.openai.com/v1/"` | Embedding endpoint. |
+| `:embed-key-env` | string | `"OPENAI_API_KEY"` | Environment variable that holds the embedding key. Always collected as a secret name. |
+| `:rerank` | boolean | `nil` | Install the cheap-model reranker. |
+| `:t2-max-episodes-per-tick` | integer | `20` | Episodes one T2 candidate build may parse in one tick. |
+| `:t2-write-cap` | integer | `400` | Most assertions one consolidation pass may write (the volume gate). |
+| `:gate-margin` | real | `0.05` | Utility-gate minimum outcome delta. |
+| `:gate-min-n` | integer | `100` | Utility-gate minimum rows per arm. |
+| `:parameters` | plist or `nil` | `nil` | Overrides merged over the shipped memory parameter defaults. |
+| `:t2-enabled` | boolean | `t` | Not read: there is no T2 schedule yet. |
+| `:t2-interval-seconds` | integer | `86400` | Not read: there is no T2 schedule yet. |
+| `:t2-episode-threshold` | integer | `200` | Not read: there is no T2 schedule yet. |
+| `:t2-max-tokens-per-pass` | integer | `30000` | Not read: there is no T2 pass budget yet. |
+| `:t2-max-tokens-per-promotion` | integer | `75000` | Not read: there is no promotion budget yet. |
+| `:canaries` | list or `nil` | `nil` | Not read: canaries are registered through the store, not loaded from here. |
+| `:canary-min-families` | integer | `4` | Not read: the canary gate does not count families yet. |
+| `:gate-alpha` | real | `0.05` | Not read: the utility gate has no significance test yet. |
+| `:tail-rarity-fraction` | real | `0.10` | Not read: there is no tail gate yet. |
+| `:tail-min-n` | integer | `50` | Not read: there is no tail gate yet. |
+| `:tail-margin` | real | `0.02` | Not read: there is no tail gate yet. |
+| `:precision-min` | real | `0.8` | Not read: there is no promotion-precision gate yet. |
+| `:quarantine-max` | real | `0.5` | Not read: there is no quarantine-rate gate yet. |
+| `:compaction-rebase-every` | integer | `8` | Not read: compaction does not rebase yet. |
+| `:compaction-rebase-turns` | integer | `24` | Not read: compaction does not rebase yet. |
 
 The store path can also be a pathname object.
 The default is under the agent directory, which is on the state volume in the container.
-No code reads the configured `:block-limits` value.
-The effective limits come from `*default-block-limits*` in the memory module, which also holds `:bootstrap` with a limit of 300.
+An operator who writes `(:block-limits (:persona 8000))` keeps the shipped limits for the other labels.
+The keys marked "Not read" belong to features that are designed but not built; they are in the shipped defaults so their values are recorded in one place.
 Raising a limit raises the fixed token cost of every prompt (see [Memory](memory.md)).
 
 The log and the cue pack are on.

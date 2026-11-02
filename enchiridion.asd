@@ -86,7 +86,8 @@
         :serial t
         :default-component-class "cl-source-file.cl"
         :components
-        ((:file "blocks")
+        ((:file "settings")
+         (:file "blocks")
          ;; The EPISODIC DDL is data only and loads before the store so
          ;; OPEN-STORE can create the whole schema from one list.
          (:file "episodic-ddl")

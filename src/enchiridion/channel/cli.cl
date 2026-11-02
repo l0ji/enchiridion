@@ -880,11 +880,13 @@ for a cap that was configured, which made an unattended budget look uncapped."
   (declare (ignore arguments))
   (let ((configuration (command-context-config (context))))
     (say "tick cap: ~A"
-         (enchiridion:config-section-value configuration :budget
-                                          :max-tokens-per-tick "none"))
+         (or (enchiridion:config-setting configuration :budget
+                                         :max-tokens-per-tick)
+             "none"))
     (say "day cap:  ~A"
-         (enchiridion:config-section-value configuration :budget
-                                          :max-tokens-per-day "none"))
+         (or (enchiridion:config-setting configuration :budget
+                                         :max-tokens-per-day)
+             "none"))
     (let ((agent (command-context-agent (context))))
       (when agent
         (say "tick spent out: ~A" (enchiridion.kernel:budget-exhausted-p agent :window :tick))

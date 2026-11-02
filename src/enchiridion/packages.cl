@@ -26,6 +26,7 @@
    #:agent-directory #:run-directory #:load-config #:config-digest
    #:control-path #:status-path #:project-root
    #:sectioned-config-p #:config-section #:config-value #:config-section-value
+   #:config-setting
    ;; CONFIG-LOOKUP is the reader that answers from the active configuration
    ;; first and the shipped defaults second, which is what the provider table
    ;; wants: a config.cl that names two keys must not blank out the other
@@ -228,7 +229,7 @@ did not think of."))
    #:block-file #:block-writable-p #:block-bytes #:block-full-p #:block-slack
    #:default-block-limit #:scan-block-text
    #:set-block-text #:compile-blocks #:block-summary #:block-descriptions
-   #:*default-block-limits*
+   #:*block-limits* #:*unlisted-block-limit*
    ;; The bootstrap state machine.
    #:bootstrap-status #:bootstrap-complete-p #:bootstrap-remaining
    #:bootstrap-refuse-writes-p #:mark-bootstrap-step
@@ -297,7 +298,9 @@ did not think of."))
    #:register-canary #:canary-check #:canary-report
    #:retention-first-p #:utility-gate #:volume-gate #:consolidate-if-gated
    #:run-arm #:compare-arms #:push-ab #:record-gate-row
-   #:+working-set-budget+ #:+push-max-fraction+
+   #:*push-max-fraction* #:*memory-pack-chars* #:*memory-graph-limit*
+   #:*memory-gate-margin* #:*memory-gate-min-n* #:*memory-write-cap*
+   #:apply-memory-settings
    ;; Integration entry points. Defined in later files; exported here so the
    ;; kernel and the command table have one visible interface.
    #:retrieve-for-turn #:retrieve-rows-for-turn #:record-retrieval

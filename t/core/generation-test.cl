@@ -272,3 +272,73 @@
                         store 0 :channel :t2)))
             (ok (= 60 (getf usage :input)))
             (ok (= 24 (getf usage :output)))))))))
+
+(defun ids-of (store table generation &optional (column "id"))
+  (mapcar (lambda (row) (enchiridion.memory.store:field row column))
+          (enchiridion.memory.store:query-rows
+           store (format nil "SELECT ~A FROM ~A WHERE generation_id = ? ORDER BY id"
+                         column table)
+           (list generation))))
+
+(deftest a-candidate-copies-the-live-layer-and-derives-only-what-is-new ()
+  ;; design/memory.md: a candidate copies the live semantic rows, then derives
+  ;; episodes not yet processed. Re-deriving the whole log every pass would
+  ;; make a pass cost what the log holds, not what it grew by.
+  (with-store (store directory)
+    (let* ((derived 0)
+           (enchiridion.memory:*assertion-deriver*
+             (lambda (store episode)
+               (incf derived)
+               (test-deriver store episode))))
+      (write-body store "alpha is beta")
+      (write-body store "alpha is beta again")
+      (let* ((first (getf (enchiridion.memory:build-candidate store :limit 10)
+                          :generation-id))
+             (live (ids-of store "assertions" first)))
+        ;; A conflict between the two live assertions, so the copy has a
+        ;; reference to renumber.
+        (enchiridion.memory.store:exec
+         store
+         "INSERT INTO conflicts (generation_id, kind, left_id, right_id,
+                                 detected_ts, basis, run_id)
+            VALUES (?, 'test', ?, ?, 0, 'test', 0)"
+         (list first (first live) (second live)))
+        (enchiridion.memory:promote-generation store first)
+        (write-body store "gamma is delta")
+        (setf derived 0)
+        (let* ((report (enchiridion.memory:build-candidate store :limit 10))
+               (second (getf report :generation-id))
+               (copied (ids-of store "assertions" second)))
+          (testing "only the new episode reaches the deriver"
+            (ok (= 1 derived))
+            (ok (= 1 (getf report :processed))))
+          (testing "the live assertions are copied as rows of their own"
+            (ok (= 2 (length copied)))
+            (ok (null (intersection copied live))))
+          (testing "the copied conflict names the copies, not the live rows"
+            (let ((row (first (enchiridion.memory.store:query-rows
+                               store "SELECT left_id, right_id FROM conflicts
+                                       WHERE generation_id = ?"
+                               (list second)))))
+              (ok (member (enchiridion.memory.store:field row "left_id") copied))
+              (ok (member (enchiridion.memory.store:field row "right_id") copied))))
+          (testing "the live generation is untouched"
+            (ok (equal live (ids-of store "assertions" first))))
+          (testing "the copy counts no writes, so the volume gate sees only new ones"
+            (ok (zerop (getf report :assertions)))))))))
+
+(deftest a-rebuild-derives-the-whole-log-again ()
+  (with-store (store directory)
+    (let* ((derived 0)
+           (enchiridion.memory:*assertion-deriver*
+             (lambda (store episode)
+               (incf derived)
+               (test-deriver store episode))))
+      (write-body store "alpha is beta")
+      (enchiridion.memory:promote-generation
+       store (getf (enchiridion.memory:build-candidate store :limit 10) :generation-id))
+      (write-body store "gamma is delta")
+      (setf derived 0)
+      (let ((report (enchiridion.memory:build-candidate store :limit 10 :rebuild t)))
+        (ok (= 2 derived))
+        (ok (= 1 (length (ids-of store "assertions" (getf report :generation-id)))))))))

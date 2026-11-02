@@ -49,30 +49,127 @@ CONFIG-DIGEST; the empty string is the valid first value.")
                        ORDER BY id DESC LIMIT 1"))))
     (and row (enchiridion.memory.store:field row "id"))))
 
+(defun table-columns (store table)
+  "Return the column names of TABLE, in declaration order."
+  (mapcar (lambda (row) (enchiridion.memory.store:field row "name"))
+          (enchiridion.memory.store:query-rows
+           store (format nil "PRAGMA table_info(~A)" table))))
+
+(defun copy-generation-rows (store table from to &key (remap (constantly nil)))
+  "Copy TABLE's rows of generation FROM into generation TO and return a hash
+table of old id to new id, empty for a table with no id column.
+
+The columns come from the table itself, so a column added to the schema is
+copied without a change here. REMAP is called with a column name, the row, the
+value, and this copy's own map so far, and returns the replacement or NIL to
+keep the value: it is how a reference to a row this copy renumbered follows the
+row. Rows are copied in id order, so a row that names an earlier row of the same
+table, a schema's parent, finds it in the map."
+  (let* ((columns (table-columns store table))
+         (id-p (member "id" columns :test #'string=))
+         (copied (remove-if (lambda (c) (member c '("id" "generation_id")
+                                                :test #'string=))
+                            columns))
+         (statement (format nil "INSERT INTO ~A (generation_id~{, ~A~}) VALUES (?~:*~{, ?~*~})"
+                            table copied))
+         (map (make-hash-table)))
+    (dolist (row (enchiridion.memory.store:query-rows
+                  store
+                  (format nil "SELECT * FROM ~A WHERE generation_id = ? ORDER BY rowid"
+                          table)
+                  (list from)))
+      (enchiridion.memory.store:exec
+       store statement
+       (cons to (mapcar (lambda (column)
+                          (let ((value (enchiridion.memory.store:field row column)))
+                            (or (funcall remap column row value map) value)))
+                        copied)))
+      (when id-p
+        (setf (gethash (enchiridion.memory.store:field row "id") map)
+              (enchiridion.memory.store:last-row-id store))))
+    map))
+
+(defun copy-live-generation (store from to)
+  "Copy generation FROM's semantic layer into generation TO, renumbering every
+reference so the copy points at its own rows and never at FROM's.
+
+Schemas go first, because assertions and later schemas name them; assertions
+next, because conflicts and semantic links name them. The derivation marks go
+too, which is what makes the candidate derive only what FROM never saw."
+  (let* ((schemas (copy-generation-rows
+                   store "schemas" from to
+                   :remap (lambda (column row value own)
+                            (declare (ignore row))
+                            (and (string= column "parent_id") value
+                                 (gethash value own)))))
+         (assertions (copy-generation-rows
+                      store "assertions" from to
+                      :remap (lambda (column row value own)
+                               (declare (ignore row own))
+                               (and (string= column "schema_id") value
+                                    (gethash value schemas))))))
+    (copy-generation-rows store "summaries" from to)
+    (copy-generation-rows store "procedures" from to)
+    (copy-generation-rows store "change_events" from to)
+    (copy-generation-rows
+     store "conflicts" from to
+     :remap (lambda (column row value own)
+              (declare (ignore row own))
+              (and (member column '("left_id" "right_id") :test #'string=)
+                   (gethash value assertions))))
+    (copy-generation-rows
+     store "links" from to
+     :remap (lambda (column row value own)
+              (declare (ignore own))
+              (let ((kind (cond ((string= column "src")
+                                 (enchiridion.memory.store:field row "src_kind"))
+                                ((string= column "dst")
+                                 (enchiridion.memory.store:field row "dst_kind")))))
+                (cond ((equal kind "assertion") (gethash value assertions))
+                      ((equal kind "schema") (gethash value schemas))))))
+    (copy-generation-rows store "generation_derivations" from to)
+    (hash-table-count assertions)))
+
 (defun start-candidate (store &key (parser-version *memory-parser-version*)
-                                   (config-hash *memory-config-hash*))
+                                   (config-hash *memory-config-hash*)
+                                   (rebuild nil))
   "Create a building generation and return its id.
-The parent is the live generation, or NIL when none has been promoted. The
-phase 2 builder fills the candidate from the log; it does not copy the parent's
-rows, so a candidate is a clean rebuild and P7 is direct."
+
+The parent is the live generation, or NIL when none has been promoted. A
+candidate starts as a copy of the live semantic layer, derivation marks
+included, so the builder derives only the episodes the live generation never
+saw and a pass costs what the log grew by, not what the log holds. A first
+generation starts empty. REBUILD starts empty even with a live parent, so the
+whole log is derived again; it is the operator's choice, never the schedule's."
   (ensure-generation-state store)
-  (let* ((parent (live-generation-id store))
-         (number (or (enchiridion.memory.store:field
-                      (first (enchiridion.memory.store:query-rows
-                              store
-                              "SELECT COALESCE(MAX(number), 0) + 1 AS n
-                                 FROM generations"))
-                      "n")
-                     1))
-         (now (get-universal-time)))
-    (enchiridion.memory.store:exec
-     store
-     "INSERT INTO generations
-        (number, parent_id, status, created_ts, from_episode, to_episode,
-         parser_version, config_hash)
-        VALUES (?, ?, 'building', ?, 0, 0, ?, ?)"
-     (list number (and (plusp parent) parent) now parser-version config-hash))
-    (enchiridion.memory.store:last-row-id store)))
+  (enchiridion.memory.store:with-store-transaction (store)
+    (let* ((parent (live-generation-id store))
+           (copy-p (and (plusp parent) (not rebuild)))
+           (from (if copy-p
+                     (or (enchiridion.memory.store:field
+                          (generation-row store parent) "to_episode")
+                         0)
+                     0))
+           (number (or (enchiridion.memory.store:field
+                        (first (enchiridion.memory.store:query-rows
+                                store
+                                "SELECT COALESCE(MAX(number), 0) + 1 AS n
+                                   FROM generations"))
+                        "n")
+                       1))
+           (now (get-universal-time)))
+      (enchiridion.memory.store:exec
+       store
+       "INSERT INTO generations
+          (number, parent_id, status, created_ts, from_episode, to_episode,
+           parser_version, config_hash)
+          VALUES (?, ?, 'building', ?, ?, ?, ?, ?)"
+       (list number (and (plusp parent) parent) now from from
+             parser-version config-hash))
+      (let ((id (enchiridion.memory.store:last-row-id store)))
+        (when copy-p
+          (copy-live-generation store parent id))
+        id))))
 
 (defun generation-row (store generation-id)
   "Return one generation row as a plist, or NIL."
@@ -290,11 +387,14 @@ before insertion. Conflict detection runs after the new assertions exist."
 
 (defun build-candidate (store &key (limit *memory-t2-episodes-per-tick*)
                                   (parser-version *memory-parser-version*)
-                                  (config-hash *memory-config-hash*))
+                                  (config-hash *memory-config-hash*)
+                                  (rebuild nil))
   "Build or resume a candidate generation and return a report plist.
 With no deriver installed the function reports :no-deriver and writes nothing.
 The build is resumable: a limited batch leaves the generation in :building and
-the next call continues the same generation."
+the next call continues the same generation. A new candidate copies the live
+layer and derives what is new; REBUILD starts it empty instead, and has no
+effect on a build already under way."
   (cond
     ((null store) (list :built nil :reason :no-store))
     ((not (enabled-p)) (list :built nil :reason :disabled))
@@ -304,7 +404,8 @@ the next call continues the same generation."
      (let* ((generation-id (or (current-building-generation store)
                                (start-candidate store
                                                 :parser-version parser-version
-                                                :config-hash config-hash)))
+                                                :config-hash config-hash
+                                                :rebuild rebuild)))
             (episodes (candidate-episodes store generation-id limit))
             (now (get-universal-time))
             (accepted 0) (rejected 0) (conflicts 0) (closed 0)

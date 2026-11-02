@@ -25,7 +25,7 @@ The model-facing `memory` tool writes a memory episode.
 
 ## What is not on yet
 
-The generation lifecycle is implemented and tested: a candidate is built from the log, it is invisible until promoted, promotion swaps the live pointer, and rollback returns it.
+The generation lifecycle is implemented and tested: a candidate starts as a copy of the live semantic layer and derives only the episodes the live generation never saw, it is invisible until promoted, promotion swaps the live pointer, and rollback returns it.
 It is not on the heartbeat yet, and promotion is not exposed on the command line until the four gates land.
 The push channels, the intention tool, the canaries, the gate log, and the code-change proposal queue are designed and scheduled but are not wired into a turn.
 Their tables exist in the schema.

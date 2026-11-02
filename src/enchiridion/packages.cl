@@ -329,7 +329,7 @@ did not think of."))
    #:live-assertion-count #:current-generation #:ensure-generation-state
    #:rebuild-derived #:graph-terms-on-p #:resolve-conflict-at-action #:forget-session
    #:add-intention #:list-intentions #:cancel-intention
-   #:propose-change #:memory-status
+   #:propose-change #:memory-status #:import-log
    #:live-generation-id #:render-pack #:pack-rows #:select-pack-rows
    #:*memory-reranker* #:make-model-reranker #:rerank-rows #:parse-rerank-reply
    #:*memory-embedder* #:*memory-embed-model* #:make-backend-embedder

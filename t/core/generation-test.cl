@@ -1015,3 +1015,34 @@ shipped schedule."
                                   (enchiridion.memory.store:query-rows
                                    store "SELECT episode_id FROM assertions ORDER BY id"))))
             (ok (equal episodes (sort (copy-list episodes) #'<)))))))))
+
+;;;; Importing a log.
+
+(deftest a-log-imports-once-as-episodes-on-the-import-channel ()
+  (with-store (store directory)
+    (let ((path (merge-pathnames "log.jsonl" directory)))
+      (ensure-directories-exist path)
+      (with-open-file (out path :direction :output :if-exists :supersede)
+        (write-line "{\"session\":\"a\",\"role\":\"user\",\"body\":\"where is the deploy key\",\"ts\":1700000000}" out)
+        (write-line "{\"session\":\"a\",\"role\":\"assistant\",\"content\":\"in vault under ops\"}" out)
+        (write-line "not json at all" out)
+        (write-line "" out)
+        (write-line "{\"session\":\"b\",\"role\":\"user\",\"body\":\"hello\"}" out))
+      (let ((report (enchiridion.memory:import-log store path)))
+        (ok (= 3 (getf report :turns)))
+        (ok (= 2 (getf report :sessions)))
+        (ok (= 1 (getf report :unreadable-lines))))
+      (testing "each turn is an episode on the import channel, with its own time"
+        (let ((rows (enchiridion.memory.store:query-rows
+                     store "SELECT session, role, body, channel, ts FROM episodes ORDER BY id")))
+          (ok (= 3 (length rows)))
+          (ok (every (lambda (row) (equal "import" (enchiridion.memory.store:field row "channel"))) rows))
+          (ok (equal "in vault under ops" (enchiridion.memory.store:field (second rows) "body")))
+          (ok (= (+ 1700000000 2208988800) (enchiridion.memory.store:field (first rows) "ts")))))
+      (testing "and an imported answer is a utility task like a live one"
+        (ok (= 1 (length (remove "hello" (enchiridion.memory:utility-tasks store)
+                                 :key (lambda (task) (getf task :cue)) :test #'equal)))))
+      (testing "importing it again adds nothing"
+        (let ((again (enchiridion.memory:import-log store path)))
+          (ok (zerop (getf again :turns)))
+          (ok (= 2 (getf again :skipped-sessions))))))))

@@ -365,7 +365,21 @@ The first argument may also be an action on the episodic log:
 ```sh
 enchiridion memory status
 enchiridion memory build
+enchiridion memory import FILE.jsonl
 ```
+
+`import` reads a conversation log as JSON Lines, one turn per line, oldest first:
+
+```json
+{"session": "2026-03-01-a", "role": "user", "body": "where is the deploy key", "ts": 1772323200}
+{"session": "2026-03-01-a", "role": "assistant", "content": "in vault under ops"}
+```
+
+`body` may be spelled `content`; `ts` is optional Unix seconds.
+Each turn is scrubbed and stored like a live one, on the `import` channel.
+A session the store already has is skipped whole, so the same file can be imported twice safely.
+Nothing calls a model: maintenance derives rarity over the next ticks, and T2 derives the semantics on its schedule.
+A first build over a large import is judged per episode by the cost gate (`:t2-max-tokens-per-episode`) and paced by `:t2-max-tokens-per-pass`, so at the shipped 200,000 a day and a measured 1,500 tokens an episode, 2,000 imported episodes take about 15 days.
 
 `status` prints the switch states and counts:
 

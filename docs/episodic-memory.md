@@ -159,6 +159,7 @@ The remaining keys in the example belong to the generation and gate path and are
 ```sh
 enchiridion memory status        # log counts, live generation, cue index, canaries
 enchiridion memory build         # run one bounded candidate build
+enchiridion memory import LOG    # add a JSON Lines conversation log to the episodes
 enchiridion memory "open ports"  # search sessions, memories and episodes
 ```
 

@@ -426,6 +426,64 @@ Never signal: the heartbeat reports a failure."
       (error (c)
         (list :failed (enchiridion.errors:condition-report-line c))))))
 
+(defparameter +unix-epoch+ 2208988800
+  "The universal time of 1970-01-01T00:00:00Z: an imported line's Unix TS
+plus this is the universal time the store keeps.")
+
+(defun import-line-turn (line)
+  "Return LINE, one JSON object, as a plist of :SESSION :ROLE :BODY :TS, or
+NIL when it is not one turn. BODY may be spelled content, as most exports do."
+  (let ((object (ignore-errors (com.inuoe.jzon:parse line))))
+    (when (hash-table-p object)
+      (let ((session (gethash "session" object))
+            (role (gethash "role" object))
+            (body (or (gethash "body" object) (gethash "content" object)))
+            (ts (gethash "ts" object)))
+        (when (and (stringp session) (plusp (length session))
+                   (stringp role) (plusp (length role))
+                   (stringp body) (plusp (length body)))
+          (list :session session :role role :body body
+                :ts (if (and (integerp ts) (plusp ts)) (+ ts +unix-epoch+) nil)))))))
+
+(defun import-log (store path &key (now (get-universal-time)))
+  "Import the conversation log at PATH into STORE and return a report plist.
+
+PATH holds JSON Lines, one turn per line, oldest first: session, role, body
+(or content), and an optional Unix ts. Each turn goes through RECORD-TURN, so
+it is scrubbed and becomes an episode exactly as a live turn does, on the
+import channel. A session the store already has is skipped whole, so running
+the same import twice adds nothing. Nothing here calls a model: maintenance
+derives the rarity of the new episodes on the next ticks, and T2 derives their
+semantics on its schedule, under its own caps."
+  (let ((existing (make-hash-table :test #'equal))
+        (skipped-sessions (make-hash-table :test #'equal))
+        (sessions (make-hash-table :test #'equal))
+        (turns 0) (bad 0) (offset 0))
+    (dolist (row (enchiridion.memory.store:query-rows
+                  store "SELECT DISTINCT session FROM episodes"))
+      (setf (gethash (enchiridion.memory.store:field row "session") existing) t))
+    (with-open-file (stream path :external-format :utf-8)
+      (enchiridion.memory.store:with-store-transaction (store)
+        (loop for line = (read-line stream nil)
+              while line
+              unless (zerop (length (string-trim '(#\Space #\Tab #\Return) line)))
+                do (let ((turn (import-line-turn line)))
+                     (cond
+                       ((null turn) (incf bad))
+                       ((gethash (getf turn :session) existing)
+                        (setf (gethash (getf turn :session) skipped-sessions) t))
+                       (t
+                        (enchiridion.memory.store:record-turn
+                         store :session (getf turn :session) :role (getf turn :role)
+                               :body (getf turn :body) :model "import" :channel :import
+                               ;; A line with no time keeps its order a second apart.
+                               :ts (or (getf turn :ts) (+ now (incf offset))))
+                        (setf (gethash (getf turn :session) sessions) t)
+                        (incf turns)))))))
+    (list :turns turns :sessions (hash-table-count sessions)
+          :skipped-sessions (hash-table-count skipped-sessions)
+          :unreadable-lines bad)))
+
 (defun memory-status (store)
   "Return a plist describing the log and the live layer.
 This is a read-only status function: it never signals on a missing table."

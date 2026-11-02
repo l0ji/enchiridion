@@ -703,7 +703,7 @@ file a block is backed by."
 
 (defun cmd-memory (arguments)
   "Search sessions, memories and episodes, or run a log action.
-The first argument selects an action when it is STATUS, BACKFILL or BUILD.
+The first argument selects an action when it is STATUS, BUILD or IMPORT.
 Anything else is a search query, so the common call keeps working."
   (let ((missing (require-store "memory")))
     (if missing
@@ -718,6 +718,19 @@ Anything else is a search query, so the common call keeps working."
                               :cue-index :canaries))
                  (say "~(~A~): ~A" key (getf status key))))
              0)
+            ((string= action "import")
+             (let ((path (second arguments)))
+               (cond
+                 ((or (null path) (not (probe-file path)))
+                  (say "memory import takes a JSON Lines file: one turn per line, with session, role and body.")
+                  2)
+                 (t
+                  (let ((report (enchiridion.memory:import-log store path)))
+                    (say "imported ~D turn~:P in ~D session~:P~[~:;; ~:*~D session~:P already in the store skipped~]~[~:;; ~:*~D unreadable line~:P~]."
+                         (getf report :turns) (getf report :sessions)
+                         (getf report :skipped-sessions) (getf report :unreadable-lines))
+                    (say "T2 derives them on its schedule, under :t2-max-tokens-per-pass a day.")
+                    0)))))
             ((string= action "build")
              (let ((report (enchiridion.memory:build-candidate store)))
                (cond

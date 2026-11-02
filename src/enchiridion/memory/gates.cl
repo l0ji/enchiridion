@@ -812,13 +812,28 @@ is off, or a busy log would make weekly mean nothing."
   (getf (enchiridion.memory.store:usage-total-since store (- now 86400) :channel :t2)
         :total))
 
+(defun maintenance-backlog (store)
+  "Return how many episodes maintenance has not derived yet."
+  (or (enchiridion.memory.store:field
+       (first (enchiridion.memory.store:query-rows
+               store "SELECT COUNT(*) AS n FROM episodes WHERE derived_ts IS NULL"))
+       "n")
+      0))
+
 (defun t2-refusal (store &key (now (get-universal-time)))
   "Return why no T2 pass may run on this tick, as a keyword, or NIL.
 A missing instrument is not a refusal here: the pass reports it with the list
-of what is missing, and spends nothing doing so."
+of what is missing, and spends nothing doing so.
+
+A maintenance backlog is: the tail sample reads rarity, which maintenance
+derives a batch per tick, so after a large import the preflight would find too
+few rare answers, call the instruments missing, and end the pass for a whole
+interval although a few more ticks would have supplied them. A refusal ends no
+pass, so T2 runs on the first tick the backlog is clear."
   (cond
     ((or (not (enabled-p)) (not *t2-enabled-p*)) :disabled)
     ((not (t2-due-p store :now now)) :not-due)
+    ((plusp (maintenance-backlog store)) :maintenance-pending)
     ;; Only the operator lifts a precision freeze, so a pass during one could
     ;; only spend. A quarantine-rate freeze is not refused: held candidates
     ;; are what lift it, and T2-INTERVAL already slows it to weekly.

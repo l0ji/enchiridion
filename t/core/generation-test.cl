@@ -1046,3 +1046,13 @@ shipped schedule."
         (let ((again (enchiridion.memory:import-log store path)))
           (ok (zerop (getf again :turns)))
           (ok (= 2 (getf again :skipped-sessions))))))))
+
+(deftest t2-waits-for-maintenance-without-ending-its-pass ()
+  ;; After a large import the first tick derives rarity for one batch, and a
+  ;; preflight then would end the pass for a day for want of a tail sample.
+  (with-t2-world (store directory)
+    (write-body store "an imported turn maintenance has not reached")
+    (ok (eq :maintenance-pending (enchiridion.memory:t2-refusal store)))
+    (ok (null (enchiridion.memory:last-t2-ts store)))
+    (enchiridion.memory.store:exec store "UPDATE episodes SET derived_ts = 1")
+    (ok (null (enchiridion.memory:t2-refusal store)))))

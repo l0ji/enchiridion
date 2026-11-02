@@ -128,6 +128,7 @@ The pass ends, and the next interval starts, at step 1's rollback, step 2's skip
 T2 is refused, with a note, while promotion precision is frozen, once T2 has spent `:t2-max-tokens-per-pass` in the last twenty-four hours, or when the day cap is spent.
 A quarantine-rate freeze does not refuse T2: the interval becomes `:t2-frozen-interval-seconds` and the episode threshold is ignored, because held candidates are what lift it.
 T2 spend counts toward the day cap, not the tick cap.
+While maintenance has episodes it has not derived, T2 is skipped as `maintenance-pending` without ending a pass: after a large import, the tail sample needs every episode's rarity, and a preflight on a partial backlog would otherwise end the pass for a whole interval.
 
 ## Configuration
 

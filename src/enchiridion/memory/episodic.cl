@@ -955,9 +955,21 @@ changed."
 (defparameter +assertion-candidate-columns+
   "a.id, a.subject, a.relation, a.object, a.polarity, a.valid_from, a.valid_to,
    a.cue_type, a.episode_id, a.tx_to, e.session, e.context_key, e.ts,
-   act.n_enc, act.last_enc, act.n_ret, act.last_ret, act.created_ts, act.supp,
-   act.supp_ts, act.imp, act.distinctness"
-  "The columns both routes to an assertion select.")
+   COALESCE(act.n_enc, eact.n_enc) AS n_enc,
+   COALESCE(act.last_enc, eact.last_enc) AS last_enc,
+   COALESCE(act.n_ret, eact.n_ret) AS n_ret,
+   COALESCE(act.last_ret, eact.last_ret) AS last_ret,
+   COALESCE(act.created_ts, eact.created_ts) AS created_ts,
+   COALESCE(act.supp, eact.supp) AS supp,
+   COALESCE(act.supp_ts, eact.supp_ts) AS supp_ts,
+   COALESCE(act.imp, eact.imp) AS imp,
+   COALESCE(act.distinctness, eact.distinctness) AS distinctness"
+  "The columns both routes to an assertion select.
+
+A claim with no activation row of its own takes each value from its source
+episode's.  Without that, every claim defaulted to created now with importance
+5, so it looked freshly encoded at every retrieval while its evidence aged, and
+one episode's claims outranked the episode on base level alone.")
 
 (defun assertion-candidate (row now)
   "Return ROW, one assertion and its supporting episode, as a candidate plist."
@@ -974,7 +986,7 @@ changed."
           :ts (enchiridion.memory.store:field row "ts")
           :lexical (let ((bm25 (enchiridion.memory.store:field row "lexical")))
                      (if bm25 (- (float bm25)) 0.0))
-          :route-ranks '()
+          :claim-rank nil
           :context (split-context-key
                     (enchiridion.memory.store:field row "context_key"))
           :cue-type (enchiridion.memory.store:field row "cue_type")
@@ -1006,15 +1018,16 @@ Two routes reach an assertion.  The claim route matches the cue against the
 assertion's own words, so a claim is found by a term its source episode never
 used: that is the recall the semantic layer can add.  The support route
 matches the episode the claim came from, so a claim is never harder to find
-than its evidence.  A candidate found by both appears once, and :ROUTE-RANKS
-holds its rank in each route, which RETRIEVE-ROWS-FOR-TURN fuses with the
-episode ranking: BM25 from two indexes is not on one scale, ranks are.  Only
-the named generation is read, so a candidate is invisible to the live layer."
+than its evidence.  A candidate found by both appears once.  :CLAIM-RANK is
+its rank in the claim route, or NIL; the support route records no rank of its
+own, because its order is the episode ranking repeated once per claim, and
+FUSE-SEMANTIC-CANDIDATES reads that ranking directly.  Only the named
+generation is read, so a candidate is invisible to the live layer."
   (when (and generation (plusp generation))
     (let ((match (cue-match cue))
           (by-id (make-hash-table))
           (order '()))
-      (flet ((route (statement)
+      (flet ((route (statement &key claim)
                (loop for row in (enchiridion.memory.store:query-rows
                                  store statement (list match generation limit))
                      for rank from 0
@@ -1022,23 +1035,29 @@ the named generation is read, so a candidate is invisible to the live layer."
                      do (unless (gethash id by-id)
                           (push id order)
                           (setf (gethash id by-id) (assertion-candidate row now)))
-                        (push rank (getf (gethash id by-id) :route-ranks)))))
+                        (when claim
+                          (setf (getf (gethash id by-id) :claim-rank) rank)))))
         (route (format nil "SELECT ~A, bm25(assertions_fts) AS lexical
                               FROM assertions_fts
                               JOIN assertions a ON a.id = assertions_fts.rowid
                               JOIN episodes e ON e.id = a.episode_id
                               LEFT JOIN activation act
                                      ON act.kind = 'assertion' AND act.id = a.id
+                              LEFT JOIN activation eact
+                                     ON eact.kind = 'episode' AND eact.id = e.id
                              WHERE assertions_fts MATCH ? AND a.tx_to IS NULL
                                AND a.generation_id = ?
                              ORDER BY rank LIMIT ?"
-                       +assertion-candidate-columns+))
+                       +assertion-candidate-columns+)
+               :claim t)
         (route (format nil "SELECT ~A, bm25(episodes_fts) AS lexical
                               FROM episodes_fts
                               JOIN episodes e ON e.id = episodes_fts.rowid
                               JOIN assertions a ON a.episode_id = e.id
                               LEFT JOIN activation act
                                      ON act.kind = 'assertion' AND act.id = a.id
+                              LEFT JOIN activation eact
+                                     ON eact.kind = 'episode' AND eact.id = e.id
                              WHERE episodes_fts MATCH ? AND a.tx_to IS NULL
                                AND a.generation_id = ?
                              ORDER BY rank LIMIT ?"

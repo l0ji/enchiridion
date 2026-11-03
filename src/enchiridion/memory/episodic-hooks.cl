@@ -266,19 +266,30 @@ not a report. OBSERVED stays NULL until an external signal arrives."
 
 With no ASSERTIONS the episodes are returned untouched, so a turn with no
 live generation, and the retention-only arm, rank exactly as they always have.
-Otherwise each candidate's :LEXICAL becomes the reciprocal-rank fusion of its
-ranks: an episode's in the episode ranking, an assertion's in each route that
-found it.  BM25 from the episode index and the claim index is not on one
-scale, so the ranks are what is compared."
+Otherwise an episode's :LEXICAL becomes the reciprocal-rank score of its rank
+in the episode ranking, and an assertion's becomes the larger of two: its
+:CLAIM-RANK in the claim route, and the rank its supporting episode holds in
+that same episode ranking.  The larger, not the sum: the support route is the
+episode ranking again, so adding it would count one piece of evidence twice
+and let every claim of a matched episode outrank the episode itself.  Through
+its evidence a claim can only tie that evidence; it rises above it only when
+its own words match the cue better.  BM25 from the episode index and the claim
+index is not on one scale, so the ranks are what is compared."
   (if (null assertions)
       episodes
       (let ((k (parameter :rrf-k *memory-parameters*))
+            (episode-rank (make-hash-table))
             (ranked (stable-sort (copy-list episodes) #'>
                                  :key (lambda (item) (or (getf item :lexical) 0.0)))))
         (loop for item in ranked for rank from 0
-              do (setf (getf item :lexical) (rrf (list rank) k)))
+              do (setf (getf item :lexical) (rrf (list rank) k))
+                 (setf (gethash (getf item :id) episode-rank) rank))
         (dolist (item assertions)
-          (setf (getf item :lexical) (rrf (getf item :route-ranks) k)))
+          (let ((claim (getf item :claim-rank))
+                (support (gethash (getf item :episode-id) episode-rank)))
+            (setf (getf item :lexical)
+                  (max (if claim (rrf (list claim) k) 0.0)
+                       (if support (rrf (list support) k) 0.0)))))
         (append episodes assertions))))
 
 (defun retrieve-rows-for-turn (store text &key (session "default") (channel :cli)

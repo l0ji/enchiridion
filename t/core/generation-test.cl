@@ -617,13 +617,63 @@ subject from the question before it, the way the model deriver is asked to."
           (let ((hits (enchiridion.memory:assertion-candidates-for
                        store "service0 secret" :generation generation)))
             (ok (= 1 (length hits)))
-            (ok (equal '(0) (getf (first hits) :route-ranks)))))))))
+            (ok (eql 0 (getf (first hits) :claim-rank)))))))))
+
+(deftest a-claim-with-no-activation-of-its-own-takes-its-episodes ()
+  ;; Found on the trial: no claim had an activation row, so each defaulted to
+  ;; created now with importance 5 and beat its own evidence on base level.
+  (with-store (store directory)
+    (let ((enchiridion.memory:*assertion-deriver* #'context-deriver))
+      (answered-questions store 1)
+      (let* ((generation (getf (enchiridion.memory:build-candidate store :limit 10)
+                               :generation-id))
+             (claim (first (enchiridion.memory:assertion-candidates-for
+                            store "service0 secret" :generation generation)))
+             (episode (first (enchiridion.memory.store:query-rows
+                              store "SELECT created_ts, imp FROM activation
+                                      WHERE kind = 'episode' AND id = ?"
+                              (list (getf claim :episode-id))))))
+        (ok (= (enchiridion.memory.store:field episode "created_ts")
+               (enchiridion.memory:activation-created-ts (getf claim :activation))))
+        (ok (= (enchiridion.memory.store:field episode "imp")
+               (enchiridion.memory:activation-imp (getf claim :activation))))))))
 
 (deftest a-retrieval-with-no-assertions-is-ranked-as-before ()
   (let ((episodes (list (list :kind "episode" :id 1 :lexical 3.0)
                         (list :kind "episode" :id 2 :lexical 1.0))))
     (ok (eq episodes (enchiridion.memory::fuse-semantic-candidates episodes '())))
     (ok (= 3.0 (getf (first episodes) :lexical)))))
+
+(deftest a-claim-never-outranks-its-own-evidence-through-it ()
+  ;; Found on the trial: summing the support route with the claim route let
+  ;; ten claims of one listing fill the pack, and the listing that held the
+  ;; answer the canary asked for was pushed out of it.
+  (let* ((k (enchiridion.memory::parameter :rrf-k enchiridion.memory::*memory-parameters*))
+         (episodes (list (list :kind "episode" :id 1 :lexical 3.0)
+                         (list :kind "episode" :id 2 :lexical 1.0)))
+         (listing (loop for i from 0 below 10
+                        collect (list :kind "assertion" :id (+ 10 i) :episode-id 1
+                                      :lexical 0.0 :claim-rank i)))
+         (better (list :kind "assertion" :id 30 :episode-id 2 :lexical 0.0 :claim-rank 0))
+         (orphan (list :kind "assertion" :id 31 :episode-id 99 :lexical 0.0 :claim-rank nil))
+         (fused (enchiridion.memory::fuse-semantic-candidates
+                 episodes (append listing (list better orphan))))
+         (score (lambda (id kind)
+                  (getf (find-if (lambda (item) (and (eql id (getf item :id))
+                                                     (equal kind (getf item :kind))))
+                                 fused)
+                        :lexical)))
+         (top (funcall score 1 "episode")))
+    (testing "no claim of the best episode scores above that episode"
+      (ok (every (lambda (claim) (<= (funcall score (getf claim :id) "assertion") top))
+                 listing)))
+    (testing "a claim ties its evidence through the support route"
+      (ok (= top (funcall score 15 "assertion"))))
+    (testing "a claim whose own words match best rises above its weaker evidence"
+      (ok (> (funcall score 30 "assertion") (funcall score 2 "episode")))
+      (ok (= (enchiridion.memory::rrf '(0) k) (funcall score 30 "assertion"))))
+    (testing "a claim reached by neither ranking scores nothing"
+      (ok (= 0.0 (funcall score 31 "assertion"))))))
 
 (deftest the-deriver-is-shown-the-turn-before-the-record ()
   (with-store (store directory)
@@ -924,7 +974,11 @@ shipped schedule."
                                :generation-id))
              (rows (enchiridion.memory:retrieve-rows-for-turn
                     store "where does service2 keep its secret" :generation generation)))
-        (ok (equal "assertion" (getf (getf (first rows) :item) :kind)))
+        (testing "the claim competes for the top of the pack, not fortieth"
+          (let ((at (position "assertion" rows
+                              :key (lambda (row) (getf (getf row :item) :kind))
+                              :test #'equal)))
+            (ok (and at (< at 3)))))
         (testing "the cue-type term no longer separates the two kinds"
           (ok (every (lambda (row)
                        (= 1.0 (enchiridion.memory::terms-cue-type (getf row :terms))))

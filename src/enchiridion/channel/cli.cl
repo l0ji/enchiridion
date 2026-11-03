@@ -230,12 +230,22 @@ A name that is not a string, or has no slash, is returned unchanged."
       (say "~A" (safe-read-file file))
       0)))
 
-(declaim (ftype (function (list) null) print-row))
+(declaim (ftype (function ((or list enchiridion.memory.store:turn-row)) null) print-row))
 
 (defun print-row (row)
-  "Print ROW, one store plist, one column per line, and return NIL."
-  (loop for (key value) on row by #'cddr
-        do (say "  ~(~A~): ~A" key value))
+  "Print ROW, a store plist or a turn row, one column per line, and return NIL.
+A session search returns turn rows, and printing one as a plist failed on the
+first turn it found."
+  (let ((row (if (typep row 'enchiridion.memory.store:turn-row)
+                 (list :id (enchiridion.memory.store:turn-row-id row)
+                       :session (enchiridion.memory.store:turn-row-session row)
+                       :role (enchiridion.memory.store:turn-row-role row)
+                       :channel (enchiridion.memory.store:turn-row-channel row)
+                       :ts (enchiridion.memory.store:turn-row-ts row)
+                       :body (enchiridion.memory.store:turn-row-body row))
+                 row)))
+    (loop for (key value) on row by #'cddr
+          do (say "  ~(~A~): ~A" key value)))
   nil)
 
 (declaim (ftype (function (t integer) (or null string)) revision-at))

@@ -79,6 +79,15 @@ here the way the operator would see it."
 
 ;;;; The table.
 
+(deftest a-session-search-prints-its-turns ()
+  ;; A session search returns turn rows, and printing one as a plist failed.
+  (let ((text (with-output-to-string (*standard-output*)
+                (enchiridion.channel.cli::print-row
+                 (enchiridion.memory.store::%make-turn-row
+                  :id 7 :session "s" :role "user" :body "where is the key" :ts 1)))))
+    (ok (search "  id: 7" text))
+    (ok (search "  body: where is the key" text))))
+
 (deftest the-command-set-is-the-plan-set ()
   (ok (equal +plan-commands+ (enchiridion.channel.cli:command-names))))
 

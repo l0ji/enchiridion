@@ -80,7 +80,7 @@ the store: retrieval and tail, that the cue brings back a record holding the
 expectation; update, that the newer value ranks above the stale one; safety,
 that no record holding the forbidden text reaches the pack."
   (let* ((rows (retrieve-rows-for-turn store (getf canary :cue) :generation generation))
-         (bodies (mapcar (lambda (row) (or (getf (getf row :item) :body) "")) rows))
+         (bodies (mapcar (lambda (row) (format nil "~{~A~^~%~}" (row-texts row))) rows))
          (expect (getf canary :expect)))
     (flet ((rank (text)
              (position-if (lambda (body) (search text body :test #'char-equal)) bodies)))
@@ -392,6 +392,7 @@ channel's own turns are not exchanges and are left out."
             (list :name (format nil "answer-~D"
                                 (enchiridion.memory.store:field row "cue_id"))
                   :cue (enchiridion.memory.store:field row "cue")
+                  :cue-episode (enchiridion.memory.store:field row "cue_id")
                   :expect-episode (enchiridion.memory.store:field row "answer_id")))
           (enchiridion.memory.store:query-rows
            store
@@ -417,18 +418,29 @@ from it: either way the answer reached the pack."
                 (eql (getf item :id) episode-id))))
         rows))
 
-(defun pack-position (store rows cue episode-id &key (budget *gate-pack-chars*))
+(defun pack-position (store rows cue episode-id &key (budget *gate-pack-chars*)
+                                                      skip-episode)
   "Return where EPISODE-ID's answer sits in the pack ROWS render at BUDGET
 characters, counting from 0, or NIL when it did not fit. The pack is built the
 way a turn builds it, through SELECT-PACK-ROWS and RENDER-PACK, so the gate
-measures what a model would be shown and not the ranking behind it."
-  (let ((included (nth-value 1 (render-pack (select-pack-rows store cue rows)
-                                            :budget budget :cue cue))))
+measures what a model would be shown and not the ranking behind it.
+
+SKIP-EPISODE, the turn the cue was taken from, still takes its room in the
+pack but is not counted as a place: it is the question repeated, it leads both
+arms' packs, and counting it made every other row cost a whole rank."
+  (let ((included (remove-if (lambda (row)
+                               (let ((item (getf row :item)))
+                                 (and skip-episode
+                                      (equal (getf item :kind) "episode")
+                                      (eql (getf item :id) skip-episode))))
+                             (nth-value 1 (render-pack (select-pack-rows store cue rows)
+                                                       :budget budget :cue cue)))))
     (position-if (lambda (row) (answer-hit-p (list row) episode-id)) included)))
 
 (defun answer-scorer (store task pushed rows)
   "Score TASK by where its answer reached the gate's pack: 1 first, 1/2
 second, 1/N at position N, and 0 when it did not fit in *GATE-PACK-CHARS*.
+The turn the cue came from is not counted as a place.
 
 A graded score and not hit or miss, because a log already brings back most
 answers to its own questions: scored as hits, nearly every pair ties and the
@@ -436,7 +448,8 @@ sign test has nothing to count. The small pack is the matched budget, and it
 is what lets a short claim beat a long answer that no longer fits."
   (declare (ignore pushed))
   (let ((position (pack-position store rows (task-cue-text (getf task :cue))
-                                 (getf task :expect-episode))))
+                                 (getf task :expect-episode)
+                                 :skip-episode (getf task :cue-episode))))
     (if position (/ 1.0 (+ 1 position)) 0.0)))
 
 (defun rare-episode-ids (store &key (fraction *tail-rarity-fraction*))

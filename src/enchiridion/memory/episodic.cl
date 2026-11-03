@@ -66,6 +66,9 @@
    :pack-line-chars    400    ; the characters one pack record shows
    :pack-excerpt       :cue   ; :CUE the cue's window, or :HEAD the first paragraph
    :pack-neighbours    0      ; turns either side of a hit, same session, to add
+   :pack-claims-attached 2    ; claims shown under their own episode in the pack
+   :pack-claims-alone  3      ; claims in the pack whose episode the cue missed
+   :pack-claims-alone-per-episode 1 ; of those, from any one source episode
    :pack-header        t      ; prefix each record with its date and role; with the
                               ; cheap model answering, +9.4 points of LongMemEval-S
                               ; accuracy, temporal questions 0.394 -> 0.701

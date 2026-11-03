@@ -45,6 +45,7 @@ A T2 pass runs only when four instruments exist, and `t2-preflight` names each o
 A utility task is a user turn and the assistant turn that answered it, in the same session.
 Both arms are scored on the same questions, in a pack of `:gate-pack-chars`, a quarter of the turn's pack.
 A task scores 1/N when the answer, or an assertion derived from it, is the Nth record in that pack, and 0 when it does not fit.
+The question's own turn is not counted as a place: it leads both arms' packs, and counting it made every other record cost a whole rank.
 The score is graded rather than hit or miss, because a log already recalls most answers to its own questions, and scored as hits nearly every pair ties.
 The small pack is the matched budget: a short claim can win where a long answer no longer fits.
 The tail sample is the subset of those tasks whose answer is rare: what consolidation loses first is the rare record.
@@ -96,9 +97,10 @@ The design enables it only after a paired no-harm run.
 1. Scrub the operator's text.
 2. Tokenise the text into a cue and store the cue with the retrieval prediction.
 3. Ask the full-text index for candidate episodes, and, when a generation is live, its assertions: by their own claim (`assertions_fts`) and through the episode each came from.
-4. Rank the candidates with the score, which is BM25 relevance under the shipped weights. When assertions are among them, every candidate's lexical term is the reciprocal-rank fusion of its ranks, because BM25 from two indexes is not on one scale. With no live generation the ranking is exactly the episode ranking.
+4. Rank the candidates with the score, which is BM25 relevance under the shipped weights. When assertions are among them, the lexical term is a reciprocal rank, because BM25 from two indexes is not on one scale: an episode's from the episode ranking, and an assertion's the better of its claim's rank and its episode's, so through its evidence a claim can only tie that evidence. A claim with no activation of its own takes its episode's. With no live generation the ranking is exactly the episode ranking.
+   Episodes then keep their own places. A claim whose episode makes the cut is shown under it, at most `:pack-claims-attached`, and takes no place of its own; any other claim stands alone at its rank, at most `:pack-claims-alone` in all and `:pack-claims-alone-per-episode` from one source. A claim line under a record uses only the budget the records leave, so it never costs a record its place.
 5. Render up to twelve records into a pack of at most four thousand four hundred and fifty characters. Each record shows the four hundred characters of its body that hold the most cue terms, with an ellipsis where it was cut.
-6. Put the pack at the head of the user message, with a data-only header and a `[ref ...]` tag per record.
+6. Put the pack at the head of the user message, with a data-only header and a `[ref ...]` tag per record and per claim shown.
 7. Persist the original text as one episode; the turns view exposes it.
 8. Every assistant message and tool result is also an episode.
 9. A tool result that reports an exit status carries an outcome; everything else is null.

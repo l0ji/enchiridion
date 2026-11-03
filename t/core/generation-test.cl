@@ -202,10 +202,14 @@
             (ok (= 13 (enchiridion.memory:assertion-span-end assertion)))))))))
 
 (defun assertion-hits (store cue generation)
-  "Return the assertion rows a retrieval for CUE ranks, reading GENERATION."
-  (remove-if-not (lambda (row) (string= "assertion" (getf (getf row :item) :kind)))
-                 (enchiridion.memory:retrieve-rows-for-turn
-                  store cue :generation generation :top-k nil)))
+  "Return the assertion rows a retrieval for CUE ranks, reading GENERATION: the
+claims that stand alone and those shown under their episode, in pack order."
+  (loop for row in (enchiridion.memory:retrieve-rows-for-turn
+                    store cue :generation generation :top-k nil)
+        if (string= "assertion" (getf (getf row :item) :kind))
+          collect row
+        else
+          append (mapcar (lambda (claim) (list :item claim)) (getf row :claims))))
 
 (deftest a-retrieval-reads-only-the-generation-it-names ()
   ;; The utility and tail gates compare a candidate arm with a retention-only
@@ -501,7 +505,9 @@
   "Score 1 when the retrieval brought back an assertion: only the candidate
 arm can, so the candidate wins every pair."
   (declare (ignore store task pushed))
-  (if (some (lambda (row) (equal "assertion" (getf (getf row :item) :kind))) rows)
+  (if (some (lambda (row) (or (equal "assertion" (getf (getf row :item) :kind))
+                               (getf row :claims)))
+            rows)
       1.0 0.0))
 
 (defmacro with-gate-world ((store directory generation) &body body)
@@ -947,6 +953,57 @@ shipped schedule."
                                               store rows "the question" 2))))))
           (ok (= 0.0 (enchiridion.memory:answer-scorer store task "" rows))))))))
 
+(deftest the-cue-turn-itself-is-not-counted-as-a-place ()
+  (with-store (store directory)
+    (let ((rows (list (pack-row "episode" 1 "the question")
+                      (pack-row "episode" 2 "the answer itself")))
+          (enchiridion.memory:*gate-pack-chars* 4000))
+      (ok (= 0.5 (enchiridion.memory:answer-scorer
+                  store (list :cue "the question" :expect-episode 2) "" rows)))
+      (ok (= 1.0 (enchiridion.memory:answer-scorer
+                  store (list :cue "the question" :expect-episode 2 :cue-episode 1)
+                  "" rows))))))
+
+(defun scored (kind id &optional episode-id)
+  (list :item (list :kind kind :id id :episode-id episode-id
+                    :body (format nil "~A ~D" kind id))))
+
+(deftest claims-ride-on-their-episode-and-lone-claims-are-capped ()
+  ;; The trial: claims in their own places pushed the answer down or out of
+  ;; the pack in 213 of 400 tasks, against 25 they helped.
+  (let* ((rows (append (loop for i from 0 below 5 collect (scored "assertion" (+ 10 i) 1))
+                       (list (scored "episode" 2) (scored "episode" 1))
+                       (loop for i from 0 below 6 collect (scored "assertion" (+ 20 i) (+ 50 (floor i 2))))
+                       (list (scored "episode" 3))))
+         (units (enchiridion.memory::fold-claims rows nil))
+         (ref (lambda (row) (enchiridion.memory::pack-ref row))))
+    (testing "episodes keep their own places, and a claim rides on its episode"
+      (ok (equal '("episode-2" "episode-1") (mapcar ref (subseq units 0 2))))
+      (ok (equal '(10 11) (mapcar (lambda (c) (getf c :id)) (getf (second units) :claims)))))
+    (testing "the episode is not shown twice"
+      (ok (= 1 (count "episode-1" units :key ref :test #'equal))))
+    (testing "claims alone: one per source, three in all"
+      (ok (equal '("assertion-20" "assertion-22" "assertion-24")
+                 (mapcar ref (remove "assertion" units
+                                     :key (lambda (u) (getf (getf u :item) :kind))
+                                     :test-not #'equal)))))
+    (testing "the cut counts units"
+      (ok (= 2 (length (enchiridion.memory::fold-claims rows 2)))))
+    (testing "a claim under its episode is rendered and its ref recorded"
+      (multiple-value-bind (text included)
+          (enchiridion.memory:render-pack (list (second units)) :budget 4000 :cue "x")
+        (ok (search "[ref assertion-10] assertion 10" text))
+        (ok (equal '("episode-1" "assertion-10" "assertion-11")
+                   (enchiridion.memory::pack-refs (first included))))))
+    (testing "a claim line never costs a record its place"
+      (let* ((wide (make-string 300 :initial-element #\x))
+             (rows (list (list :claims (list (list :id 5 :body wide))
+                               :item (list :kind "episode" :id 1 :body "first record"))
+                         (list :item (list :kind "episode" :id 2 :body "second record"))))
+             (included (nth-value 1 (enchiridion.memory:render-pack rows :budget 200 :cue "x"))))
+        (ok (= 2 (length included)))
+        (ok (null (getf (first included) :claims)))))))
+
 (deftest the-tail-gate-counts-a-graded-outcome-as-recall ()
   (with-store (store directory)
     (flet ((pair (hash retention candidate)
@@ -975,9 +1032,10 @@ shipped schedule."
              (rows (enchiridion.memory:retrieve-rows-for-turn
                     store "where does service2 keep its secret" :generation generation)))
         (testing "the claim competes for the top of the pack, not fortieth"
-          (let ((at (position "assertion" rows
-                              :key (lambda (row) (getf (getf row :item) :kind))
-                              :test #'equal)))
+          (let ((at (position-if (lambda (row)
+                                   (or (equal "assertion" (getf (getf row :item) :kind))
+                                       (getf row :claims)))
+                                 rows)))
             (ok (and at (< at 3)))))
         (testing "the cue-type term no longer separates the two kinds"
           (ok (every (lambda (row)

@@ -324,7 +324,7 @@ did not think of."))
    ;; kernel and the command table have one visible interface.
    #:retrieve-for-turn #:retrieve-rows-for-turn #:record-retrieval
    #:record-retrieval-outcome #:maintenance
-   #:build-candidate #:promote-generation #:rollback-generation #:generation-row
+   #:build-candidate #:promote-generation #:rollback-generation #:requeue-generation #:generation-row
    #:start-candidate #:generation-status #:generation-assertion-count
    #:live-assertion-count #:current-generation #:ensure-generation-state
    #:rebuild-derived #:graph-terms-on-p #:resolve-conflict-at-action #:forget-session

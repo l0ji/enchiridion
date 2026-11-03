@@ -168,6 +168,7 @@ enchiridion memory import LOG    # add a JSON Lines conversation log to the epis
 enchiridion memory candidates    # every generation and the gates' verdict
 enchiridion memory gates ID      # one generation's checks
 enchiridion memory promote ID    # run the gates now; never bypasses them
+enchiridion memory regate ID     # a quarantined generation through the gates again
 enchiridion memory rollback ID   # back to the parent generation
 enchiridion memory canaries      # canary coverage by family
 enchiridion memory "open ports"  # search sessions, memories and episodes

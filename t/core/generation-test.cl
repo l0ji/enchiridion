@@ -563,6 +563,27 @@ for five tasks."
         (ok (eq :not-a-candidate
                 (getf (enchiridion.memory:gate-candidate store generation) :reason)))))))
 
+(deftest a-quarantined-generation-can-be-gated-again ()
+  (with-gate-world (store directory generation)
+    (enchiridion.memory:gate-candidate store generation :canaries '())
+    (ok (string= "quarantined" (status-of store generation)))
+    (testing "only a quarantined generation is requeued"
+      (ok (eq :no-such-generation
+              (getf (enchiridion.memory:requeue-generation store 999) :reason))))
+    (ok (getf (enchiridion.memory:requeue-generation store generation) :requeued))
+    (ok (string= "candidate" (status-of store generation)))
+    (testing "its earlier verdict no longer counts toward the quarantine rate"
+      (ok (null (getf (enchiridion.memory::quarantine-rate store) :rate))))
+    (let ((report (enchiridion.memory:gate-candidate
+                   store generation :canaries (passing-canaries) :scorer #'assertion-scorer)))
+      (ok (getf report :promoted))
+      (testing "the earlier checks are kept"
+        (ok (equal '("canary" "fail")
+                   (find "fail" (check-rows store generation) :key #'second :test #'string=)))))
+    (testing "a live generation is not requeued"
+      (ok (eq :not-quarantined
+              (getf (enchiridion.memory:requeue-generation store generation) :reason))))))
+
 (deftest a-failed-post-promotion-check-rolls-the-promotion-back ()
   (with-gate-world (store directory generation)
     (enchiridion.memory:gate-candidate

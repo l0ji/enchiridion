@@ -704,7 +704,7 @@ file a block is backed by."
 (defun cmd-memory (arguments)
   "Search sessions, memories and episodes, or run a log action.
 The first argument selects an action when it is STATUS, BUILD, IMPORT,
-CANDIDATES, GATES, PROMOTE, ROLLBACK or CANARIES.
+CANDIDATES, GATES, PROMOTE, REGATE, ROLLBACK or CANARIES.
 Anything else is a search query, so the common call keeps working."
   (let ((missing (require-store "memory")))
     (if missing
@@ -734,7 +734,7 @@ Anything else is a search query, so the common call keeps working."
                             (let ((r (f "promotion_result"))) (and r (plusp (length r)) r))
                             (let ((r (f "quarantine_reason"))) (and r (plusp (length r)) r))))))
                0))
-            ((member action '("gates" "promote" "rollback") :test #'string=)
+            ((member action '("gates" "promote" "regate" "rollback") :test #'string=)
              (let ((id (ignore-errors (parse-integer (or (second arguments) "")))))
                (cond
                  ((or (null id) (null (enchiridion.memory:generation-row store id)))
@@ -752,10 +752,18 @@ Anything else is a search query, so the common call keeps working."
                                  (let ((d (or (f "detail") "")))
                                    (subseq d 0 (min 160 (length d))))))))
                     0))
-                 ((string= action "promote")
+                 ((member action '("promote" "regate") :test #'string=)
                   ;; Through the gates, never around them: this is the same
-                  ;; decision the heartbeat makes, asked for now.
-                  (let ((report (enchiridion.memory:gate-candidate store id)))
+                  ;; decision the heartbeat makes, asked for now. REGATE first
+                  ;; returns a quarantined generation to them.
+                  (let ((report
+                          (if (string= action "regate")
+                              (let ((requeue (enchiridion.memory:requeue-generation store id)))
+                                (if (getf requeue :requeued)
+                                    (enchiridion.memory:gate-candidate store id)
+                                    (list :promoted nil :reason (getf requeue :reason)
+                                          :status (getf requeue :status))))
+                              (enchiridion.memory:gate-candidate store id))))
                     (cond ((getf report :promoted) (say "generation ~D promoted." id) 0)
                           (t (say "generation ~D not promoted: ~(~A~)~@[ at the ~A gate~]~@[ (~(~A~))~]."
                                   id (getf report :reason) (getf report :failed)

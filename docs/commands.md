@@ -369,6 +369,7 @@ enchiridion memory import FILE.jsonl
 enchiridion memory candidates
 enchiridion memory gates ID
 enchiridion memory promote ID
+enchiridion memory regate ID
 enchiridion memory rollback ID
 enchiridion memory canaries
 ```
@@ -376,7 +377,8 @@ enchiridion memory canaries
 `candidates` lists every generation: status, episodes derived, writes, tokens, and the gates' verdict with the gate that failed.
 `gates ID` prints that generation's checks in order, each with its result, its number, and the start of its report.
 `promote ID` runs the generation through the gates, exactly as the heartbeat would; it never bypasses one, and it exits 1 when the candidate is quarantined, held, or not a candidate.
-`rollback ID` rolls a live generation back to its parent, or marks a candidate rolled back.
+`regate ID` returns a quarantined generation to candidate and runs it through the gates as `promote` does. It is for a quarantine the reading code caused rather than the claims: gating stored claims again calls no model. The earlier checks stay listed under `gates ID`; the quarantine rate counts only the new verdict.
+`rollback ID` rolls a live generation back to its parent, or marks a candidate, or a build under way, rolled back.
 `canaries` lists the configured canaries and says whether their families cover `:canary-min-families`.
 
 `import` reads a conversation log as JSON Lines, one turn per line, oldest first:

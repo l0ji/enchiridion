@@ -636,6 +636,32 @@ untouched."
          (list :rolled-back t :generation-id generation-id
                :status "rolled-back"))))))
 
+(defun requeue-generation (store generation-id)
+  "Return a quarantined GENERATION-ID to the gates as a candidate, and return a
+report plist.
+
+This is for a quarantine the reading code caused rather than the claims: the
+trial's first generation was quarantined by a ranking bug, and gating its
+8,693 claims again costs no model call where deriving them again cost 5.2
+million tokens.  Its checks stay in generation_checks as the record of the
+earlier verdict; its promotion result is cleared, so the quarantine rate
+counts the verdict the gates give it next and not both."
+  (let ((row (generation-row store generation-id)))
+    (cond
+      ((null row) (list :requeued nil :reason :no-such-generation))
+      ((not (string= (enchiridion.memory.store:field row "status") "quarantined"))
+       (list :requeued nil :reason :not-quarantined
+             :status (enchiridion.memory.store:field row "status")))
+      (t
+       (enchiridion.memory.store:exec
+        store
+        "UPDATE generations
+            SET status = 'candidate', promotion_result = '',
+                promotion_checked_ts = NULL, quarantine_reason = ''
+          WHERE id = ?"
+        (list generation-id))
+       (list :requeued t :generation-id generation-id :status "candidate")))))
+
 (defun generation-status (store generation-id)
   "Return a plist describing one generation, or NIL."
   (let ((row (generation-row store generation-id)))

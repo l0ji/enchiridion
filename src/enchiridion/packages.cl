@@ -54,7 +54,8 @@ because a file in the repository is a file that ends up in a store path."))
    #:script-arguments #:exit-with #:backtrace-string
    #:encode-utf8 #:decode-utf8 #:decode-utf8-lenient #:run-program-capture
    #:temp-directory
-   #:set-file-mode #:file-mode #:with-interrupt-handler #:signal-interactive-interrupt
+   #:set-file-mode #:file-mode #:symlink-target
+   #:with-interrupt-handler #:signal-interactive-interrupt
    #:install-shutdown-signals #:shutdown-interrupt-p #:signal-shutdown-interrupt)
   (:documentation
    "The only file in the tree that contains implementation extensions.
@@ -66,12 +67,15 @@ able to rewrite itself without rewriting the porting layer."))
   (:export
    #:git-available-p #:git-program #:repository-p #:git-init #:git-commit-all
    #:git-log #:git-show #:git-diff #:git-revert #:git-head
-   #:git-run #:git-current-branch #:git-test-environment #:*commit-environment*)
+   #:git-run #:git-current-branch #:git-test-environment #:*commit-environment*
+    #:*git-identity* #:*history-failure-reporter*)
   (:documentation
    "The agent directory is its own git repository, so personality evolution and
 authored code are a diff the operator can read and revert. Every call goes
-through ENCHIRIDION.COMPAT, and no call ever writes git identity: the operator's
-global configuration and signing key are the only ones used."))
+through ENCHIRIDION.COMPAT. A non-root process uses the operator's global
+configuration and signing key; a root process runs repository Git through
+src/git-exec.cl as the configured agent uid and gid, with the agent's own
+configuration. No call writes git identity."))
 
 (defpackage #:enchiridion.errors
   (:use #:cl)
@@ -229,7 +233,8 @@ did not think of."))
    #:block #:make-block #:block-label #:block-text #:block-limit
    #:block-file #:block-writable-p #:block-bytes #:block-full-p #:block-slack
    #:default-block-limit #:canonical-block-label #:scan-block-text
-   #:set-block-text #:compile-blocks #:block-summary #:block-descriptions
+   #:set-block-text #:write-block-file #:compile-blocks #:block-summary
+   #:block-descriptions
    #:*block-limits* #:*unlisted-block-limit*
    ;; The bootstrap state machine.
    #:bootstrap-status #:bootstrap-complete-p #:bootstrap-remaining
@@ -334,7 +339,9 @@ did not think of."))
    #:*memory-reranker* #:make-model-reranker #:rerank-rows #:parse-rerank-reply
    #:*memory-embedder* #:*memory-embed-model* #:make-backend-embedder
    #:embed-pending #:hybrid-candidates #:dense-ranking
-   #:encode-vector #:decode-vector)
+   #:encode-vector #:decode-vector
+   ;; The bounded recent-conversation window a prompt carries.
+   #:conversation-window #:*recent-turn-count* #:*recent-window-chars*)
   (:documentation
    "Memory blocks, the operator seed files that back the first three of them,
 the three loading tiers, the bootstrap state machine, and the episodic log
@@ -430,7 +437,15 @@ middle of anything oversized to a file the agent can go and read."))
    #:load-generation #:generation-result #:generation-result-ok-p
    #:generation-result-report #:generation-result-generation
    #:plugin-manifests #:manifest-name #:manifest-description #:manifest-schema
-   #:verify-file #:run-self-tests #:tool)
+   #:verify-file #:run-self-tests #:tool
+   ;; Skills. Lisp function skills and markdown reference skills live side by
+   ;; side under skills/, and the listing surface reads both through these.
+   #:skill-files #:reference-skill-files #:read-reference-skill
+   #:generation-result-reference-skills #:verify-result-reference-skills
+    #:snapshot-sources #:source-snapshot #:source-snapshot-p
+    #:source-snapshot-files #:source-snapshot-digest #:source-snapshot-directory
+    #:source-changes #:source-mismatch #:source-digest-value
+    #:generation-result-digests #:verify-result-digests)
   (:documentation
    "Hot reloadable agent code. Each generation loads into a fresh package, so
 a rename leaves no stale symbol behind and a bad edit costs one turn rather
@@ -454,6 +469,7 @@ into. The agent loop never learns which channel a turn arrived on."))
   (:export #:start-cli #:make-cli-channel
            #:run-repl #:run-command #:command-table #:command-names
            #:command-help #:repl-only-commands
+           #:command-requirements #:command-problem #:*doctor-function*
            ;; The context a command reads. Handlers keep the one-argument
            ;; shape the shared table promises, so the live objects a command
            ;; needs travel in a special rather than in a second parameter.
@@ -503,6 +519,7 @@ reactions are all out, so the allowlist is the whole authorisation story."))
    #:supervisor-agent #:supervisor-session #:supervisor-broker
    #:supervisor-run-directory
    #:supervisor-generation #:supervisor-channels #:supervisor-running-p
+    #:supervisor-enable-channel #:supervisor-channel-factory
    #:supervisor-heartbeat-p #:supervisor-heartbeat-interval
    #:supervisor-poll-control #:supervisor-poll-loop
    #:supervisor-write-status #:supervisor-started #:channel-row

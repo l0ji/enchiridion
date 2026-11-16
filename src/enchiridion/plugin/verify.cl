@@ -22,11 +22,16 @@
 
 (declaim (ftype function verify-ok-p verify-report verify-directory))
 
+;; ok-p says every file compiled and every self-test passed, report is why
+;; not or what ran, digests is the source snapshot that was compiled, and
+;; reference-skills are the markdown skills beside the Lisp ones.
 (defstruct (verify-result (:constructor %make-verify-result))
   (ok-p nil :type boolean)
   (report "" :type string)
   (tests '() :type list)
   (failures '() :type list)
+  (reference-skills '() :type list)
+  (digests nil :type t)
   (directory nil :type t))
 
 (declaim (ftype function verify-ok-p))
@@ -90,45 +95,76 @@ optional, and a generation of plain skills is a normal generation."
 
 (declaim (ftype function verify-directory))
 
-(defun verify-directory (directory &key (generation nil) (self-tests-p t))
+(defun verify-directory (directory &key (generation nil) (self-tests-p t)
+                                      (source-digests nil))
   "Compile and load every agent file in DIRECTORY into a throwaway package,
 run the self-tests, and return a VERIFY-RESULT.
 
 GENERATION is the generation number the files are loaded under, and it is
 bound so that the tools a verified file registers carry the number the real
-load will use. SELF-TESTS-P is for a caller that only wants the compile."
+load will use. SELF-TESTS-P is for a caller that only wants the compile.
+
+SOURCE-DIGESTS is the source as its caller read it, a SOURCE-SNAPSHOT or the
+digest string that crossed a process. A directory that no longer matches it is
+refused without compiling a file, because a generation verified from one tree
+and loaded from another is the mismatch the snapshot exists to stop."
   (let* ((directory (uiop:ensure-directory-pathname directory))
-         (generation (or generation (1+ (current-generation))))
-         (sources (agent-source-files directory))
-         (package (ensure-generation-package generation))
-         (before (plugin-registry))
-         (failures '())
-         (tests '()))
-    (let ((*generation* generation))
+         (snapshot (snapshot-sources directory))
+         (mismatch (source-mismatch source-digests snapshot)))
+    (if mismatch
+        (refused-verification mismatch directory snapshot)
+        (verify-snapshot directory generation self-tests-p snapshot))))
+
+(declaim (ftype (function (t t t) verify-result) refused-verification))
+
+(defun refused-verification (report directory snapshot)
+  "Return a failed VERIFY-RESULT for a directory that no longer matches."
+  (%make-verify-result :ok-p nil
+                       :report report
+                       :directory directory
+                       :digests snapshot
+                       :reference-skills (reference-skill-files directory)))
+
+(declaim (ftype (function (t t t t) verify-result) verify-snapshot))
+
+(defun verify-snapshot (directory generation self-tests-p snapshot)
+  "Compile and self-test the agent files of DIRECTORY, which SNAPSHOT describes."
+  (let ((enchiridion.tools::*registry*
+          (copy-tool-registry (enchiridion.tools:registry)))
+        (*plugins* (copy-list *plugins*))
+        (*generation* (or generation (1+ (current-generation)))))
+    (let* ((generation *generation*)
+           (sources (agent-source-files directory))
+           (package (ensure-generation-package generation))
+           (before (plugin-registry))
+           (failures '())
+           (tests '()))
       (dolist (path sources)
         (multiple-value-bind (ok-p warnings) (verify-file path :package package)
           (unless ok-p
             (push (format nil "~A: ~{~A~^; ~}" (file-namestring path) warnings)
-                  failures)))))
-    (let ((added (remove-if (lambda (plugin) (member plugin before))
-                            (plugin-registry))))
-      (when self-tests-p
-        (multiple-value-bind (ok-p results) (run-self-tests added)
-          (unless ok-p
-            (setf failures (append failures results))))
-        (setf tests (mapcar #'plugin-name added))))
-    ;; Verification registers the tools it loads. Left alone, the real load
-    ;; that follows would record every plugin a second time, and a caller that
-    ;; only verifies would leave tools in the registry for a generation that
-    ;; never loaded. The result already names what was tested, so the
-    ;; registration can go.
-    (discard-generation generation)
-    (%make-verify-result
-     :ok-p (null failures)
-     :report (if failures
-                 (format nil "~{~A~^~%~}" (reverse failures))
-                 (format nil "~D file~:P compiled, ~D self-test~:P ran"
-                         (length sources) (length tests)))
-     :tests tests
-     :failures (reverse failures)
-     :directory directory)))
+                  failures))))
+      (let ((added (remove-if (lambda (plugin) (member plugin before))
+                              (plugin-registry))))
+        (when self-tests-p
+          (multiple-value-bind (ok-p results) (run-self-tests added)
+            (unless ok-p
+              (setf failures (append failures results))))
+          (setf tests (mapcar #'plugin-name added))))
+      ;; Verification registers the tools it loads. Left alone, the real load
+      ;; that follows would record every plugin a second time, and a caller that
+      ;; only verifies would leave tools in the registry for a generation that
+      ;; never loaded. The result already names what was tested, so the
+      ;; registration can go.
+      (discard-generation generation)
+      (%make-verify-result
+       :ok-p (null failures)
+       :report (if failures
+                   (format nil "~{~A~^~%~}" (reverse failures))
+                   (format nil "~D file~:P compiled, ~D self-test~:P ran"
+                           (length sources) (length tests)))
+       :tests tests
+       :failures (reverse failures)
+       :digests snapshot
+       :reference-skills (reference-skill-files directory)
+       :directory directory))))

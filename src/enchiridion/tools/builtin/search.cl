@@ -87,20 +87,23 @@ that answered a question nobody asked."
                    (walk sub)))))
       (if (uiop:directory-exists-p path)
           (walk (uiop:ensure-directory-pathname path))
-          (when (searchable-file-p path) (list path))))
+          (when (searchable-file-p path)
+            (incf seen)
+            (push path files))))
     (nreverse files)))
 
 (defun search-file (path query limit results)
   "Add matching lines from PATH to RESULTS, up to LIMIT."
   (handler-case
-      (let ((text (uiop:read-file-string path :external-format :utf-8)))
+      (let ((text (read-file-bounded path)))
         (loop for line in (split-lines text)
               for number from 1
               when (search query line :test #'char-equal)
                 do (push (format nil "~A:~D: ~A" (namestring path) number line) results)
                    (when (>= (length results) limit)
                      (return))))
-    (file-error () nil))
+    (file-error () nil)
+    (enchiridion.errors:tool-error () nil))
   results)
 
 (defun search-files-run (args)

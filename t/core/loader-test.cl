@@ -56,6 +56,27 @@ unwind-protect, which is also what keeps a failed assertion from leaking."
     (enchiridion.tools:register-tool tool))
   nil)
 
+(declaim (ftype (function (list list integer) null) restore-loader-state))
+
+(defun restore-loader-state (tools plugins generation)
+  "Restore all mutable loader state after a generation test."
+  (restore-registry tools)
+  (setf enchiridion.plugin:*generation* generation
+        enchiridion.plugin::*plugins* plugins)
+  nil)
+
+(defmacro with-loader-state (() &body body)
+  "Run BODY and restore tools, plugins, and the current generation."
+  (let ((tools (gensym "TOOLS"))
+        (plugins (gensym "PLUGINS"))
+        (generation (gensym "GENERATION")))
+    `(let ((,tools (enchiridion.tools:list-tools))
+           (,plugins (copy-list (enchiridion.plugin:plugin-registry)))
+           (,generation (enchiridion.plugin:current-generation)))
+       (unwind-protect
+            (progn ,@body)
+         (restore-loader-state ,tools ,plugins ,generation)))))
+
 ;;;; The plugin files the tests load and read.
 
 (defparameter +good-source+
@@ -124,6 +145,23 @@ unwind-protect, which is also what keeps a failed assertion from leaking."
 "
   "A plugin file that compiles and loads but whose self-test says no.")
 
+(defparameter +accepted-then-failing-load-source+
+  "(defpackage #:loader-test-load-failure (:use #:cl))
+(in-package #:loader-test-load-failure)
+(defvar *load-count* 0)
+(incf *load-count*)
+(when (= *load-count* 2)
+  (error \"the accepted generation fails on its second load\"))
+(enchiridion.plugin:define-plugin loader-test-last-good
+  :tool (enchiridion.tools:make-tool
+         :name \"loader-test-last-good\"
+         :description \"The replacement must not go live.\"
+         :schema '(:object :properties ()))
+  :handler #'identity
+  :self-test #'(lambda () t))
+"
+  "A clean verification followed by a failure during the real load.")
+
 (defparameter +broken-source+
   "(defun broken (
 "
@@ -150,6 +188,12 @@ tripwire: a manifest reader that evaluates the file fails on it.")
   "(define-plugin unfinished
 "
   "A manifest file the reader cannot finish either.")
+
+(declaim (ftype (function (string string) string) source-named))
+
+(defun source-named (source name)
+  "Return SOURCE with its plugin and package identifiers replaced by NAME."
+  (ppcre:regex-replace-all "loader-test-last-good" source name))
 
 ;;;; The tests.
 
@@ -226,6 +270,47 @@ tripwire: a manifest reader that evaluates the file fails on it.")
                  (ok (not (null (enchiridion.tools:find-tool "loader-test-last-good")))))))
         (restore-registry saved)))))
 
+(deftest an-accepted-generation-that-fails-to-load-keeps-last-good ()
+  (with-scratch-directory (directory)
+    (with-loader-state ()
+      (let ((good (merge-pathnames "good/" directory))
+            (broken (merge-pathnames "broken/" directory)))
+        (write-source good "tools/last-good.cl"
+                      (source-named +last-good-source+ "loader-test-load-refusal"))
+        (ok (enchiridion.plugin:generation-result-ok-p
+             (enchiridion.plugin:load-generation good)))
+        (let ((generation (enchiridion.plugin:current-generation))
+              (tool (enchiridion.tools:find-tool "loader-test-load-refusal")))
+          (write-source broken "tools/load-failure.cl"
+                        (source-named +accepted-then-failing-load-source+
+                                      "loader-test-load-refusal"))
+          (let ((result (enchiridion.plugin:load-generation broken)))
+            (ng (enchiridion.plugin:generation-result-ok-p result))
+            (ok (search "second load"
+                        (enchiridion.plugin:generation-result-report result)))
+            (ok (= generation (enchiridion.plugin:current-generation)))
+            (ok (eq tool (enchiridion.tools:find-tool "loader-test-load-refusal")))))))))
+
+(deftest an-oversized-manifest-keeps-last-good ()
+  (with-scratch-directory (directory)
+    (with-loader-state ()
+      (let ((good (merge-pathnames "good/" directory))
+            (oversized (merge-pathnames "oversized/" directory)))
+        (write-source good "tools/last-good.cl"
+                      (source-named +last-good-source+ "loader-test-oversized-good"))
+        (ok (enchiridion.plugin:generation-result-ok-p
+             (enchiridion.plugin:load-generation good)))
+        (let ((generation (enchiridion.plugin:current-generation))
+              (tool (enchiridion.tools:find-tool "loader-test-oversized-good")))
+          (write-source oversized "tools/too-large.cl"
+                        (make-string (1+ enchiridion.plugin::+manifest-file-limit+)
+                                     :initial-element #\;))
+          (let ((result (enchiridion.plugin:load-generation oversized)))
+            (ng (enchiridion.plugin:generation-result-ok-p result))
+            (ok (plusp (length (enchiridion.plugin:generation-result-report result))))
+            (ok (= generation (enchiridion.plugin:current-generation)))
+            (ok (eq tool (enchiridion.tools:find-tool "loader-test-oversized-good")))))))))
+
 (deftest a-failing-self-test-refuses-the-generation ()
   (with-scratch-directory (directory)
     (let ((saved (enchiridion.tools:list-tools))
@@ -300,3 +385,278 @@ tripwire: a manifest reader that evaluates the file fails on it.")
                       (first (enchiridion.plugin:plugin-manifests (list path))))))))
     (testing "and nothing it named was interned in the plugin package"
       (ok (null (find-symbol "MADE" :enchiridion.plugin))))))
+
+;;;; The source snapshot and the publication point.
+
+(defparameter +target-source+
+  "(defpackage #:loader-test-target (:use #:cl))
+(in-package #:loader-test-target)
+
+(defun target-run (arguments)
+  \"Return the arguments unchanged.\"
+  arguments)
+
+(enchiridion.plugin:define-plugin loader-test-target
+  :tool (enchiridion.tools:make-tool
+         :name \"loader-test-target\"
+         :description \"The file the mutator rewrites.\"
+         :schema '(:object :properties ()))
+  :handler #'target-run
+  :self-test #'(lambda () t))
+"
+  "A plugin the mutator rewrites while the generation around it loads.")
+
+(declaim (ftype (function (pathname) string) mutating-source))
+
+(defun mutating-source (target)
+  "Return a plugin file whose load rewrites TARGET, a sibling source.
+
+The rewrite lands in the middle of the same load: skills load before tools, so
+the mutator runs first and the file it rewrites is read afterwards. That is the
+window the snapshot has to close, and a file that changes before the load starts
+would not prove it."
+  (format nil
+          "(defpackage #:loader-test-mutator (:use #:cl))
+(in-package #:loader-test-mutator)
+
+(defun mutate ()
+  \"Rewrite a sibling source during the load.\"
+  (with-open-file (stream ~S :direction :output :if-exists :supersede
+                             :if-does-not-exist :create :external-format :utf-8)
+    (write-string \"(defun rewritten () :changed)~%\" stream))
+  t)
+
+(enchiridion.plugin:define-plugin loader-test-mutator
+  :tool (enchiridion.tools:make-tool
+         :name \"loader-test-mutator\"
+         :description \"A plugin that changes the tree it loads from.\"
+         :schema '(:object :properties ()))
+  :handler #'mutate
+  :self-test #'(lambda () t))
+
+(mutate)
+"
+          (namestring target)))
+
+(deftest a-snapshot-covers-the-sources-in-load-order ()
+  (with-scratch-directory (directory)
+    (write-source directory "tools/beta.cl" "(in-package #:cl-user)\n")
+    (write-source directory "skills/alpha.cl" "(in-package #:cl-user)\n")
+    (let* ((snapshot (enchiridion.plugin:snapshot-sources directory))
+           (files (enchiridion.plugin:source-snapshot-files snapshot)))
+      (testing "the relative paths are the load order"
+        (ok (equal '("skills/alpha.cl" "tools/beta.cl") (mapcar #'car files)))
+        (ok (every (lambda (pair) (= 64 (length (cdr pair)))) files)))
+      (testing "and one string covers the whole list"
+        (ok (search "sha256:" (enchiridion.plugin:source-snapshot-digest snapshot)))
+        (ok (string= (enchiridion.plugin:source-snapshot-digest snapshot)
+                     (enchiridion.plugin:source-snapshot-digest
+                      (enchiridion.plugin:snapshot-sources directory)))))
+      (testing "a changed file changes the digest and is named"
+        (write-source directory "tools/beta.cl" "(in-package #:cl-user)\n; changed\n")
+        (let ((after (enchiridion.plugin:snapshot-sources directory)))
+          (ng (string= (enchiridion.plugin:source-snapshot-digest snapshot)
+                       (enchiridion.plugin:source-snapshot-digest after)))
+          (ok (equal '("tools/beta.cl changed")
+                     (enchiridion.plugin:source-changes snapshot after)))))
+      (testing "a renamed file is two changes, not none"
+        (let ((before (enchiridion.plugin:snapshot-sources directory)))
+          (write-source directory "tools/gamma.cl" "(in-package #:cl-user)\n")
+          (delete-file (merge-pathnames "tools/beta.cl" directory))
+          (ok (equal '("tools/beta.cl removed" "tools/gamma.cl added")
+                     (enchiridion.plugin:source-changes
+                      before (enchiridion.plugin:snapshot-sources directory)))))))))
+
+(deftest a-digest-that-crossed-a-process-is-accepted-when-it-matches ()
+  (with-scratch-directory (directory)
+    (with-loader-state ()
+      (let ((good (merge-pathnames "good/" directory)))
+        (write-source good "tools/last-good.cl"
+                      (source-named +last-good-source+ "loader-test-digest"))
+        (let* ((snapshot (enchiridion.plugin:snapshot-sources good))
+               (wire (enchiridion.plugin:source-snapshot-digest snapshot)))
+          (testing "the string alone is enough to pin the source"
+            (ok (enchiridion.plugin:generation-result-ok-p
+                 (enchiridion.plugin:load-generation good :source-digests wire)))
+            (ok (enchiridion.tools:find-tool "loader-test-digest")))
+          (testing "and a bare hex digest is the same digest"
+            (ok (string= wire
+                         (enchiridion.plugin:source-digest-value (subseq wire 7)))))
+          (testing "a digest that is neither fails loudly instead of checking nothing"
+            (ok (signals (enchiridion.plugin:source-digest-value 42)
+                         'enchiridion.errors:configuration-error))))))))
+
+(deftest a-source-changed-after-it-was-read-is-refused ()
+  (with-scratch-directory (directory)
+    (with-loader-state ()
+      (let ((good (merge-pathnames "good/" directory)))
+        (write-source good "tools/last-good.cl"
+                      (source-named +last-good-source+ "loader-test-changed"))
+        (let ((snapshot (enchiridion.plugin:snapshot-sources good))
+              (generation (enchiridion.plugin:current-generation)))
+          (write-source good "tools/last-good.cl"
+                        (source-named +last-good-source+ "loader-test-changed-twice"))
+          (let ((result (enchiridion.plugin:load-generation
+                         good :source-digests snapshot)))
+            (ng (enchiridion.plugin:generation-result-ok-p result))
+            (ok (search "tools/last-good.cl changed"
+                        (enchiridion.plugin:generation-result-report result)))
+            (ok (= generation (enchiridion.plugin:current-generation)))
+            (ng (enchiridion.tools:find-tool "loader-test-changed-twice"))
+            (ok (enchiridion.plugin:generation-result-digests result))))))))
+
+(deftest a-source-changed-during-the-load-is-refused-before-publication ()
+  (with-scratch-directory (directory)
+    (with-loader-state ()
+      (let* ((target (write-source directory "tools/99-target.cl" +target-source+))
+             (generation (enchiridion.plugin:current-generation)))
+        (write-source directory "tools/00-mutator.cl" (mutating-source target))
+        (let* ((snapshot (enchiridion.plugin:snapshot-sources directory))
+               (result (enchiridion.plugin:load-generation
+                        directory :verify nil :source-digests snapshot)))
+          (testing "the load ran and the mutator really did rewrite the file"
+            (ok (search "rewritten" (uiop:read-file-string target))))
+          (testing "and the generation was refused with the file named"
+            (ng (enchiridion.plugin:generation-result-ok-p result))
+            (ok (search "tools/99-target.cl changed"
+                        (enchiridion.plugin:generation-result-report result))))
+          (testing "so neither plugin is live and the generation stands still"
+            (ok (= generation (enchiridion.plugin:current-generation)))
+            (ng (enchiridion.tools:find-tool "loader-test-mutator"))
+            (ng (enchiridion.tools:find-tool "loader-test-target"))
+            (ok (null (find "loader-test-mutator"
+                            (enchiridion.plugin:plugin-registry)
+                            :key #'enchiridion.plugin:plugin-name
+                            :test #'equal)))))))))
+
+(deftest a-source-too-large-to-snapshot-is-refused ()
+  (with-scratch-directory (directory)
+    (with-loader-state ()
+      (write-source directory "tools/huge.cl"
+                    (make-string (1+ enchiridion.plugin::+source-file-limit+)
+                                 :initial-element #\;))
+      (ok (signals (enchiridion.plugin:snapshot-sources directory)
+                   'enchiridion.errors:configuration-error))
+      (let ((result (enchiridion.plugin:load-generation directory)))
+        (ng (enchiridion.plugin:generation-result-ok-p result))
+        (ok (search "larger than"
+                    (enchiridion.plugin:generation-result-report result)))))))
+
+(deftest verification-refuses-a-source-that-changed-under-it ()
+  (with-scratch-directory (directory)
+    (with-loader-state ()
+      (write-source directory "tools/last-good.cl"
+                    (source-named +last-good-source+ "loader-test-verify-changed"))
+      (let ((snapshot (enchiridion.plugin:snapshot-sources directory))
+            (tools (length (enchiridion.tools:list-tools))))
+        (write-source directory "tools/last-good.cl"
+                      (source-named +last-good-source+ "loader-test-verify-twice"))
+        (let ((result (enchiridion.plugin:verify-directory
+                       directory :generation 1 :source-digests snapshot)))
+          (ng (enchiridion.plugin:verify-ok-p result))
+          (ok (search "changed since it was read"
+                      (enchiridion.plugin:verify-report result)))
+          (testing "nothing was compiled into the live registry"
+            (ok (= tools (length (enchiridion.tools:list-tools))))
+            (ng (enchiridion.tools:find-tool "loader-test-verify-twice"))))))))
+
+(deftest every-attempt-is-recorded-including-a-verification-refusal ()
+  (with-scratch-directory (directory)
+    (with-loader-state ()
+      (write-source directory "tools/bad-test.cl" +failing-self-test-source+)
+      (let* ((attempts (length (enchiridion.plugin:generation-history)))
+             (result (enchiridion.plugin:load-generation directory))
+             (history (enchiridion.plugin:generation-history)))
+        (ng (enchiridion.plugin:generation-result-ok-p result))
+        (ok (= (1+ attempts) (length history)))
+        (ok (eq result (first history)))))))
+
+(deftest a-generation-replaces-the-registry-wholesale ()
+  (with-scratch-directory (directory)
+    (with-loader-state ()
+      (let ((first (merge-pathnames "first/" directory))
+            (second (merge-pathnames "second/" directory)))
+        (write-source first "tools/replaced.cl"
+                      (source-named +last-good-source+ "loader-test-replaced"))
+        (write-source first "tools/only-in-first.cl"
+                      (source-named +last-good-source+ "loader-test-only-in-first"))
+        (ok (enchiridion.plugin:generation-result-ok-p
+             (enchiridion.plugin:load-generation first :verify nil)))
+        (let ((registry (enchiridion.tools:registry))
+              (count (hash-table-count (enchiridion.tools:registry)))
+              (tool (enchiridion.tools:find-tool "loader-test-replaced")))
+          (ok tool)
+          (ok (enchiridion.tools:find-tool "loader-test-only-in-first"))
+          (write-source second "tools/replaced-again.cl"
+                        (source-named +last-good-source+ "loader-test-replaced"))
+          (write-source second "tools/new.cl"
+                        (source-named +last-good-source+ "loader-test-new"))
+          (ok (enchiridion.plugin:generation-result-ok-p
+               (enchiridion.plugin:load-generation second :verify nil)))
+          (testing "the live registry is a new table holding the new generation"
+            (ok (not (eq registry (enchiridion.tools:registry))))
+            (ok (enchiridion.tools:find-tool "loader-test-replaced"))
+            (ok (not (eq tool (enchiridion.tools:find-tool "loader-test-replaced"))))
+            (ok (enchiridion.tools:find-tool "loader-test-new"))
+            (ng (enchiridion.tools:find-tool "loader-test-only-in-first")))
+          (testing "and the table the last generation published is untouched"
+            (ok (eq tool (gethash "loader-test-replaced" registry)))
+            (ok (= count (hash-table-count registry)))))))))
+
+(deftest a-reader-never-sees-a-partly-published-registry ()
+  (with-scratch-directory (directory)
+    (with-loader-state ()
+      (let ((one (merge-pathnames "one/" directory))
+            (two (merge-pathnames "two/" directory)))
+        (write-source one "tools/race.cl"
+                      (source-named +last-good-source+ "loader-test-race"))
+        (write-source two "tools/race.cl"
+                      (source-named +last-good-source+ "loader-test-race"))
+        (ok (enchiridion.plugin:generation-result-ok-p
+             (enchiridion.plugin:load-generation one :verify nil)))
+        (let ((missed (make-array 8 :initial-element nil))
+              (readers '()))
+          (dotimes (index 8)
+            (let ((slot index))
+              (push (bordeaux-threads:make-thread
+                     (lambda ()
+                       (dotimes (pass 2000)
+                         (unless (and (enchiridion.tools:find-tool "loader-test-race")
+                                      (member "loader-test-race"
+                                              (enchiridion.tools:tool-names)
+                                              :test #'string=))
+                           (setf (aref missed slot) t)
+                           (return)))))
+                    readers)))
+          (dotimes (round 8)
+            (enchiridion.plugin:load-generation (if (evenp round) two one)
+                                                :verify nil))
+          (mapc #'bordeaux-threads:join-thread readers)
+          (ok (notany #'identity missed)))))))
+
+(deftest an-empty-directory-unloads-the-generation-before-it ()
+  (with-scratch-directory (directory)
+    (with-loader-state ()
+      (let ((agent (merge-pathnames "agent/" directory))
+            (builtins (hash-table-count (enchiridion.tools:registry))))
+        (write-source agent "tools/last-good.cl"
+                      (source-named +last-good-source+ "loader-test-unloaded"))
+        (ok (enchiridion.plugin:generation-result-ok-p
+             (enchiridion.plugin:load-generation agent :verify nil)))
+        (ok (enchiridion.tools:find-tool "loader-test-unloaded"))
+        (let ((requested (1+ (enchiridion.plugin:current-generation))))
+          (delete-file (merge-pathnames "tools/last-good.cl" agent))
+          (let ((result (enchiridion.plugin:load-generation agent :verify nil)))
+            (testing "an empty tree publishes the generation it was asked for"
+              (ok (enchiridion.plugin:generation-result-ok-p result))
+              (ok (= requested (enchiridion.plugin:generation-result-generation result)))
+              (ok (= requested (enchiridion.plugin:current-generation)))
+              (ok (search "0 files"
+                          (enchiridion.plugin:generation-result-report result))))
+            (testing "and the tools and plugins of the old generation go"
+              (ng (enchiridion.tools:find-tool "loader-test-unloaded"))
+              (ok (null (find "loader-test-unloaded"
+                              (enchiridion.plugin:plugin-registry)
+                              :key #'enchiridion.plugin:plugin-name
+                              :test #'equal)))
+              (ok (= builtins (hash-table-count (enchiridion.tools:registry)))))))))))

@@ -239,3 +239,22 @@
                 (enchiridion.tools.builtin::search-files-run
                  (list :query "needle" :path (namestring scratch))))
         "the walk ends and still finds the file")))
+
+(deftest search-visits-an-explicit-file-instead-of-nothing ()
+  (with-scratch-directory (scratch)
+    (let ((path (merge-pathnames "one.md" scratch))
+          (binary (merge-pathnames "two.bin" scratch)))
+      (write-text path (format nil "alpha~%beta line~%"))
+      (write-text binary "beta in a type the walk does not read")
+      (testing "the walk answers with the file it was given"
+        (ok (equal (list path)
+                   (enchiridion.tools.builtin::collect-search-files path))))
+      (testing "and the tool reads that one file"
+        (let ((output (enchiridion.tools.builtin:search-run
+                       (list :query "beta" :path (namestring path) :limit 10))))
+          (ok (search "one.md" output))
+          (ok (search "beta line" output))))
+      (testing "a file the walk does not read is no matches, not an error"
+        (ok (string= "no matches"
+                     (enchiridion.tools.builtin:search-run
+                      (list :query "beta" :path (namestring binary) :limit 10))))))))

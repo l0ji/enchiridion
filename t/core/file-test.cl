@@ -110,3 +110,50 @@
         (if previous-home
             (enchiridion.compat:set-environment-variable "ENCHIRIDION_HOME" previous-home)
             (enchiridion.compat:unset-environment-variable "ENCHIRIDION_HOME"))))))
+
+(deftest an-empty-file-reads-as-nothing-by-default ()
+  (with-scratch-directory (scratch)
+    (let ((path (merge-pathnames "empty.txt" scratch)))
+      (write-text path "")
+      (testing "no range means the whole file, and an empty file is empty"
+        (ok (string= "" (enchiridion.tools.builtin::tool-read
+                         (list :path (namestring path)))))))))
+
+(deftest an-explicit-range-outside-an-empty-file-is-refused ()
+  (with-scratch-directory (scratch)
+    (let ((path (merge-pathnames "empty.txt" scratch)))
+      (write-text path "")
+      (testing "a range on a file with no lines is not silently empty"
+        (ok (signals (enchiridion.tools.builtin::tool-read
+                      (list :path (namestring path) :from 1 :to 3))
+                     'enchiridion.errors:schema-error))
+        (ok (signals (enchiridion.tools.builtin::tool-read
+                      (list :path (namestring path) :from 1))
+                     'enchiridion.errors:schema-error))
+        (ok (signals (enchiridion.tools.builtin::tool-read
+                      (list :path (namestring path) :to 1))
+                     'enchiridion.errors:schema-error))))))
+
+(deftest a-range-outside-a-file-is-refused-and-the-last-line-is-not ()
+  (with-scratch-directory (scratch)
+    (let ((path (merge-pathnames "three.txt" scratch)))
+      (write-text path (format nil "one~%two~%three~%"))
+      (testing "the last line is inside the file"
+        (ok (string= "three" (enchiridion.tools.builtin::tool-read
+                              (list :path (namestring path) :from 3 :to 3))))
+        (ok (string= "two" (enchiridion.tools.builtin::tool-read
+                            (list :path (namestring path) :from 2 :to 2)))))
+      (testing "and the whole file reads back exactly, trailing newline included"
+        (ok (string= (format nil "one~%two~%three~%")
+                     (enchiridion.tools.builtin::tool-read
+                      (list :path (namestring path))))))
+      (testing "and a reversed or past-the-end range is refused"
+        (ok (signals (enchiridion.tools.builtin::tool-read
+                      (list :path (namestring path) :from 3 :to 2))
+                     'enchiridion.errors:schema-error))
+        (ok (signals (enchiridion.tools.builtin::tool-read
+                      (list :path (namestring path) :from 1 :to 5))
+                     'enchiridion.errors:schema-error))
+        (ok (signals (enchiridion.tools.builtin::tool-read
+                      (list :path (namestring path) :from 0 :to 1))
+                     'enchiridion.errors:schema-error))))))

@@ -12,6 +12,26 @@
 the model gets the head plus the path, which is cheaper than the whole result
 and still recoverable.")
 
+(defparameter *file-read-byte-limit* (* 1024 1024)
+  "The largest whole file a file or search tool decodes at once, in bytes.")
+
+(declaim (ftype (function (t) string) read-file-bounded))
+
+(defun read-file-bounded (path)
+  "Return PATH decoded as UTF-8, reading at most the configured byte limit."
+  (with-open-file (stream path :direction :input
+                               :element-type '(unsigned-byte 8))
+    (let* ((buffer (make-array (1+ *file-read-byte-limit*)
+                               :element-type '(unsigned-byte 8)))
+           (end (read-sequence buffer stream)))
+      (when (> end *file-read-byte-limit*)
+        (error 'enchiridion.errors:tool-error
+               :tool "read-file"
+               :detail (format nil "~A is larger than ~D bytes."
+                               (namestring (pathname path))
+                               *file-read-byte-limit*)))
+      (sb-ext:octets-to-string buffer :external-format :utf-8 :end end))))
+
 (defun spill-path (text &key (directory (enchiridion.compat:temp-directory)))
   "Write TEXT to a fresh file under DIRECTORY and return the namestring."
   (let* ((directory (uiop:ensure-directory-pathname directory))
@@ -72,7 +92,7 @@ agent-authored, so an evaluated reader macro in the index would be a remote
 code execution with the index's permissions. The package keeps symbols from
 polluting the running image and keeps an IN-PACKAGE form from changing the
 reader's package for the next form."
-  (let ((text (uiop:read-file-string path :external-format :utf-8))
+  (let ((text (read-file-bounded path))
         (forms '())
         (position 0)
         (package (make-package (format nil "ENCHIRIDION-INDEX-~D"
@@ -134,10 +154,14 @@ not fail on the shape of the thing it was called with."
 (defun tool-read (args)
   "Read a 1-based inclusive line range from PATH."
   (let* ((path (pathname (argument args "path")))
-         (lines (split-lines (uiop:read-file-string path :external-format :utf-8)))
-         (from (or (argument args "from") 1))
-         (to (or (argument args "to") (length lines))))
-    (when (or (< from 1) (> from to) (> to (length lines)))
+         (lines (split-lines (read-file-bounded path)))
+         (from-argument (argument args "from"))
+         (to-argument (argument args "to"))
+         (from (or from-argument 1))
+         (to (or to-argument (length lines))))
+    (when (or (and (null lines) (or from-argument to-argument))
+              (and lines
+                   (or (< from 1) (> from to) (> to (length lines)))))
       (error 'enchiridion.errors:schema-error
              :detail (format nil "Line range ~D..~D is outside ~D lines."
                              from to (length lines))))
@@ -198,7 +222,7 @@ not fail on the shape of the thing it was called with."
          (old (argument args "old"))
          (new (argument args "new")))
     (check-seed-backed-write path)
-    (let* ((text (uiop:read-file-string path :external-format :utf-8))
+    (let* ((text (read-file-bounded path))
            (position (and (stringp old)
                           (plusp (length old))
                           (search old text))))

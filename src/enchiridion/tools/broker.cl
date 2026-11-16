@@ -26,7 +26,24 @@
 (defparameter *load-generation-function* nil
   "A function of (directory generation) returning (values ok-p report), or NIL.
 BROKER-EXEC sets it to the plugin loader. The supervisor never calls it: the
-load happens in the child, as the agent user.")
+load happens in the child, as the agent user.
+
+A hook may return two more values: the digest string of the source it published,
+and the generation number that is live after the call. Both travel back in the
+reply, so the supervisor can refuse a publication that does not match what it
+verified and what it asked for. A hook that returns only the first two keeps
+working and reports neither, which leaves those two checks with nothing to
+compare and therefore failing.
+
+The snapshot the supervisor verified arrives through *LOAD-SOURCE-DIGESTS*
+rather than a third argument, so the two-argument shape every hook already has
+does not change.")
+
+(defparameter *load-source-digests* nil
+  "The digest string the supervisor verified for the load in flight, or NIL.
+LOAD-GENERATION-RESPONSE binds it from the request, and the child's hook reads
+it from here. It is bound rather than passed so that a hook stays a function of
+two arguments.")
 
 ;; The supervisor's progress hook. The broker module does not print: the CLI
 ;; decides what an operator sees while the child starts.
@@ -122,27 +139,20 @@ call may take, or NIL for no limit."
              (enchiridion.compat:decode-utf8 octets))))))))
 
 (defun scrub-value (value)
-  "Return VALUE with every string scrubbed, including strings inside a hash
-table. A tool result is the last place a secret can enter a transcript, so the
-broker scrubs before it writes the response."
-  (typecase value
-    (string (enchiridion.llm.secrets:scrub value))
-    (hash-table
-     (let ((copy (make-hash-table :test #'equal)))
-       (maphash (lambda (key item)
-                  (setf (gethash key copy) (scrub-value item)))
-                value)
-       copy))
-    (cons (enchiridion.llm.secrets:scrub-tree value))
-    (vector (enchiridion.llm.secrets:scrub-tree value))
-    (t value)))
+  "Return VALUE with secret text and credential fields redacted."
+  (enchiridion.llm.secrets:scrub-tree value))
 
 (defun error-response (condition)
+  ;; A detail may be a plist rather than text, and a structured detail is where
+  ;; a credential field would survive a string scrub. Walk it as a tree.
   (json-object "ok" nil
                "error" (enchiridion.llm.secrets:scrub
                         (princ-to-string condition))
-               "detail" (enchiridion.llm.secrets:scrub
-                         (or (enchiridion.errors:error-detail condition) ""))))
+               "detail" (let ((detail (enchiridion.errors:error-detail condition)))
+                          (cond ((null detail) "")
+                                ((stringp detail)
+                                 (enchiridion.llm.secrets:scrub detail))
+                                (t (enchiridion.llm.secrets:scrub-tree detail))))))
 
 (declaim (ftype (function (t t &optional t) t) request-value))
 
@@ -161,17 +171,27 @@ This runs in the child, as the agent user, and it is the only place agent code
 is loaded for real. The supervisor asks for it over the socket, so the process
 that holds the secrets never compiles what the agent wrote. The loader itself
 arrives through *LOAD-GENERATION-FUNCTION*, which keeps this file free of the
-plugin module it would otherwise have to load before."
+plugin module it would otherwise have to load before.
+
+The reply carries the digest string the child published and the generation that
+is live after the call, and both are null when the hook did not report them. The
+supervisor compares them with what it verified and what it asked for, so a hook
+that reports neither fails that check instead of passing it by default."
   (let ((function *load-generation-function*)
         (directory (request-value arguments "directory"))
-        (generation (request-value arguments "generation")))
+        (generation (request-value arguments "generation"))
+        (digests (request-value arguments "digests")))
     (unless function
       (error 'enchiridion.errors:configuration-error
              :key :plugin
              :detail "This process has no plugin loader attached."))
-    (multiple-value-bind (ok-p report)
-        (funcall function (pathname directory) generation)
-      (json-object "ok" ok-p "report" report))))
+    (multiple-value-bind (ok-p report source-digests live-generation)
+        (let ((*load-source-digests* digests))
+          (funcall function (pathname directory) generation))
+      (json-object "ok" ok-p
+                   "report" report
+                   "digests" source-digests
+                   "generation" live-generation))))
 
 (defun serve-connection (stream)
   "Answer requests on STREAM until the peer closes it.
@@ -261,42 +281,59 @@ secret in the supervisor's environment must not be one of these strings."
           (push (format nil "~A=~A" name value) entries))))
     entries))
 
-(declaim (ftype (function (pathname &key (:uid t) (:gid t) (:timeout t)) t)
+(declaim (ftype (function (pathname &key (:uid t) (:gid t) (:timeout t)
+                                       (:digests t)) t)
                 broker-verify-plugin))
 
-(defun broker-verify-plugin (directory &key (uid 1000) (gid 1000) (timeout 120))
+(defun broker-verify-plugin (directory &key (uid 1000) (gid 1000) (timeout 120)
+                                          (digests nil))
   "Verify DIRECTORY in a one-shot child that runs as UID, and return two
 values: whether the child exited zero, and the child's combined output.
 
 A separate process, and not the serving child, because a file that kills the
 compiler must not take the agent's running generation with it. The child gets
 the same minimal environment as the broker, so nothing this process holds
-crosses the boundary in either direction."
+crosses the boundary in either direction.
+
+DIGESTS is the digest string of the source the supervisor read. The child
+refuses a directory that no longer matches it, so the tree it compiles is the
+tree the supervisor has the manifests of."
   (let ((program (or (uiop:getenv "ENCHIRIDION_SBCL")
                       (enchiridion.compat:lisp-runtime-path)))
-        (arguments (list "--script" (namestring (broker-exec-path))
-                         "--verify-plugin"
-                         (namestring (uiop:ensure-directory-pathname directory))
-                         "--uid" (princ-to-string uid)
-                         "--gid" (princ-to-string gid))))
+        (arguments (append (list "--script" (namestring (broker-exec-path))
+                                 "--verify-plugin"
+                                 (namestring (uiop:ensure-directory-pathname directory))
+                                 "--uid" (princ-to-string uid)
+                                 "--gid" (princ-to-string gid))
+                           (when digests (list "--digests" digests)))))
     (multiple-value-bind (output status)
         (enchiridion.compat:run-program-capture program arguments
                                                 :timeout timeout
                                                 :environment (child-environment))
       (values (eql 0 status) output))))
 
-(declaim (ftype (function (broker t &key (:generation integer)) t)
+(declaim (ftype (function (broker t &key (:generation integer) (:digests t)) t)
                 broker-load-generation))
 
-(defun broker-load-generation (broker directory &key generation)
+(defun broker-load-generation (broker directory &key generation (digests nil))
   "Ask BROKER's child to load GENERATION from DIRECTORY and return the child's
-report, a hash table with the keys ok, generation and report."
+report, a hash table with the keys ok, report, digests, and generation.
+
+DIGESTS is the digest string the verification child was held to. The serving
+child refuses a tree that no longer matches it, and the reply says which digest
+it published and which generation is live, so the caller can refuse a
+publication that is not the one it asked for."
   (let* ((arguments (list :directory (namestring
                                       (uiop:ensure-directory-pathname directory))
                           :generation generation))
-         (reply (broker-call broker "load-generation" arguments)))
+         (request (if digests (append arguments (list :digests digests)) arguments))
+         (reply (broker-call broker "load-generation" request)))
     ;; Remembered so that a child restarted after a hang serves the same
-    ;; generation and not only the builtins.
+    ;; generation and not only the builtins. The digest stays out of it: it
+    ;; belonged to the verification this call carried, and a remembered digest
+    ;; would refuse the replay as soon as the agent wrote one more file, which
+    ;; would leave the child serving the builtins while the supervisor still
+    ;; records the generation as live.
     (when (and (hash-table-p reply) (gethash "ok" reply))
       (setf (broker-last-load broker) arguments))
     reply))

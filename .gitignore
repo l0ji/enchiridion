@@ -47,6 +47,7 @@ run/
 # The run script copies it into a container tmpfs that the agent cannot read.
 /.env
 /.env.*
+!/.env.example
 
 # Editor and operating system
 .DS_Store
@@ -57,3 +58,4 @@ run/
 
 # The benchmark harness, its data and its run output.
 /bench/
+klara/

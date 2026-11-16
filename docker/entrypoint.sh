@@ -87,6 +87,24 @@ fi
 AGENT_UID=$(id -u agent)
 AGENT_GID=$(id -g agent)
 
+# The supervisor validates that its configuration file and every parent
+# directory belong to a uid the agent cannot write as. A bind mount keeps the
+# host owner, which is usually the operator and not root, so a check that
+# insisted on root ownership would reject the documented Compose run line. The
+# copy is root-owned, mode 600, in a root-owned directory, and the supervisor is
+# pointed at it explicitly.
+if [ -f /opt/enchiridion/config.cl ]; then
+  mkdir -p /etc/enchiridion
+  if ! cmp -s /opt/enchiridion/config.cl /etc/enchiridion/config.cl 2>/dev/null; then
+    cp /opt/enchiridion/config.cl /etc/enchiridion/config.cl
+  fi
+  chown 0:0 /etc/enchiridion /etc/enchiridion/config.cl
+  chmod 700 /etc/enchiridion
+  chmod 600 /etc/enchiridion/config.cl
+  export ENCHIRIDION_CONFIG=/etc/enchiridion/config.cl
+  log "configuration copied to $ENCHIRIDION_CONFIG and closed to the agent"
+fi
+
 # run holds the broker socket and the control and status files. The broker
 # child drops to the agent uid and binds the socket there, so run must exist
 # before the chown and must belong to the agent. tmp is the agent's scratch
@@ -98,6 +116,19 @@ mkdir -p "$STATE_DIR" "$STATE_DIR/agents/default" "$STATE_DIR/run" "$STATE_DIR/t
 chown -R "$AGENT_UID:$AGENT_GID" "$STATE_DIR"
 chown "$AGENT_UID:$AGENT_GID" /run/enchiridion
 chmod 700 /run/enchiridion
+
+# The agent's own Git identity. Repository Git runs as the agent with HOME set
+# to the state root, so this is the configuration every commit uses. It holds no
+# secret: a name, an address, and signing off, because the agent has no key and a
+# refused commit would cost the turn its history.
+AGENT_GITCONFIG="$STATE_DIR/.gitconfig"
+if [ ! -f "$AGENT_GITCONFIG" ]; then
+  printf '%s\n' '[user]' '	name = enchiridion agent' \
+    '	email = agent@enchiridion.invalid' '[commit]' '	gpgsign = false' \
+    > "$AGENT_GITCONFIG"
+  chown "$AGENT_UID:$AGENT_GID" "$AGENT_GITCONFIG"
+  chmod 600 "$AGENT_GITCONFIG"
+fi
 
 # The agent gets a home it can write and nothing else. PATH is built here, not
 # inherited: nothing reaches this process's environment and is passed on by

@@ -21,10 +21,13 @@ set -eu
 
 ENCHIRIDION_SOURCE=${ENCHIRIDION_SOURCE:-/opt/enchiridion}
 ENCHIRIDION_SBCL=${ENCHIRIDION_SBCL:-/usr/local/bin/sbcl}
-XDG_CACHE_HOME=${XDG_CACHE_HOME:-/opt/enchiridion-cache}
+XDG_CACHE_HOME=/opt/enchiridion-cache
+XDG_CONFIG_HOME=/opt/enchiridion-config
+ASDF_OUTPUT_TRANSLATIONS='(:output-translations (t "/opt/enchiridion-cache/common-lisp/") :ignore-inherited-configuration)'
 SBCL_HOME=${SBCL_HOME:-/usr/local/lib/sbcl}
 CL_SOURCE_REGISTRY="${ENCHIRIDION_SOURCE}//:/opt/quicklisp/dists/quicklisp/software//"
 
 export ENCHIRIDION_SOURCE ENCHIRIDION_SBCL XDG_CACHE_HOME SBCL_HOME CL_SOURCE_REGISTRY
+export XDG_CONFIG_HOME ASDF_OUTPUT_TRANSLATIONS
 
 exec "$ENCHIRIDION_SBCL" --script "$ENCHIRIDION_SOURCE/src/main.cl" "$@"

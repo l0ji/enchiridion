@@ -6,33 +6,6 @@
       inherit (nixpkgs) lib;
       systems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
       pkgsFor = system: import nixpkgs { inherit system; };
-      sbclVersion = "2.6.9";
-      mkSbcl = pkgs:
-        let
-          base = pkgs.callPackage (nixpkgs.outPath + "/pkgs/development/compilers/sbcl") {
-            version = "2.6.8";
-            bootstrapLisp = "${pkgs.sbcl}/bin/sbcl --disable-debugger --no-userinit --no-sysinit";
-          };
-        in
-        pkgs.wrapLisp {
-          pkg = base.overrideAttrs (old: {
-            version = sbclVersion;
-            src = pkgs.fetchurl {
-              url = "mirror://sourceforge/project/sbcl/sbcl/${sbclVersion}/sbcl-${sbclVersion}-source.tar.bz2";
-              hash = "sha256-xv0dc1Vw60/zTK+WCZiMp37QvRK1XQmk/tB1vokNpRM=";
-            };
-            sbclPatchPhase = (old.sbclPatchPhase or "") + lib.optionalString
-              pkgs.stdenv.hostPlatform.isDarwin ''
-                (
-                  shopt -s nullglob
-                  substituteInPlace {tests,src/code}/*.{lisp,sh} \
-                    --replace-quiet "${pkgs.darwin.shell_cmds}" "${pkgs.coreutils}"
-                )
-              '';
-          });
-          faslExt = "fasl";
-          flags = [ "--dynamic-space-size" "3000" ];
-        };
       source-root = toString ./.;
       relative-path = path:
         let text = toString path;
@@ -77,7 +50,7 @@
       ];
       lispClosure = pkgs:
         let
-          package-set = (mkSbcl pkgs).pkgs;
+          package-set = pkgs.sbcl.pkgs;
           direct = map (name: package-set.${name}) lispPackageNames;
           walk = seen: pending:
             let fresh = builtins.filter (p: !(builtins.elem p seen)) pending;
@@ -90,7 +63,7 @@
         lib.concatStringsSep ":"
           ((map (path: "${path}//") (lispClosure pkgs)) ++ extra);
       devRegistry = pkgs:
-        source-registry pkgs [ "${(mkSbcl pkgs).pkgs.slynk}//" ];
+        source-registry pkgs [ "${pkgs.sbcl.pkgs.slynk}//" ];
       muffled = body: ''
         (handler-bind ((warning (lambda (condition)
                                    (let ((report (princ-to-string condition)))
@@ -108,7 +81,7 @@
                    (when failure-p (error "compile-file reported a failure for ~A" source)))))'';
       mkEnchiridion = { pkgs }:
         let
-          sbcl = mkSbcl pkgs;
+          sbcl = pkgs.sbcl;
           library-path = lib.makeLibraryPath [ pkgs.sqlite pkgs.openssl ];
           registry = source-registry pkgs [ "$out/lib" ];
         in
@@ -146,6 +119,8 @@
                 (let ((root (uiop:pathname-directory-pathname *default-pathname-defaults*)))
                   (compile-entry (merge-pathnames "src/main.cl" root)
                                  (merge-pathnames "main.fasl" #p"."))
+                  (compile-entry (merge-pathnames "src/git-exec.cl" root)
+                                 (merge-pathnames "git-exec.fasl" #p"."))
                   (compile-entry (merge-pathnames "src/broker-exec.cl" root)
                                  (merge-pathnames "broker-exec.fasl" #p"."))))''}'
             runHook postBuild
@@ -187,7 +162,7 @@
       mkGate = { pkgs, run-tests }:
         let
           enchiridion = mkEnchiridion { inherit pkgs; };
-          sbcl = mkSbcl pkgs;
+          sbcl = pkgs.sbcl;
           name = if run-tests then "enchiridion-test" else "enchiridion-check";
           registry = source-registry pkgs [ "${enchiridion}/lib" "${source}/t" ];
         in
@@ -223,6 +198,8 @@
                               (out (pathname (uiop:getenv "GATE_DIR"))))
                          (compile-entry (merge-pathnames "src/main.cl" root)
                                         (merge-pathnames "main.fasl" out))
+                         (compile-entry (merge-pathnames "src/git-exec.cl" root)
+                                        (merge-pathnames "git-exec.fasl" out))
                          (compile-entry (merge-pathnames "src/broker-exec.cl" root)
                                         (merge-pathnames "broker-exec.fasl" out))))'
 
@@ -241,7 +218,7 @@
       perSystem = system:
         let
           pkgs = pkgsFor system;
-          sbcl = mkSbcl pkgs;
+          sbcl = pkgs.sbcl;
           library-path = lib.makeLibraryPath [ pkgs.sqlite pkgs.openssl ];
           enchiridion = mkEnchiridion { inherit pkgs; };
           check = mkGate { inherit pkgs; run-tests = false; };
@@ -283,6 +260,7 @@
           };
 
           packages = {
+            default = enchiridion;
             inherit enchiridion;
             enchiridion-aarch64-linux = mkEnchiridion { pkgs = pkgsFor "aarch64-linux"; };
             enchiridion-x86_64-linux = mkEnchiridion { pkgs = pkgsFor "x86_64-linux"; };

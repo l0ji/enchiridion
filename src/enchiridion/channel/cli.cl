@@ -273,9 +273,10 @@ first turn it found."
 (defun command-table ()
   "Return the shared command table: one row per command.
 
-A row is (name minimum maximum handler summary). MAXIMUM is NIL for a command
-that takes any number of arguments, which only ASK and MEMORY do, because
-their argument is free text."
+A row is (name minimum maximum handler summary requirements). MAXIMUM is NIL
+for a command that takes any number of arguments, which only ASK and MEMORY do,
+because their argument is free text. REQUIREMENTS is a plist of :DEFAULT and
+:ACTIONS; see COMMAND-REQUIREMENTS."
   *commands*)
 
 (declaim (ftype (function (t) (or null list)) find-command))
@@ -301,6 +302,49 @@ their argument is free text."
       ((null maximum) (format nil "at least ~D argument~:P" minimum))
       ((= minimum maximum) (format nil "exactly ~D argument~:P" minimum))
       (t (format nil "~D to ~D arguments" minimum maximum)))))
+
+(declaim (ftype (function (t &optional list) (values list boolean))
+                command-requirements))
+
+(defun command-requirements (name &optional arguments)
+  "Return NAME's capabilities and whether NAME is a command.
+
+The first value is a list of keywords from the row's REQUIREMENTS plist. When
+ARGUMENTS selects an action whose requirements differ, that action's list is
+returned; otherwise the :DEFAULT list is. The second value is NIL for an
+unknown NAME. This function reads metadata only: it does not validate arity,
+dispatch a handler, or load anything."
+  (let ((row (find-command name)))
+    (if (null row)
+        (values nil nil)
+        (let* ((spec (sixth row))
+               (action (and arguments (first arguments)
+                            (string-downcase (string (first arguments)))))
+               (entry (and action (assoc action (getf spec :actions)
+                                         :test #'string=))))
+          (values (if entry (cdr entry) (getf spec :default)) t)))))
+
+(declaim (ftype (function (t list) (or null string)) command-problem))
+
+(defun command-problem (name arguments)
+  "Return NIL when NAME and ARGUMENTS may be dispatched, else one line.
+
+The line is the one RUN-COMMAND prints for an unknown command or an argument
+count outside the table's range. It is returned rather than printed so a shell
+entry point can reject the call before loading configuration, and RUN-COMMAND
+reuses it so the messages cannot drift. Subcommand actions are not validated
+here: their handlers own that refusal."
+  (let ((row (find-command name)))
+    (unless row
+      (return-from command-problem
+        (format nil "There is no command called ~A. Try `~A`."
+                name (command-label "help"))))
+    (let ((count (length arguments))
+          (minimum (second row))
+          (maximum (third row)))
+      (unless (and (>= count minimum) (or (null maximum) (<= count maximum)))
+        (format nil "~A takes ~A; got ~D."
+                (command-label (first row)) (arity-text row) count)))))
 
 (defparameter +repl-only-commands+
   '(("stop" "Ask the turn in flight to stop")
@@ -361,19 +405,13 @@ The table's minimum and maximum are checked before dispatch. An unknown name,
 or a call outside the range, prints one line and returns 2 without running
 anything. A command that succeeded returns 0; a command that refused its
 situation returns 1 and says why."
-  (let ((row (find-command name)))
-    (unless row
-      (say "There is no command called ~A. Try `~A`." name (command-label "help"))
-      (return-from run-command 2))
-    (let ((count (length arguments))
-          (minimum (second row))
-          (maximum (third row)))
-      (unless (and (>= count minimum) (or (null maximum) (<= count maximum)))
-        (say "~A takes ~A; got ~D."
-             (command-label (first row)) (arity-text row) count)
-        (return-from run-command 2))
-      (let ((status (funcall (fourth row) arguments)))
-        (if (integerp status) status 0)))))
+  (let ((problem (command-problem name arguments)))
+    (when problem
+      (say "~A" problem)
+      (return-from run-command 2)))
+  (let* ((row (find-command name))
+         (status (funcall (fourth row) arguments)))
+    (if (integerp status) status 0)))
 
 ;;;; The REPL surface.
 
@@ -1256,6 +1294,22 @@ one that asks a provider what its account can reach."
   "Print the command list, or the detail for one command."
   (command-help (first arguments)))
 
+(defparameter *doctor-function* nil
+  "The health check the process supplies, or NIL.
+
+The check needs the state paths and the configuration reader, which live in the
+entry script. The table row calls through this hook so that this file stays free
+of the entry script and a test can supply its own check.")
+
+(declaim (ftype (function (list) integer) cmd-doctor))
+
+(defun cmd-doctor (arguments)
+  "Run the process health check, or say that this process has none."
+  (if *doctor-function*
+      (funcall *doctor-function* arguments)
+      (progn (say "This surface has no health check; run `enchiridion doctor` in a shell.")
+             1)))
+
 (declaim (ftype (function (list) integer) cmd-health))
 
 (defun cmd-health (arguments)
@@ -1314,16 +1368,20 @@ agent is still running the old code."
 (declaim (ftype (function (list) integer) cmd-channels))
 
 (defun cmd-channels (arguments)
-  "List, enable or disable a channel on the running supervisor."
+  "List, enable, replace, or disable a channel on the running supervisor."
   (let ((action (string-downcase (or (first arguments) "list"))))
-    (unless (member action '("list" "enable" "disable") :test #'string=)
-      (say "channels takes list, enable NAME or disable NAME.")
+    (unless (member action '("list" "enable" "replace" "disable") :test #'string=)
+      (say "channels takes list, enable NAME, replace NAME or disable NAME.")
       (return-from cmd-channels 2))
     (let* ((line (if (rest arguments)
                      (format nil "channels ~A ~A" action (second arguments))
                      (format nil "channels ~A" action)))
            (status (enchiridion.supervisor:request-control line)))
-      (if status (report-control status) (no-supervisor "channels")))))
+      (cond
+        ((null status) (no-supervisor "channels"))
+        ((enchiridion.supervisor:status-report-ok-p status)
+         (report-control status))
+        (t (report-control status) 1)))))
 
 (declaim (ftype (function (list) integer) cmd-heartbeat))
 
@@ -1365,8 +1423,9 @@ enough for a shell command in another process to believe it."
 ;;;; Filling the table.
 ;;;;
 ;;;; This runs last, so every function the rows name already exists. The rows
-;;;; are plain data: name, minimum, maximum, handler, summary. MAXIMUM is NIL
-;;;; for ASK and MEMORY, whose argument is free text of any length.
+;;;; are plain data: name, minimum, maximum, handler, summary, requirements.
+;;;; MAXIMUM is NIL for ASK and MEMORY, whose argument is free text of any
+;;;; length.
 
 (declaim (ftype (function (list) integer) cmd-bootstrap))
 
@@ -1417,39 +1476,78 @@ and archives BOOTSTRAP.md."
 (declaim (ftype (function () list) build-command-table))
 
 (defun build-command-table ()
-  "Return the shared command table."
-  (list
-   (list "init" 0 1 #'cmd-init "Create the agent directory and seed files")
-   (list "ask" 1 nil #'cmd-ask "One turn in a short lived session")
-   (list "check" 0 0 #'cmd-check "Compile every system file and both entry scripts")
-   (list "skills" 0 2 #'cmd-skills "List or show skills")
-   (list "tools" 0 2 #'cmd-tools "List or show tools")
-   (list "blocks" 0 2 #'cmd-blocks "Blocks with character counts and capacity")
-   (list "persona" 0 1 #'cmd-persona "SOUL.md")
-   (list "operator" 0 1 #'cmd-operator "OPERATOR.md")
-   (list "world" 0 1 #'cmd-world "WORLD.md")
-   (list "memory" 1 nil #'cmd-memory "Search sessions, memories and episodes")
-   (list "sessions" 0 0 #'cmd-sessions "Stored sessions with turn counts")
-   (list "journey" 0 2 #'cmd-journey "Everything the agent has learned or written")
-   (list "undo" 1 1 #'cmd-undo "Roll back the nth change in the agent directory")
-   (list "usage" 0 0 #'cmd-usage "Token ledger by model, day and channel")
-   (list "budget" 0 0 #'cmd-budget "Spend against the caps")
-   (list "tasks" 0 nil #'cmd-tasks "The task queue")
-   (list "secrets" 0 0 #'cmd-secrets "Names and sources, never values")
-   (list "providers" 0 2 #'cmd-providers "Provider list, one provider, its models, or a catalog refresh")
-   (list "version" 0 0 #'cmd-version "Version and build provenance")
-   (list "help" 0 1 #'cmd-help "Command list, or detail for one")
-   (list "bootstrap" 0 2 #'cmd-bootstrap "Bootstrap state, remaining steps, a step record, or a reset")
-   (list "health" 0 0 #'cmd-health "Read the running supervisor's status")
-   (list "reload" 0 0 #'cmd-reload "Ask a running supervisor to reload its code")
-   (list "channels" 0 2 #'cmd-channels "List, enable or disable a channel")
-   (list "heartbeat" 0 1 #'cmd-heartbeat "Turn the heartbeat on, off, or run one")
-   (list "chat" 0 0 #'cmd-chat "Start the REPL")
-   (list "serve" 0 0 #'cmd-serve "Start the supervisor and its channels")))
+  "Return the shared command table.
 
+Each row carries its capability requirements as a plist of :DEFAULT and
+:ACTIONS. :ACTIONS names only the subcommands whose requirements differ from
+the default, so the table stays one source of command names and handlers."
+  (list
+   (list "init" 0 1 #'cmd-init "Create the agent directory and seed files"
+         '(:default (:config :directory :git)))
+   (list "ask" 1 nil #'cmd-ask "One turn in a short lived session"
+         '(:default (:config :directory :secrets :store :backend :agent)))
+   (list "check" 0 0 #'cmd-check "Compile every system file and both entry scripts"
+         '(:default ()))
+   (list "skills" 0 2 #'cmd-skills "List or show skills"
+         '(:default (:directory)))
+   (list "tools" 0 2 #'cmd-tools "List or show tools"
+         '(:default ()))
+   (list "blocks" 0 2 #'cmd-blocks "Blocks with character counts and capacity"
+         '(:default (:config :directory)
+           :actions (("edit" . (:directory)))))
+   (list "persona" 0 1 #'cmd-persona "SOUL.md"
+         '(:default (:directory)))
+   (list "operator" 0 1 #'cmd-operator "OPERATOR.md"
+         '(:default (:directory)))
+   (list "world" 0 1 #'cmd-world "WORLD.md"
+         '(:default (:directory)))
+   (list "memory" 1 nil #'cmd-memory "Search sessions, memories and episodes"
+         '(:default (:config :store)
+           :actions (("build" . (:config :directory :secrets :store :backend))
+                     ("promote" . (:config :directory :secrets :store :backend))
+                     ("regate" . (:config :directory :secrets :store :backend)))))
+   (list "sessions" 0 0 #'cmd-sessions "Stored sessions with turn counts"
+         '(:default (:config :store)))
+   (list "journey" 0 2 #'cmd-journey "Everything the agent has learned or written"
+         '(:default (:config :directory :git)))
+   (list "undo" 1 1 #'cmd-undo "Roll back the nth change in the agent directory"
+         '(:default (:config :directory :git)))
+   (list "usage" 0 0 #'cmd-usage "Token ledger by model, day and channel"
+         '(:default (:config :store)))
+   (list "budget" 0 0 #'cmd-budget "Spend against the caps"
+         '(:default (:config)))
+   (list "tasks" 0 nil #'cmd-tasks "The task queue"
+         '(:default (:config :store)))
+   (list "secrets" 0 0 #'cmd-secrets "Names and sources, never values"
+         '(:default (:config :secrets)))
+   (list "providers" 0 2 #'cmd-providers "Provider list, one provider, its models, or a catalog refresh"
+         '(:default (:config)
+           :actions (("models" . (:config :secrets)))))
+   (list "version" 0 0 #'cmd-version "Version and build provenance"
+         '(:default ()))
+   (list "help" 0 1 #'cmd-help "Command list, or detail for one"
+         '(:default ()))
+   (list "bootstrap" 0 2 #'cmd-bootstrap "Bootstrap state, remaining steps, a step record, or a reset"
+         '(:default (:directory)
+           :actions (("step" . (:config :directory :git)))))
+   (list "doctor" 0 0 #'cmd-doctor "Check local dependencies and the broker"
+         '(:default ()))
+   (list "health" 0 0 #'cmd-health "Read the running supervisor's status"
+         '(:default ()))
+   (list "reload" 0 0 #'cmd-reload "Ask a running supervisor to reload its code"
+         '(:default ()))
+   (list "channels" 0 2 #'cmd-channels "List, enable or disable a channel"
+         '(:default ()))
+   (list "heartbeat" 0 1 #'cmd-heartbeat "Turn the heartbeat on, off, or run one"
+         '(:default ()))
+   (list "chat" 0 0 #'cmd-chat "Start the REPL"
+         '(:default (:config :directory :secrets :store :backend :agent :supervised)))
+   (list "serve" 0 0 #'cmd-serve "Start the supervisor and its channels"
+         '(:default (:config :directory :secrets :store :backend :agent :supervised)))))
 (defparameter *commands* (build-command-table)
   "The shared command table. One list of rows backs the shell and the REPL, so
-the two surfaces cannot drift. A row is (name minimum maximum handler summary).")
+the two surfaces cannot drift. A row is (name minimum maximum handler summary
+requirements); COMMAND-REQUIREMENTS reads the last element.")
 
 ;;;; The CLI channel.
 
@@ -1463,7 +1561,9 @@ the two surfaces cannot drift. A row is (name minimum maximum handler summary)."
 through it prints, so the supervisor can own it on a thread exactly like every
 other channel."))
 
-(declaim (ftype (function (&key (:context t) (:output t)) cli-channel) make-cli-channel))
+(declaim (ftype (function (&key (:context t) (:output t))
+                           (values cli-channel &rest t))
+                make-cli-channel))
 
 (defun make-cli-channel (&key (context *command-context*) (output *standard-output*))
   "Return a stopped CLI channel over CONTEXT, printing to OUTPUT."
@@ -1486,7 +1586,7 @@ instead, and the operator reads that line rather than a restart every second."
             "~&enchiridion: stdin is not a terminal, so the cli channel stays down.~%")
     (finish-output *error-output*)
     (setf (enchiridion.channel:channel-live-p channel) nil
-          (enchiridion.channel:channel-state channel) :stopped)
+          (enchiridion.channel:channel-state channel) :unavailable)
     (return-from enchiridion.channel:channel-start channel))
   (setf (enchiridion.channel:channel-live-p channel) t
         (enchiridion.channel:channel-state channel) :live)
@@ -1515,7 +1615,7 @@ instead, and the operator reads that line rather than a restart every second."
   "Return CHANNEL's state."
   (enchiridion.channel:channel-state channel))
 
-(declaim (ftype (function (&key (:context t)) cli-channel) start-cli))
+(declaim (ftype (function (&key (:context t)) (values cli-channel &rest t)) start-cli))
 
 (defun start-cli (&key (context *command-context*))
   "Create the CLI channel, run the REPL to completion, and return the channel."

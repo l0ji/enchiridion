@@ -12,7 +12,33 @@
 ;; script, so nothing has loaded the system yet, and both UIOP and ASDF have
 ;; to exist at read time for the import and the qualified references below.
 ;; SBCL accepts it.
+(require :sb-posix)
 (require :asdf)
+
+(defun initialize-supervisor-asdf ()
+  "Initialize root's ASDF registries without HOME or XDG configuration files."
+  (when (zerop (sb-posix:geteuid))
+    (flet ((without-inheritance (configuration)
+             (append (remove-if (lambda (entry)
+                                  (member entry
+                                          '(:inherit-configuration
+                                            :ignore-inherited-configuration)))
+                                configuration)
+                     '(:ignore-inherited-configuration))))
+      (asdf:initialize-source-registry
+       (without-inheritance
+        (or (asdf/source-registry:parse-source-registry-string
+             (uiop:getenv "CL_SOURCE_REGISTRY"))
+            `(:source-registry
+              (:directory ,(uiop:pathname-parent-directory-pathname
+                            (uiop:pathname-directory-pathname *load-pathname*)))))))
+      (asdf:initialize-output-translations
+       (without-inheritance
+        (or (asdf/output-translations:parse-output-translations-string
+             (uiop:getenv "ASDF_OUTPUT_TRANSLATIONS"))
+            '(:output-translations (t nil))))))))
+
+(initialize-supervisor-asdf)
 
 (defpackage #:enchiridion.main
   (:use #:cl)
@@ -146,6 +172,9 @@ the operator has to choose a provider and a state layout."
       (error 'enchiridion.errors:configuration-error
              :key :config
              :detail "config.cl is required. Copy config.example.cl to config.cl and edit it."))
+    (setf enchiridion.git:*git-identity*
+          (cons (enchiridion:config-setting config :sandbox :agent-uid)
+                (enchiridion:config-setting config :sandbox :agent-gid)))
     config))
 
 ;;;; The agent context.
@@ -425,80 +454,113 @@ best answer available."
         (finish-output *error-output*))))
   nil)
 
-(defun make-context (&key (refresh-models nil))
-  "Build the context for one command. Start nothing and open no socket.
+(defparameter +turn-requirements+
+  '(:config :directory :secrets :store :backend :agent)
+  "The capabilities a command that runs a turn needs.")
 
-The store is opened before the agent because the agent's prompt is compiled
-from the blocks, and two of those blocks are rows in the store.
+(declaim (ftype (function (list t) boolean) requirement-p))
+
+(defun requirement-p (requirements capability)
+  "Return T when REQUIREMENTS names CAPABILITY."
+  (not (null (member capability requirements))))
+
+(declaim (ftype (function (t t t) t) install-memory-instruments))
+
+(defun install-memory-instruments (config backend key)
+  "Install the deriver, the embedder, and the reranker BACKEND can provide.
+
+The T2 parser has a backend of its own, resolved with :T2-DERIVER-MAX-TOKENS as
+the reply cap: a reasoning model spent the turn's 4096 thinking and returned no
+text at all. Dense retrieval has its own endpoint and key, so a store can use an
+embeddings provider other than the chat one."
+  (setf enchiridion.memory:*assertion-deriver*
+        (when backend
+          (enchiridion.memory:make-model-assertion-deriver
+           (enchiridion.llm:resolve-backend
+            :config (enchiridion:config-with-llm-value
+                     config :max-tokens enchiridion.memory:*t2-deriver-max-tokens*)
+            :api-key key)
+           :model (or enchiridion.memory:*t2-deriver-model*
+                      (enchiridion:model-for :cheap)))))
+  (let ((settings enchiridion.memory::*memory-embed-settings*))
+    (setf enchiridion.memory:*memory-embedder* nil)
+    (when (getf settings :enabled)
+      (let ((key (enchiridion.llm.secrets:secret-value (getf settings :key-env))))
+        (if (and key (plusp (length key)))
+            (setf enchiridion.memory:*memory-embed-model* (getf settings :model)
+                  enchiridion.memory:*memory-embedder*
+                  (enchiridion.memory:make-backend-embedder
+                   (enchiridion.llm:openai-backend :base-url (getf settings :base-url)
+                                                   :api-key key)
+                   :model (getf settings :model)
+                   :dimensions (getf settings :dimensions)))
+            (format *error-output*
+                    "~&enchiridion: :embed is on but ~A is empty; dense retrieval is off.~%"
+                    (getf settings :key-env))))))
+  (setf enchiridion.memory:*memory-reranker*
+        (when (and backend enchiridion.memory::*memory-rerank-p*)
+          (enchiridion.memory:make-model-reranker
+           backend :model (enchiridion:model-for :cheap))))
+  backend)
+
+(declaim (ftype (function (list &key (:refresh-models t)) context)
+                make-command-state))
+
+(defun make-command-state (requirements &key (refresh-models nil))
+  "Build only the state REQUIREMENTS names, and leave the rest NIL.
+
+A command that prints the command list has no reason to load a configuration, a
+secret, a backend, a store, or an agent, and one that does those things on a
+fresh install fails where it should have printed a line. The capability list
+comes from the command table, so the table is the one place a command says what
+it needs.
+
+The store is opened before the agent because the agent's prompt is compiled from
+the blocks, and two of those blocks are rows in the store.
 
 REFRESH-MODELS is T for the commands that run a turn (`ask`, `chat`, `serve`)
-and NIL for every other command. It is the one thing this function does that
-can open a socket, it is bounded, it honours :OFFLINE, and it is the reason the
-sentence above says no socket rather than no network."
-  (declare (ignorable refresh-models))
-  (let* ((config (load-config))
-         (directory (agent-directory))
-         (key (load-configured-secrets config))
-         (_ (when (and refresh-models (plusp (length key)))
-              (refresh-provider-knowledge config)))
-         (_ (prepare-sandbox config))
-         ;; Before the agent: compiling its prompt reads the block limits.
-         (_ (enchiridion.memory:configure-memory config))
-         (store (open-agent-store config))
-         (backend (when (plusp (length key))
-                    (enchiridion.llm:resolve-backend :config config :api-key key)))
-         (broker (enchiridion.tools.broker:make-broker
-                  :socket (broker-socket-path)
-                  :uid (agent-uid config)
-                  :gid (agent-gid config)
-                  :timeout 30
-                  :log (merge-pathnames "broker.log"
-                                        (uiop:ensure-directory-pathname
-                                         (enchiridion:run-directory)))))
-         (agent (enchiridion.kernel:make-agent
-                 :name "default"
-                 :backend backend
-                 :directory directory
-                 :budget (agent-budget-plist config)
-                 :store store
-                 :broker broker)))
-    ;; The T2 parser is installed on the context. The heartbeat's T2 phase
-    ;; calls it through BUILD-CANDIDATE once every instrument is present, and
-    ;; `memory build` runs one bounded build by hand. It has a backend of its
-    ;; own, resolved with :T2-DERIVER-MAX-TOKENS as the reply cap: a reasoning
-    ;; model spent the turn's 4096 thinking and returned no text at all.
-    (setf enchiridion.memory:*assertion-deriver*
-          (when backend
-            (enchiridion.memory:make-model-assertion-deriver
-             (enchiridion.llm:resolve-backend
-              :config (enchiridion:config-with-llm-value
-                       config :max-tokens enchiridion.memory:*t2-deriver-max-tokens*)
-              :api-key key)
-             :model (or enchiridion.memory:*t2-deriver-model*
-                        (enchiridion:model-for :cheap)))))
-    ;; Dense retrieval has its own endpoint and key, so a store can use an
-    ;; embeddings provider other than the chat one.
-    (let ((settings enchiridion.memory::*memory-embed-settings*))
-      (setf enchiridion.memory:*memory-embedder* nil)
-      (when (getf settings :enabled)
-        (let ((key (enchiridion.llm.secrets:secret-value (getf settings :key-env))))
-          (if (and key (plusp (length key)))
-              (setf enchiridion.memory:*memory-embed-model* (getf settings :model)
-                    enchiridion.memory:*memory-embedder*
-                    (enchiridion.memory:make-backend-embedder
-                     (enchiridion.llm:openai-backend :base-url (getf settings :base-url)
-                                                     :api-key key)
-                     :model (getf settings :model)
-                     :dimensions (getf settings :dimensions)))
-              (format *error-output*
-                      "~&enchiridion: :embed is on but ~A is empty; dense retrieval is off.~%"
-                      (getf settings :key-env))))))
-    ;; The reranker is on the turn path, so it is installed only when the
-    ;; :memory section asks for it.
-    (setf enchiridion.memory:*memory-reranker*
-          (when (and backend enchiridion.memory::*memory-rerank-p*)
-            (enchiridion.memory:make-model-reranker
-             backend :model (enchiridion:model-for :cheap))))
+and NIL for every other command. It is the one thing here that can open a
+socket, it is bounded, it honours :OFFLINE, and it is the reason the docstring
+of the old full builder said no socket rather than no network."
+  (let ((config (when (requirement-p requirements :config) (load-config))))
+    ;; One ownership pass, before anything reads or writes the agent tree. A
+    ;; command that only reads the tree still needs it when this process is
+    ;; root: the tools that read it run as the agent uid, and a root-owned
+    ;; directory is a directory they cannot open.
+    (when (and config
+               (or (requirement-p requirements :store)
+                   (requirement-p requirements :directory)
+                   (requirement-p requirements :git)))
+      (prepare-sandbox config))
+    (let* ((directory (agent-directory))
+         (key (when (requirement-p requirements :secrets)
+                (load-configured-secrets config)))
+         (store (when (requirement-p requirements :store)
+                  (when (and refresh-models key (plusp (length key)))
+                    (refresh-provider-knowledge config))
+                  (open-agent-store config)))
+         (backend (when (requirement-p requirements :backend)
+                    (when (and key (plusp (length key)))
+                      (enchiridion.llm:resolve-backend :config config :api-key key))))
+         (broker (when (requirement-p requirements :agent)
+                   (enchiridion.tools.broker:make-broker
+                    :socket (broker-socket-path)
+                    :uid (agent-uid config)
+                    :gid (agent-gid config)
+                    :timeout 30
+                    :log (merge-pathnames "broker.log"
+                                          (uiop:ensure-directory-pathname
+                                           (enchiridion:run-directory))))))
+         (agent (when (requirement-p requirements :agent)
+                  (enchiridion.kernel:make-agent
+                   :name "default"
+                   :backend backend
+                   :directory directory
+                   :budget (agent-budget-plist config)
+                   :store store
+                   :broker broker))))
+    (when config (enchiridion.memory:configure-memory config))
+    (when (and config backend) (install-memory-instruments config backend key))
     (enchiridion.tools.builtin:register-builtin-tools)
     (%make-context :directory directory
                    :config config
@@ -508,54 +570,64 @@ sentence above says no socket rather than no network."
                    :agent agent
                    :generation (handler-case
                                    (enchiridion.memory:state-generation directory)
-                                 (error () 0)))))
+                                 (error () 0))))))
 
-(defun install-agent-proxies (context sources generation)
-  "Register one proxy tool per agent plugin and record GENERATION.
+(defun stage-agent-proxies (context manifests generation)
+  "Return a complete unpublished proxy registry for GENERATION."
+  (let ((enchiridion.tools::*registry*
+          (alexandria:copy-hash-table (enchiridion.tools:registry)))
+        (enchiridion.plugin::*plugins*
+          (copy-list (enchiridion.plugin:plugin-registry))))
+    (enchiridion.plugin:discard-generation (context-generation context))
+    (dolist (manifest manifests)
+      (enchiridion.tools:register-tool
+       (enchiridion.tools:make-tool
+        :name (enchiridion.plugin:manifest-name manifest)
+        :description (enchiridion.plugin:manifest-description manifest)
+        :schema (enchiridion.plugin:manifest-schema manifest)
+        :generation generation
+        :broker-side-p t
+        :handler (lambda (arguments)
+                   (declare (ignore arguments))
+                   (error 'enchiridion.errors:configuration-error
+                          :key :broker
+                          :detail "This tool runs in the broker.")))))
+    enchiridion.tools::*registry*))
 
-The model has to see each authored schema, and the supervisor must not hold the
-handler. A proxy is the tool the model sees with a handler that refuses: every
-call is routed to the broker before dispatch reaches it."
-  (enchiridion.plugin:discard-generation (context-generation context))
-  (dolist (manifest (handler-case (enchiridion.plugin:plugin-manifests sources)
-                      (error () '())))
-    (enchiridion.tools:register-tool
-     (enchiridion.tools:make-tool
-      :name (enchiridion.plugin:manifest-name manifest)
-      :description (enchiridion.plugin:manifest-description manifest)
-      :schema (enchiridion.plugin:manifest-schema manifest)
-      :generation generation
-      :broker-side-p t
-      :handler (lambda (arguments)
-                 (declare (ignore arguments))
-                 (error 'enchiridion.errors:configuration-error
-                        :key :broker
-                        :detail "This tool runs in the broker.")))))
-  (setf (context-generation context) generation)
-  generation)
-
-(defun load-agent-generation (context)
-  "Verify the agent's skills and tools in a one-shot child, then load them in
-the broker and register the proxy tools the model sees. Return the generation.
-
-The supervisor never compiles agent code. The child does it as the agent user,
-and only a generation that exits zero is loaded for real."
+(defun load-agent-generation (context &key generation)
+  "Verify and activate one source snapshot, then publish its staged proxies."
   (let* ((directory (context-directory context))
-         (generation (1+ (context-generation context)))
-         (sources (enchiridion.plugin:agent-source-files directory)))
+         (generation (or generation (1+ (context-generation context))))
+         (snapshot (enchiridion.plugin:snapshot-sources directory))
+         (digests (enchiridion.plugin:source-snapshot-digest snapshot))
+         (sources (enchiridion.plugin:agent-source-files directory))
+         (manifests (enchiridion.plugin:plugin-manifests sources))
+         (registry (stage-agent-proxies context manifests generation)))
     (when sources
-      (multiple-value-bind (ok-p output)
+      (multiple-value-bind (ok-p report)
           (enchiridion.tools.broker:broker-verify-plugin
            (uiop:ensure-directory-pathname directory)
            :uid (agent-uid (context-config context))
-           :gid (agent-gid (context-config context)))
+           :gid (agent-gid (context-config context))
+           :digests digests)
         (unless ok-p
-          (error 'enchiridion.errors:tool-error :tool "reload" :detail output))
-        (install-agent-proxies context sources generation)
-        (enchiridion.tools.broker:broker-load-generation
-         (context-broker context) directory :generation generation)))
-    (setf (context-generation context) generation)
-    generation))
+          (error 'enchiridion.errors:tool-error :tool "reload" :detail report))))
+    (let ((reply (enchiridion.tools.broker:broker-load-generation
+                  (context-broker context) directory
+                  :generation generation :digests digests)))
+      (unless (and (hash-table-p reply) (gethash "ok" reply)
+                   (eql generation (gethash "generation" reply))
+                   (equal digests (gethash "digests" reply)))
+        (error 'enchiridion.errors:tool-error
+               :tool "reload"
+               :detail (if (hash-table-p reply)
+                           (or (gethash "report" reply)
+                               (gethash "error" reply)
+                               "The broker returned a mismatched generation.")
+                           "The broker returned no generation report.")))
+      (setf enchiridion.tools::*registry* registry
+            (context-generation context) generation)
+      (values generation (or (gethash "report" reply) "")))))
 
 (defun start-broker-with-status (broker)
   "Start BROKER, and show a status line on standard error while it takes more
@@ -620,6 +692,130 @@ file."
     (write-string output)
     (finish-output)
     (if ok-p 0 1)))
+
+(defun doctor-condition-label (condition)
+  "Return CONDITION's type without its potentially sensitive report text."
+  (string-downcase (symbol-name (type-of condition))))
+
+(declaim (ftype (function (list) integer) run-doctor))
+
+(defun run-doctor (arguments)
+  "Check local runtime dependencies without constructing an agent or backend.
+
+Provider variables are reported by name and presence only. Condition reports
+are deliberately omitted because arbitrary text may contain a credential."
+  (when arguments
+    (format *error-output* "enchiridion: doctor takes no arguments.~%")
+    (finish-output *error-output*)
+    (return-from run-doctor 2))
+  (let ((healthy t)
+        (configuration nil))
+    (labels ((report (name ok &optional detail)
+               (format t "doctor ~A: ~:[failed~;ok~]~@[: ~A~]~%"
+                       name ok detail)
+               (unless ok (setf healthy nil))
+               (finish-output)
+               ok)
+             (condition-report (name condition)
+               (report name nil (doctor-condition-label condition))))
+      (handler-case
+          (report "git" (enchiridion.git:git-available-p)
+                  (if (enchiridion.git:git-available-p) "available" "missing"))
+        (error (condition) (condition-report "git" condition)))
+      (handler-case
+          (progn
+            (setf configuration (load-config))
+            (report "config" t "loaded"))
+        (error (condition)
+          (setf configuration (enchiridion:default-config))
+          (condition-report "config" condition)))
+      (handler-case
+          (progn
+            (load-configured-secrets configuration)
+            (dolist (name (remove-duplicates
+                           (enchiridion.llm:provider-key-names configuration)
+                           :test #'string=))
+              (let ((value (enchiridion.llm.secrets:secret-value name)))
+                (format t "doctor provider key ~A: ~:[missing~;present~]~%"
+                        name (and value (plusp (length value))))))
+            (finish-output))
+        (error (condition) (condition-report "provider keys" condition)))
+      ;; A check must not create what it reports on. An absent store is a fresh
+      ;; install, not a fault, and opening one here would migrate or create a
+      ;; database the operator never asked for.
+      (let ((store nil)
+            (path (memory-store-path configuration)))
+        (unwind-protect
+             (handler-case
+                 (if (probe-file path)
+                     (progn
+                       (setf store (enchiridion.memory.store:open-store :path path))
+                       (enchiridion.memory.store:close-store store)
+                       (setf store nil)
+                       (report "store open/close" t))
+                     (report "store open/close" t "absent; nothing created"))
+               (error (condition) (condition-report "store open/close" condition)))
+          (when store
+            (ignore-errors (enchiridion.memory.store:close-store store)))))
+      (let ((broker nil)
+            (started nil))
+        (unwind-protect
+             (progn
+               (handler-case
+                   (progn
+                     ;; A private socket and log under the temporary
+                     ;; directory: a check must not collide with a supervisor
+                     ;; that is already serving, and it must not leave a stale
+                     ;; socket or log in run/ if it dies.
+                     (let ((scratch (uiop:ensure-directory-pathname
+                                     (enchiridion.compat:temp-directory))))
+                       (ensure-directories-exist (merge-pathnames "x" scratch))
+                       (setf broker
+                             (enchiridion.tools.broker:make-broker
+                              :socket (merge-pathnames
+                                       (format nil "doctor-~D-~D.sock"
+                                               (get-universal-time)
+                                               (random 1000000))
+                                       scratch)
+                              :uid (agent-uid configuration)
+                              :gid (agent-gid configuration)
+                              :timeout 10
+                              :log (merge-pathnames
+                                    (format nil "doctor-~D-~D.log"
+                                            (get-universal-time)
+                                            (random 1000000))
+                                    scratch))))
+                     (enchiridion.tools.broker:broker-start broker)
+                     (setf started t)
+                     (report "broker start" t))
+                 (error (condition) (condition-report "broker start" condition)))
+               (if started
+                   (handler-case
+                       (report "broker ping"
+                               (enchiridion.tools.broker:broker-health broker))
+                     (error (condition) (condition-report "broker ping" condition)))
+                   (report "broker ping" nil "not run"))
+               (handler-case
+                   (progn
+                     (if broker
+                         (enchiridion.tools.broker:broker-stop broker)
+                         (error "No broker was constructed."))
+                     (report "broker stop" t))
+                 (error (condition) (condition-report "broker stop" condition))))
+          (when broker
+            (ignore-errors (enchiridion.tools.broker:broker-stop broker)))))
+      (handler-case
+          (report "seed" (enchiridion.memory:agent-seeded-p (agent-directory))
+                  (if (enchiridion.memory:agent-seeded-p (agent-directory))
+                      "present" "missing; run enchiridion init"))
+        (error (condition) (condition-report "seed" condition)))
+      (handler-case
+          (format t "doctor bootstrap: ~A~%"
+                  (enchiridion.llm.secrets:scrub
+                   (enchiridion.memory:bootstrap-status-line (agent-directory))))
+        (error (condition) (condition-report "bootstrap" condition)))
+      (finish-output)
+      (if healthy 0 1))))
 
 ;;;; Driving a command.
 ;;;;
@@ -776,37 +972,28 @@ else only the finished steps are written, one plain line each. The event
           (:finish
            (stop)))))))
 
-(defun broker-reload (context supervisor)
-  "Verify the agent files in a one-shot child, load them in the broker, and
-return the plist the supervisor records: :OK-P, :GENERATION and :REPORT.
+(declaim (ftype (function (t) string) condition-line))
 
-The supervisor process never compiles agent code. The child does it as the
-agent user, and only a generation that exits zero is loaded for real."
-  (let* ((directory (context-directory context))
-         (previous (enchiridion.supervisor:supervisor-generation supervisor))
-         (generation (1+ previous))
-         (sources (handler-case (enchiridion.plugin:agent-source-files directory)
-                    (error () '()))))
-    (if (null sources)
-        (progn
-          (enchiridion.plugin:discard-generation previous)
-          (setf (context-generation context) generation)
-          (list :ok-p t :generation generation :report "no agent files to load"))
-        (multiple-value-bind (ok-p output)
-            (enchiridion.tools.broker:broker-verify-plugin
-             (uiop:ensure-directory-pathname directory)
-             :uid (agent-uid (context-config context))
-             :gid (agent-gid (context-config context)))
-          (if (not ok-p)
-              (list :ok-p nil :generation previous :report output)
-              (progn
-                (install-agent-proxies context sources generation)
-                (let ((reply (enchiridion.tools.broker:broker-load-generation
-                              (context-broker context) directory
-                              :generation generation)))
-                  (list :ok-p (not (null (gethash "ok" reply)))
-                        :generation generation
-                        :report (or (gethash "report" reply) "")))))))))
+(defun condition-line (condition)
+  "Return CONDITION as one line: its report, then its detail when it has one."
+  (let ((detail (and (typep condition 'enchiridion.errors:enchiridion-error)
+                     (enchiridion.errors:error-detail condition))))
+    (if (stringp detail)
+        (format nil "~A ~A" condition detail)
+        (princ-to-string condition))))
+
+(declaim (ftype (function (t &key (:block-p t)) function) make-channel-turn))
+
+
+(defun broker-reload (context supervisor)
+  "Return the result of staging and activating one generation for SUPERVISOR."
+  (let ((previous (enchiridion.supervisor:supervisor-generation supervisor)))
+    (handler-case
+        (multiple-value-bind (generation report)
+            (load-agent-generation context :generation (1+ previous))
+          (list :ok-p t :generation generation :report report))
+      (error (condition)
+        (list :ok-p nil :generation previous :report (condition-line condition))))))
 
 (defun make-respond (context cancelled &key (channel :cli))
   "Return the function the command table calls for one turn.
@@ -867,18 +1054,6 @@ over the webhook is not filed as a turn typed at the terminal."
 (defun channel-failure (reason message)
   "Return the plist a channel reports when a turn did not run."
   (list :ok-p nil :reply "" :error message :reason reason :usage nil))
-
-(declaim (ftype (function (t) string) condition-line))
-
-(defun condition-line (condition)
-  "Return CONDITION as one line: its report, then its detail when it has one."
-  (let ((detail (and (typep condition 'enchiridion.errors:enchiridion-error)
-                     (enchiridion.errors:error-detail condition))))
-    (if (stringp detail)
-        (format nil "~A ~A" condition detail)
-        (princ-to-string condition))))
-
-(declaim (ftype (function (t &key (:block-p t)) function) make-channel-turn))
 
 (defun make-channel-turn (context &key (block-p nil))
   "Return the function a channel calls to run one turn.
@@ -1002,53 +1177,59 @@ shape filter cannot catch."
                (enchiridion.llm.secrets:register-secret name value :env)
                value)))))))
 
-(declaim (ftype (function (t t t list string) list) build-channels))
+(declaim (ftype (function (t t t list string) (values list list)) build-channels))
 
 (defun build-channels (context supervisor command-context options command)
-  "Return the channels this process supervises.
+  "Return two values: the initially running channels and their factories.
 
-Every channel the process can run is built, not only the enabled ones: the
-control file's `channels enable http` has to be able to start a channel that
-was disabled at startup, and an object that does not exist cannot be started.
-Building one binds no port and opens no socket.
+The factory alist maps lowercase channel names to zero-argument constructors.
+Every call returns a fresh stopped channel, so enabling a channel that was
+disabled at startup never reuses a stopped or failed instance.
 
-CHAT and SERVE differ by one channel. The REPL is the command's own foreground
-surface, so the cli channel is a supervised channel only under `serve`; giving
-it to chat as well would run a second REPL on a thread."
+CHAT owns its foreground REPL directly. SERVE supervises the CLI channel beside
+the network channels."
   (let* ((config (context-config context))
          (requested (getf options :channel))
          (http-p (or (and (stringp requested) (string-equal requested "http"))
                      (enchiridion:channel-enabled-p :http)))
          (fluxer-p (or (and (stringp requested) (string-equal requested "fluxer"))
                        (enchiridion:channel-enabled-p :fluxer)))
-         (channels '()))
-    (when (string= command "serve")
-      (push (enchiridion.channel.cli:make-cli-channel :context command-context)
-            channels))
-    (when http-p
+         (channels '())
+         (factories '()))
+    (flet ((add-channel (name enabled-p constructor)
+             (push (cons name constructor) factories)
+             (when enabled-p
+               (push (funcall constructor) channels))))
+      (when (string= command "serve")
+        (add-channel "cli" t
+                     (lambda ()
+                       (enchiridion.channel.cli:make-cli-channel
+                        :context command-context))))
       (let* ((entry (http-entry config options))
              (bind (or (getf entry :bind) "127.0.0.1"))
              (port (or (getf entry :port) 8787)))
-        (push (enchiridion.channel.http:make-http-channel
-               :service (enchiridion.channel.http:make-http-service
-                         :turn (make-channel-turn context)
-                         :health (make-http-health supervisor)
-                         :usage (make-ledger-reader (context-store context))
-                         :token (http-token entry)
-                         :bind bind
-                         :port port
-                         :body-limit (or (getf entry :max-body-bytes)
-                                         enchiridion.channel.http:+http-body-limit+)))
-              channels)))
-    (when fluxer-p
-      ;; The channel resolves its own allowlist and token from the
-      ;; configuration it is handed, so a test and the supervisor use the same
-      ;; reader and a short :fluxer entry cannot lose the operator's allowlist.
-      (push (enchiridion.channel.fluxer:make-fluxer-channel
-             :turn (make-channel-turn context :block-p t)
-             :config config)
-            channels))
-    (nreverse channels)))
+        (add-channel
+         "http" http-p
+         (lambda ()
+           (enchiridion.channel.http:make-http-channel
+            :service (enchiridion.channel.http:make-http-service
+                      :turn (make-channel-turn context)
+                      :health (make-http-health supervisor)
+                      :usage (make-ledger-reader (context-store context))
+                      :token (http-token entry)
+                      :bind bind
+                      :port port
+                      :body-limit (or (getf entry :max-body-bytes)
+                                      enchiridion.channel.http:+http-body-limit+))))))
+      ;; The channel resolves its own allowlist and token from the configuration
+      ;; it is handed, so a factory and the initial instance use the same reader.
+      (add-channel
+       "fluxer" fluxer-p
+       (lambda ()
+         (enchiridion.channel.fluxer:make-fluxer-channel
+          :turn (make-channel-turn context :block-p t)
+          :config config))))
+    (values (nreverse channels) (nreverse factories))))
 
 (declaim (ftype (function (list) null) check-channel-policy))
 
@@ -1123,28 +1304,46 @@ the way the operator typed it."
 
 (declaim (ftype (function (string list) integer) run-command))
 
+(defun command-requirements (name arguments)
+  "Return the capabilities NAME needs for ARGUMENTS, from the command table."
+  (nth-value 0 (enchiridion.channel.cli:command-requirements name arguments)))
+
 (defun run-command (name arguments)
   "Run NAME with ARGUMENTS through the shared command table.
 Return an exit status.
 
+Only what the command table says the command needs is built. A command with no
+capabilities loads no configuration, opens no store, resolves no backend, and
+builds no agent: `enchiridion help` and `enchiridion version` answer on a fresh
+install with no configuration file, and a `--help` never creates a database.
+
 Only ASK refreshes the provider knowledge: it is the one command here that
-spends a turn. Every other command in this table inspects the configuration or
-the store, and an inspection must not open a socket or rewrite a cache."
-  (let ((context (make-context :refresh-models (string= name "ask"))))
-    (let ((status
-            (unwind-protect
-                 (let* ((cancelled (list nil))
-                        (enchiridion.channel.cli:*command-context*
-                          (command-context-for
-                           context
-                           :respond (make-respond context cancelled)
-                           :cancel (lambda () (setf (car cancelled) t)))))
-                   (enchiridion.channel.cli:run-command name arguments))
-              (close-context context))))
-      ;; Seed files and the store are created by the command, so the ownership
-      ;; pass runs again after it as well as before.
-      (prepare-sandbox (context-config context))
-      status)))
+spends a turn."
+  (let ((requirements (command-requirements name arguments)))
+    (if (null requirements)
+        (let ((enchiridion.channel.cli:*command-context*
+                (enchiridion.channel.cli:make-command-context)))
+          (enchiridion.tools.builtin:register-builtin-tools)
+          (enchiridion.channel.cli:run-command name arguments))
+        (progn
+          (when (requirement-p requirements :git) (require-git))
+          (let ((context (make-command-state requirements
+                                             :refresh-models (string= name "ask"))))
+            (let ((status
+                    (unwind-protect
+                         (let* ((cancelled (list nil))
+                                (enchiridion.channel.cli:*command-context*
+                                  (command-context-for
+                                   context
+                                   :respond (make-respond context cancelled)
+                                   :cancel (lambda () (setf (car cancelled) t)))))
+                           (enchiridion.channel.cli:run-command name arguments))
+                      (close-context context))))
+              ;; Seed files and the store are created by the command, so the
+              ;; ownership pass runs again after it as well as before.
+              (when (context-config context)
+                (prepare-sandbox (context-config context)))
+              status))))))
 
 (declaim (ftype (function (string) boolean) supervisor-command-p))
 
@@ -1165,9 +1364,10 @@ foreground itself.
 The channels are built and handed over before the supervisor starts. It starts
 whatever is in its list, and an empty list is why `serve` used to come up with
 no channels at all."
-  (let ((context (make-context :refresh-models t)))
+  (let ((context (make-command-state +turn-requirements+ :refresh-models t)))
     (unwind-protect
          (progn
+           (require-git)
            (ensure-started context)
            (let* ((supervisor (make-application-supervisor context))
                   (cancelled (list nil))
@@ -1178,8 +1378,14 @@ no channels at all."
                      :supervisor supervisor
                      :respond (make-respond context cancelled)
                      :cancel (lambda () (setf (car cancelled) t)))))
-             (setf (enchiridion.supervisor:supervisor-channels supervisor)
-                   (build-channels context supervisor command-context options name))
+             (multiple-value-bind (channels factories)
+                 (build-channels context supervisor command-context options name)
+               (setf (enchiridion.supervisor:supervisor-channels supervisor) channels
+                     (enchiridion.supervisor:supervisor-channel-factory supervisor)
+                     (lambda (channel-name)
+                       (let ((constructor (cdr (assoc channel-name factories
+                                                      :test #'string-equal))))
+                         (when constructor (funcall constructor))))))
              (check-channel-policy
               (enchiridion.supervisor:supervisor-channels supervisor))
              (unwind-protect
@@ -1279,10 +1485,12 @@ the operator has had a chance to edit the seed files."
   ;; SBCL starts every process from the same random state, so without this
   ;; every session id and temporary file name repeats from one run to the next.
   (setf *random-state* (make-random-state t))
+  ;; The command table reaches the health check through the process that owns
+  ;; the state paths, so `enchiridion doctor` and `doctor` inside the REPL run
+  ;; the same code.
+  (setf enchiridion.channel.cli:*doctor-function* #'run-doctor)
   (handler-case
       (multiple-value-bind (options arguments) (split-options argv)
-        (load-config)
-        (require-git)
         (let ((command (or (first arguments) ""))
               (problem (validate-options options)))
           (when problem
@@ -1314,9 +1522,28 @@ the operator has had a chance to edit the seed files."
                        (format *error-output* "~&enchiridion: ~A~%" later-problem)
                        (finish-output *error-output*)
                        (return-from main 2))
-                     (run-supervised-command command rest-arguments all)))
-                 (run-command command (rest arguments))))
-            ((first-launch-p) (print-first-launch))
+                     (let ((problem (enchiridion.channel.cli:command-problem
+                                     command rest-arguments)))
+                       (when problem
+                         (format t "~&~A~%" problem)
+                         (finish-output)
+                         (return-from main 2))
+                       (run-supervised-command command rest-arguments all))))
+                 ;; An unknown name and a wrong argument count are answered from
+                 ;; the table, before a configuration is read or a store opened.
+                 (let ((problem (enchiridion.channel.cli:command-problem
+                                 command (rest arguments))))
+                   (if problem
+                       (progn (format t "~&~A~%" problem)
+                              (finish-output)
+                              2)
+                       (run-command command (rest arguments))))))
+            ;; Nothing before this point loaded a configuration, so the paths
+            ;; that only print a line work on a fresh install with no config.
+            ((first-launch-p)
+             (load-config)
+             (require-git)
+             (print-first-launch))
             ;; `enchiridion --channel http --bind 127.0.0.1 --port 8787` is a
             ;; whole invocation with no subcommand, so a channel flag with no
             ;; command is a request to serve.
@@ -1351,6 +1578,9 @@ the operator has had a chance to edit the seed files."
 
 (defun print-first-launch ()
   "Create the agent directory and print what happened. Return an exit status."
+  ;; The directory has to belong to the agent uid before INIT-AGENT runs, not
+  ;; after: init creates the repository, and repository Git runs as that uid.
+  (prepare-sandbox (enchiridion:config))
   (let ((result (enchiridion.memory:init-agent (agent-directory))))
     (format t "~A~%" (enchiridion.memory:init-status-line result))
     (dolist (name (enchiridion.memory:init-created result))

@@ -17,8 +17,8 @@
   '("init" "ask" "check" "skills" "tools" "blocks" "persona" "operator" "world"
     "memory" "sessions" "journey" "undo" "usage" "budget" "tasks"
     "secrets"
-    "providers" "version" "help" "bootstrap" "health" "reload" "channels"
-    "heartbeat" "chat" "serve")
+    "providers" "version" "help" "bootstrap" "doctor" "health" "reload"
+    "channels" "heartbeat" "chat" "serve")
   "The commands in table order.")
 
 (defmacro with-empty-context (&body body)
@@ -104,7 +104,8 @@ here the way the operator would see it."
   (dolist (expected '(("ask" 1 nil) ("memory" 1 nil) ("skills" 0 2)
                       ("undo" 1 1) ("reload" 0 0) ("help" 0 1)
                       ("journey" 0 2) ("tasks" 0 nil) ("channels" 0 2)
-                      ("heartbeat" 0 1) ("init" 0 1) ("check" 0 0)))
+                      ("heartbeat" 0 1) ("init" 0 1) ("check" 0 0)
+                      ("doctor" 0 0)))
     (destructuring-bind (name minimum maximum) expected
       (let ((row (command-row name)))
         (testing name
@@ -574,3 +575,134 @@ here the way the operator would see it."
                        (list (list :name "r" :family "retrieval" :cue "deploy key" :expect "vault"))))
                  (ok (search "1 family covered (retrieval)" (captured-run "memory" '("canaries")))))))
         (ignore-errors (enchiridion.memory.store:close-store store))))))
+
+
+;;;; Command requirements.
+
+(defparameter +capability-keywords+
+  '(:config :directory :git :store :secrets :backend :agent :supervised)
+  "The capabilities a command row may name.")
+
+(defparameter +expected-base-requirements+
+  '(("init" (:config :directory :git))
+    ("ask" (:config :directory :secrets :store :backend :agent))
+    ("check" ())
+    ("skills" (:directory))
+    ("tools" ())
+    ("blocks" (:config :directory))
+    ("persona" (:directory))
+    ("operator" (:directory))
+    ("world" (:directory))
+    ("memory" (:config :store))
+    ("sessions" (:config :store))
+    ("journey" (:config :directory :git))
+    ("undo" (:config :directory :git))
+    ("usage" (:config :store))
+    ("budget" (:config))
+    ("tasks" (:config :store))
+    ("secrets" (:config :secrets))
+    ("providers" (:config))
+    ("version" ())
+    ("help" ())
+    ("bootstrap" (:directory))
+    ("doctor" ())
+    ("health" ())
+    ("reload" ())
+    ("channels" ())
+    ("heartbeat" ())
+    ("chat" (:config :directory :secrets :store :backend :agent :supervised))
+    ("serve" (:config :directory :secrets :store :backend :agent :supervised)))
+  "The default capability set every command row promises.")
+
+(deftest every-row-carries-requirement-metadata ()
+  (dolist (row (enchiridion.channel.cli:command-table))
+    (testing (first row)
+      (let ((spec (sixth row)))
+        (ok (listp spec))
+        (ok (listp (getf spec :default)))
+        (dolist (capability (getf spec :default))
+          (ok (member capability +capability-keywords+)))
+        (dolist (entry (getf spec :actions))
+          (ok (consp entry))
+          (ok (stringp (car entry)))
+          (ok (listp (cdr entry)))
+          (dolist (capability (cdr entry))
+            (ok (member capability +capability-keywords+))))))))
+
+(deftest each-command-states-its-base-requirements ()
+  (dolist (expected +expected-base-requirements+)
+    (destructuring-bind (name requirements) expected
+      (multiple-value-bind (actual known-p)
+          (enchiridion.channel.cli:command-requirements name)
+        (testing name
+          (ok known-p)
+          (ok (equal requirements actual)))))))
+
+(deftest subcommand-requirements-differ-where-the-work-differs ()
+  (flet ((requirements (name arguments)
+           (multiple-value-bind (actual known-p)
+               (enchiridion.channel.cli:command-requirements name arguments)
+             (ok known-p)
+             actual)))
+    (testing "providers only asks for a key when it asks a provider"
+      (ok (equal '(:config) (requirements "providers" '("list"))))
+      (ok (equal '(:config) (requirements "providers" '("show" "deepseek"))))
+      (ok (equal '(:config) (requirements "providers" '("refresh"))))
+      (ok (equal '(:config :secrets)
+                 (requirements "providers" '("models" "deepseek"))))
+      (ng (member :backend (requirements "providers" '("models" "deepseek")))))
+    (testing "blocks reads configured limits only when it shows them"
+      (ok (equal '(:config :directory) (requirements "blocks" '())))
+      (ok (equal '(:config :directory) (requirements "blocks" '("show"))))
+      (ok (equal '(:directory) (requirements "blocks" '("edit" "1")))))
+    (testing "memory derivation needs the backend and its directory"
+      (ok (equal '(:config :store) (requirements "memory" '("status"))))
+      (ok (equal '(:config :store) (requirements "memory" '("search" "x"))))
+      (ok (equal '(:config :directory :secrets :store :backend)
+                 (requirements "memory" '("build"))))
+      (ok (equal '(:config :directory :secrets :store :backend)
+                 (requirements "memory" '("promote" "1"))))
+      (ok (equal '(:config :directory :secrets :store :backend)
+                 (requirements "memory" '("regate" "1")))))
+    (testing "bootstrap commits only when it records a step"
+      (ok (equal '(:directory) (requirements "bootstrap" '("status"))))
+      (ok (equal '(:directory) (requirements "bootstrap" '("run"))))
+      (ok (equal '(:directory) (requirements "bootstrap" '("reset"))))
+      (ok (equal '(:config :directory :git)
+                 (requirements "bootstrap" '("step" "1")))))
+    (testing "an unknown action falls back to the command default"
+      (ok (equal '(:config :store) (requirements "memory" '("nonesuch"))))
+      (ok (equal '(:config) (requirements "providers" '("nonesuch")))))
+    (testing "action names are case-insensitive"
+      (ok (equal '(:directory) (requirements "blocks" '("EDIT" "1")))))
+    (testing "an unknown command has no requirements and no known flag"
+      (multiple-value-bind (actual known-p)
+          (enchiridion.channel.cli:command-requirements "not-a-command")
+        (ng known-p)
+        (ok (null actual))))))
+
+(deftest command-problem-is-pure-and-run-command-still-prints ()
+  (let ((problems nil)
+        (output (make-string-output-stream)))
+    (let ((*standard-output* output))
+      (setf problems
+            (list (enchiridion.channel.cli:command-problem
+                   "not-a-command" '())
+                  (enchiridion.channel.cli:command-problem "undo" '())
+                  (enchiridion.channel.cli:command-problem "undo" '("1"))
+                  (enchiridion.channel.cli:command-problem
+                   "providers" '("nonesuch")))))
+    (let ((unknown (first problems))
+          (arity (second problems))
+          (valid (third problems))
+          (unvalidated-action (fourth problems)))
+      (ok (string= "" (get-output-stream-string output)))
+      (ok unknown)
+      (ok (search "no command called" unknown))
+      (ok arity)
+      (ok (search "exactly 1 argument" arity))
+      (ok (null valid))
+      (ok (null unvalidated-action)))
+    (multiple-value-bind (text status) (captured-run "undo" '())
+      (ok (eql 2 status))
+      (ok (search "exactly 1 argument" text)))))

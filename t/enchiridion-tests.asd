@@ -32,6 +32,7 @@
     ((:file "errors-test")
      (:file "compat-test")
      (:file "config-test")
+     (:file "startup-test")
      (:file "llm-test")
      ;; The Anthropic wire format. It is a separate file because it is a
      ;; separate wire shape; it loads right after the OpenAI one for the same
@@ -58,6 +59,7 @@
      (:file "registry-test")
      (:file "pipe-test")
      (:file "file-test")
+     (:file "reload-test")
      (:file "broker-test")
      (:file "builtin-test")
      (:file "git-test")

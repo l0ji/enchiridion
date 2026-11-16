@@ -1,13 +1,11 @@
 ;;;; config.example.cl --- Template for enchiridion configuration.
 ;;;;
 ;;;; Copy this file to config.cl and edit it. config.cl is gitignored, so your
-;;;; edits, local paths, and allowed user ids stay out of history. The tracked
-;;;; copy of this template is how a new user discovers the format.
+;;;; edits, local paths, and allowed user ids stay out of history.
 ;;;;
 ;;;; The file holds paths and behavior only. It never holds a secret value.
 ;;;; Secrets come from the environment or from .env beside the source.
-;;;; If config.cl is absent, enchiridion starts on defaults and you need not
-;;;; write one at all.
+;;;; Most commands need this file; `help` and `version` do not.
 
 (in-package #:enchiridion.user)
 
@@ -16,75 +14,55 @@
     ;;; No provider is pinned here. A key in OPENAI_API_KEY selects OpenAI, a
     ;;; key in OPENCODE_API_KEY selects OpenCode Go, a key in
     ;;; ANTHROPIC_API_KEY selects the Messages API, and OpenAI is the fallback.
-    ;;; Uncomment :provider to pin the choice and beat the key detection.
+    ;;; Uncomment :provider to pin the choice.
     ;;;(:provider :openai)
 
-    ;;; Which backend protocol to speak. Omit it and the selected provider row
-    ;;; names its wire. :openai covers OpenAI, OpenCode Go, and any local
-    ;;; OpenAI-compatible server. :anthropic covers the Messages API. An
-    ;;; adapter id this build registers also works, and any other value is a
-    ;;; configuration error.
+    ;;; The wire protocol: :openai covers OpenAI, OpenCode Go, and any local
+    ;;; OpenAI-compatible server; :anthropic covers the Messages API.
     ;;;(:backend :openai)
 
     ;;; Base URL. Omit it, or leave NIL, for the provider default.
     ;;;(:base-url "https://api.openai.com/v1/")
 
-    ;;; Name of the variable in .env that holds the key. The file holds the
-    ;;; name, never the value. Omit it and the selected provider names the
-    ;;; variable: OPENAI_API_KEY, OPENCODE_API_KEY, or ANTHROPIC_API_KEY.
+    ;;; The variable in .env that holds the key. The file holds the name, never
+    ;;; the value. Omit it and the selected provider names the variable.
     ;;;(:api-key-env "OPENAI_API_KEY")
 
-    ;;; Model tiers. Primary handles reasoning turns. Cheap handles memory
-    ;;; digests and compaction. Sleep handles the sleep-time agent, which can
-    ;;; afford a stronger model because nothing is waiting on it. NIL means
-    ;;; the selected provider row's model. Name a model here to override it.
+    ;;; Primary handles reasoning turns, cheap handles memory digests and
+    ;;; compaction, sleep handles the sleep-time agent. NIL means the selected
+    ;;; provider row's model.
     (:model-primary nil)
     (:model-cheap   nil)
     (:model-sleep   nil)
 
-    ;;; The Messages API requires a max_tokens field on every request and has
-    ;;; no default of its own. The OpenAI-shaped wire ignores this key.
+    ;;; The Messages API requires max_tokens on every request. The
+    ;;; OpenAI-shaped wire ignores this key.
     (:max-tokens 4096)
 
     ;;; The runtime catalog. Provider knowledge is generated from models.dev at
-    ;;; run time and cached under run/; nothing about a provider is committed
-    ;;; to the tree apart from the three rows this build ships for :openai,
-    ;;; :opencode and :anthropic, which are configuration defaults. The
-    ;;; commands that run a turn (ask, chat, serve) refresh the cache at
-    ;;; context build, once per process, when the cached index is missing or
-    ;;; older than the TTL, and a provider's model list when a key is present
-    ;;; and its cache is stale; an inspection command never fetches. The TTLs,
-    ;;; :offline, :headers, :query-params and :profile apply to whichever
-    ;;; provider is selected. `enchiridion providers refresh` and
-    ;;; `enchiridion providers models ID` do it by hand. :offline t stops the
-    ;;; start-up fetching, the model list included; those two explicit commands
-    ;;; still run.
+    ;;; run time and cached under run/. The three rows this build ships are
+    ;;; configuration defaults. Turns refresh the cache when it is stale;
+    ;;; inspection commands do not. `providers refresh` and `providers models
+    ;;; ID` fetch by hand, even when :offline is t.
     (:providers-url "https://models.dev/api.json")
     (:providers-ttl-seconds 86400)   ; the provider index
     (:models-ttl-seconds 86400)      ; one provider's model list
     (:offline nil)
 
     ;;; Cloud placement. Bedrock reads :region; Vertex reads :project and
-    ;;; :location. The environment variables of the same meaning (AWS_REGION,
-    ;;; GOOGLE_VERTEX_PROJECT, GOOGLE_VERTEX_LOCATION) win when these are nil.
+    ;;; :location. AWS_REGION, GOOGLE_VERTEX_PROJECT, and GOOGLE_VERTEX_LOCATION
+    ;;; fill a key these leave NIL.
     (:region nil)
     (:project nil)
     (:location nil)
 
-    ;;; Providers you define or override. A row is the same shape as the rows
-    ;;; this build ships for :openai, :opencode and :anthropic, so any field
-    ;;; can be overridden one at a time. A row whose :id matches a models.dev
-    ;;; provider overrides that provider; a new :id adds one.
-    ;;;
-    ;;; :api names the wire. :openai-chat covers OpenAI, OpenCode Go, Azure,
-    ;;; OpenRouter, Groq and the long tail; :anthropic-messages covers the
-    ;;; Messages API; :bedrock-invoke and :bedrock-messages cover Amazon
-    ;;; Bedrock; :vertex-anthropic covers Claude on Google Vertex. :profile
-    ;;; names the quirks to apply, and an individual quirk may be overridden
-    ;;; directly (:auth-scheme, :auth-header, :chat-path, :models-path,
-    ;;; :max-tokens-field, :system-role, :reasoning-field). A header may be
-    ;;; written ("Name" "value") or ("Name" . "value"); both reach the wire
-    ;;; identically.
+    ;;; Providers you define or override. A row has the same shape as the rows
+    ;;; this build ships, so any field can be overridden one at a time. A row
+    ;;; whose :id matches a models.dev provider overrides it; a new :id adds one.
+    ;;; :api names the wire, :profile names the quirks, and an individual quirk
+    ;;; may be overridden with :auth-scheme, :auth-header, :chat-path,
+    ;;; :models-path, :max-tokens-field, :system-role, or :reasoning-field.
+    ;;; A header may be written ("Name" "value") or ("Name" . "value").
     ;;;
     ;;; (:providers
     ;;;  ((:id my-llm :name "My LLM" :api :openai-chat :profile :openai
@@ -92,24 +70,16 @@
     ;;;    :api-key-env "MY_LLM_KEY"
     ;;;    :headers (("X-Tenant" "acme"))
     ;;;    :models ("m-1" "m-2"))
-    ;;;   ;; Override only what differs from the catalog row.
     ;;;   (:id deepseek :api-key-env "DEEPSEEK_KEY")
-    ;;;   ;; Azure, which needs the api-key header and a deployment path.
     ;;;   (:id azure :api :openai-chat :profile :azure
     ;;;    :base-url "https://myresource.openai.azure.com/")
-    ;;;   ;; Claude on Amazon Bedrock. AWS_BEARER_TOKEN_BEDROCK selects bearer
-    ;;;   ;; auth; AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY select SigV4.
     ;;;   (:id amazon-bedrock :api :bedrock-invoke :profile :bedrock-invoke
     ;;;    :region "us-east-1")
-    ;;;   ;; Claude on Google Vertex, with a service-account JSON in
-    ;;;   ;; GOOGLE_APPLICATION_CREDENTIALS or a token in
-    ;;;   ;; GOOGLE_VERTEX_ACCESS_TOKEN.
     ;;;   (:id google-vertex-anthropic :api :vertex-anthropic
     ;;;    :profile :vertex :project "my-project" :location "us-east5")))
 
-    ;;; The generic custom provider: no preset at all, everything from the
-    ;;; :llm keys above, and one of the two API routes reused. Set
-    ;;; (:provider :custom) and name the route with :backend.
+    ;;; The generic custom provider: no preset, everything from the :llm keys
+    ;;; above, and one of the two API routes reused.
     ;;;
     ;;; (:provider :custom)
     ;;; (:backend :anthropic)                 ; or :openai
@@ -118,28 +88,25 @@
     ;;; (:headers (("X-Route" "team-a")))
     ;;; (:model-primary "claude-sonnet-5-5")
 
-   ;;; Channels are a subcategory. Every entry has the same shape, with
-   ;;; :enabled, and only the keys that channel understands. The CLI entry is
-   ;;; reported in the status file; `serve` builds the terminal channel
-   ;;; regardless of this key.
-   :channels
+    ;;; Channels. Every entry has the same shape, with :enabled and only the
+    ;;; keys that channel understands. The CLI entry is reported in the status
+    ;;; file; `serve` builds the terminal channel regardless of this key.
+    :channels
     (:cli (:enabled t))
 
     (:http
      (:enabled nil)
-     ;;; Loopback only by default. A non-loopback bind requires a token, and
-     ;;; the harness refuses to start without one. Name the variable here and
-     ;;; keep the value in .env or the environment: a token written into this
-     ;;; file is a token in a file a person copies between hosts. A literal
-     ;;; :token below is accepted and registered with the scrubber, and it is
-     ;;; meant for a loopback bind and for tests.
+     ;;; Loopback only by default. A non-loopback bind requires a token. Name
+     ;;; the variable here and keep the value in .env or the environment. A
+     ;;; literal :token is accepted, registered with the scrubber, and meant
+     ;;; for a loopback bind and for tests.
      (:bind "127.0.0.1")
      (:port 8787)
      (:token-env "ENCHIRIDION_HTTP_TOKEN")
      (:token nil)
-     ;;; How many bytes of request body the webhook will read. The declared
-     ;;; length is checked first and the bytes are counted as they arrive, so
-     ;;; a chunked body with no length is bounded too.
+     ;;; How many bytes of request body the webhook reads. The declared length
+     ;;; is checked first and the bytes are counted as they arrive, so a chunked
+     ;;; body with no length is bounded too.
      (:max-body-bytes 65536))
 
     (:fluxer
@@ -149,40 +116,48 @@
      (:allowed-users '("REPLACE-WITH-YOUR-FLUXER-USER-ID"))
      (:token-env "FLUXER_BOT_TOKEN"))
 
-   :budget
+    :budget
     ;;; Caps for unattended work. The heartbeat starts no new phase once the
     ;;; spend reaches them, so a phase already under way finishes.
     (:max-tokens-per-tick 4000)
     (:max-tokens-per-day 400000)
 
-   :sandbox
-    ;;; The agent-side uid and gid for the container image, and for a checkout
-    ;;; started as root. The supervisor holds the secrets; the broker and the
-    ;;; reload verifier drop to this uid and gid. A checkout started as the
+    :sandbox
+    ;;; The agent-side uid and gid for the container image and for a checkout
+    ;;; started as root. The supervisor holds the secrets; the broker, the
+    ;;; reload verifier, and git-exec drop to these. A checkout started as the
     ;;; operator has no uid split.
     (:agent-uid 1000)
     (:agent-gid 1000)
 
     ;;; /proc is mounted with hidepid=2 so the sandbox cannot read the
-    ;;; supervisor's environment or memory. The container entrypoint does
-    ;;; that remount before Lisp starts, so it is set by ENCHIRIDION_HIDEPID
-    ;;; on the run line, not here.
+    ;;; supervisor's environment or memory. The container entrypoint does that
+    ;;; remount before Lisp starts, so it is set by ENCHIRIDION_HIDEPID on the
+    ;;; run line, not here.
 
-   :memory
+    :memory
+    ;;; The common keys are here; docs/configuration.md lists every key and
+    ;;; default.
     ;;; The store path. NIL puts memory.db beside the agent files, which is on
     ;;; the state volume in the container. Set an absolute path to override it.
     (:db nil)
 
-    ;;; Character limits per memory block. Raising these raises the fixed
-    ;;; token cost of every prompt. A label left out keeps its shipped limit.
+    ;;; How much recent conversation a prompt carries after the frozen system
+    ;;; prompt: at most this many user and assistant turns of the current
+    ;;; session, and this many characters in total.
+    (:recent-turns 6)
+    (:recent-window-chars 4000)
+
+    ;;; Character limits per memory block. Raising these raises the fixed token
+    ;;; cost of every prompt. A label left out keeps its shipped limit.
     ;;;(:block-limits (:persona 6000 :operator 1600 :world 3000
     ;;;                :session 400 :ledger 250 :bootstrap 300))
 
     ;;; The episodic log and cue retrieval are on. Push is off until a paired
-    ;;; no-harm run says otherwise. Consolidation runs on its schedule, but a
-    ;;; pass with no assertion parser, canary set, utility task set, or tail
-    ;;; sampler is a reported no-op: it does not spend tokens on a candidate
-    ;;; nobody can promote.
+    ;;; no-harm run says otherwise. T2 runs on its schedule, but a pass with no
+    ;;; assertion parser, canary set, utility task set, or tail sampler is a
+    ;;; reported no-op: it does not spend tokens on a candidate nobody can
+    ;;; promote.
     (:enabled t)
     (:retrieve t)
     (:push nil)
@@ -209,9 +184,9 @@
     (:t2-writes-per-episode 8)
     ;;; Operator-authored behavioural canaries, the memory's only external
     ;;; ground truth. Each entry is a plist of :name, :family, :cue and
-    ;;; :expect. The family says what the check asserts about a retrieval for
-    ;;; :cue: "retrieval" and "tail", that a record holding :expect comes
-    ;;; back; "safety", that none does; "update", that :expect ranks above the
+    ;;; :expect. The family says what the check asserts for :cue:
+    ;;; "retrieval" and "tail", that a record holding :expect comes back;
+    ;;; "safety", that none does; "update", that :expect ranks above the
     ;;; entry's :stale value. T2 does not run until four families are covered.
     ;;;
     ;;;(:canaries ((:name "deploy-key" :family "retrieval"
@@ -235,13 +210,13 @@
     (:quarantine-max 0.5)
     (:compaction-rebase-every 8)
     (:compaction-rebase-turns 24)
-    ;;; A plist merged over the shipped memory parameter defaults. Every
-    ;;; weight and decay value is an invented default; changing one is a new
-    ;;; config hash and a new measurement run.
+    ;;; A plist merged over the shipped memory parameter defaults. Every weight
+    ;;; and decay value is an invented default; changing one is a new config
+    ;;; hash and a new measurement run.
     (:parameters nil)
 
-   :sleep
-    ;;; How often the sleep-time agent wakes to maintain the three identity
-    ;;; files, consolidate memory, and work the task queue.
+    :sleep
+    ;;; How often the sleep-time agent wakes to maintain the identity files,
+    ;;; consolidate memory, and work the task queue.
     (:enabled t)
     (:interval-seconds 900)))

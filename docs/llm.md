@@ -258,12 +258,12 @@ Sixteen profiles ship.
 | `:openai`             | none                                                                                                                                 |
 | `:openai-local`       | `:auth-scheme :none`, `:send-tool-choice-p nil`                                                                                      |
 | `:ollama`             | as `:openai-local`, and `:models-path "api/tags"`, `:models-list-shape :ollama`                                                      |
-| `:azure`              | `api-key` header, `openai/deployments/{model}/chat/completions`, `api-version=2024-06-01`, `max_completion_tokens`, `developer` role |
+| `:azure`              | `api-key` header, `openai/deployments/{model}/chat/completions`, `api-version=2024-06-01`, `max_tokens`, `system` role, models at `openai/models` |
 | `:openrouter`         | `X-Title: enchiridion`, `reasoning` field, cache write tokens under `prompt_tokens_details`                                          |
 | `:deepseek`           | `reasoning_content`, cache hits under `prompt_cache_hit_tokens`                                                                      |
-| `:google-openai`      | no `tool_choice`, no `parallel_tool_calls`                                                                                           |
-| `:qwen`               | no `parallel_tool_calls`, `enable_thinking` true in the body                                                                         |
-| `:zai`                | `reasoning_content`, `thinking` enabled in the body                                                                                  |
+| `:google-openai`      | no `parallel_tool_calls`                                                                                           |
+| `:qwen`               | no `parallel_tool_calls`, `reasoning_content`; model-specific thinking defaults                                                                         |
+| `:zai`                | `reasoning_content`; model-specific thinking defaults                                                                                  |
 | `:groq`               | no `stream_options`, no `parallel_tool_calls`                                                                                        |
 | `:cloudflare-gateway` | `cf-aig-authorization` header with the prefix `Bearer `                                                                              |
 | `:anthropic`          | none                                                                                                                                 |
@@ -305,9 +305,8 @@ models.dev names the AI SDK package, and the package decides whether this build 
 | `@ai-sdk/google-vertex/anthropic`        | `:vertex-anthropic`   | `:vertex`             | none                                               |
 
 A package that is absent is unsupported, and the refusal names the package.
-A `${NAME}` placeholder is expanded from the process environment.
+A `${NAME}` placeholder reads the loaded secret table before the process environment.
 An absent or empty name makes the whole endpoint nil, which resolution reports as a provider with no endpoint.
-The value is not read from the secret loader.
 
 ## The chat completions wire
 
@@ -542,10 +541,20 @@ Attempt n waits n times `*retry-delay*`, which is 2, so the default waits are 2 
 Every other 4xx is reported at once.
 
 A failure becomes `transport-error` with `:status` and the detail `~D after ~D attempt~:P: ~A`: the status, the number of attempts, and the provider's error text.
-`provider-error-message` reads that text from an `error.message` object, an `error` string, a `message` field, or a `Message` field.
+`provider-error-message` reads that text from an `error.message` object, an
+`error_description` field, an `error` string, a `message` field, or a `Message` field.
 A reply that is not JSON becomes the note `the provider replied with something that is not JSON`.
 
 The reply is parsed after `post-with-retries` returns, so a 200 that is not JSON is not retried.
+Catalog and model-list GETs share the bounded transport and retry policy.
+Response bodies are capped at 16 MiB of decompressed bytes, including error
+responses. Each in-flight response allocates a buffer of that size plus one byte.
+
+Thinking with tool calls is not supported: the message model cannot replay
+reasoning blocks or signatures. OpenAI-compatible `reasoning_content` and
+Anthropic thinking blocks combined with tool calls produce a backend error
+rather than a tool transcript missing required reasoning. Plain-text and
+ordinary tool-call responses remain supported.
 
 Three specials make the transport testable without a socket.
 

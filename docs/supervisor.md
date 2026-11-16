@@ -9,12 +9,12 @@ An operator can read the process state, change the schedule, and reload the code
 
 A supervisor holds the configuration, the memory store, the agent and its session, the broker, and the loaded code generation.
 It also holds one channel object for each surface it runs.
-It starts each channel on its own thread, polls the control file once a second, and rewrites the status file on every pass.
+It starts each channel on its own thread, polls the control queue once a second, and rewrites the status file on every pass.
 It never loads agent code.
 A reload calls a function the process supplies, so a daemon can do the broker round trip and a test can load in process.
 
-The two files are the whole interface between a running supervisor and a shell command.
-`run/enchiridion.control` carries requests into the process, one request per line, and `run/enchiridion.status` carries state out of it as JSON (JavaScript Object Notation).
+The status file and the control queue are the whole interface between a running supervisor and a shell command.
+Requests reach the process through files under `run/control/`, and `run/enchiridion.status` carries state out of it as JSON (JavaScript Object Notation).
 Both live under `<home>/run/`, where the home is `ENCHIRIDION_HOME` when it is set and the current directory when it is not.
 
 The supervisor is built by `make-supervisor` and starts nothing.
@@ -56,8 +56,8 @@ The store opens before the agent.
 A generation that fails to load is reported and does not stop the process.
 Each enabled channel is built, and so is one that a `--channel` flag names.
 The terminal channel is built under `serve` only, because the REPL is the foreground surface under `chat` and is not a supervised channel.
-`start-channel` names each thread `enchiridion channel <name>` and sets the channel state to `:running`.
-A channel that returns or signals is restarted after one second while the supervisor runs.
+`start-channel` names each thread `enchiridion channel <name>` and sets `:starting` before it launches the thread.
+A channel that returns or signals is restarted after one second while the supervisor runs, except an intentional `:unavailable` channel.
 A webhook that would answer the network without a token is refused before any channel starts.
 
 Under `chat`, the terminal channel is not a supervised channel.
@@ -93,43 +93,52 @@ Under `chat` the main thread runs the REPL, and the control poll runs on `enchir
 Under `serve` the main thread runs the control poll.
 The heartbeat runs on `enchiridion heartbeat`, and each channel runs on `enchiridion channel <name>`.
 
-## The control file
+## The control queue
 
-The control file is `run/enchiridion.control`, and `control-file` returns its path.
-It holds one request per line.
-A caller appends a line and the supervisor consumes the file, acts on each line in order, and truncates it.
-The last report lands in the status file.
+`queue-control` publishes one UTF-8 request file by rename under `run/control/`.
+Each request has its own identifier and response file, so concurrent callers cannot consume another caller's success.
+Exclusive claim files limit admission to 256 outstanding requests across processes.
+A full queue signals an error; one request is at most 4096 characters and cannot contain a newline.
 
-```sh
-printf 'heartbeat run\n' >> run/enchiridion.control
-```
+`request-control` first requires a fresh status file, then publishes a request and polls its response every 0.05 seconds.
+It returns that response, including `request-id`, or `nil` when its wait expires.
+The default wait is five seconds, and callers may select zero through 30 seconds.
+`queue-control` returns the published pathname without waiting.
+A request that arrives during a heartbeat tick remains queued.
 
-The shell commands use `request-control`, which is more than an append.
-It first reads the status file and refuses when that file is not fresh.
-It records the `handled` counter, appends the line, then polls every 0.05 seconds until the counter grows or five seconds pass.
-It returns the status when the request was answered and `nil` when no supervisor answered.
-A request that arrives during a tick is queued by the heartbeat, not dropped.
+Pending request files survive a process restart.
+A request older than 60 seconds receives an explicit `control request expired.` refusal instead of executing.
+A response is removed on the first poll or enqueue more than 60 seconds after publication, unless its caller consumes it first.
+Polling and enqueueing remove expired responses, abandoned staging files, orphaned claims, and unrecognized spool files after the same retention.
+A crash between applying a command and publishing its response can still leave an uncertain outcome; this is not a durable exactly-once transaction.
 
-The agent path uses `queue-control`.
-It appends one line and returns without waiting, because a turn must not block on a poll.
-The answer arrives in the transcript of a later turn.
+The legacy `run/enchiridion.control` input is deprecated.
+The supervisor rotates completed legacy input into a batch instead of reading and truncating the same pathname.
+Concurrent raw append is unsupported: a writer holding an already-open file across rotation can still lose its late append.
+Use `request-control`, `queue-control`, or the shell commands instead.
 
-| Request                   | Report                                                                                                                                               | Answered                  |
-| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------- |
-| `reload`                  | `reload done, generation <n>.` or `reload refused: <report>`                                                                                         | Yes, or no when refused   |
-| `channels list`           | `name state, name state` or `no channels are up.`                                                                                                    | Yes                       |
-| `channels enable <name>`  | `<name> is up.`, `<name> is already up.`, or `channel <name> is not implemented yet.`                                                                | Yes                       |
-| `channels disable <name>` | `<name> is down.`                                                                                                                                    | Yes                       |
+| Request                   | Report                                                                                                                                                | Answered                  |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------- |
+| `reload`                  | `reload done, generation <n>.` or `reload refused: <report>`                                                                                          | Yes, or no when refused   |
+| `channels list`           | `name state, name state` or `no channels are up.`                                                                                                     | Yes                       |
+| `channels enable <name>`  | `<name> is up.`, `<name> is already up.`, or a construction/start refusal                                                                             | Yes, or no on refusal     |
+| `channels replace <name>` | `<name> is up.` or a construction/start refusal                                                                                                       | Yes, or no on refusal     |
+| `channels disable <name>` | `<name> is down.`                                                                                                                                     | Yes                       |
 | `heartbeat on`            | `heartbeat on.` or `heartbeat on, but no sleep agent is attached to this process.`                                                                   | Yes, or no without a hook |
 | `heartbeat off`           | `heartbeat off.`                                                                                                                                     | Yes                       |
 | `heartbeat run`           | `heartbeat tick requested; the answer lands in the status file.` or `a tick is running; one more is queued and the answer lands in the status file.` | Yes, or no without a hook |
 | Anything else             | `unknown control request: <line>`                                                                                                                    | No                        |
 
 The `channels enable` request with no name answers `which channel?`.
-A name the process does not hold answers that way because the process builds only the channels the configuration enables or a flag names.
+A registered channel is constructed lazily when enabled, including a channel disabled at startup.
+`channels replace <name>` constructs a fresh candidate and waits up to 20 seconds for it to become live.
+A failed factory, failed start, or readiness timeout leaves the old channel published and running.
+The old instance stops only after its candidate becomes live.
+A listener replacement on the same bound address and port can fail with an address-in-use error; change the endpoint or disable the old listener first.
 
-The supervisor increments `handled` before it acts on a line, and it prints every report to the error stream as `enchiridion: <report>`.
-A line appended between the read and the truncate is lost, and the caller asks again.
+`make-supervisor` accepts `:channel-factory`, a function from a channel name to a fresh stopped channel or `nil`.
+`supervisor-enable-channel` returns a report and success flag; `:replace t` requests a new instance.
+`handled` counts completed requests, but callers match their response identifier, not that shared counter.
 
 ## The status file
 
@@ -202,14 +211,14 @@ The thread that runs a tick is the whole scheduler for unattended work.
 
 The heartbeat thread is separate from the control poll thread, because a tick is one or more model calls and a poll loop held inside one stops rewriting the status file.
 
-`heartbeat on`, `heartbeat off`, and `heartbeat run` go through the control file.
+`heartbeat on`, `heartbeat off`, and `heartbeat run` go through the control queue.
 `on` sets the schedule flag and starts the thread when a tick hook is attached.
 That is how a process that began with `:sleep :enabled nil` gains a schedule.
 `off` clears the flag and stops the schedule, and a forced `run` still ticks, because the request was explicit.
 
 ## The sleep agent and its phases
 
-A tick runs five phases in a fixed order.
+A tick runs seven phases in a fixed order.
 Each phase has its own guard, so a failed phase adds a note and sets `:ok-p` false while the later phases still run.
 The notes are joined into one line by a semicolon, and a tick with no notes reports `idle`.
 
@@ -217,18 +226,29 @@ The notes are joined into one line by a semicolon, and a tick with no notes repo
 | ----- | ------------------- | -------------------------------------------------------------- |
 | 1     | Task recovery       | Marks every running task failed                                |
 | 2     | Memory maintenance  | Copies old turns into the episodic log and derives scalars   |
-| 3     | The harness blocks  | Writes the ledger block and the session fallback               |
-| 4     | The sleep agent     | Claims one task, or runs one maintenance pass, or does nothing |
-| 5     | Compaction          | Rewrites the session block when new turns are due              |
+| 3     | Memory embedding    | Embeds pending episodes when an embedder is configured and the budget has room |
+| 4     | Memory T2           | Runs a due T2 candidate build or gate pass under its own token caps |
+| 5     | The harness blocks  | Writes the ledger block and the session fallback               |
+| 6     | The sleep agent     | Claims one task, or runs one maintenance pass, or does nothing |
+| 7     | Compaction          | Rewrites the session block when new turns are due              |
 
 Phase 2 is model-free.
 It calls `maintenance` in the memory module, which derives rarity and links for episodes without them and reports `N episodes derived` when it writes.
 A tick with nothing to copy adds no note.
 
-Phase 3 builds the ledger line from the session total and the rolling day total, and writes one line about the queue into an empty session block.
+Phase 3 embeds episodes that have no vector under the current model and size, when `:memory :embed` is on.
+It asks the same budget as the sleep agent and gives `embed-pending` only the room that is left, so a spent cap reports `memory embedding skipped: <reason>` and starts no request.
+The estimate is checked before each batch of sixty-four, so a backlog stops at the cap instead of paying for all of it.
+The rows it writes are on the `embed` channel and count toward both the tick and the day windows.
+
+Phase 4 runs one T2 pass when it is due and its day budget has room.
+A pass that is off or not due says nothing, and a refused pass reports `T2 skipped: <reason>`.
+Its spend counts toward the day cap but not the tick cap.
+
+Phase 5 builds the ledger line from the session total and the rolling day total, and writes one line about the queue into an empty session block.
 Compaction overwrites that fallback.
 
-Phase 4 builds a fresh sleep agent on every tick over the same directory and broker as the operator's agent, with the three seed-backed blocks writable.
+Phase 6 builds a fresh sleep agent on every tick over the same directory and broker as the operator's agent, with the three seed-backed blocks writable.
 It claims the oldest pending task and runs one pass for it.
 With an empty queue it runs one maintenance pass when a turn newer than `last-sleep-turn` exists, and reports `idle` otherwise.
 The pass uses its own session and closes it afterwards.
@@ -246,13 +266,15 @@ The sleep agent refuses to run for a named reason, and each reason is a sentence
 | `no model backend is configured`                                                | No backend                     |
 | `bootstrap has not handed over, so the identity files are still the operator's` | The first steps are unfinished |
 
-A refused phase writes `sleep skipped: <reason>` or `compaction skipped: <reason>`.
+A refused phase writes `sleep skipped: <reason>`, `memory embedding skipped: <reason>`, `T2 skipped: <reason>`, or `compaction skipped: <reason>`.
 A budget the store cannot read adds `the budget is unreadable: <condition line>` in place of the refusal, and sets `:ok-p` false.
-A phase that raises writes `<phase> failed: <condition line>`, where the phase name is `task recovery`, `memory maintenance`, `the harness blocks`, `the sleep agent`, or `compaction`.
+A phase that raises writes `<phase> failed: <condition line>`, where the phase name is `task recovery`, `memory maintenance`, `memory embedding`, `memory T2`, `the harness blocks`, `the sleep agent`, or `compaction`.
 
-Phase 5 runs when four new turns exist and the newest is past `last-compacted-turn`.
+Phase 7 runs when four eligible turns are past `last-compacted-turn`.
+Sleep-agent turns do not count.
 It runs as a separate compactor agent with no tools and uses the cheap model.
 The cursor lives on the supervisor, so a restart rereads the last few turns once.
+A pass that returns no text spends the call and lands nothing: the report says `compaction produced no text`, the cursor does not move, and the next tick offers the same four turns.
 [Memory](memory.md) documents the compaction prompt and the block write.
 
 ## The budget windows
@@ -262,7 +284,7 @@ A missing cap bounds nothing, so unattended work is limited only when the operat
 
 | Window | Measured from                                                                         | Refusal when reached    |
 | ------ | ------------------------------------------------------------------------------------- | ----------------------- |
-| Tick   | The store total at the start of this tick, or the in-memory rows after the tick began | `the tick cap is spent` |
+| Tick   | The store total at the start of this tick, over the `sleep` and `embed` channels, or the in-memory rows after the tick began | `the tick cap is spent` |
 | Day    | The rolling 24 hours before the current time                                          | `the day cap is spent`  |
 
 The tick window is a difference in totals, not a timestamp window.
@@ -314,7 +336,7 @@ In a checkout started as the operator it runs as that user, and [Deployment](dep
 The supervisor records the generation only when `:ok-p` is true.
 A refused generation changes nothing, so the last good code keeps serving.
 
-The shell path asks through the control file.
+The shell path asks through the control queue.
 `request-control` returns `nil` when no supervisor answers, and the command then writes `reload: no supervisor is running, so nothing was asked.` and exits 1.
 An answered reload prints its report and the current generation.
 A refused reload prints the report and exits 1, so an operator script can tell a refusal from a load.
@@ -329,7 +351,7 @@ The `generation` in the agent directory's `state.json` is a separate counter tha
 | Symptom                                                                    | Cause                                                                               | Fix                                                                 |
 | -------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
 | `health` reports no supervisor while `serve` runs                          | The two processes resolve different homes, or the file is more than ten seconds old | Set `ENCHIRIDION_HOME` for both, and check `run/enchiridion.status` |
-| `reload` returns `reload: no supervisor is running, so nothing was asked.` | No fresh status file, so `request-control` refused to append                        | Start the supervisor, and check the status file path                |
+| `reload` returns `reload: no supervisor is running, so nothing was asked.` | No fresh status file, so `request-control` refused to publish                        | Start the supervisor, and check the status file path                |
 | `reload refused: ...`                                                      | The new generation failed verification or loading                                   | Read the report, fix the agent files, and reload                    |
 | The heartbeat ticks, but the report says `idle`                            | No task waits, and no new turn arrived since the last pass                          | Add a task with `enchiridion tasks add`, or send a turn             |
 | `sleep skipped: the tick cap is spent`                                     | This tick reached `:max-tokens-per-tick`                                            | Raise the cap, or wait for the next tick                            |

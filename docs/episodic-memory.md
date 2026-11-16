@@ -1,6 +1,6 @@
 # Episodic memory
 
-The harness keeps an immutable log of every ordinary turn and derives rankings from that log without asking a model to summarise it.
+The harness stores ordinary turns and derives retrieval rankings from that log.
 This page describes what the current implementation does.
 [The design record](design/memory.md) is the authority for the full model and for the parts that are still being built.
 
@@ -10,23 +10,55 @@ The log and the cue pack are on by default.
 Each persisted turn is one row in `episodes`.
 The `turns` view is the transcript projection over that log, and the `memories` view is the saved-memory projection over the same rows.
 A later turn builds a cue from the operator's text before it calls the model.
-The cue selects candidate episodes through the full-text index, the score ranks them, and the best records are rendered into the user message as a fenced block of data.
+Each candidate's body is loaded as its first four thousand characters; the score reads the body only for cue coverage.
+The pack re-reads up to twenty thousand characters of each record it shows, so a record's size does not decide how much memory a turn uses.
+The cue selects candidate episodes through the full-text index, the score ranks them, and the best records are rendered into the user message with a data-only warning.
 With the shipped weights the ranking is the index's own BM25 relevance; the activation terms are in the score with weight zero until a measurement says otherwise (see [Measured results](#measured-results)).
 The system prompt is the frozen snapshot and never changes.
+A turn sends that prompt, then the recent conversation, then the current message.
+The conversation window is bounded by `:recent-turns` and `:recent-window-chars`, so a long session costs a bounded prompt.
 
-The pack is not stored as the user turn.
-The transcript keeps the operator's text, so recalled material cannot become new memory through the conversation.
-The pack is scanned with the same injection scan the block writer uses.
-A refused pack is dropped and the turn continues.
+The transcript stores the operator's original text, not the augmented retrieval pack.
+An assistant can still repeat recalled material in its reply, which may be stored.
+Retrieval is not an information-flow barrier.
 
 `episodes` is the one memory table.
 `turns` and `memories` are views over it, so the transcript, the search surface, and the saved memories cannot drift from the log.
 The model-facing `memory` tool writes a memory episode.
 
+## Trust and threat model
+
+Stored turns, saved memories, tool output, and derived assertions are untrusted
+model input. An attacker who can influence any of them can plant instructions,
+false facts, or misleading references for a later retrieval. Relevance scores,
+source spans, and promotion gates do not establish truth or authority.
+
+The renderer adds a data-only warning and bounded excerpts. It does not create
+an isolated model channel or a fenced execution boundary, and it does not run
+the block writer's injection scan over the pack. Even a scanner or Markdown
+fence would not prevent a model from following recalled instructions.
+
+Credential scrubbing removes registered secrets and recognized credential
+fields/shapes. It does not detect every sensitive fact, prevent a model from
+revealing supplied information, or authorize sending private history to a
+provider. Operators must choose the provider and stored material accordingly.
+
+The model's tool requests remain subject to argument validation and the broker's
+OS identity. Prompt text does not change the broker's configured OS privileges. Those
+controls limit execution authority, not whether an agent can misuse the files,
+network, and tools already available to its own identity. Review destructive
+work and do not give the agent credentials or access it must not use.
+
+Retrieval quality gates measure configured samples and provenance. They are not
+a prompt-injection detector, a confidentiality proof, or a correctness guarantee.
+Failures in retrieval must not be described as proof of model compromise; tests
+must distinguish retained attack text from an observed unauthorized action.
+
 ## What is not on yet
 
 The generation lifecycle is implemented and tested: a candidate starts as a copy of the live semantic layer and derives only the episodes the live generation never saw, it is invisible until promoted, promotion swaps the live pointer, and rollback returns it.
-Promotion goes through the gates below. They are not on the heartbeat or the command line yet.
+Promotion goes through the gates below; the configured T2 heartbeat phase and
+memory commands drive the lifecycle when its prerequisites are present.
 The push channels, the intention tool, the canaries, the gate log, and the code-change proposal queue are designed and scheduled but are not wired into a turn.
 Their tables exist in the schema.
 `memory status` reports zero generations until a candidate is built.

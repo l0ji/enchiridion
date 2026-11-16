@@ -20,6 +20,10 @@ The build context is the repository root.
 `.dockerignore` keeps `.git`, `docs/`, `t/`, `config.cl`, `.env`, and `.env.*` out, among other paths.
 The image carries no `config.cl` and no secret file.
 The run line binds the checkout `config.cl` into `/opt/enchiridion/config.cl`, so the required file is present and the image stays free of local paths.
+The entrypoint copies it to `/etc/enchiridion/config.cl`, mode 600 and owned by root, and sets `ENCHIRIDION_CONFIG` to that path.
+
+The copy exists because the supervisor refuses a configuration file that the agent uid could rewrite, and a bind mount keeps the host file's owner, which is usually the operator and not root.
+Pointing the supervisor at a root-owned copy keeps the documented Compose run line working without weakening the check, and it keeps a configuration holding a literal token closed to uid 1000.
 A run line without that mount stops with `Configuration is wrong at CONFIG.`.
 
 | Item              | Value                                                                                                                    |
@@ -27,7 +31,7 @@ A run line without that mount stops with `Configuration is wrong at CONFIG.`.
 | File              | `docker/Dockerfile`                                                                                                      |
 | Build command     | `docker build -t enchiridion:0.1.0 -f docker/Dockerfile .`                                                               |
 | Compose build     | `docker compose build`                                                                                                   |
-| Base image        | `clfoundation/sbcl` on Debian bookworm                                                                                   |
+| Base image        | `clfoundation/sbcl:2.6.9-bookworm-slim` at its manifest-list digest                                                      |
 | Exposed port      | 8787                                                                                                                     |
 | Volume            | `/var/lib/enchiridion`                                                                                                   |
 | Working directory | `/var/lib/enchiridion`                                                                                                   |
@@ -41,6 +45,22 @@ The image installs these paths.
 `/opt/quicklisp` holds the dependency sources, `/opt/enchiridion-cache` holds the compiled files from the build stage, and `/etc/ssl/certs/ca-certificates.crt` is Debian's certificate bundle.
 The image sets `PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin`, `ENCHIRIDION_HOME=/var/lib/enchiridion`, `ENCHIRIDION_SOURCE=/opt/enchiridion`, and `ENCHIRIDION_SBCL=/usr/local/bin/sbcl`.
 It also sets `ENCHIRIDION_GIT=/usr/bin/git`, `SBCL_HOME=/usr/local/lib/sbcl`, `XDG_CACHE_HOME=/opt/enchiridion-cache`, `CL_SOURCE_REGISTRY=/opt/enchiridion//:/opt/quicklisp/dists/quicklisp/software//`, and `SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt`.
+
+### Pinned inputs
+
+Every input the image builds from is pinned, because a floating one is a change nobody reviewed.
+
+| Input | Pin |
+| --- | --- |
+| Base image | the manifest-list digest in `docker/Dockerfile`, not the tag |
+| Debian packages | `snapshot.debian.org/archive/debian/20260101T000000Z`, in both stages |
+| Quicklisp bootstrap | SHA-256 checked before it is loaded |
+| Quicklisp distribution | the released `2026-01-01` distribution, and the build fails if the server answers with a different version |
+
+`/opt/enchiridion/dist-lock.txt` in the built image records the digest, the snapshot date, the bootstrap hash, the distribution version, and the resolved version of every installed package.
+
+To update any of them, change the pin, rebuild, and commit the Dockerfile change with the reason.
+Bumping the Debian snapshot also picks up security updates, which is the intended way to get them: the image does not silently change between builds.
 
 The fasl cache lives outside `/root`, because the broker child runs as uid 1000 and must read the compiled files.
 The wrapper in `docker/enchiridion.sh` sets the same paths with fallbacks and runs `sbcl --script /opt/enchiridion/src/main.cl`.
@@ -85,21 +105,32 @@ The image supplies the split. A checkout can use the same split when the supervi
 2. Set `ENCHIRIDION_HOME` to that root.
    The supervisor creates `agents/default`, `run`, and `tmp`, and gives them to `:sandbox :agent-uid` and `:sandbox :agent-gid`.
 
-3. Keep the checkout `.env` at mode 600 owned by root, and keep `config.cl` root-owned when it holds a literal token.
-   The agent uid then cannot read either file.
-   Configure a Git identity and signing key for root, because the supervisor commits the agent directory as root.
+3. Install supervisor configuration at `/etc/enchiridion/config.cl`, owned by root.
+   The file and every parent directory must be root-owned and not group- or
+   world-writable. The same checks apply to symlink paths and their targets.
+   Keep secrets in a separate root-owned file at mode 600, not in the agent tree.
+   Set `ENCHIRIDION_CONFIG` to the installed configuration path.
 
 4. Run `init` and `serve` as root:
 
    ```sh
-   sudo env ENCHIRIDION_HOME=/var/lib/enchiridion \
+   sudo env ENCHIRIDION_CONFIG=/etc/enchiridion/config.cl \
+     ENCHIRIDION_HOME=/var/lib/enchiridion \
      "$(command -v nix)" run .#enchiridion -- init
-   sudo env ENCHIRIDION_HOME=/var/lib/enchiridion \
+   sudo env ENCHIRIDION_CONFIG=/etc/enchiridion/config.cl \
+     ENCHIRIDION_HOME=/var/lib/enchiridion \
      "$(command -v nix)" run .#enchiridion -- serve
    ```
 
 The broker child drops the supplementary groups, then the group id, then the user id.
 The user drop is `setuid`, not `seteuid`, so the child cannot return to root.
+
+Git runs as the agent too.
+The agent directory is the agent's repository, and Git executes the hooks and local configuration it finds there, so a root supervisor starts `src/git-exec.cl`: the bootstrap clears the supplementary groups, sets the configured gid, sets the configured uid, verifies both, and only then runs Git.
+The dropped child gets an allowlisted environment with the agent's `HOME` and `TMPDIR`; no `GIT_*`, SSH agent, or gpg agent variable crosses.
+A root process with no `:sandbox :agent-uid` or `:agent-gid` refuses to run repository Git.
+A non-root checkout runs Git directly, with the operator's configuration and signing key.
+A refused commit is reported on standard error and the turn's reply is still delivered.
 
 The agent tree and the run files belong to the agent uid after the start.
 Edit the seed files with `sudo`, and read or repair the tree with `sudo`.
@@ -302,58 +333,67 @@ The store schema creates missing tables and has no migration code, so a schema c
 ## The isolation check
 
 `docker/isolation-test.sh` checks the security model from inside the container, and nothing in the image runs it automatically.
-One pass runs as uid 1000 and reads what the agent can reach, and the other runs as uid 0 and reads the supervisor environment.
-`ISOLATION_PHASE` selects the agent pass and defaults to `all`.
-`present` runs the checks that need the secret file, `absent` the checks that need it gone, and `all` runs both.
+Each view proves only what its own uid can observe, because a uid 1000 process cannot tell an absent file from an unreadable one under a root-only directory.
+Deletion and mount policy are proved as uid 0; denial is proved as uid 1000.
 
 ```sh
-# The agent view, with the secret file still in place
-docker exec -u agent -e ISOLATION_PHASE=present enchiridion /usr/local/bin/isolation-test.sh
+# The supervisor view, which is the only view that can see the file
+docker exec -u 0 -e ISOLATION_PHASE=present enchiridion /usr/local/bin/isolation-test.sh
+docker exec -u 0 -e ISOLATION_PHASE=absent enchiridion /usr/local/bin/isolation-test.sh
 
-# The agent view at steady state, after the supervisor read the file
-docker exec -u agent -e ISOLATION_PHASE=absent enchiridion /usr/local/bin/isolation-test.sh
-
-# The supervisor view
-docker exec -u 0 enchiridion /usr/local/bin/isolation-test.sh
+# The agent view, which is the one that proves the denial
+docker exec -u agent enchiridion /usr/local/bin/isolation-test.sh
 ```
 
 Each passing command prints one line and exits 0:
 
 ```text
-isolation: phase present passed as uid 1000
-isolation: phase absent passed as uid 1000
-isolation: phase all passed as uid 0; supervisor env is clean
+isolation: phase present: /run/secrets/.env is present, 600:0, on a root-only tmpfs
+isolation: phase present passed as uid 0: supervisor environment and mounts are clean
+isolation: phase absent: /run/secrets/.env is gone
+isolation: phase absent passed as uid 0: supervisor environment and mounts are clean
+isolation: phase present passed as uid 1000: secrets denied, no readable copy, hidepid set
 ```
 
 A failing check prints `FAIL: <message>` to the error stream and exits 1.
 In those messages `NAME` is the environment variable the check found, and `PATH` is the path `find` reported.
 
-The agent pass runs these checks:
+The supervisor view runs these checks:
 
-| Check | Test                                                        | Failure message                                             |
-| ----- | ----------------------------------------------------------- | ----------------------------------------------------------- |
-| 1     | Uid 1000 cannot read `/run/secrets/.env` with `cat`         | `the agent can read /run/secrets/.env`                      |
-| 2     | A shell started by uid 1000 cannot read `/run/secrets/.env` | `a shell can read /run/secrets/.env`                        |
-| 3     | `/proc/1/environ` is not readable by uid 1000               | `/proc/1/environ is readable; hidepid is not active`        |
-| 4     | The agent environment holds no configured secret name       | `NAME is in the agent environment`                          |
-| 4     | The agent environment holds no credential-shaped name       | `NAME is credential shaped and is in the agent environment` |
-| 6     | `/run/secrets/.env` does not exist at steady state          | `/run/secrets/.env still exists at steady state`            |
-| 7     | No `.env` file exists outside `/run/secrets`                | `a .env exists outside /run/secrets: PATH`                  |
+| Check | Test                                                                   | Failure message                                                            |
+| ----- | ---------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+|       | Pid 1 is the supervisor                                                | `pid 1 is not the supervisor; run this in the image the entrypoint starts` |
+|       | `/proc/1/environ` is readable as uid 0                                 | `/proc/1/environ is not readable as uid 0; nothing was checked`            |
+|       | No configured secret name remains in the supervisor environment        | `NAME is in this environment`                                              |
+|       | No credential-shaped name remains in the supervisor environment        | `NAME is credential shaped and is in this environment`                     |
+|       | `/run/secrets` is a mount, mode 700, owned by root                     | `/run/secrets is not a mount` and the mode and owner messages              |
+|       | `/proc` is mounted with the configured `hidepid`, read from `/proc/mounts` | `/proc is not mounted with hidepid=N; ...`                              |
+|       | `present`: the secret file is mode 600, owned by root                  | `/run/secrets/.env is mode N, not 600`                                     |
+|       | `absent`: the secret file is gone                                      | `/run/secrets/.env still exists at steady state`                           |
 
-Check 5 is the scrubber test in the unit suite, covered by [Testing](testing.md).
+The agent view runs these checks:
+
+| Check | Test                                                             | Failure message                                             |
+| ----- | ---------------------------------------------------------------- | ----------------------------------------------------------- |
+|       | `/proc` is mounted with the configured `hidepid`                 | `/proc is not mounted with hidepid=N; ...`                  |
+|       | `present`: uid 1000 cannot traverse `/run/secrets`               | `uid 1000 can traverse /run/secrets, so denial was never proved` |
+|       | `present`: `cat` cannot read `/run/secrets/.env`                 | `the agent can read /run/secrets/.env`                      |
+|       | `present`: a shell started by uid 1000 cannot read it            | `a shell can read /run/secrets/.env`                        |
+|       | `/proc/1/environ` is not readable by uid 1000                    | `/proc/1/environ is readable; hidepid is not active`        |
+|       | The agent environment holds no configured secret name            | `NAME is in this environment`                               |
+|       | The agent environment holds no credential-shaped name            | `NAME is credential shaped and is in this environment`      |
+|       | `absent`: `/run/secrets` is still closed to uid 1000             | `uid 1000 can traverse /run/secrets at steady state`        |
+|       | `absent`: no readable `.env` exists outside `/run/secrets`       | `a .env exists outside /run/secrets: PATH`                  |
+
+Two of these checks exist because the earlier version passed without proving anything.
+A `present` phase on an empty tmpfs used to pass because an absent file also fails to open, so the phase now requires the directory itself to be closed to uid 1000, and the supervisor view records whether a file was there at all.
+The `hidepid` check reads the mount options rather than inferring them from an unreadable `/proc/1/environ`, because a process that never had the file open looks the same.
+
+When the operator supplies secrets through `env_file` instead of a file mount, the supervisor view says `no secret file; the container environment route is in use` instead of reporting a denial that was never tested.
+
+The scrubber unit test in [Testing](testing.md) covers the fifth guarantee, which is that tool output and transcripts are scrubbed.
+
 The script refuses any uid other than 0 and 1000 with `run this as uid 1000 or uid 0, not N`.
-
-The supervisor pass runs as uid 0 and checks these conditions:
-
-| Test                                                            | Failure message                                                            |
-| --------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| Pid 1 is the supervisor                                         | `pid 1 is not the supervisor; run this in the image the entrypoint starts` |
-| `/proc/1/environ` is readable as uid 0                          | `/proc/1/environ is not readable as uid 0; nothing was checked`            |
-| No configured secret name remains in the supervisor environment | `NAME is still in the supervisor environment`                              |
-| No credential-shaped name remains in the supervisor environment | `NAME is credential shaped and is still in the supervisor environment`     |
-
-The configured names are `OPENCODE_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `FLUXER_BOT_TOKEN`, and `ENCHIRIDION_HTTP_TOKEN`.
-The shape check uses the same vocabulary as `credential-variable-p`, so a name a `config.cl` adds is caught without a second list.
 
 Check 7 runs `find` from two roots, because `-xdev` stops at a filesystem boundary:
 

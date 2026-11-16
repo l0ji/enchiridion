@@ -1,82 +1,46 @@
 # enchiridion documentation
 
 enchiridion is an autonomous agent harness written in Common Lisp.
-The supervisor process holds the model client, the secret values, the memory store, and the channels.
-The kernel compiles the memory blocks into one prompt for a session.
-A turn calls the model with that prompt, and calls it again for each round of tool calls, up to the tool-round limit.
-In the container deployment and in a root-started checkout, agent code runs in a child process under its own user, and the supervisor never loads that code.
-A checkout started as the operator has no split (see [Deployment](deployment.md)).
+The supervisor holds the model client, the secrets, the memory store, and the channels; agent code runs in a child process, under its own user in the container and a root-started checkout, and as the operator in an operator checkout (see [Deployment](deployment.md)).
+This documentation describes the code as it is.
 
-This documentation covers the operator's side of the program and the developer's side of it.
-It describes the behaviour of the code as it is, and it names the source file that owns each mechanism.
+## Start here
 
-## Audience
+- [Getting started](getting-started.md) creates one agent and holds the first conversation.
 
-The documentation assumes a reader who is comfortable on Unix and can read Common Lisp.
-Three groups use it:
+## Running an agent
 
-- Operators run the program: build it, write `config.cl`, start the supervisor, and read the status output.
-- Developers change the program: add a provider, a tool, a plugin, or a channel.
-- Readers of the internals want to know how the prompt, the memory store, and the budget work before changing them.
+- [Configuration](configuration.md): every key of `config.cl` and the secret rules.
+- [Commands](commands.md): commands, flags, arguments, and exit statuses.
+- [Channels](channels.md): the terminal, the HTTP webhook, and Fluxer.
+- [Supervisor and heartbeat](supervisor.md): the process, the schedule, the status file, and the budget.
+- [Deployment](deployment.md): the container, the two users, the isolation test, and backup.
 
-## How this documentation is organised
+## How it works
 
-Each page has one subject.
-A page opens with what the subject is, then gives the procedure the reader needs, then the reference tables.
-A fact lives on the page that owns it, and other pages link to that page instead of restating the fact.
+- [Memory](memory.md): blocks, seed files, the store, and compaction.
+- [Episodic memory](episodic-memory.md): the log, the cue pack, and the gates.
+- [Large language model backends](llm.md): backends, the provider catalog, token accounting, and the scrubber.
+- [Tools](tools.md): the schema, the registry, the broker, and every built-in tool.
+- [Plugins and self-modification](plugins.md): manifests, verification, and reloads.
+- [Skills](skills.md): the two kinds of skill.
+- [Testing](testing.md): the test systems, the bridge, and the gate.
 
-Part I, starting the program:
+## Changing the program
 
-- [Getting started](getting-started.md) creates one persistent agent and holds the first conversation.
-
-Part II, running the program:
-
-- [Configuration](configuration.md) is the reference for every key of `config.cl`, and for the secret rules.
-- [Commands](commands.md) is the reference for the commands, their arguments, and their exit statuses.
-- [Channels](channels.md) covers the surfaces a message arrives on: the terminal, the HTTP webhook, and Fluxer.
-- [Supervisor and heartbeat](supervisor.md) covers the process, the status file, the schedule, and the budget.
-- [Deployment](deployment.md) covers the container, the two users, the isolation test, and the backup and upgrade procedure.
-
-Part III, how it works inside:
-
-- [Memory](memory.md) covers the blocks, the seed files, the tiers, the store, and compaction.
-- [Episodic memory](episodic-memory.md) covers the episodic log, the cue pack, and the memory integration.
-- [Large language model backends](llm.md) covers the backends, the provider catalog, the token accounting, and the scrubber.
-- [Tools](tools.md) covers the schema, the registry, the pipe, the broker, and every built-in tool.
-- [Plugins and self-modification](plugins.md) covers the manifest, verification, and the extension surface.
-- [Testing](testing.md) covers the two test systems, the bridge, and the gate.
-
-Part IV, changing the program:
-
-- [Development](development.md) covers the layout, the build, the style rules, and the commit policy.
+- [Development](development.md): layout, build, style, and commit policy.
 
 The [README](../README.md) holds the build and run summary.
 
 ## Conventions
 
-| Notation                    | Meaning                                                         |
-| --------------------------- | --------------------------------------------------------------- |
-| `enchiridion chat`          | A command to run in a shell.                                    |
-| `/help`                     | A command to type at the REPL prompt.                           |
-| `config.cl`                 | A file or a path.                                               |
-| `:model-primary`            | A Lisp keyword: a configuration key, a field, or a status word. |
-| `src/enchiridion/kernel.cl` | A source file, relative to the repository root.                 |
+| Notation                    | Meaning                                          |
+| --------------------------- | ------------------------------------------------ |
+| `enchiridion chat`          | A shell command.                                 |
+| `/help`                     | A command typed at the REPL prompt.              |
+| `config.cl`                 | A file or path.                                  |
+| `:model-primary`            | A Lisp keyword or status word.                   |
+| `src/enchiridion/kernel.cl` | A source file, relative to the repository root.  |
 
-A table with a default column gives the value the program uses when the key is absent.
+A default column gives the value the program uses when the key is absent.
 An exit status is the value the shell reports.
-`> **Note:**` marks information, `> **Important:**` marks a condition that breaks a guarantee, and `> **Warning:**` marks a risk to data or to secret isolation.
-
-## Reading order
-
-A first installation follows [Getting started](getting-started.md), then [Configuration](configuration.md), then [Commands](commands.md).
-
-An operator who runs the program follows [Supervisor and heartbeat](supervisor.md), then [Channels](channels.md), then [Deployment](deployment.md).
-
-A reader of the internals follows [Memory](memory.md), then [Episodic memory](episodic-memory.md), then [Tools](tools.md), then [Large language model backends](llm.md), then [Plugins and self-modification](plugins.md).
-
-A developer starts at [Development](development.md), then [Testing](testing.md).
-
-## See also
-
-- [Getting started](getting-started.md)
-- [Development](development.md)

@@ -75,6 +75,9 @@ A generation is one load of the agent directory, and generation 0 is the built-i
 | `discard-generation`          | Removes the tools and plugins of one generation                            |
 | `plugin-registry`             | The plugins this process loaded, newest first                              |
 | `generation-history`          | Every load attempt this process made, newest first                         |
+| `snapshot-sources`            | The SHA-256 of every compiled source, in load order                        |
+| `source-changes`              | The files that differ between two snapshots                                |
+| `source-mismatch`             | Why two snapshots disagree, or nil when they agree                         |
 
 `agent-source-files` reads `skills/` before `tools/`, and the file name orders each directory, so a skill can define a function that a tool file calls.
 Each generation loads into a package of its own, named `ENCHIRIDION.DYN.N`, so a rename leaves no stale symbol behind.
@@ -89,10 +92,13 @@ Each generation loads into a package of its own, named `ENCHIRIDION.DYN.N`, so a
 | `generation` | The number live after the call                   |
 | `loaded`     | The pathnames that arrived                       |
 | `manifests`  | The manifests the files declare                  |
+| `reference-skills` | The markdown skills beside the Lisp ones   |
+| `digests`    | The source snapshot the attempt read             |
 
 A good generation reports `generation N loaded, M file` with the plural when needed.
 A refused generation reports the failure lines and leaves `current-generation` where it was.
-A directory with no agent files is not a failure: the in-process loader reports `no agent files to load` and leaves the generation where it is.
+A directory with no agent files is not a failure and it is not a no-op: the loader publishes the generation it was asked for with no agent code, which reports `generation N loaded, 0 files` and leaves the builtins in place.
+An agent that deleted its last plugin therefore stops serving the tools of the previous generation, and a supervisor that asked for that generation and dropped the proxies of the old one stays in step with the child.
 `discard-generation` touches only tools whose generation is positive and equal to its argument, so a built-in at generation 0 survives a reload.
 
 ## Verification in a child process
@@ -112,6 +118,8 @@ The result is a `verify-result`:
 | `report`    | The failure lines, or the count of files and tests |
 | `tests`     | The plugin names whose self-tests ran              |
 | `failures`  | The failure lines                                  |
+| `reference-skills` | The markdown skills under the directory     |
+| `digests`   | The source snapshot that was compiled              |
 | `directory` | The directory under test                           |
 
 A passing report reads `N file compiled, M self-test ran`, with each noun in the plural when the count is not one.
@@ -228,8 +236,9 @@ The registry is a hash table keyed by the lowercased tool name, and `register-to
 Two files that define the same name leave the later one in the registry, and both plugins stay in the plugin registry.
 A plugin named `read-file` therefore replaces the built-in in the broker child, and a later `discard-generation` removes the name without bringing the built-in back in that process.
 
-The supervisor registers one proxy per manifest after discarding the previous generation.
+The supervisor registers one proxy per manifest in a private copy of the registry, discarding the previous generation in that copy and not in the live table.
 A proxy carries the authored name, description, and schema, and `:broker-side-p` true, and its handler refuses with `configuration-error` at `:broker` because every call is routed to the broker first.
+The copy becomes the live registry by one assignment, and only after the child's reply has agreed on the digest and the generation, so a failed staging or a refused load leaves the previous proxies in place.
 
 ## Reload
 
@@ -243,9 +252,64 @@ Reload is a control request, not a second supervisor.
 | No supervisor answered     | `reload: no supervisor is running, so nothing was asked.` | 1           |
 
 The supervisor consumes the line, runs its reload hook, and records the new generation only when the hook reports success.
-The daemon hook verifies in a one-shot child, installs the proxies, and asks the broker child to load with verification off, because the one-shot child already verified the files.
+The daemon hook reads one source snapshot, stages the complete proxy registry in a private copy, verifies in a one-shot child, and asks the broker child to load with verification off, because the one-shot child already verified the files.
+Both children are handed the same digest string, and the load reply carries the digest the child published and the generation that is live after the call.
+The supervisor installs the staged registry only when the reply agrees on both, and the install is a pointer swap: no proxy is built or registered after the child is live.
+
+| Field                    | Where                             | Meaning                                                     |
+| ------------------------ | --------------------------------- | ----------------------------------------------------------- |
+| `--digests STRING`       | The verification child's argv     | The snapshot to hold the directory to; a mismatch exits 1    |
+| `digests` in the request | The `load-generation` call        | The same string, bound for the child's hook as `*load-source-digests*` |
+| `digests` in the reply   | The child's answer                | The digest the child published, or null when it reports none |
+| `generation` in the reply| The child's answer                | The generation live after the call, or null                 |
+| `report` in the reply    | The child's answer                | The refusal lines, or what loaded                           |
+
+The child's hook reads the digest from `enchiridion.tools.broker::*load-source-digests*` rather than from a third argument, so a hook that takes `(directory generation)` keeps working.
+A hook returns `(values ok-p report)`, and optionally the digest it published and the generation it left live; a hook that returns only two values reports neither, and the supervisor's two checks then fail rather than pass by default.
 A refused generation is a report and not a crash: the last good generation keeps serving, and the next attempt computes the same next number.
 The same control file carries the channel and heartbeat requests, and [Supervisor and heartbeat](supervisor.md) owns it.
+
+## The reload transaction
+
+A reload reads one directory three times: for manifests, in the verification child, and in the child that loads. Those reads are seconds apart, and a file that changes between them would install a proxy for a handler the child never loaded.
+The snapshot closes that window as far as a file system allows, and the publication point decides what a reader can see.
+
+`snapshot-sources` reads every compiled source once, in load order, and returns a `source-snapshot`: a relative path and a SHA-256 per file, plus one digest string over the list.
+The digest string is the whole snapshot in a form that crosses a process boundary, `sha256:` and 64 lowercase hex characters.
+
+| Function                      | Result                                                              |
+| ----------------------------- | ------------------------------------------------------------------- |
+| `snapshot-sources`            | The snapshot of a directory, or a `configuration-error` above the size bound |
+| `snapshot-sources` on an empty tree | A snapshot with no files and the digest of the empty list     |
+| `source-snapshot-files`       | The relative path and digest pairs, in load order                    |
+| `source-snapshot-digest`      | The one digest string that names the whole snapshot                  |
+| `source-changes`              | One line per file added, removed, or changed between two snapshots    |
+| `source-mismatch`             | Why a snapshot and a directory disagree, or nil                      |
+
+`load-generation` accepts `:source-digests`, which is a snapshot or that one string, and it refuses before anything becomes visible in four cases:
+
+| Case                                  | Report                                                     |
+| ------------------------------------- | ---------------------------------------------------------- |
+| The tree no longer matches the caller | `the agent source changed since it was read: FILE changed` |
+| A file changed after verification     | The same line, naming each file                            |
+| A file changed during the load        | `the agent source changed while it loaded: FILE changed`   |
+| A file above the snapshot size bound  | `Configuration is wrong at PLUGIN. FILE is larger than N bytes.` |
+
+`verify-directory` takes the same keyword and refuses without compiling a file when the tree moved, so the child that compiles and the child that loads are held to one snapshot.
+A refusal carries `:ok-p nil`, the generation that is still live, and the snapshot it read.
+
+Publication is one function and one place. `load-generation` holds the reload lock from the snapshot to the publication, builds the new registry and plugin list as private copies, checks the snapshot once more, and only then calls `publish-generation`, which sets the registry, the plugins, and the generation counter.
+The registry is a complete table that no reader has seen before, so a dispatch sees every tool of the old generation or every tool of the new one, and never a half filled table.
+The three setfs are sequential, and a reader of two of them could see one new value beside one old one, so no reader does that: dispatch reads the registry, the status reads the generation, and the reload itself is what needs all three, which is why it holds the lock.
+
+Rollback covers the registry entries, the plugin records, the generation counter, and dispatch in this process.
+It does not undo a global side effect that a top-level form performed while it loaded, such as a `defvar`, a package it created, a file it wrote, or a thread it started.
+The isolation for code that must not do that is the process and uid boundary, not a transaction, and this page says so instead of promising more.
+
+> **Important:** a failed activation keeps both sides only when each side refuses before it publishes.
+> The loader refuses before its setf. The supervisor's proxies are a second registry in a second process, and a proxy install that signals after a successful load leaves the supervisor a generation behind the child. Building every proxy before registering any of them, and installing only after the child answers, is what narrows that to a failed construction with nothing installed.
+
+> **Note:** the digest is a change detector for source bytes and not a proof that the loaded code was the verified code. The loader digests a file and then reads it to load, so a writer that swaps a file between those two operations is not detected, and a digest says nothing about what a top-level form does while it runs: writing files, starting threads, and mutating globals are outside what any recheck can see. What the digest buys is that an ordinary edit between the manifest read, the verification child, and the load no longer installs a proxy for a handler the child did not compile, and that the reader is told which file moved.
 
 ## Limits of verification
 
@@ -258,6 +322,9 @@ The same control file carries the channel and heartbeat requests, and [Superviso
 - The schema budget is shared by every tool and is 2000 estimated tokens.
   An oversized plugin schema makes `registry-tool-definitions` signal `budget-exceeded`, and every turn then fails with the message `The SCHEMA budget is spent: N of 2000 tokens.`
 - The supervisor reads only the manifest of an agent file, so it cannot see a handler before the load.
+- A source that changes between the manifest read, the verification child, and the load is refused only when the caller passes `:source-digests`.
+  The daemon path in `src/main.cl` takes one snapshot, hands its digest to both children, and refuses a reply that reports another one; a caller of `load-generation` that passes nothing can only check the load-time window.
+- The snapshot covers the compiled sources under `skills/` and `tools/`, and not the markdown reference skills, which are read on demand and never loaded.
 
 ## Troubleshooting
 
@@ -279,4 +346,5 @@ The same control file carries the channel and heartbeat requests, and [Superviso
 - [Commands](commands.md) for the command table that carries `reload`.
 - [Supervisor and heartbeat](supervisor.md) for the control file and the process that owns the generations.
 - [Deployment](deployment.md) for the container and the uid split that makes the broker boundary real.
+- [Skills](skills.md) for the two kinds of skill and what the tree implements of each.
 - [Testing](testing.md) for the loader and verification tests.

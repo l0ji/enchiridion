@@ -47,15 +47,15 @@ Each shipped channel is one subclass, and a subclass declares only the slots it 
 | `state`  | `channel-state`  | `:stopped` | Where the channel is                           |
 | `thread` | `channel-thread` | `nil`      | The thread the supervisor runs it on, or `nil` |
 
-The slot documents four state keywords, and the supervisor uses a fifth.
+The channel and supervisor use these state keywords.
 
-| Keyword     | Set by                                      | Meaning                                                    |
-| ----------- | ------------------------------------------- | ---------------------------------------------------------- |
-| `:stopped`  | The class default and every stop            | The channel does no work                                   |
-| `:starting` | Nothing in the shipped channels             | The start is in progress                                   |
-| `:live`     | A channel start                             | The channel accepts traffic                                |
-| `:failed`   | A refused start or a spent reconnect budget | The channel gave up, and the supervisor may start it again |
-| `:running`  | `start-channel` in the supervisor           | The supervisor owns a thread for the channel               |
+| Keyword        | Set by                                      | Meaning                                                        |
+| -------------- | ------------------------------------------- | -------------------------------------------------------------- |
+| `:stopped`     | The class default and every stop            | The channel does no work                                       |
+| `:starting`    | `start-channel` in the supervisor           | The start is in progress                                       |
+| `:live`        | A channel start                             | The channel accepts traffic                                    |
+| `:failed`      | A refused start or a spent reconnect budget | The channel gave up, and the supervisor may start it again     |
+| `:unavailable` | A headless terminal start                   | The surface is intentionally unavailable and is not restarted  |
 
 Four generic functions carry every channel.
 Each has a default method, so a channel that implements nothing refuses by name instead of dropping traffic.
@@ -92,7 +92,7 @@ The supervisor owns one thread per channel and restarts a channel that returns o
 The process builds a channel when the configuration enables it, or when a `--channel` flag names it.
 The terminal channel is built under `serve` only.
 `chat` runs the REPL in its foreground instead.
-A channel start that returns at once makes the supervisor call it again one second later.
+A channel start that returns at once makes the supervisor call it again one second later, unless it reports `:unavailable`.
 A start that signals is logged as `enchiridion: channel <name> stopped: <condition>` and restarted the same way.
 A stop destroys the channel thread, and one surface restarting does not stop the process.
 
@@ -125,13 +125,13 @@ It adds `context`, the command context the REPL reads, and `output`, the stream 
 `channel-send` prints the text and returns it, and `channel-status` returns the state keyword.
 
 `channel-start` checks `interactive-stream-p` on `*standard-input*` first.
-Without one it writes one line to the error stream, sets `:stopped`, and returns without running the REPL.
+Without one it writes one line to the error stream, sets `:unavailable`, and returns without running the REPL.
 
 ```text
 enchiridion: stdin is not a terminal, so the cli channel stays down.
 ```
 
-Under `serve` without a terminal the supervisor starts the channel again after one second, so the line repeats for the life of the process.
+Under `serve` without a terminal the supervisor leaves the channel unavailable instead of restarting it.
 A send prints the text and a newline, and a `reply-to` adds an indented `(reply to <id>)` line.
 
 Start a session with `enchiridion chat`.
@@ -258,9 +258,20 @@ A reply is scrubbed and cut into pieces of at most 2000 characters on whitespace
 Each piece is posted to `POST /channels/<channel-id>/messages` with a body of one `content` field, and the channel returns the accepted message identifiers.
 A long reply becomes several messages.
 An empty reply sends nothing, and a 429 repeats after the wait its body names, up to three times.
+Discovery and sends use the shared bounded HTTP transport, with a 64 KiB response-body limit and an overall deadline per request.
+A whole reply, including chunks and retry waits, has a 30 second deadline.
+Retry waits are capped at 30 seconds and check the stop flag every 0.05 seconds.
 
 A send through a channel that never started signals `configuration-error` with `:key "fluxer"` and detail `the channel is not started, so there is no token to send with.`
 `start-fluxer` blocks while the channel runs, `stop-fluxer` stops it, and `fluxer-running-p` reports whether it is live.
+
+### Lazy enable and replacement
+
+The supervisor accepts a channel factory function from a name to a fresh stopped channel or `nil`.
+Enabling a disabled surface constructs it on demand.
+Replacing a surface starts a candidate, waits up to 20 seconds for `:live`, then publishes it and stops the old instance.
+Construction errors, startup errors, and timeouts leave the old channel running.
+A same-address, same-port listener replacement may fail because the old listener still owns the endpoint; change the endpoint or disable it first.
 
 ## Adding a channel
 

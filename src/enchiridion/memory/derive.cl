@@ -200,7 +200,9 @@ The model numbers records from 1."
 
 (defun make-model-reranker (backend &key model (chars 300))
   "Return a reranker that asks BACKEND to order records. Each body is cut to
-CHARS characters around the cue, the same window the pack shows."
+CHARS characters around the cue, the same window the pack shows. The call bills
+the ledger the retrieval bound, on the :RERANK channel, so one cheap call per
+turn is visible in the usage report and counts toward the day cap."
   (lambda (cue bodies)
     (let* ((tokens (remove-duplicates (tokenise cue) :test #'string=))
            (listing (with-output-to-string (out)
@@ -217,5 +219,12 @@ CHARS characters around the cue, the same window the pack shows."
                               (enchiridion.llm:user-message
                                (format nil "Question: ~A~%~%~A" cue listing)))
                         :model model)))
+      (record-memory-usage
+       :model (enchiridion.llm:completion-model completion)
+       :input (enchiridion.llm:completion-input-tokens completion)
+       :output (enchiridion.llm:completion-output-tokens completion)
+       :cache-read (enchiridion.llm:completion-cache-read-tokens completion)
+       :cache-write (enchiridion.llm:completion-cache-write-tokens completion)
+       :channel :rerank)
       (parse-rerank-reply (enchiridion.llm:completion-text completion)
                           (length bodies)))))

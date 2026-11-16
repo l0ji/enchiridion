@@ -235,12 +235,15 @@ where one bad byte must not cost the whole result."
 
 Inside the container /tmp is root owned and mode 755, so a tool that writes
 there fails for uid 1000. ENCHIRIDION_HOME is the agent's writable state, and
-the host keeps using /tmp."
-  (if (uiop:getenv "ENCHIRIDION_HOME")
-      (merge-pathnames "tmp/"
-                       (uiop:ensure-directory-pathname
-                        (uiop:getenv "ENCHIRIDION_HOME")))
-      #p"/tmp/"))
+the host keeps using /tmp.
+
+A state root that does not exist is not created here. A command that only prints,
+like `version`, must not create the tree it reports on, and root would create it
+owned by root."
+  (let ((state (uiop:getenv "ENCHIRIDION_HOME")))
+    (if (and state (plusp (length state)) (probe-file state))
+        (merge-pathnames "tmp/" (uiop:ensure-directory-pathname state))
+        #p"/tmp/")))
 
 (defparameter +signal-numbers+
   '((:sigterm . 15) (:sigkill . 9) (:sigint . 2) (:sighup . 1) (:sigtstp . 20))
@@ -566,6 +569,23 @@ against #o600 or #o004 and a type bit would make every comparison lie."
 portable spelling of stat. The secret file check reads NIL as a mode it cannot
 refuse on, which is the same answer it gives for a file that is absent, so no
 implementation other than SBCL loses a check it was able to make."
+  (declare (ignore path))
+  nil)
+
+(declaim (ftype (function (t) (or null string)) symlink-target))
+
+#+sbcl
+(defun symlink-target (path)
+  "Return what the symbolic link at PATH points at, or NIL when PATH is not one.
+LSTAT is the question: STAT follows the link and describes its target instead."
+  (let ((info (ignore-errors (sb-posix:lstat (pathname path)))))
+    (when (and info
+               (eql (logand (sb-posix:stat-mode info) #o170000) #o120000))
+      (sb-posix:readlink (pathname path)))))
+
+#-sbcl
+(defun symlink-target (path)
+  "Return the link target of PATH, which is unavailable in ~A."
   (declare (ignore path))
   nil)
 

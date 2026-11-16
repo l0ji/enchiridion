@@ -381,7 +381,7 @@ that, because it is not text to a parser and NOT a term to match."
 
 ;;;; Opening and closing.
 
-(defparameter +schema-version+ 6
+(defparameter +schema-version+ 7
   "The schema version a store records in PRAGMA user_version once it is built.
 
 Every statement in +SCHEMA+ is CREATE ... IF NOT EXISTS, which adds a missing
@@ -407,7 +407,12 @@ T2 pass ended, which the episode threshold counts from, in ADD-MISSING-COLUMNS.
 
 Version 6 adds GENERATIONS.EPISODES_DERIVED, the episodes a build derived
 itself and did not copy, which the volume gate's allowance is counted from, in
-ADD-MISSING-COLUMNS.")
+ADD-MISSING-COLUMNS.
+
+Version 7 keys EPISODE_VECTORS by episode, model and size instead of by episode
+alone, so one dense cache per model is kept rather than each model replacing
+the last. MIGRATE-EPISODE-VECTORS copies every row into the new shape; the
+vectors are a cache, but a switch back to a model is free only if they survive.")
 
 (defparameter +added-columns+
   '(("memory_state" "precision_reset_generation" "INTEGER")
@@ -427,6 +432,31 @@ ADD-MISSING-COLUMNS does.")
   (loop for (table column type) in +added-columns+
         unless (column-exists-p store table column)
           do (exec store (format nil "ALTER TABLE ~A ADD COLUMN ~A ~A" table column type))))
+
+(defun episode-vector-key-p (store)
+  "Return T when EPISODE_VECTORS is keyed by episode, model and size."
+  (some (lambda (row)
+          (and (string= (field row "name") "model")
+               (plusp (or (field row "pk") 0))))
+        (query-rows store "PRAGMA table_info(episode_vectors)")))
+
+(defun migrate-episode-vectors (store)
+  "Give EPISODE_VECTORS one row per model and size, keeping every stored vector.
+A store written before version 7 keys the table by episode alone, where a second
+model's write replaced the first model's vector. Every row is copied and nothing
+is dropped. Running it on the new shape changes nothing."
+  (unless (episode-vector-key-p store)
+    (exec store "ALTER TABLE episode_vectors RENAME TO episode_vectors_old")
+    (exec store "CREATE TABLE episode_vectors (
+                   id    INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+                   model TEXT    NOT NULL,
+                   dims  INTEGER NOT NULL,
+                   vec   BLOB    NOT NULL,
+                   PRIMARY KEY (id, model, dims))")
+    (exec store "INSERT OR IGNORE INTO episode_vectors (id, model, dims, vec)
+                   SELECT id, model, dims, vec FROM episode_vectors_old")
+    (exec store "DROP TABLE episode_vectors_old"))
+  t)
 
 (defun drop-unstemmed-index (store)
   "Drop EPISODES_FTS when it exists without the porter tokenizer and return T,
@@ -515,6 +545,7 @@ not an exposure."
                 (dolist (statement +schema+)
                   (exec store statement))
                 (add-missing-columns store)
+                (migrate-episode-vectors store)
                 (when reindex
                   (exec store "INSERT INTO episodes_fts(episodes_fts) VALUES ('rebuild')"))))
           (error (condition)
@@ -702,44 +733,36 @@ tokens and can be wrong."
 ;;;; Memories.
 
 (defun save-memory (store name body &key session (ts (get-universal-time)))
-  "Store one memory called NAME and return its row id.
-
-An exact duplicate is refused, the way a block write is: a write that changes
-nothing is a turn spent for no memory. An empty body after the scrub is
-refused too, because a memory that holds nothing is a match the operator
-cannot read. The name is scrubbed as well as the body: a name is text, and a
-name is searchable."
+  "Store one scrubbed memory called NAME and return its row id.
+An empty body or an exact name/body duplicate is refused. The duplicate check
+and insert share a transaction across connections."
   (check-type name string)
   (check-type body string)
   (check-type ts integer)
   (let ((name (scrubbed name))
-        (body (scrubbed body)))
-    (cond
-      ((zerop (length body))
-       (error 'enchiridion.errors:configuration-error
-              :key :memory
-              :detail "A memory needs text."))
-      ((query-rows store
-                   "SELECT id FROM episodes
-                     WHERE role = 'memory' AND name = ? AND body = ?"
-                   (list name body))
-       (error 'enchiridion.errors:configuration-error
-              :key :memory
-              :detail (format nil "Memory ~A already holds that text." name)))
-      (t
-       ;; The duplicate check, the insert and the row id are one unit; a
-       ;; second writer between any two of them would pass the check twice.
-       (with-store-lock (store)
-         (exec store
-               "INSERT INTO episodes
-                  (session, role, body, model, name, ts, channel, provenance,
-                   authority, cue_type, depth, span, context_key, horizon,
-                   source_turn_id, source_memory_id)
-                  VALUES (?, 'memory', ?, '', ?, ?, 'cli', 'owner', 5,
-                          'semantic', 0, '', ?, 2592000, NULL, NULL)"
-               (list (or session "") body name ts
-                     (format nil "~A,~A,cli" (or session "") (or session ""))))
-         (last-row-id store))))))
+        (body (scrubbed body))
+        (session (scrubbed (or session ""))))
+    (when (zerop (length body))
+      (error 'enchiridion.errors:configuration-error
+             :key :memory :detail "A memory needs text."))
+    (with-store-transaction (store)
+      (when (query-rows store
+                        "SELECT id FROM episodes
+                          WHERE role = 'memory' AND name = ? AND body = ?"
+                        (list name body))
+        (error 'enchiridion.errors:configuration-error
+               :key :memory
+               :detail (format nil "Memory ~A already holds that text." name)))
+      (exec store
+            "INSERT INTO episodes
+               (session, role, body, model, name, ts, channel, provenance,
+                authority, cue_type, depth, span, context_key, horizon,
+                source_turn_id, source_memory_id)
+               VALUES (?, 'memory', ?, '', ?, ?, 'cli', 'owner', 5,
+                       'semantic', 0, '', ?, 2592000, NULL, NULL)"
+            (list session body name ts
+                  (scrubbed (format nil "~A,~A,cli" session session))))
+      (last-row-id store))))
 
 (defun list-memories (store &key (limit 100))
   "Return stored memories newest first, each a plist with :ID, :NAME, :BODY,
@@ -947,25 +970,34 @@ from the argument, so the grouping is never a string a caller supplies."
                       (usage-totals row)))
             rows)))
 
-(declaim (ftype (function (store integer &key (:channel t)) list) usage-total-since))
+(declaim (ftype (function (store integer &key (:channel t) (:channels t)) list)
+                usage-total-since))
 
-(defun usage-total-since (store since &key channel)
+(defun usage-total-since (store since &key channel channels)
   "Return every column of the ledger summed from SINCE, a universal time.
 A store with no rows answers zeroes rather than NIL, so a caller that prints
 the number never has to ask whether the ledger exists. CHANNEL, when given,
-sums only the rows that channel wrote."
+sums the rows that one channel wrote; CHANNELS sums any channel in its list and
+is how the tick's own spend is read across the channels unattended work uses."
   (check-type since integer)
-  (usage-totals
-   (first (query-rows store
-                      (format nil "SELECT SUM(input) AS input, SUM(output) AS output,
-                                          SUM(cache_read) AS cache_read,
-                                          SUM(cache_write) AS cache_write,
-                                          COUNT(*) AS calls
-                                     FROM usage WHERE ts >= ?~:[~; AND channel = ?~]"
-                              channel)
-                      (if channel
-                          (list since (string-downcase (string channel)))
-                          (list since))))))
+  (let ((channels (if channels (copy-list channels) (and channel (list channel)))))
+    (usage-totals
+     (first (query-rows store
+                        (format nil "SELECT SUM(input) AS input,
+                                            SUM(output) AS output,
+                                            SUM(cache_read) AS cache_read,
+                                            SUM(cache_write) AS cache_write,
+                                            COUNT(*) AS calls
+                                       FROM usage WHERE ts >= ?~A"
+                                (if channels
+                                    (format nil " AND channel IN (~{~A~^,~})"
+                                            (make-list (length channels)
+                                                       :initial-element "?"))
+                                    ""))
+                        (append (list since)
+                                (mapcar (lambda (name)
+                                          (string-downcase (string name)))
+                                        channels)))))))
 
 (declaim (ftype (function (store t) list) usage-session-total))
 
@@ -982,27 +1014,39 @@ sums only the rows that channel wrote."
 
 ;;;; Turns, newest first.
 
-(declaim (ftype (function (store &key (:limit integer) (:not-channel t)) list)
+(declaim (ftype (function (store &key (:limit integer) (:not-channel t)
+                                    (:body-chars t))
+                          list)
                 recent-turns))
 
-(defun recent-turns (store &key (limit 4) not-channel)
+(defun recent-turns (store &key (limit 4) not-channel body-chars)
   "Return the newest turns first, for a prompt that summarises them.
 
 NOT-CHANNEL drops the rows one channel wrote, so a summariser reading the
-transcript back does not read its own output and summarise that."
+transcript back does not read its own output and summarise that. BODY-CHARS,
+when given, cuts each body in the query itself, so a prompt with a per-turn
+limit does not load a whole tool result to show four hundred characters."
   (check-type limit (integer 1 *))
   (let ((rows (if not-channel
                   (query-rows store
-                              "SELECT id, session, role, body, model, channel, ts
-                                 FROM episodes
-                                WHERE role <> 'memory' AND channel <> ?
-                                ORDER BY id DESC LIMIT ?"
+                              (format nil "SELECT id, session, role, ~A AS body,
+                                                  model, channel, ts
+                                             FROM episodes
+                                            WHERE role <> 'memory' AND channel <> ?
+                                            ORDER BY id DESC LIMIT ?"
+                                      (if body-chars
+                                          (format nil "substr(body, 1, ~D)" body-chars)
+                                          "body"))
                               (list (string-downcase (string not-channel)) limit))
                   (query-rows store
-                              "SELECT id, session, role, body, model, channel, ts
-                                 FROM episodes
-                                WHERE role <> 'memory'
-                                ORDER BY id DESC LIMIT ?"
+                              (format nil "SELECT id, session, role, ~A AS body,
+                                                  model, channel, ts
+                                             FROM episodes
+                                            WHERE role <> 'memory'
+                                            ORDER BY id DESC LIMIT ?"
+                                      (if body-chars
+                                          (format nil "substr(body, 1, ~D)" body-chars)
+                                          "body"))
                               (list limit)))))
     (mapcar #'turn-row-from rows)))
 

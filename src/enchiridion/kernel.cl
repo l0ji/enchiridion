@@ -526,11 +526,28 @@ caller that does is a caller that runs two turns at once."
            (user-text (if (and pack (plusp (length pack)))
                           (format nil "~A~%~%~A" pack scrubbed)
                           scrubbed))
-           (messages (list (enchiridion.llm:system-message
-                            (enchiridion.llm.secrets:scrub
-                             (prompt-text snapshot)))
-                           (enchiridion.llm:user-message
-                            (enchiridion.llm.secrets:scrub user-text))))
+           ;; The frozen prompt stays first and unchanged, then the recent
+           ;; conversation, then this turn. The window is bounded by turn count
+           ;; and characters, so a long session costs a bounded prompt.
+           (history (when store
+                      (enchiridion.memory:conversation-window
+                       store
+                       :session (or (and session (session-id session)) "default")
+                       :limit enchiridion.memory:*recent-turn-count*
+                       :chars enchiridion.memory:*recent-window-chars*)))
+           (messages (append
+                      (list (enchiridion.llm:system-message
+                             (enchiridion.llm.secrets:scrub
+                              (prompt-text snapshot))))
+                      (mapcar (lambda (entry)
+                                (let ((body (enchiridion.llm.secrets:scrub
+                                             (cdr entry))))
+                                  (if (string= (car entry) "assistant")
+                                      (enchiridion.llm:assistant-message body)
+                                      (enchiridion.llm:user-message body))))
+                              history)
+                      (list (enchiridion.llm:user-message
+                             (enchiridion.llm.secrets:scrub user-text)))))
            (rounds 0)
            (wrapped-up nil)
            (last-words nil)

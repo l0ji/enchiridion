@@ -2,7 +2,8 @@
 ;;;;
 ;;;; A block is a file the agent can reason about, not a database row. The
 ;;;; tool patches a unique span, checks the capacity and the injection scan,
-;;;; and writes the file last. A failed write leaves the old text in place.
+;;;; and writes through the same atomic writer SET-BLOCK-TEXT uses. A failed
+;;;; write leaves the old text in place.
 
 (in-package #:enchiridion.tools.builtin)
 
@@ -71,12 +72,7 @@ the operator from the agent, not the operator from themselves."
              :label label
              :current (block-limit-for label)
              :wanted (length text)))
-    (ensure-directories-exist path)
-    (with-open-file (stream path :direction :output
-                                 :if-exists :supersede
-                                 :if-does-not-exist :create
-                                 :external-format :utf-8)
-      (write-string text stream))
+    (enchiridion.memory:write-block-file path text)
     text))
 
 (defun block-list (directory)

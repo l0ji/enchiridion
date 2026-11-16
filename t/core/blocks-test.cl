@@ -131,3 +131,128 @@
         (ok (search "persona 5/40" one))
         (ok (search "operator 5/40" one))
         (ok (search "world 10/40" one))))))
+
+(deftest a-file-replacement-failure-keeps-block-and-disk-retryable ()
+  (uiop:with-temporary-file (:pathname path :stream stream :type "md")
+    (write-string "old identity" stream)
+    (close stream)
+    (let* ((block (enchiridion.memory:make-block
+                   :label :persona :text "old identity" :file path))
+           (rename (symbol-function 'uiop:rename-file-overwriting-target))
+           (attempted nil)
+           (temporary-path nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'uiop:rename-file-overwriting-target)
+                   (lambda (temporary target)
+                     (declare (ignore target))
+                     (setf attempted (uiop:read-file-string temporary)
+                           temporary-path temporary)
+                     (error "injected replacement failure")))
+             (ok (handler-case
+                     (progn (enchiridion.memory:set-block-text block "new identity") nil)
+                   (error () t))))
+        (setf (symbol-function 'uiop:rename-file-overwriting-target) rename))
+      (ok (string= "new identity" attempted))
+      (ng (probe-file temporary-path))
+      (ok (string= "old identity" (enchiridion.memory:block-text block)))
+      (ok (string= "old identity" (uiop:read-file-string path)))
+      (enchiridion.memory:set-block-text block "new identity")
+      (ok (string= "new identity" (enchiridion.memory:block-text block)))
+      (ok (string= "new identity" (uiop:read-file-string path))))))
+
+;;;; The atomic file write. A block file is the operator's identity: a write
+;;;; that loses its mode, replaces its link, or changes the file after refusing
+;;;; is a change they did not make.
+
+(defun block-write-directory ()
+  "Return a fresh directory that exists, under the directory this build may write."
+  (let ((directory (uiop:ensure-directory-pathname
+                    (merge-pathnames
+                     (format nil "enchiridion-blocks-write-~D/"
+                             (random most-positive-fixnum))
+                     (uiop:ensure-directory-pathname *default-pathname-defaults*)))))
+    (ensure-directories-exist (merge-pathnames "probe" directory))
+    directory))
+
+(defmacro with-block-write-directory ((var) &body body)
+  `(let ((,var (block-write-directory)))
+     (unwind-protect (progn ,@body)
+       (uiop:delete-directory-tree ,var :validate t :if-does-not-exist :ignore))))
+
+(defun write-block-test-file (path text)
+  "Write TEXT to PATH and return PATH."
+  (ensure-directories-exist path)
+  (with-open-file (stream path :direction :output :if-exists :supersede
+                               :if-does-not-exist :create
+                               :external-format :utf-8)
+    (write-string text stream))
+  path)
+
+(deftest a-block-write-keeps-the-files-mode ()
+  (with-block-write-directory (directory)
+    (let* ((file (write-block-test-file (merge-pathnames "SOUL.md" directory) "old"))
+           (block (enchiridion.memory:make-block
+                   :label :persona :text "old" :limit 40 :file file)))
+      (enchiridion.compat:set-file-mode file #o600)
+      (enchiridion.memory:set-block-text block "new")
+      (ok (= #o600 (enchiridion.compat:file-mode file)))
+      (ok (string= "new" (uiop:read-file-string file)))
+      (testing "and a second write keeps it as well"
+        (enchiridion.memory:set-block-text block "again")
+        (ok (= #o600 (enchiridion.compat:file-mode file)))))))
+
+(deftest a-read-only-block-file-refuses-before-any-rename ()
+  (with-block-write-directory (directory)
+    (let* ((file (write-block-test-file (merge-pathnames "SOUL.md" directory) "old"))
+           (block (enchiridion.memory:make-block
+                   :label :persona :text "old" :limit 40 :file file)))
+      (enchiridion.compat:set-file-mode file #o444)
+      (ok (handler-case
+              (progn (enchiridion.memory:set-block-text block "new") nil)
+            (error () t)))
+      (testing "the old text survives in both places"
+        (ok (string= "old" (uiop:read-file-string file)))
+        (ok (string= "old" (enchiridion.memory:block-text block))))
+      (enchiridion.compat:set-file-mode file #o600)
+      (enchiridion.memory:set-block-text block "new")
+      (ok (string= "new" (uiop:read-file-string file))))))
+
+(deftest a-block-write-follows-a-symbolic-link-and-keeps-it ()
+  (with-block-write-directory (directory)
+    (let* ((target (write-block-test-file (merge-pathnames "identity.md" directory)
+                                         "old"))
+           (link (merge-pathnames "SOUL.md" directory)))
+      (sb-posix:symlink (namestring target) (namestring link))
+      (let ((block (enchiridion.memory:make-block
+                    :label :persona :text "old" :limit 40 :file link)))
+        (enchiridion.memory:set-block-text block "new")
+        (testing "the path is still a symbolic link"
+          (ok (= #o120000
+                 (logand (sb-posix:stat-mode (sb-posix:lstat (namestring link)))
+                         #o170000))))
+        (testing "and the target holds the new text"
+          (ok (string= "new" (uiop:read-file-string target)))
+          (ok (string= "new" (uiop:read-file-string link))))))))
+
+(deftest a-relative-block-path-resolves-against-the-current-directory ()
+  (with-block-write-directory (directory)
+    (uiop:with-current-directory (directory)
+      (let ((block (enchiridion.memory:make-block
+                    :label :world :text "old" :limit 40
+                    :file (pathname "WORLD.md"))))
+        (enchiridion.memory:set-block-text block "new")
+        (ok (string= "new" (uiop:read-file-string
+                            (merge-pathnames "WORLD.md" directory))))))))
+
+(deftest the-block-tool-writes-through-the-same-writer ()
+  ;; The tool writes the seed files without going through a BLOCK, so it is a
+  ;; second caller of the one writer rather than a second writer.
+  (with-block-write-directory (directory)
+    (let ((file (write-block-test-file (merge-pathnames "WORLD.md" directory) "old")))
+      (enchiridion.compat:set-file-mode file #o600)
+      (enchiridion.tools.builtin:block-ops
+       (list :action "patch" :label "world" :old "old" :new "new"
+             :directory (namestring directory)))
+      (ok (= #o600 (enchiridion.compat:file-mode file)))
+      (ok (string= "new" (uiop:read-file-string file))))))

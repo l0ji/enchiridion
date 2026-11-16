@@ -100,6 +100,14 @@ A key present with the value NIL returns NIL; only a missing key signals."
         value)))
 
 ;;;; ---------------------------------------------------------------------
+(defparameter *retrieval-body-chars* 4000
+  "How much of an episode body a candidate query loads. Ranking a candidate needs
+the body only to match the cue's terms, and the pack reads its own window.")
+
+(defparameter *pack-body-chars* 20000
+  "How much of an episode body the pack searches for its excerpt. The rest stays
+in the store, where the search tool reads it.")
+
 (defun table-names ()
   "Return the tables the memory model adds, index table first."
   *episodic-tables*)
@@ -264,6 +272,55 @@ records BM25 as the alternative and requires the two to be compared."
             (/ (count-if (lambda (token) (member token body :test #'string=))
                          unique)
                (float (length unique)))))))
+
+;;;; Model call accounting.
+;;;;
+;;;; A few calls in this module are optional extras on top of a turn's own call:
+;;;; the reranker, the cue embedder, and the embedder that fills the cache. Each
+;;;; one bills through RECORD-MEMORY-USAGE, so the ledger the day cap reads sees
+;;;; it and no call is free just because the reply path did not make it.
+
+(defvar *memory-usage-store* nil
+  "The store the optional model calls inside a retrieval bill to, or NIL.")
+
+(defvar *memory-usage-session* nil
+  "The session id those calls are attributed to.")
+
+(defvar *memory-usage-channel* :cli
+  "The channel those calls are attributed to. A call site that knows better,
+such as the reranker, passes its own.")
+
+(defmacro with-memory-usage ((store &key session (channel :cli)) &body body)
+  "Run BODY with STORE as the ledger its optional model calls bill to."
+  `(let ((*memory-usage-store* ,store)
+         (*memory-usage-session* ,session)
+         (*memory-usage-channel* ,channel))
+     ,@body))
+
+(defun record-memory-usage (&key (store *memory-usage-store*)
+                              (session *memory-usage-session*)
+                              model input output cache-read cache-write
+                              (channel *memory-usage-channel*))
+  "Write one optional model call's usage to STORE's ledger and return its row id.
+Nothing is written without a store, so a caller with no ledger still works. A
+store that refuses the write prints one line: the tokens are spent either way,
+and a broken report must not be a broken answer."
+  (when store
+    (handler-case
+        (enchiridion.memory.store:record-usage
+         store
+         :session (or session "")
+         :model (or model "")
+         :input (or input 0)
+         :output (or output 0)
+         :cache-read (or cache-read 0)
+         :cache-write (or cache-write 0)
+         :channel channel)
+      (error (condition)
+        (format *error-output*
+                "~&enchiridion: could not write a ~A usage row: ~A~%"
+                channel condition)
+        nil))))
 
 (defun jaccard (left right &key (test #'string=))
   "Return the Jaccard similarity of the sets LEFT and RIGHT, in 0..1."
@@ -893,13 +950,16 @@ behaviour."
 
 The lexical pass is a *candidate generator*, not a ranker: its output is
 re-scored by RETRIEVE.  The activation summary is joined in the same query, so
-scoring a candidate costs no second round trip.  A cue with no searchable term
+scoring a candidate costs no second round trip.  Each body is its first
+*RETRIEVAL-BODY-CHARS* characters: the score reads the body only for cue
+coverage, and the pack re-reads what it renders.  A cue with no searchable term
 signals SCHEMA-ERROR, which is the existing FTS-QUERY behaviour and is not
 changed."
   (let ((match (cue-match cue)))
     (loop for row in (enchiridion.memory.store:query-rows
                       store
-                      "SELECT e.id, e.body, e.session, e.channel, e.cue_type,
+                      "SELECT e.id, substr(e.body, 1, ?) AS body,
+                              e.session, e.channel, e.cue_type,
                               e.role, e.ts,
                               bm25(episodes_fts) AS lexical,
                               e.context_key, e.horizon, e.scene_trace,
@@ -913,7 +973,7 @@ changed."
                         WHERE episodes_fts MATCH ?
                         ORDER BY rank
                         LIMIT ?"
-                      (list match limit))
+                      (list *retrieval-body-chars* match limit))
           collect (episode-candidate row now))))
 
 (defun episode-candidate (row now)
@@ -1180,30 +1240,43 @@ determined is never promoted to the highest authority."
                   +authority-by-provenance+ :test #'string=))
       1))
 
-(defun rarity-of (store body)
+(defun prior-document-frequency (store token before-id)
+  "Return how many episodes before BEFORE-ID hold TOKEN.
+BEFORE-ID NIL counts every episode, which is what the write path wants before it
+inserts the row it is weighing. The rowid bound keeps an episode out of its own
+count once the index has it."
+  (or (enchiridion.memory.store:field
+       (first (enchiridion.memory.store:query-rows
+               store
+               "SELECT COUNT(*) AS n FROM episodes_fts
+                 WHERE episodes_fts MATCH ? AND episodes_fts.rowid < ?"
+               (list (enchiridion.memory.store:fts-query token)
+                     (or before-id most-positive-fixnum))))
+       "n")
+      0))
+
+(defun rarity-of (store body &key before-id)
   "Return a cheap lexical rarity hint for BODY, in 0..1, with no model call.
 
-One minus the fraction of the body's content tokens that the episodic index
-already holds.  A text made of words the agent has never used is distinctive; a
-text made of words it uses constantly is not.  This is a proxy for the
-distinctiveness claim and it is INVENTED-DESIGN: the original distinctiveness
-studies were not retrieved, so only the relative form of the claim is used."
+A token's commonness is df/(df+1), where df is how many episodes before
+BEFORE-ID hold it, and BODY's rarity is one minus the mean commonness of its
+distinct content tokens. The prior documents are what matter: maintenance runs
+after the episode is indexed, so counting the whole index let every ordinary
+body see its own words and the measure collapsed to zero. The result depends on
+the insert order alone, not on the batch a maintenance pass happened to use.
+
+This is a proxy for the distinctiveness claim and it is INVENTED-DESIGN: the
+original distinctiveness studies were not retrieved, so only the relative form
+of the claim is used."
   (let ((tokens (remove-duplicates (tokenise body) :test #'string=)))
     (if (null tokens)
         0.0
-        (let ((known 0))
+        (let ((commonness 0.0))
           (dolist (token tokens)
-            (when (plusp (or (enchiridion.memory.store:field
-                              (first (enchiridion.memory.store:query-rows
-                                      store
-                                      "SELECT COUNT(*) AS n FROM episodes_fts
-                                        WHERE episodes_fts MATCH ?"
-                                      (list (enchiridion.memory.store:fts-query
-                                             token))))
-                              "n")
-                             0))
-              (incf known)))
-          (- 1.0 (/ (float known) (float (length tokens))))))))
+            (let ((df (prior-document-frequency store token before-id)))
+              (incf commonness (/ (float df) (float (1+ df))))))
+          (let ((rarity (- 1.0 (/ commonness (float (length tokens))))))
+            (max 0.0 (min 1.0 rarity)))))))
 
 (defun arousal-proxy (body)
   "Return a bounded lexical arousal proxy for BODY, in 0..1, with no model call.

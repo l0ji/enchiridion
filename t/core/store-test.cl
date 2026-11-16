@@ -678,7 +678,7 @@ itself is what proves the trigger ran."
            (enchiridion.memory.store::set-schema-version store 3)
            (enchiridion.memory.store:close-store store)
            (setf store (enchiridion.memory.store:open-store :path path))
-           (ok (= 6 (enchiridion.memory.store::schema-version store)))
+           (ok (= 7 (enchiridion.memory.store::schema-version store)))
            (testing "the existing claim is indexed"
              (ok (= 1 (length (enchiridion.memory.store::query-rows
                                store "SELECT rowid FROM assertions_fts
@@ -694,3 +694,101 @@ itself is what proves the trigger ran."
                   store "generations" "episodes_derived"))))
       (ignore-errors (enchiridion.memory.store:close-store store))
       (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(deftest saved-memory-scrubs-session-and-context ()
+  (with-scratch-store (store)
+    (enchiridion.llm.secrets:register-secret "memory-test" +fake-key+)
+    (unwind-protect
+         (progn
+           (enchiridion.memory.store:save-memory
+            store +fake-key+ +fake-key+ :session +fake-key+)
+           (let ((row (first (enchiridion.memory.store:query-rows
+                              store "SELECT * FROM episodes WHERE role = 'memory'"))))
+             (dolist (column '("name" "body" "session" "context_key"))
+               (ng (search +fake-key+ (enchiridion.memory.store:field row column))))))
+      (enchiridion.llm.secrets:clear-secrets))))
+
+(deftest saved-memory-dedup-serializes-independent-connections ()
+  ;; The two writers must both be inside the check when one of them wins, or the
+  ;; test passes for a store that never made the check and the insert one unit.
+  ;; A third connection holds the write lock, and the two are started after it,
+  ;; so both are blocked at BEGIN IMMEDIATE when the holder commits.
+  (with-scratch-store (store)
+    (let* ((path (enchiridion.memory.store:store-path store))
+           (other (enchiridion.memory.store:open-store :path path))
+           (holder (enchiridion.memory.store:open-store :path path))
+           (results (make-array 2 :initial-element nil))
+           (threads nil))
+      (unwind-protect
+           (progn
+             (enchiridion.memory.store:exec holder "BEGIN IMMEDIATE")
+             (setf threads
+                   (loop for connection in (list store other)
+                         for i from 0
+                         collect
+                         (let ((connection connection) (i i))
+                           (bordeaux-threads:make-thread
+                            (lambda ()
+                              (setf (aref results i)
+                                    (handler-case
+                                        (progn
+                                          (enchiridion.memory.store:save-memory
+                                           connection "same" "same body")
+                                          :saved)
+                                      (enchiridion.errors:configuration-error () :duplicate)
+                                      (error () :unexpected))))))))
+             (sleep 0.2)
+             (enchiridion.memory.store:exec holder "COMMIT")
+             (mapc #'bordeaux-threads:join-thread threads)
+             (ok (= 1 (count :saved results)))
+             (ok (= 1 (count :duplicate results)))
+             (ok (zerop (count :unexpected results)))
+             (ok (= 1 (length (enchiridion.memory.store:list-memories store)))))
+        (ignore-errors (enchiridion.memory.store:close-store other))
+        (ignore-errors (enchiridion.memory.store:close-store holder))))))
+
+;;;; The dense cache across a schema change, and a bounded prompt read.
+
+(deftest an-old-vector-cache-keeps-its-rows-and-gains-the-model-key ()
+  ;; A version-6 store keyed EPISODE_VECTORS by episode alone, so a second
+  ;; model's write replaced the first model's vector. The upgrade copies every
+  ;; row instead of dropping the cache.
+  (with-scratch-store (store)
+    (enchiridion.memory.store:record-turn
+     store :session "s" :role "user" :body "hello world")
+    (let ((path (enchiridion.memory.store:store-path store)))
+      (enchiridion.memory.store:exec store "DROP TABLE episode_vectors")
+      (enchiridion.memory.store:exec
+       store "CREATE TABLE episode_vectors (
+                id INTEGER PRIMARY KEY REFERENCES episodes(id) ON DELETE CASCADE,
+                model TEXT NOT NULL, dims INTEGER NOT NULL, vec BLOB NOT NULL)")
+      (enchiridion.memory.store:exec
+       store "INSERT INTO episode_vectors (id, model, dims, vec)
+               VALUES (1, 'old-model', 2, ?)"
+       (list (enchiridion.memory:encode-vector
+              (enchiridion.memory::normalise-vector #(1.0 0.0)))))
+      (enchiridion.memory.store:exec store "PRAGMA user_version = 6")
+      (enchiridion.memory.store:close-store store)
+      (setf store (enchiridion.memory.store:open-store :path path))
+      (ok (= 7 (enchiridion.memory.store::schema-version store)))
+      (testing "the stored vector survived the upgrade"
+        (ok (= 1 (length (enchiridion.memory.store:query-rows
+                          store "SELECT * FROM episode_vectors
+                                  WHERE id = 1 AND model = 'old-model' AND dims = 2")))))
+      (testing "and a second model can live beside it"
+        (enchiridion.memory.store:exec
+         store "INSERT INTO episode_vectors (id, model, dims, vec)
+                 VALUES (1, 'new-model', 2, ?)"
+         (list (enchiridion.memory:encode-vector
+                (enchiridion.memory::normalise-vector #(0.0 1.0)))))
+        (ok (= 2 (length (enchiridion.memory.store:query-rows
+                          store "SELECT * FROM episode_vectors WHERE id = 1"))))))))
+
+(deftest recent-turns-reads-no-more-than-the-prompt-shows ()
+  (with-scratch-store (store)
+    (enchiridion.memory.store:record-turn
+     store :session "s" :role "user"
+     :body (make-string 5000 :initial-element #\z))
+    (let ((row (first (enchiridion.memory.store:recent-turns
+                       store :limit 1 :body-chars 401))))
+      (ok (= 401 (length (enchiridion.memory.store:turn-row-body row)))))))

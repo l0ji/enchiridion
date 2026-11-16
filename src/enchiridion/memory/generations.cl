@@ -437,32 +437,46 @@ that dies without a result leaves NIL, which the caller reads as a failure."
           collect (and result (list* :tokens (aref spent i)
                                      (alexandria:remove-from-plist result :tokens))))))
 
-(defun apply-derivation (store episode generation-id parser-version now assertions events)
-  "Write one episode's derived ASSERTIONS and EVENTS into GENERATION-ID, mark
-the episode derived, and return a report plist."
-    (let ((accepted 0)
-          (rejected 0)
-          (conflicts 0)
-          (closed 0))
-      (let ((inserted '()))
-        (dolist (assertion assertions)
-          (if (span-valid-p assertion episode)
-              (let ((id (insert-assertion store assertion generation-id
-                                          generation-id)))
-                (setf (assertion-id assertion) id)
-                (push assertion inserted)
-                (incf accepted))
-              (incf rejected)))
-        (dolist (event events)
-          (insert-change-event store event generation-id generation-id))
-        (dolist (assertion (nreverse inserted))
-          (let ((report (detect-candidate-conflicts store generation-id
-                                                    assertion now)))
-            (incf conflicts (getf report :conflicts))
-            (incf closed (getf report :closed)))))
-      (mark-derived store generation-id (episode-id episode) parser-version)
-      (list :assertions accepted :rejected rejected
-            :conflicts conflicts :closed closed)))
+(defun apply-derivation (store episode generation-id parser-version now
+                         assertions events)
+  "Apply one episode and its counters atomically. Return zero counts on replay."
+  (enchiridion.memory.store:with-store-transaction (store)
+    (if (enchiridion.memory.store:query-rows
+         store
+         "SELECT 1 FROM generation_derivations
+           WHERE generation_id = ? AND episode_id = ?"
+         (list generation-id (episode-id episode)))
+        (list :assertions 0 :rejected 0 :conflicts 0 :closed 0 :applied nil)
+        (let ((accepted 0)
+              (rejected 0)
+              (conflicts 0)
+              (closed 0))
+          (let ((inserted '()))
+            (dolist (assertion assertions)
+              (if (span-valid-p assertion episode)
+                  (let ((id (insert-assertion store assertion generation-id
+                                              generation-id)))
+                    (setf (assertion-id assertion) id)
+                    (push assertion inserted)
+                    (incf accepted))
+                  (incf rejected)))
+            (dolist (event events)
+              (insert-change-event store event generation-id generation-id))
+            (dolist (assertion (nreverse inserted))
+              (let ((report (detect-candidate-conflicts store generation-id
+                                                        assertion now)))
+                (incf conflicts (getf report :conflicts))
+                (incf closed (getf report :closed)))))
+          (mark-derived store generation-id (episode-id episode) parser-version)
+          (enchiridion.memory.store:exec
+           store
+           "UPDATE generations
+               SET to_episode = MAX(to_episode, ?),
+                   writes = writes + ?, episodes_derived = episodes_derived + 1
+             WHERE id = ?"
+           (list (episode-id episode) (+ accepted conflicts closed) generation-id))
+          (list :assertions accepted :rejected rejected
+                :conflicts conflicts :closed closed :applied t)))))
 
 (defun build-candidate (store &key (limit *memory-t2-episodes-per-tick*)
                                   (parser-version *memory-parser-version*)
@@ -504,6 +518,11 @@ effect on a build already under way."
        ;; past the first failure is applied or marked, and the next tick tries.
        (let ((results (derive-concurrently store episodes)))
          (dolist (result results) (incf tokens (or (getf result :tokens) 0)))
+         ;; Billing survives an apply failure: these calls already happened
+         (when (plusp tokens)
+           (enchiridion.memory.store:exec
+            store "UPDATE generations SET tokens_used = tokens_used + ? WHERE id = ?"
+            (list tokens generation-id)))
          (let ((outage (> (* 2 (count-if (lambda (r) (or (null r) (getf r :error))) results))
                           (length results))))
            (loop for episode in episodes
@@ -517,14 +536,16 @@ effect on a build already under way."
                        (unless failure-note
                          (setf failure-note (or (getf result :error) "the deriver returned nothing")))
                        (incf skipped)
-                       (push episode derived)
-                       (apply-derivation store episode generation-id parser-version now nil nil))
+                       (when (getf (apply-derivation store episode generation-id
+                                                   parser-version now nil nil)
+                                   :applied)
+                         (push episode derived)))
                       (t
                        (let ((report (apply-derivation store episode generation-id
                                                        parser-version now
                                                        (getf result :assertions)
                                                        (getf result :events))))
-                         (push episode derived)
+                         (when (getf report :applied) (push episode derived))
                          (incf accepted (getf report :assertions))
                          (incf rejected (getf report :rejected))
                          (incf conflicts (getf report :conflicts))
@@ -533,20 +554,6 @@ effect on a build already under way."
        (let ((remaining (unprocessed-episode-count store generation-id)))
          (when (zerop remaining)
            (set-generation-status store generation-id "candidate"))
-         (let ((last-episode (and derived (episode-id (car (last derived))))))
-           ;; Also when nothing was derived: a batch whose first call failed
-           ;; still spent what it spent.
-           (when (or last-episode (plusp tokens))
-             (enchiridion.memory.store:exec
-              store
-              "UPDATE generations
-                  SET to_episode = MAX(to_episode, ?),
-                      writes = writes + ?,
-                      episodes_derived = episodes_derived + ?,
-                      tokens_used = tokens_used + ?
-                WHERE id = ?"
-              (list (or last-episode 0) (+ accepted conflicts closed) (length derived) tokens
-                    generation-id))))
          (list :built t
                :generation-id generation-id
                :processed (length derived)

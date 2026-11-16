@@ -188,6 +188,16 @@ cost of every prompt.")
 (setf (documentation '*unlisted-block-limit* 'variable)
       "The limit for a block whose label *BLOCK-LIMITS* does not name.")
 
+(defvar *recent-turn-count* 6
+  "How many recent turns a prompt may carry, before the character budget.")
+
+(defvar *recent-window-chars* 4000
+  "The total characters of recent conversation a prompt may carry.
+
+The count and the character budget are both bounds: a turn count alone lets six
+long replies cost more than the frozen prompt, and a character budget alone lets
+a thousand one-line turns arrive.")
+
 (declaim (ftype (function (list list) list) merge-plist))
 
 (defun merge-plist (base overrides)
@@ -219,6 +229,8 @@ key by key to the shipped defaults. Return NIL."
           *memory-maintenance-batch* (setting :maintenance-batch)
           *memory-t2-episodes-per-tick* (setting :t2-max-episodes-per-tick)
           *memory-pack-chars* (setting :pack-chars)
+          *recent-turn-count* (max 0 (setting :recent-turns))
+          *recent-window-chars* (max 0 (setting :recent-window-chars))
           *push-max-fraction* (setting :push-max-fraction)
           *memory-graph-limit* (setting :graph-limit)
           *memory-gate-margin* (setting :gate-margin)

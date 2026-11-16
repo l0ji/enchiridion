@@ -427,3 +427,259 @@
     (record-pair store 1 "win" 0.0 1.0)
     (ok (enchiridion.memory:utility-gate store 1 :margin 0.05 :min-n 1 :alpha 1.0))
     (ng (enchiridion.memory:utility-gate store 1 :margin 0.06 :min-n 1 :alpha 1.0))))
+
+;;;; Rarity, the dense cache, and what the optional calls cost.
+
+(defun test-embedder (&key (calls nil))
+  "Return an embedder whose vector follows the configured size, or is four long.
+CALLS, when given, is a cons whose car counts the requests."
+  (lambda (texts)
+    (when calls (incf (car calls)))
+    (let ((dimensions (or (getf enchiridion.memory::*memory-embed-settings*
+                                  :dimensions)
+                          4)))
+      (loop for text in texts
+            collect (let ((vector (make-array dimensions
+                                             :initial-element 0.0
+                                             :element-type 'single-float)))
+                      (setf (aref vector (mod (length text) dimensions)) 1.0)
+                      vector)))))
+
+(defun row-count (store sql &optional parameters)
+  (enchiridion.memory.store:field
+   (first (enchiridion.memory.store:query-rows store sql parameters)) "n"))
+
+(defun turn-writer (store)
+  "Return a function that records one user turn with BODY."
+  (lambda (body)
+    (enchiridion.memory.store:record-turn
+     store :session "s" :role "user" :body body :channel :cli)))
+
+(defun episode-rarity (store id)
+  (enchiridion.memory.store:field
+   (first (enchiridion.memory.store:query-rows
+           store "SELECT rarity_raw FROM episodes WHERE id = ?" (list id)))
+   "rarity_raw"))
+
+(deftest rarity-measures-the-prior-documents-not-the-row-itself ()
+  (with-store (store)
+    (let ((write (turn-writer store)))
+      (loop for index from 1 to 40
+            do (funcall write (if (member index '(20 40))
+                                  (format nil "Zyzzyva ~D quartzite obsidian malachite"
+                                          index)
+                                  (format nil "the build failed with error code ~D"
+                                          index))))
+      (ok (= 40 (getf (enchiridion.memory:maintenance store :limit 100) :derived)))
+      (testing "the measure is a distribution, not one collapsed value"
+        (ok (> (row-count store
+                           "SELECT COUNT(DISTINCT rarity_raw) AS n FROM episodes")
+               1))
+        (ok (plusp (episode-rarity store 19))))
+      (testing "a record of new words outranks its ordinary neighbour"
+        (ok (> (episode-rarity store 20) (+ 0.5 (episode-rarity store 19))))
+        (ok (> (episode-rarity store 40) (episode-rarity store 39))))
+      (testing "and the tail sample follows rarity rather than the id"
+        (let ((enchiridion.memory:*tail-rarity-fraction* 0.1)
+              (rare (enchiridion.memory:rare-episode-ids store)))
+          (ok (gethash 20 rare))
+          (ok (gethash 40 rare))
+          (ng (gethash 19 rare))
+          (ng (gethash 39 rare)))))))
+
+(deftest rarity-does-not-depend-on-the-maintenance-batch ()
+  (with-store (store)
+    (let ((write (turn-writer store)))
+      (dotimes (index 6)
+        (funcall write (format nil "the deploy failed on host ~D again" index)))
+      (loop repeat 6 do (enchiridion.memory:maintenance store :limit 1))
+      (let ((batched (loop for id from 1 to 6 collect (episode-rarity store id))))
+        (enchiridion.memory:rebuild-derived store)
+        (enchiridion.memory:maintenance store :limit 6)
+        (ok (equal batched
+                   (loop for id from 1 to 6 collect (episode-rarity store id))))))))
+
+(deftest a-changed-model-is-pending-and-keeps-the-old-vectors ()
+  (with-store (store)
+    (let ((write (turn-writer store)))
+      (funcall write "the blue garage door")
+      (funcall write "the red bicycle shed")
+      (let ((enchiridion.memory:*memory-embedder* (test-embedder))
+            (enchiridion.memory:*memory-embed-model* "model-a")
+            (enchiridion.memory::*memory-embed-settings* '(:dimensions 4)))
+        (ok (= 2 (enchiridion.memory:embed-pending store)))
+        (ok (zerop (enchiridion.memory:embed-pending store)))
+        (setf enchiridion.memory:*memory-embed-model* "model-b")
+        (testing "a new model is pending again"
+          (ok (= 2 (enchiridion.memory:embed-pending store)))
+          (ok (zerop (enchiridion.memory:embed-pending store))))
+        (testing "and both models' caches survive"
+          (ok (= 2 (row-count store
+                              "SELECT COUNT(*) AS n FROM episode_vectors
+                                WHERE model = 'model-a'")))
+          (ok (= 2 (row-count store
+                              "SELECT COUNT(*) AS n FROM episode_vectors
+                                WHERE model = 'model-b'"))))
+        (testing "a switch back needs no work"
+          (setf enchiridion.memory:*memory-embed-model* "model-a")
+          (ok (zerop (enchiridion.memory:embed-pending store))))))))
+
+(deftest a-changed-size-is-pending-under-the-same-model ()
+  (with-store (store)
+    (funcall (turn-writer store) "the blue garage door")
+    (let ((enchiridion.memory:*memory-embedder* (test-embedder))
+          (enchiridion.memory:*memory-embed-model* "m")
+          (enchiridion.memory::*memory-embed-settings* '(:dimensions 3)))
+      (ok (= 1 (enchiridion.memory:embed-pending store)))
+      (ok (zerop (enchiridion.memory:embed-pending store)))
+      (setf enchiridion.memory::*memory-embed-settings* '(:dimensions 5))
+      (testing "the new size is a new cache key"
+        (ok (= 1 (enchiridion.memory:embed-pending store)))
+        (ok (zerop (enchiridion.memory:embed-pending store)))
+        (ok (= 2 (row-count store
+                            "SELECT COUNT(*) AS n FROM episode_vectors
+                              WHERE model = 'm'")))))))
+
+(deftest embedding-stops-between-requests-at-its-budget ()
+  (with-store (store)
+    (let ((write (turn-writer store)))
+      (dotimes (index 5) (funcall write (format nil "record ~D" index)))
+      (let* ((calls (list 0))
+             (enchiridion.memory:*memory-embedder* (test-embedder :calls calls))
+            (enchiridion.memory:*memory-embed-model* "m")
+            (enchiridion.memory::*memory-embed-settings* '(:dimensions 4))
+            (enchiridion.memory::*embed-batch* 2))
+        (testing "the budget covers one request of two texts"
+          (ok (= 2 (enchiridion.memory:embed-pending
+                    store :max-tokens
+                    (enchiridion.memory::embedding-token-estimate
+                     '("record 0" "record 0")))))
+          (ok (= 1 (car calls)))
+          (ok (= 3 (row-count store
+                              "SELECT COUNT(*) AS n FROM episodes e
+                                WHERE NOT EXISTS (SELECT 1 FROM episode_vectors v
+                                                   WHERE v.id = e.id)"))))
+        (testing "the rest waits for the next call"
+          ;; Three texts at a batch of two are two more requests.
+          (ok (= 3 (enchiridion.memory:embed-pending store)))
+          (ok (zerop (enchiridion.memory:embed-pending store)))
+          (ok (= 3 (car calls))))))))
+
+(deftest a-dense-index-keeps-the-newest-vectors-of-one-store ()
+  (with-store (store)
+    (let ((write (turn-writer store)))
+      (dotimes (index 300) (funcall write (format nil "record number ~D" index)))
+      (let ((enchiridion.memory:*memory-embedder* (test-embedder))
+            (enchiridion.memory:*memory-embed-model* "m")
+            (enchiridion.memory::*memory-embed-settings* '(:dimensions 8))
+            (enchiridion.memory::*dense-index-max-vectors* 128)
+            (enchiridion.memory::*vector-index-max-stores* 1))
+        (ok (= 300 (enchiridion.memory:embed-pending store :limit 400)))
+        (let* ((index (enchiridion.memory::vector-index-for store))
+               (ids (coerce (enchiridion.memory::vector-index-ids index) 'list)))
+          (testing "the index holds its cap and not the whole history"
+            (ok (<= (length ids) 128))
+            (ok (>= (length ids) 120)))
+          (testing "and what it keeps is the newest tail"
+            (ok (= 300 (car (last ids))))
+            (ng (member 1 ids))
+            (ok (equal ids (sort (copy-list ids) #'<)))))))))
+
+(deftest a-dense-index-drops-the-least-recently-used-store ()
+  (clrhash enchiridion.memory::*vector-indexes*)
+  (with-store (first-store)
+    (funcall (turn-writer first-store) "first store record")
+    (let ((enchiridion.memory:*memory-embedder* (test-embedder))
+          (enchiridion.memory:*memory-embed-model* "m")
+          (enchiridion.memory::*memory-embed-settings* '(:dimensions 4))
+          (enchiridion.memory::*vector-index-max-stores* 1))
+      (enchiridion.memory:embed-pending first-store)
+      (enchiridion.memory::vector-index-for first-store)
+      (ok (= 1 (hash-table-count enchiridion.memory::*vector-indexes*)))
+      (with-store (second-store)
+        (funcall (turn-writer second-store) "second store record")
+        (enchiridion.memory:embed-pending second-store)
+        (enchiridion.memory::vector-index-for second-store)
+        (testing "only one store's index stays cached"
+          (ok (= 1 (hash-table-count enchiridion.memory::*vector-indexes*))))
+        (testing "and the older store's index is the one dropped"
+          (ok (null (gethash (namestring (enchiridion.memory.store:store-path
+                                          first-store))
+                             enchiridion.memory::*vector-indexes*))))))))
+
+(deftest a-candidate-loads-a-prefix-and-the-pack-reads-further ()
+  (with-store (store)
+    (let ((enchiridion.memory::*retrieval-body-chars* 100)
+          (enchiridion.memory::*pack-body-chars* 2000)
+          (body (concatenate 'string
+                             (make-string 500 :initial-element #\x)
+                             " zebra stripes here "
+                             (make-string 500 :initial-element #\y))))
+      (enchiridion.memory:write-episode store :session "s" :role "user"
+                                               :body body :derive-p nil)
+      (let ((rows (enchiridion.memory:retrieve-rows-for-turn store "zebra")))
+        (ok (= 1 (length rows)))
+        (testing "ranking read a bounded prefix"
+          (ok (<= (length (getf (getf (first rows) :item) :body)) 100))
+          (ng (search "zebra" (getf (getf (first rows) :item) :body))))
+        (testing "and the pack searches the larger bound"
+          (let ((pack (nth-value 0
+                                 (enchiridion.memory:render-pack
+                                  (enchiridion.memory:select-pack-rows
+                                   store "zebra" rows)
+                                  :cue "zebra"))))
+            (ok (search "zebra" pack))))))))
+
+(defstruct (rerank-backend (:constructor make-rerank-backend))
+  (text "1,2" :type string))
+
+(defmethod enchiridion.llm:complete ((backend rerank-backend) messages
+                                     &key model tools budget)
+  (declare (ignore messages model tools budget))
+  (enchiridion.llm::%make-completion :text (rerank-backend-text backend)
+                                     :model "rerank-model"
+                                     :input-tokens 30 :output-tokens 7))
+
+(defmethod enchiridion.llm:model-capabilities ((backend rerank-backend))
+  (declare (ignore backend))
+  '(:tools nil))
+
+(defmethod enchiridion.llm:backend-name ((backend rerank-backend))
+  (declare (ignore backend))
+  "rerank")
+
+(deftest an-optional-call-bills-the-turn-ledger ()
+  (with-store (store)
+    (let ((write (turn-writer store)))
+      (funcall write "the zebra stripes are on the wall")
+      (funcall write "the garage door is blue")
+      (let ((enchiridion.memory:*memory-embedder* (test-embedder))
+            (enchiridion.memory:*memory-embed-model* "m")
+            (enchiridion.memory::*memory-embed-settings* '(:dimensions 4))
+            (enchiridion.memory:*memory-reranker*
+              (enchiridion.memory:make-model-reranker (make-rerank-backend))))
+        (enchiridion.memory:embed-pending store)
+        (ok (enchiridion.memory:retrieve-for-turn store "zebra stripes"
+                                                  :session "s7"))
+        (let* ((rows (enchiridion.memory.store:usage-rows store))
+               (embed (find-if (lambda (row)
+                                 (and (string= "embed"
+                                               (enchiridion.memory.store:field
+                                                row "channel"))
+                                      (string= "s7"
+                                               (enchiridion.memory.store:field
+                                                row "session"))))
+                               rows))
+               (rerank (find "rerank" rows
+                             :key (lambda (row)
+                                    (enchiridion.memory.store:field row "channel"))
+                             :test #'string=)))
+          (testing "the cue embedding is a ledger row in the turn's session"
+            (ok embed)
+            (ok (string= "s7" (enchiridion.memory.store:field embed "session")))
+            (ok (plusp (enchiridion.memory.store:field embed "input"))))
+          (testing "and so is the rerank, with what the provider reported"
+            (ok rerank)
+            (ok (= 30 (enchiridion.memory.store:field rerank "input")))
+            (ok (= 7 (enchiridion.memory.store:field rerank "output")))
+            (ok (string= "s7" (enchiridion.memory.store:field rerank "session")))))))))

@@ -225,7 +225,11 @@ nothing and is reported instead. A pass that lands records a projections row."
                   :limit (if rebase-p
                              enchiridion.memory:*compaction-rebase-turns*
                              +compaction-turns+)
-                  :not-channel :sleep))
+                  :not-channel :sleep
+                  ;; One character past the display limit: SHORTEN then cuts
+                  ;; the same 397 characters and adds the ellipsis, and the
+                  ;; prompt never reads a whole tool result to show 400.
+                  :body-chars (1+ +recent-turn-limit+)))
          (user (format nil "~:[Previous summary:~%~A~%~%~;~*~]Recent turns:~%~{~A~%~}"
                        rebase-p
                        (if (plusp (length previous)) previous "(none)")
@@ -343,19 +347,61 @@ queue is cheaper than the confusion. Compaction overwrites this."
 (declaim (ftype (function (t) integer) store-total))
 
 (defun store-total (store)
-  "Return the tokens unattended work has spent, summed over every row the
-sleep channel wrote, or zero.
+  "Return the tokens unattended work has spent, or zero.
 
-Only the sleep channel's rows count. The tick's spend is the difference in this
+Only the channels unattended work writes count: the sleep agent's own calls and
+the embeddings the tick paid for. The tick's spend is the difference in this
 number across the tick, and an operator turn answered on another channel while
 the tick runs is the operator's spend, not the tick's: counting it let a busy
 webhook use up the tick cap and stop the sleep agent."
   (if store
       (handler-case (getf (enchiridion.memory.store:usage-total-since
-                           store 0 :channel :sleep)
+                           store 0 :channels '(:sleep :embed))
                           :total)
         (error () 0))
       0))
+
+(declaim (ftype (function (agent t integer integer) (values integer integer))
+                spend-pair))
+
+(defun spend-pair (agent store start-total tick-index)
+  "Return two values: the tokens this tick has spent, and the last day's.
+
+The tick's share is the store's unattended total now minus START-TOTAL, or the
+in-memory ledger's difference when no store is open. The day window is the
+rolling twenty-four hours either way, and it counts every channel, so it bounds
+the process rather than one tick."
+  (values
+   (if store
+       (max 0 (- (store-total store) start-total))
+       (getf (spend-summary (spend-since agent tick-index)) :total))
+   (if store
+       (handler-case
+           (getf (enchiridion.memory.store:usage-total-since
+                  store (- (get-universal-time) 86400))
+                 :total)
+         (error () 0))
+       (spend-total agent :window :day))))
+
+(declaim (ftype (function (agent t integer integer &key (:day-only t))
+                          (or null integer))
+                budget-remaining))
+
+(defun budget-remaining (agent store start-total tick-index &key (day-only nil))
+  "Return the most tokens this tick may still spend, or NIL when no cap binds.
+DAY-ONLY asks the day cap alone, the way the T2 phase does. The answer is what
+a phase that spends without a turn, such as the embedder, may offer one call."
+  (multiple-value-bind (tick-spend day-spend)
+      (spend-pair agent store start-total tick-index)
+    (let* ((tick-cap (and (not day-only)
+                          (getf (agent-budget agent) :max-tokens-per-tick)))
+           (day-cap (getf (agent-budget agent) :max-tokens-per-day))
+           (tick-room (and tick-cap (max 0 (- tick-cap tick-spend))))
+           (day-room (and day-cap (max 0 (- day-cap day-spend)))))
+      (cond ((and tick-room day-room) (min tick-room day-room))
+            (tick-room tick-room)
+            (day-room day-room)
+            (t nil)))))
 
 (declaim (ftype (function (agent t integer integer &key (:reserve integer) (:day-only t))
                           (or null string))
@@ -383,23 +429,13 @@ be larger than one tick. DAY-ONLY asks the day window alone, which is how the
 T2 phase asks."
   (let ((tick-cap (and (not day-only) (getf (agent-budget agent) :max-tokens-per-tick)))
         (day-cap (getf (agent-budget agent) :max-tokens-per-day)))
-    (labels ((tick-spend ()
-               (if store
-                   (max 0 (- (store-total store) start-total))
-                   (getf (spend-summary (spend-since agent tick-index)) :total)))
-             (day-spend ()
-               (if store
-                   (handler-case
-                       (getf (enchiridion.memory.store:usage-total-since
-                              store (- (get-universal-time) 86400))
-                             :total)
-                     (error () 0))
-                   (spend-total agent :window :day))))
+    (multiple-value-bind (tick-spend day-spend)
+        (spend-pair agent store start-total tick-index)
       (cond
-        ((and tick-cap (>= (tick-spend) tick-cap)) "the tick cap is spent")
-        ((and tick-cap (plusp reserve) (> (+ (tick-spend) reserve) tick-cap))
+        ((and tick-cap (>= tick-spend tick-cap)) "the tick cap is spent")
+        ((and tick-cap (plusp reserve) (> (+ tick-spend reserve) tick-cap))
          (format nil "the tick cap cannot cover a ~D token pass" reserve))
-        ((and day-cap (>= (day-spend) day-cap)) "the day cap is spent")
+        ((and day-cap (>= day-spend day-cap)) "the day cap is spent")
         (t nil)))))
 
 (declaim (ftype (function (t t t) (or null string)) sleep-refusal))
@@ -468,17 +504,23 @@ turns once, which is harmless and bounded."
                                                        :limit +compaction-turns+
                                                        :not-channel :sleep)))
     (when (and (= (length recent) +compaction-turns+)
-               (> (enchiridion.memory.store:turn-row-id (first recent)) cursor))
+               (> (enchiridion.memory.store:turn-row-id (car (last recent))) cursor))
       (let ((compacted (compact-session (compactor-agent agent (if rebase-p
                                                                      +rebase-brief+
                                                                      +compaction-brief+))
                                         store
                                         :rebase-p rebase-p)))
-        (setf (enchiridion.supervisor:supervisor-last-compacted-turn supervisor)
-              (enchiridion.memory.store:turn-row-id (first recent)))
-        (cond ((null compacted) nil)
-              (rebase-p "the session block was rebuilt from raw turns")
-              (t "the session block was compacted"))))))
+        (cond
+          ;; A blank answer spends the call and summarises nothing. The cursor
+          ;; stays where it was, so the next tick offers the same window and the
+          ;; operator sees the paid retry instead of four silently dropped rows.
+          ((null compacted) "compaction produced no text")
+          (t
+           (setf (enchiridion.supervisor:supervisor-last-compacted-turn supervisor)
+                 (enchiridion.memory.store:turn-row-id (first recent)))
+           (if rebase-p
+               "the session block was rebuilt from raw turns"
+               "the session block was compacted")))))))
 
 (defun t2-report-line (report)
   "Return the heartbeat's sentence for one T2 pass REPORT."
@@ -575,13 +617,29 @@ session block."
                        (t nil))))))
       (when (and store enchiridion.memory:*memory-embedder*)
         ;; Dense vectors, when an embedder is configured. This one calls a
-        ;; model, so it is a separate step: a failed call reports here and the
-        ;; same episodes are tried on the next tick.
-        (attempt "memory embedding"
-                 (lambda ()
-                   (let ((written (enchiridion.memory:embed-pending store)))
-                     (when (plusp written)
-                       (format nil "~D episode~:P embedded" written))))))
+        ;; model, so it asks the same budget as the sleep agent and hands the
+        ;; embedder only the room that is left: a spent cap skips the phase
+        ;; instead of starting work it cannot pay for.
+        (let* ((refusal (and agent
+                             (handler-case
+                                 (budget-refusal agent store start-total tick-index)
+                               (error (condition)
+                                 (setf ok-p nil)
+                                 (format nil "the budget is unreadable: ~A"
+                                         (enchiridion.errors:condition-report-line
+                                          condition))))))
+               (room (and agent (null refusal)
+                          (handler-case
+                              (budget-remaining agent store start-total tick-index)
+                            (error () 0)))))
+          (if refusal
+              (say "memory embedding skipped: ~A" refusal)
+              (attempt "memory embedding"
+                       (lambda ()
+                         (let ((written (enchiridion.memory:embed-pending
+                                         store :max-tokens room)))
+                           (when (plusp written)
+                             (format nil "~D episode~:P embedded" written))))))))
       (when (and store agent)
         ;; T2: after maintenance, so the tail sample reads fresh rarity, and
         ;; before the sleep agent. Its spend counts toward the day cap but not

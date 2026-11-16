@@ -119,15 +119,18 @@ references.")
    "CREATE TRIGGER IF NOT EXISTS episodes_activation_ad AFTER DELETE ON episodes BEGIN
       DELETE FROM activation WHERE kind = 'episode' AND id = old.id;
     END"
-   ;; One embedding per episode, written by EMBED-PENDING when an embedder is
-   ;; configured. VEC is the unit-length vector as packed little-endian
-   ;; float32, so a dot product is the cosine. A deleted episode takes its
-   ;; vector with it.
+   ;; One column of dense cache per episode, model and size, written by
+   ;; EMBED-PENDING when an embedder is configured. VEC is the unit-length
+   ;; vector as packed little-endian float32, so a dot product is the cosine.
+   ;; The model and size are part of the key, so changing either invalidates
+   ;; what retrieval cannot use and keeps what it could use again. A deleted
+   ;; episode takes its vectors with it.
    "CREATE TABLE IF NOT EXISTS episode_vectors (
-      id     INTEGER PRIMARY KEY REFERENCES episodes(id) ON DELETE CASCADE,
+      id     INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
       model  TEXT    NOT NULL,
       dims   INTEGER NOT NULL,
-      vec    BLOB    NOT NULL)"
+      vec    BLOB    NOT NULL,
+      PRIMARY KEY (id, model, dims))"
 
    ;; The rows a store written before the trigger never got. Running it again
    ;; changes nothing.

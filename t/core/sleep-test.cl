@@ -443,3 +443,99 @@ countable from the test."
     (let ((enchiridion.memory:*t2-enabled-p* t))
       (ok (search "T2 skipped: the day cap is spent"
                   (getf (enchiridion.kernel:heartbeat supervisor) :report))))))
+
+(deftest compaction-requires-four-new-rows-after-each-pass ()
+  (with-scratch-world (store supervisor)
+    (flet ((add-turn ()
+             (enchiridion.memory.store:record-turn
+              store :session "operator" :role "user" :body "new turn"))
+           (compact ()
+             (enchiridion.kernel::compact-when-due supervisor store (agent-of supervisor))))
+      (dotimes (i 4) (add-turn))
+      (ok (compact))
+      (ok (= 1 (calls-made supervisor)))
+      (dotimes (i 3)
+        (add-turn)
+        (enchiridion.memory.store:record-turn
+         store :session "sleep" :channel :sleep :role "assistant" :body "sleep output")
+        (ng (compact))
+        (ok (= 1 (calls-made supervisor))))
+      (add-turn)
+      (ok (compact))
+      (ok (= 2 (calls-made supervisor)))
+      (ok (= 2 (length (projection-rows store)))))))
+
+(deftest a-blank-compaction-keeps-its-window-and-reports-the-retry ()
+  ;; The paid call that returns nothing must not advance the cursor: with the
+  ;; four-new-row gate, advancing on a blank answer drops the whole window.
+  (with-scratch-world (store supervisor)
+    (flet ((add-turn (index)
+             (enchiridion.memory.store:record-turn
+              store :session "operator" :role "user"
+              :body (format nil "turn ~D" index))))
+      (dotimes (index 4) (add-turn index))
+      (setf (counting-backend-reply (backend-of supervisor)) "")
+      (enchiridion.memory.store:set-session-block store "the session so far")
+      (let ((cursor (enchiridion.supervisor:supervisor-last-compacted-turn supervisor))
+            (first-report (enchiridion.kernel:heartbeat supervisor)))
+        (testing "the blank answer is visible in the phase report"
+          (ok (search "compaction produced no text" (getf first-report :report))))
+        (testing "and the cursor, the block and the projections are untouched"
+          (ok (= cursor
+                 (enchiridion.supervisor:supervisor-last-compacted-turn supervisor)))
+          (ok (null (projection-rows store)))
+          (ok (string= "the session so far"
+                      (enchiridion.memory.store:session-block store))))
+        (testing "the next tick summarises the same four rows"
+          (setf (counting-backend-reply (backend-of supervisor)) "done")
+          (let ((second-report (enchiridion.kernel:heartbeat supervisor)))
+            (ok (search "the session block was compacted" (getf second-report :report)))
+            (ok (= 1 (length (projection-rows store))))
+            (ok (search "turn 0"
+                        (counting-backend-last-prompt (backend-of supervisor))))
+            (let ((row (first (projection-rows store))))
+              (ok (= 3 (- (enchiridion.memory.store:field row "to_turn")
+                          (enchiridion.memory.store:field row "from_turn")))))))))))
+
+;;;; Dense embedding inside the tick.
+
+(deftest a-spent-cap-skips-the-embedding-phase ()
+  (with-scratch-world (store supervisor)
+    (let ((calls (list 0)))
+      (enchiridion.memory.store:record-turn
+       store :session "s" :role "user" :body "an episode with no vector yet")
+      (let ((enchiridion.memory:*memory-embedder*
+              (lambda (texts)
+                (incf (car calls))
+                (mapcar (lambda (text) (declare (ignore text)) (vector 1.0 0.0))
+                        texts)))
+            (enchiridion.memory:*memory-embed-model* "m")
+            (enchiridion.memory::*memory-embed-settings* '(:dimensions 2)))
+        ;; The day window counts every channel and every earlier second, so a
+        ;; row written before the tick is what a mid-tick phase can find spent.
+        (setf (enchiridion.kernel:agent-budget (agent-of supervisor))
+              '(:max-tokens-per-tick 4000 :max-tokens-per-day 100))
+        (enchiridion.memory.store:record-usage store :input 4000 :output 0
+                                                     :channel :sleep)
+        (let ((report (getf (enchiridion.kernel:heartbeat supervisor) :report)))
+          (testing "the phase is skipped with the reason"
+            (ok (search "memory embedding skipped" report))
+            (ok (search "day cap" report)))
+          (testing "and no paid request started"
+            (ok (zerop (car calls)))
+            (ok (null (enchiridion.memory.store:query-rows
+                       store "SELECT * FROM episode_vectors")))))))))
+
+(deftest embedding-spend-counts-toward-the-tick ()
+  (with-scratch-world (store supervisor)
+    (let ((agent (agent-of supervisor))
+          (start (enchiridion.kernel::store-total store)))
+      (setf (enchiridion.kernel:agent-budget agent)
+            '(:max-tokens-per-tick 100 :max-tokens-per-day 400000))
+      (enchiridion.memory.store:record-usage store :input 100 :output 0
+                                                   :channel :embed)
+      (testing "the embedding row is this tick's spend"
+        (ok (= 100 (- (enchiridion.kernel::store-total store) start))))
+      (testing "and the tick cap then refuses the next phase"
+        (ok (search "tick cap"
+                    (enchiridion.kernel::budget-refusal agent store start 0)))))))

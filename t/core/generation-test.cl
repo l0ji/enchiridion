@@ -1283,3 +1283,157 @@ shipped schedule."
         (ok (zerop (getf report :processed)))
         (ok (= 40 (getf report :remaining)))
         (ok (getf report :failed))))))
+
+(deftest episode-application-is-atomic-through-accounting-and-restart ()
+  (dolist (fault '("BEFORE INSERT ON assertions WHEN NEW.subject = 'extra'"
+                   "BEFORE INSERT ON change_events"
+                   "BEFORE UPDATE OF tx_to ON assertions"
+                   "BEFORE INSERT ON generation_derivations WHEN NEW.episode_id > 1"
+                   "BEFORE UPDATE OF episodes_derived ON generations"))
+    (with-store (store directory)
+      (let ((enchiridion.memory:*t2-deriver-concurrency* 1)
+            (enchiridion.memory:*assertion-deriver*
+              (lambda (store episode)
+                (incf enchiridion.memory::*derivation-tokens* 7)
+                (multiple-value-bind (assertions events) (test-deriver store episode)
+                  (when (search "gamma" (enchiridion.memory:episode-body episode))
+                    (setf assertions
+                          (append assertions
+                                  (list (simple-assertion episode "extra" "is" "value")))))
+                  (values assertions events)))))
+        (write-body store "alpha is beta")
+        (write-body store "alpha is gamma")
+        (let* ((first (enchiridion.memory:build-candidate store :limit 1))
+               (generation (getf first :generation-id))
+               (path (enchiridion.memory.store:store-path store)))
+          (enchiridion.memory.store:exec
+           store (format nil "CREATE TRIGGER fail_apply ~A
+                              BEGIN SELECT RAISE(ABORT, 'injected apply failure'); END" fault))
+          (ok (handler-case
+                  (progn (enchiridion.memory:build-candidate store :limit 1) nil)
+                (error () t)))
+          (testing fault
+            (ok (= 1 (enchiridion.memory:generation-assertion-count store generation)))
+            (ng (enchiridion.memory.store:query-rows store "SELECT * FROM change_events"))
+            (ng (enchiridion.memory.store:query-rows
+                 store "SELECT * FROM assertions WHERE tx_to IS NOT NULL"))
+            (ok (= 1 (length (enchiridion.memory.store:query-rows
+                              store "SELECT * FROM generation_derivations"))))
+            (let ((row (enchiridion.memory::generation-row store generation)))
+              (ok (= 1 (enchiridion.memory.store:field row "writes")))
+              (ok (= 1 (enchiridion.memory.store:field row "episodes_derived")))
+              (ok (= 1 (enchiridion.memory.store:field row "to_episode")))
+              (ok (= 14 (enchiridion.memory.store:field row "tokens_used")))))
+          (enchiridion.memory.store:close-store store)
+          (setf store (enchiridion.memory.store:open-store :path path))
+          (enchiridion.memory.store:exec store "DROP TRIGGER fail_apply")
+          (let ((retry (enchiridion.memory:build-candidate store :limit 1)))
+            (ok (= generation (getf retry :generation-id)))
+            (ok (= 1 (getf retry :processed)))
+            (ok (= 2 (getf retry :assertions)))
+            (ok (= 1 (getf retry :closed)))
+            (ok (zerop (getf retry :remaining))))
+          (let* ((episode (enchiridion.memory::episode-from-row
+                           (first (enchiridion.memory.store:query-rows
+                                   store "SELECT * FROM episodes WHERE id = 2"))))
+                 (before (enchiridion.memory::generation-row store generation)))
+            (multiple-value-bind (assertions events) (test-deriver store episode)
+              (dotimes (i 2)
+                (declare (ignorable i))
+                (let ((replay (enchiridion.memory::apply-derivation
+                               store episode generation "episodic-1" 500 assertions events)))
+                  (ng (getf replay :applied))
+                  (ok (zerop (getf replay :assertions)))
+                  (ok (zerop (getf replay :closed))))))
+            (ok (equal before (enchiridion.memory::generation-row store generation)))
+            (ok (= 4 (enchiridion.memory.store:field before "writes")))
+            (ok (= 2 (enchiridion.memory.store:field before "episodes_derived")))
+            (ok (= 21 (enchiridion.memory.store:field before "tokens_used")))))))))
+
+(deftest a-conflict-insert-is-rolled-back-with-its-episode ()
+  (with-store (store directory)
+    (let ((enchiridion.memory:*assertion-deriver*
+            (lambda (store episode)
+              (values (nth-value 0 (test-deriver store episode)) nil))))
+      (write-body store "alpha is beta")
+      (write-body store "alpha is gamma")
+      (let ((generation (getf (enchiridion.memory:build-candidate store :limit 1)
+                             :generation-id)))
+        (enchiridion.memory.store:exec
+         store "CREATE TRIGGER fail_mark BEFORE INSERT ON generation_derivations
+                BEGIN SELECT RAISE(ABORT, 'injected mark failure'); END")
+        (ok (handler-case
+                (progn (enchiridion.memory:build-candidate store :limit 1) nil)
+              (error () t)))
+        (ng (enchiridion.memory.store:query-rows store "SELECT * FROM conflicts"))
+        (ok (= 1 (enchiridion.memory:generation-assertion-count store generation)))
+        (enchiridion.memory.store:exec store "DROP TRIGGER fail_mark")
+        (let ((report (enchiridion.memory:build-candidate store :limit 1)))
+          (ok (= 1 (getf report :assertions)))
+          (ok (= 1 (getf report :conflicts))))))))
+
+(deftest two-connections-apply-one-episode-once ()
+  ;; The in-process replay test proves the check; this proves the transaction.
+  ;; A third connection holds the write lock, so both appliers are blocked at
+  ;; BEGIN IMMEDIATE when it commits: one sees an empty derivation and writes,
+  ;; the other sees the committed row and reports :APPLIED NIL.
+  (with-store (store directory)
+    (let ((enchiridion.memory:*assertion-deriver*
+            (lambda (store episode)
+              (values (nth-value 0 (test-deriver store episode)) nil))))
+      (write-body store "alpha is beta")
+      (write-body store "alpha is gamma")
+      (let* ((generation (getf (enchiridion.memory:build-candidate store :limit 1)
+                               :generation-id))
+             (path (enchiridion.memory.store:store-path store))
+             (second (enchiridion.memory.store:open-store :path path))
+             (holder (enchiridion.memory.store:open-store :path path))
+             (episode (enchiridion.memory::episode-from-row
+                       (first (enchiridion.memory.store:query-rows
+                               store "SELECT * FROM episodes WHERE id = 2"))))
+             (reports (make-array 2 :initial-element nil))
+             (threads nil))
+        (unwind-protect
+             (multiple-value-bind (assertions events) (test-deriver store episode)
+               (enchiridion.memory.store:exec holder "BEGIN IMMEDIATE")
+               (setf threads
+                     (loop for connection in (list store second)
+                           for i from 0
+                           collect
+                           (let ((connection connection) (i i))
+                             (bordeaux-threads:make-thread
+                              (lambda ()
+                                (setf (aref reports i)
+                                      (enchiridion.memory::apply-derivation
+                                       connection episode generation
+                                       "episodic-1" 500 assertions events)))))))
+               (sleep 0.2)
+               (enchiridion.memory.store:exec holder "COMMIT")
+               (mapc #'bordeaux-threads:join-thread threads)
+               (testing "one write and one replay"
+                 (ok (= 1 (count-if (lambda (report) (getf report :applied)) reports)))
+                 (ok (= 1 (count-if (lambda (report) (not (getf report :applied))) reports))))
+               (testing "and the episode exists once in every table"
+                 (ok (= 1 (enchiridion.memory.store:field
+                           (first (enchiridion.memory.store:query-rows
+                                   store "SELECT COUNT(*) AS n FROM assertions
+                                           WHERE generation_id = ? AND episode_id = 2"
+                                   (list generation)))
+                           "n")))
+                 (ok (= 1 (enchiridion.memory.store:field
+                           (first (enchiridion.memory.store:query-rows
+                                   store "SELECT COUNT(*) AS n FROM generation_derivations
+                                           WHERE generation_id = ? AND episode_id = 2"
+                                   (list generation)))
+                           "n"))))
+               (testing "and the counters counted the episode once"
+                 ;; WRITES counts rows, so episode 2's assertion and the
+                 ;; conflict it opens with episode 1 are two writes by one
+                 ;; application. The derivation count is what a double apply
+                 ;; would double, and it is 2.
+                 (let ((row (enchiridion.memory::generation-row store generation)))
+                   (ok (= 3 (enchiridion.memory.store:field row "writes")))
+                   (ok (= 2 (enchiridion.memory.store:field row "episodes_derived")))
+                   (ok (= 2 (enchiridion.memory.store:field row "to_episode"))))))
+          (ignore-errors (enchiridion.memory.store:close-store second))
+          (ignore-errors (enchiridion.memory.store:close-store holder)))))))

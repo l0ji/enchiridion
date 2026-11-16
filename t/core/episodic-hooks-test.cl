@@ -85,11 +85,18 @@
           (ok (string= "system" (enchiridion.llm:message-role (first transcript))))
           (ng (search "Retrieved records"
                       (enchiridion.llm:message-content (first transcript)))))
-        (testing "the pack reaches the user message"
-          (ok (search "Retrieved records"
-                      (enchiridion.llm:message-content (second transcript))))
-          (ok (search "[ref episode-"
-                      (enchiridion.llm:message-content (second transcript))))))
+        (testing "the pack reaches this turn's user message and no history row"
+          (let ((current (car (last transcript)))
+                (history (butlast transcript)))
+            (ok (string= "user" (enchiridion.llm:message-role current)))
+            (ok (search "Retrieved records"
+                        (enchiridion.llm:message-content current)))
+            (ok (search "[ref episode-"
+                        (enchiridion.llm:message-content current)))
+            (ok (null (find-if (lambda (message)
+                                 (search "Retrieved records"
+                                         (enchiridion.llm:message-content message)))
+                               history))))))
       (testing "the stored user turn is the operator's text, not the pack"
         (let ((row (first (enchiridion.memory.store:search-sessions
                            store "what port is the index on"))))

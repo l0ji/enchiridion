@@ -155,6 +155,54 @@ the limits count."
 loaded over its limit, which set-block-text never allows."
   (- (block-limit block) (block-bytes block)))
 
+(defun absolute-block-file (path)
+  "Return PATH against the current directory, so a relative block path works."
+  (merge-pathnames (pathname path) (uiop:getcwd)))
+
+(defun followed-block-file (path)
+  "Return the file PATH names, with a final symbolic link followed to its target.
+A relative link target resolves against the link's own directory, which is what
+the kernel does when the file is opened through the link."
+  (let ((target (enchiridion.compat:symlink-target path)))
+    (if target
+        (merge-pathnames (pathname target)
+                         (uiop:pathname-directory-pathname path))
+        path)))
+
+(declaim (ftype (function (t string) string) write-block-file))
+
+(defun write-block-file (path text)
+  "Replace the block file at PATH with TEXT through one atomic rename and return TEXT.
+
+PATH is taken against the current directory. A final symbolic link is followed,
+so the link survives and its target is the file replaced. The existing
+permission bits are copied to the temporary file before the rename, and an
+existing file is opened for append and closed without writing first, so a
+read-only target refuses before anything is renamed and the old text stays. A
+hard link is not preserved: the rename gives the path a new inode, and the other
+name keeps the old text. The directory has to be writable because the temporary
+file lives in it, and nothing is fsynced, so a process crash leaves one whole
+file or the other and a power loss is not covered."
+  (let* ((path (absolute-block-file path))
+         (target (followed-block-file path))
+         (mode (enchiridion.compat:file-mode target)))
+    (when (probe-file target)
+      (with-open-file (stream target :direction :output
+                                     :if-exists :append
+                                     :if-does-not-exist nil)
+        (declare (ignorable stream))))
+    (ensure-directories-exist target)
+    (uiop:with-temporary-file (:stream stream :pathname temporary
+                               :directory (uiop:pathname-directory-pathname target)
+                               :type "tmp" :external-format :utf-8)
+      (write-string text stream)
+      (finish-output stream)
+      (close stream)
+      (when mode
+        (enchiridion.compat:set-file-mode temporary mode))
+      (uiop:rename-file-overwriting-target temporary target))
+    text))
+
 (declaim (ftype (function (block string) string) set-block-text))
 
 (defun set-block-text (block text)
@@ -163,8 +211,8 @@ loaded over its limit, which set-block-text never allows."
 An exact duplicate is refused: a write that changes nothing is a turn spent
 for no memory. A write over the limit signals BLOCK-OVERFLOW with the limit as
 CURRENT and the attempted length as WANTED, so the report names the exact
-number of characters to free. The file is written last, and only if the block
-has one."
+number of characters to free. A file is replaced before the block changes, and
+WRITE-BLOCK-FILE says what that replacement preserves."
   (check-type text string)
   (unless (block-writable-p block)
     (error 'enchiridion.errors:block-frozen :label (block-label block)))
@@ -178,16 +226,9 @@ has one."
            :label (block-label block)
            :current (block-limit block)
            :wanted (length text)))
-  (setf (block-text block) text)
   (when (block-file block)
-    (ensure-directories-exist (block-file block))
-    (with-open-file (stream (block-file block)
-                            :direction :output
-                            :if-exists :supersede
-                            :if-does-not-exist :create
-                            :external-format :utf-8)
-      (write-string text stream)))
-  text)
+    (write-block-file (block-file block) text))
+  (setf (block-text block) text))
 
 ;;;; Compilation.
 

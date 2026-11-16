@@ -30,6 +30,43 @@ effective parameter plist."
       (setf *memory-parameters* (merge-plist *memory-parameters* overrides))))
   *memory-parameters*)
 
+(declaim (ftype (function (t &key (:session t) (:limit integer) (:chars integer)) list)
+                conversation-window))
+
+(defun conversation-window (store &key (session "default")
+                                        (limit *recent-turn-count*)
+                                        (chars *recent-window-chars*))
+  "Return the recent conversation as (ROLE . TEXT) pairs, oldest first.
+
+LIMIT bounds the number of turns and CHARS the total characters, because either
+bound alone is a way to send a prompt that costs more than it is worth. Only a
+user turn and an assistant turn of SESSION are conversation: a saved memory, a
+system row, another channel's entry, or a sleep pass is not something this
+session said. The read is bounded so the role and session filters cannot walk
+the whole log."
+  (let ((rows (enchiridion.memory.store:recent-turns
+               store :limit (* 4 (max 1 limit)) :not-channel :sleep))
+        (used 0)
+        (taken 0)
+        (kept '()))
+    (dolist (row rows)
+      (let ((role (enchiridion.memory.store:turn-row-role row))
+            (body (or (enchiridion.memory.store:turn-row-body row) ""))
+            (row-session (enchiridion.memory.store:turn-row-session row)))
+        (when (and (< taken limit)
+                   (member role '("user" "assistant") :test #'string=)
+                   (equal row-session session)
+                   (plusp (length body)))
+          (if (> (+ used (length body)) chars)
+              (return)
+              (progn (incf used (length body))
+                     (incf taken)
+                     (push (cons role body) kept))))))
+    ;; The rows arrive newest first and each is pushed, so the list already
+    ;; reads oldest first; reversing it would hand the model its own replies
+    ;; before the questions that prompted them.
+    kept))
+
 (defun enabled-p ()
   "Return T when the memory integration is on."
   (not (null *memory-enabled-p*)))
@@ -164,9 +201,11 @@ so the pack can show the question an answer replied to."
                            :neighbour t))
                    (enchiridion.memory.store:query-rows
                     store
-                    (format nil "SELECT id, body, session, role, ts FROM episodes
+                    (format nil "SELECT id, substr(body, 1, ~D) AS body, session,
+                                        role, ts
+                                   FROM episodes
                                   WHERE session = ? AND id ~A ? AND role <> 'memory'
-                                  ORDER BY id ~A LIMIT ?" comparison order)
+                                  ORDER BY id ~A LIMIT ?" *pack-body-chars* comparison order)
                     (list (getf item :session) (getf item :id) count)))))
     (values (reverse (side "<" "DESC")) (side ">" "ASC"))))
 
@@ -224,13 +263,42 @@ were, so reranking can only reorder and never lose a candidate."
                           unless (member i order) collect row)
                     tail)))))
 
+(defun refresh-pack-bodies (store rows)
+  "Return ROWS with each episode body re-read up to *PACK-BODY-CHARS*.
+The candidate query loads a smaller prefix, because ranking reads no further.
+What the pack shows gets its own bounded read, so a record's size never decides
+how much memory a turn uses."
+  (if (null store)
+      rows
+      (let ((ids (remove-duplicates
+                  (loop for row in rows
+                        for item = (getf row :item)
+                        when (and (equal (getf item :kind) "episode")
+                                  (getf item :id))
+                          collect (getf item :id)))))
+        (when ids
+          (let ((bodies (make-hash-table)))
+            (dolist (row (enchiridion.memory.store:query-rows
+                          store
+                          (format nil "SELECT id, substr(body, 1, ~D) AS body
+                                         FROM episodes WHERE id IN (~{~D~^,~})"
+                                  *pack-body-chars* ids)))
+              (setf (gethash (enchiridion.memory.store:field row "id") bodies)
+                    (enchiridion.memory.store:field row "body")))
+            (dolist (row rows rows)
+              (let ((item (getf row :item)))
+                (when (equal (getf item :kind) "episode")
+                  (let ((body (gethash (getf item :id) bodies)))
+                    (when body
+                      (setf (getf item :body) body)))))))))))
+
 (defun select-pack-rows (store cue ranked)
   "Return the rows the pack renders from RANKED, the score's order: reranked
 when a reranker is installed, cut to :TOP-K, then with neighbouring turns
 added. The turn path and the benchmark both go through here."
   (let* ((rows (rerank-rows ranked cue))
          (k (parameter :top-k *memory-parameters*)))
-    (pack-rows store (subseq rows 0 (min k (length rows))))))
+    (refresh-pack-bodies store (pack-rows store (subseq rows 0 (min k (length rows)))))))
 
 (defun render-pack (rows &key (budget *memory-pack-chars*) cue)
   "Return ROWS rendered as prompt text, or NIL when there is nothing to show.
@@ -398,14 +466,16 @@ GENERATION names the semantic layer whose assertions compete with the episodes:
 is that generation, which is the candidate arm a gate measures; NIL is the log
 alone, the retention-only arm."
   (when (and store (tokenise text))
-    (let* ((assertions (assertion-candidates-for
+    (with-memory-usage (store :session session :channel channel)
+     (let* ((assertions (assertion-candidates-for
                         store text
                         :generation (if (eq generation :live)
                                         (live-generation-id store)
                                         generation)
                         :limit 200 :now now))
            (candidates (fuse-semantic-candidates
-                        (hybrid-candidates store text :limit 200 :now now)
+                        (hybrid-candidates store text :limit 200 :now now
+                                           :session session)
                         assertions)))
       (when candidates
         (let ((rows (retrieve candidates text
@@ -421,7 +491,7 @@ alone, the retention-only arm."
                               ;; Claims fold into their episodes before the
                               ;; cut, so TOP-K counts what the pack shows.
                               :top-k (if assertions nil top-k))))
-          (if assertions (fold-claims rows top-k) rows))))))
+          (if assertions (fold-claims rows top-k) rows)))))))
 
 (defun retrieve-for-turn (store text &key (session "default") (channel :cli)
                                           (now (get-universal-time)))
@@ -430,7 +500,8 @@ The cue is computed from the original text before any retrieval. A store that
 is closed, a cue with no searchable term, and a query error all return NIL
 instead of failing the turn."
   (when (and store (retrieval-enabled-p))
-    (let ((terms (tokenise text)))
+    (with-memory-usage (store :session session :channel channel)
+     (let ((terms (tokenise text)))
       (when terms
         (handler-case
             (let ((rows (retrieve-rows-for-turn
@@ -461,7 +532,7 @@ instead of failing the turn."
             (format *error-output*
                     "~&enchiridion: could not build a cue pack: ~A~%" c)
             (finish-output *error-output*)
-            nil))))))
+            nil)))))))
 
 (defun record-retrieval-outcome (store retrieval-id observed
                                  &key (signal "") (ts (get-universal-time)))
@@ -499,8 +570,9 @@ Return the number of episodes marked."
   "Run the model-free T1a pass and return a report plist.
 The pass copies old turns into the log, then derives the cheap scalars for
 episodes that have not been derived yet: rarity, and lexical co-occurrence
-links when GRAPH-TERMS-ON-P. Nothing here calls a model and nothing rewrites
-an episode body.
+links when GRAPH-TERMS-ON-P. Rarity is measured against the episodes before it
+in the log, because the row is already indexed when this pass reaches it.
+Nothing here calls a model and nothing rewrites an episode body.
 Never signal: the heartbeat reports a failure."
   (when (and store (enabled-p))
     (handler-case
@@ -515,7 +587,7 @@ Never signal: the heartbeat reports a failure."
                    (body (enchiridion.memory.store:field row "body"))
                    (ts (or (enchiridion.memory.store:field row "ts")
                            (get-universal-time)))
-                   (rarity (rarity-of store body)))
+                   (rarity (rarity-of store body :before-id id)))
               (when (graph-terms-on-p)
                 (link-co-occurrences store id body ts *memory-parameters*))
               (enchiridion.memory.store:exec

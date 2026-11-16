@@ -175,3 +175,167 @@
     (ok (= 9 (enchiridion:config-value
               (enchiridion:config-with-llm-value '(:max-tokens 1) :max-tokens 9)
               :max-tokens)))))
+
+
+(defmacro with-environment ((name value) &body body)
+  "Run BODY with environment variable NAME set to VALUE, then restore it."
+  (let ((previous (gensym "PREVIOUS")))
+    `(let ((,previous (uiop:getenv ,name)))
+       (unwind-protect
+            (progn
+              (if ,value
+                  (enchiridion.compat:set-environment-variable ,name ,value)
+                  (enchiridion.compat:unset-environment-variable ,name))
+              ,@body)
+         (if ,previous
+             (enchiridion.compat:set-environment-variable ,name ,previous)
+             (enchiridion.compat:unset-environment-variable ,name))))))
+
+(defmacro with-process-uid ((uid) &body body)
+  "Run BODY with PROCESS-UID returning UID, then restore the real function."
+  (let ((original (gensym "ORIGINAL")))
+    `(let ((,original (symbol-function 'enchiridion.compat:process-uid)))
+       (unwind-protect
+            (progn
+              (setf (symbol-function 'enchiridion.compat:process-uid)
+                    (lambda () ,uid))
+              ,@body)
+         (setf (symbol-function 'enchiridion.compat:process-uid) ,original)))))
+
+(defmacro with-config-scratch ((directory) &body body)
+  "Run BODY in a fresh DIRECTORY containing trusted and untrusted configs."
+  `(let ((,directory (uiop:ensure-directory-pathname
+                      (merge-pathnames
+                       (format nil "enchiridion-config-test-~D/"
+                               (random most-positive-fixnum))
+                       *default-pathname-defaults*))))
+     (unwind-protect
+          (progn
+            (dolist (name '("cwd/nested/" "source/"))
+              (let ((parent (merge-pathnames name ,directory)))
+                (ensure-directories-exist parent)
+                (with-open-file (stream (merge-pathnames "config.cl" parent)
+                                        :direction :output :if-exists :supersede)
+                  (write-string "(list :backend :openai)" stream))))
+            (with-open-file (stream (merge-pathnames "enchiridion.asd" ,directory)
+                                    :direction :output :if-exists :supersede)
+              (write-string "" stream))
+             (with-environment ("ENCHIRIDION_CONFIG" nil)
+               ,@body))
+       (uiop:delete-directory-tree ,directory :validate t
+                                              :if-does-not-exist :ignore))))
+
+(defmacro with-root-config-metadata ((&rest overrides) &body body)
+  "Run BODY with root-owned metadata, except for OVERRIDES."
+  `(let ((original (symbol-function 'sb-posix:stat)))
+     (unwind-protect
+          (progn
+            (setf (symbol-function 'sb-posix:stat)
+                  (lambda (path &optional stat)
+                    (let* ((info (if stat (funcall original path stat)
+                                     (funcall original path)))
+                           (override (assoc path (list ,@overrides) :test #'equal)))
+                      (setf (slot-value info 'sb-posix::uid)
+                            (if override (second override) 0)
+                            (slot-value info 'sb-posix::mode)
+                            (if override (third override) #o755))
+                      info)))
+            ,@body)
+       (setf (symbol-function 'sb-posix:stat) original))))
+
+(deftest a-nonroot-installed-run-keeps-working-directory-config-resolution ()
+  (with-config-scratch (scratch)
+    (let ((cwd (merge-pathnames "cwd/nested/" scratch))
+          (source (merge-pathnames "source/" scratch)))
+      (uiop:with-current-directory (cwd)
+        (with-environment ("ENCHIRIDION_SOURCE" (namestring source))
+          (with-process-uid (1000)
+            (ok (uiop:pathname-equal
+                 (merge-pathnames "config.cl" cwd)
+                 (enchiridion::config-path)))))
+        (testing "root trusts only the installed source"
+          (with-environment ("ENCHIRIDION_SOURCE" (namestring source))
+            (with-process-uid (0)
+              (with-root-config-metadata ()
+                (ok (uiop:pathname-equal
+                     (merge-pathnames "config.cl" source)
+                     (enchiridion::config-path)))))))))))
+
+(deftest root-without-an-installed-source-does-not-read-the-working-directory ()
+  (with-config-scratch (scratch)
+    (uiop:with-current-directory ((merge-pathnames "cwd/nested/" scratch))
+      (with-environment ("ENCHIRIDION_SOURCE" nil)
+        (with-process-uid (0)
+          (ok (null (enchiridion::config-path))))))))
+
+(deftest an-unprivileged-checkout-keeps-current-directory-config-resolution ()
+  (with-config-scratch (scratch)
+    (let ((cwd (merge-pathnames "cwd/nested/" scratch)))
+      (uiop:with-current-directory (cwd)
+        (with-environment ("ENCHIRIDION_SOURCE" nil)
+          (with-process-uid (1000)
+            (ok (uiop:pathname-equal
+                 (merge-pathnames "config.cl" cwd)
+                 (enchiridion::config-path)))))))))
+
+(deftest recent-message-window-defaults-are-bounded ()
+  (let ((config (enchiridion:default-config)))
+    (ok (eql 6 (enchiridion:config-setting config :memory :recent-turns)))
+    (ok (eql 4000 (enchiridion:config-setting config :memory :recent-window-chars)))))
+
+(deftest an-explicit-config-path-wins-without-fallback ()
+  (with-config-scratch (scratch)
+    (let ((explicit (merge-pathnames "source/config.cl" scratch)))
+      (uiop:with-current-directory ((merge-pathnames "cwd/nested/" scratch))
+        (with-environment ("ENCHIRIDION_CONFIG" (namestring explicit))
+          (dolist (uid '(0 1000))
+            (with-process-uid (uid)
+              (with-root-config-metadata ()
+                (ok (equal explicit (enchiridion::config-path)))))))
+        (with-environment ("ENCHIRIDION_CONFIG"
+                           (namestring (merge-pathnames "absent.cl" scratch)))
+          (ok (null (enchiridion::config-path))))))))
+
+(deftest root-config-checks-file-and-both-symlink-ancestries ()
+  (with-config-scratch (scratch)
+    (let* ((path (merge-pathnames "source/config.cl" scratch))
+           (link (merge-pathnames "cwd/config.cl" scratch)))
+      (sb-posix:symlink (namestring path) (namestring link))
+      (with-root-config-metadata ()
+        (ok (equal (truename path) (enchiridion::check-root-config-path path)))
+        (ok (equal (truename path) (enchiridion::check-root-config-path link))))
+      (dolist (entry (list path (merge-pathnames "source/" scratch)
+                          (merge-pathnames "cwd/" scratch)))
+        (let ((candidate (if (equal entry path) path link)))
+          (testing "an agent-owned file or parent is refused"
+            (with-root-config-metadata ((list (namestring entry) 1000 #o755))
+              (ok (signals (enchiridion::check-root-config-path candidate)
+                           'enchiridion.errors:configuration-error))))
+          (testing "a writable file or parent is refused"
+            (with-root-config-metadata ((list (namestring entry) 0 #o777))
+              (ok (signals (enchiridion::check-root-config-path candidate)
+                           'enchiridion.errors:configuration-error))))))
+      (with-root-config-metadata ()
+        (ok (signals (enchiridion::check-root-config-path #p"config.cl")
+                     'enchiridion.errors:configuration-error))))))
+
+(deftest root-config-loading-does-not-execute-a-working-directory-shadow ()
+  (with-config-scratch (scratch)
+    (let ((source (merge-pathnames "source/" scratch))
+          (cwd (merge-pathnames "cwd/nested/" scratch)))
+      (with-open-file (stream (merge-pathnames "config.cl" cwd)
+                              :direction :output :if-exists :supersede)
+        (write-string "(error \"Working directory shadow executed.\")" stream))
+      (with-open-file (stream (merge-pathnames "config.cl" source)
+                              :direction :output :if-exists :supersede)
+        (write-string "(setf enchiridion.user::*enchiridion-config* '(:model-primary \"trusted\"))" stream))
+      (uiop:with-current-directory (cwd)
+        (with-environment ("ENCHIRIDION_SOURCE" (namestring source))
+          (with-process-uid (0)
+            (with-root-config-metadata ()
+              (let ((enchiridion:*config* nil)
+                    (enchiridion:*config-source* nil))
+                (progv '(enchiridion.user::*enchiridion-config*) '(nil)
+                  (ok (equal "trusted"
+                             (enchiridion:config-value
+                              (enchiridion:read-config) :model-primary))))))))))))

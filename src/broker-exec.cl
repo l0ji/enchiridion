@@ -9,6 +9,42 @@
 ;;;;
 ;;;;   sbcl --script src/broker-exec.cl --socket /tmp/enchiridion-broker.sock
 
+(require :sb-posix)
+
+(defun broker-exec-argument (arguments name)
+  "Return the value after NAME in ARGUMENTS, or NIL."
+  (let ((tail (member name arguments :test #'string=)))
+    (when tail (second tail))))
+
+;; This bootstrap cannot depend on the system it must drop privileges to load
+(sb-alien:define-alien-routine ("setgroups" broker-exec-setgroups) sb-alien:int
+  (size sb-alien:unsigned-int)
+  (list sb-alien:system-area-pointer))
+
+(defun broker-exec-drop-privileges (arguments)
+  "Drop root privileges before ASDF can read configuration or cached code."
+  (when (zerop (sb-posix:geteuid))
+    (let ((uid (parse-integer
+                (or (broker-exec-argument arguments "--uid") "")))
+          (gid (parse-integer
+                (or (broker-exec-argument arguments "--gid") ""))))
+      (unless (and (plusp uid) (plusp gid))
+        (error "Root broker requires positive --uid and --gid values."))
+      (when (minusp (broker-exec-setgroups 0 (sb-sys:int-sap 0)))
+        (error "Could not clear the supplementary groups."))
+      (sb-posix:setgid gid)
+      (sb-posix:setuid uid)
+      (unless (and (= uid (sb-posix:getuid) (sb-posix:geteuid))
+                   (= gid (sb-posix:getgid) (sb-posix:getegid)))
+        (error "Broker privilege drop did not take effect.")))))
+
+(handler-case
+    (broker-exec-drop-privileges (rest sb-ext:*posix-argv*))
+  (error (condition)
+    (format *error-output* "broker-exec: privilege drop failed: ~A~%"
+            condition)
+    (sb-ext:exit :code 1)))
+
 (require :asdf)
 
 ;; The same duplicate-contrib warning the supervisor suppresses. The child
@@ -37,30 +73,17 @@ format control of a SIMPLE-WARNING in its own representation."
                             (muffle-warning condition)))))
   (asdf:load-system "enchiridion" :verbose nil))
 
-(defun broker-exec-argument (arguments name)
-  "Return the value after NAME in ARGUMENTS, or NIL."
-  (let ((tail (member name arguments :test #'string=)))
-    (when tail (second tail))))
-
-(defun broker-exec-drop-privileges (uid gid)
-  "Drop to UID and GID when this process is root and UID is a real user.
-The supplementary groups go first, then the group id, then the user id. A
-non-root process stays where it is: dropping to a uid it does not own would
-only fail, and the tests run as an ordinary user."
-  (when (and uid (plusp uid) (zerop (enchiridion.compat:process-uid)))
-    (enchiridion.compat:clear-supplementary-groups)
-    (when (and gid (plusp gid))
-      (enchiridion.compat:set-process-gid gid))
-    (enchiridion.compat:set-process-uid uid)))
-
-(defun broker-exec-verify (directory uid gid)
+(defun broker-exec-verify (directory &optional digests)
   "Compile and self-test every agent file in DIRECTORY and report.
 Return 0 when the generation is good and 1 when it is not. The uid is dropped
 before a single agent file is read, so a verification that runs away runs away
-as the agent and not as the process that holds the secrets."
-  (broker-exec-drop-privileges uid gid)
+as the agent and not as the process that holds the secrets.
+
+DIGESTS is the digest string the supervisor read, and a directory that no longer
+matches it is refused without compiling a file."
   (handler-case
-      (let ((result (enchiridion.plugin:verify-directory (pathname directory))))
+      (let ((result (enchiridion.plugin:verify-directory (pathname directory)
+                                                        :source-digests digests)))
         (format t "~A~%" (enchiridion.plugin:verify-report result))
         (finish-output)
         (if (enchiridion.plugin:verify-ok-p result) 0 1))
@@ -76,20 +99,32 @@ as the agent and not as the process that holds the secrets."
 
 (defun broker-exec-load-generation (directory generation)
   "Load a generation through the plugin loader.
-Return two values, the ok flag and the report, which is the shape
-*LOAD-GENERATION-FUNCTION* promises the broker.
+Return four values: the ok flag, the report, the digest string of the source that
+was published, and the generation that is live after the call. The last two are
+what the broker puts in its reply, and the supervisor compares them with the
+digest it verified and the generation it asked for.
 
 VERIFY is NIL: a separate one-shot child already compiled and self-tested these
 files before the supervisor asked for this load. Verifying here as well would
 load every file twice in one process, and the second load redefines each
-function, which verification counts as a warning and therefore as a failure."
-  (let ((result (enchiridion.plugin:load-generation
-                 directory
-                 :generation (or generation
-                                 (1+ (enchiridion.plugin:current-generation)))
-                 :verify nil)))
+function, which verification counts as a warning and therefore as a failure.
+
+The digest the supervisor verified arrives in *LOAD-SOURCE-DIGESTS*, which the
+broker binds around this call, and the loader refuses a tree that no longer
+matches it."
+  (let* ((digests enchiridion.tools.broker::*load-source-digests*)
+         (result (enchiridion.plugin:load-generation
+                  directory
+                  :generation (or generation
+                                  (1+ (enchiridion.plugin:current-generation)))
+                  :verify nil
+                  :source-digests digests))
+         (snapshot (enchiridion.plugin:generation-result-digests result)))
     (values (enchiridion.plugin:generation-result-ok-p result)
-            (enchiridion.plugin:generation-result-report result))))
+            (enchiridion.plugin:generation-result-report result)
+            (and snapshot
+                 (enchiridion.plugin:source-snapshot-digest snapshot))
+            (enchiridion.plugin:generation-result-generation result))))
 
 (defun broker-exec-main ()
   "Parse the small command line and serve until killed, or verify and exit."
@@ -98,13 +133,14 @@ function, which verification counts as a warning and therefore as a failure."
   (setf *random-state* (make-random-state t))
   (let* ((arguments (enchiridion.compat:script-arguments))
          (verify (broker-exec-argument arguments "--verify-plugin"))
+         (digests (broker-exec-argument arguments "--digests"))
          (socket (broker-exec-argument arguments "--socket"))
          (uid-text (broker-exec-argument arguments "--uid"))
          (gid-text (broker-exec-argument arguments "--gid"))
-         (uid (and uid-text (parse-integer uid-text :junk-allowed t)))
-         (gid (and gid-text (parse-integer gid-text :junk-allowed t))))
+         (uid (and uid-text (parse-integer uid-text)))
+         (gid (and gid-text (parse-integer gid-text))))
     (when verify
-      (return-from broker-exec-main (broker-exec-verify verify uid gid)))
+      (return-from broker-exec-main (broker-exec-verify verify digests)))
     (unless socket
       (format *error-output* "broker-exec: --socket PATH is required.~%")
       (return-from broker-exec-main 2))

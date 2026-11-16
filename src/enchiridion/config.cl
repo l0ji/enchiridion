@@ -203,6 +203,8 @@ store path. The model defaults match the shipped adapter defaults."
 
     :memory
     (:db nil)
+    (:recent-turns 6)
+    (:recent-window-chars 4000)
     (:block-limits (:persona 6000 :operator 1600 :world 3000 :session 400 :ledger 250
                     :bootstrap 300))
     ;; The limit for a block whose label :block-limits does not name.
@@ -364,8 +366,11 @@ this is only the reader that gives a missing key a caller's default."
 (declaim (ftype (function (t) boolean) channel-enabled-p))
 
 (defun channel-enabled-p (name)
-  "Return T when the channel called NAME is enabled. A channel with no entry
-is disabled, because an unconfigured channel that starts is a surprise."
+  "Return T when the channel called NAME is enabled.
+
+The shipped entry decides when the operator writes none: :cli ships enabled and
+the network channels ship disabled, so a network surface never starts because
+nobody mentioned it."
   (not (null (channel-value name :enabled))))
 
 (declaim (ftype (function (t) list) configured-secret-names))
@@ -465,25 +470,65 @@ enchiridion.asd is the root."
 
 (declaim (ftype (function () (or null pathname)) config-path))
 
+(defun check-root-config-path (path)
+  "Reject a config file or ancestor replaceable by a non-root user."
+  (labels ((refuse (entry)
+             (error 'enchiridion.errors:configuration-error
+                    :key :config
+                    :detail (format nil "Root config requires root-owned paths without ~
+                                         group or world write permission: ~A"
+                                    entry)))
+           (check-chain (entry)
+             (loop
+               (let ((info (sb-posix:stat (namestring entry))))
+                 (unless (and (zerop (sb-posix:stat-uid info))
+                              (zerop (logand #o022 (sb-posix:stat-mode info))))
+                   (refuse entry)))
+               (let ((parent (if (uiop:directory-pathname-p entry)
+                                 (uiop:pathname-parent-directory-pathname entry)
+                                 (uiop:pathname-directory-pathname entry))))
+                 (when (equal entry parent) (return))
+                 (setf entry parent)))))
+    (unless (and (uiop:absolute-pathname-p path)
+                 (notany (lambda (part) (member part '(:up :back)))
+                         (pathname-directory path)))
+      (refuse path))
+    (check-chain path)
+    (let ((resolved (truename path)))
+      (check-chain resolved)
+      resolved)))
+
 (defun config-path ()
-  "Return the config.cl to read, or NIL.
-The current directory wins over the installed source, because a checkout keeps
-config.cl beside the code and looking only beside the script would silently
-fall back to the defaults."
-  (let ((here (merge-pathnames "config.cl" (uiop:getcwd))))
-    (or (probe-file here)
-        (let ((root (project-root)))
-          (and root
-               (probe-file (merge-pathnames
-                            "config.cl"
-                            (uiop:ensure-directory-pathname root))))))))
+  "Return the operator config, excluding working-directory lookup for root."
+  (let* ((explicit (enchiridion.compat:environment-value "ENCHIRIDION_CONFIG"))
+         (source (enchiridion.compat:environment-value "ENCHIRIDION_SOURCE"))
+         (root-p (zerop (enchiridion.compat:process-uid)))
+         (path
+           (cond
+             (explicit (pathname explicit))
+             (root-p
+              (and source
+                   (merge-pathnames
+                    "config.cl" (uiop:ensure-directory-pathname source))))
+             (t
+              (or (probe-file (merge-pathnames "config.cl" (uiop:getcwd)))
+                  (let ((root (project-root)))
+                    (and root
+                         (merge-pathnames
+                          "config.cl" (uiop:ensure-directory-pathname root)))))))))
+    (when (and path (probe-file path))
+      (if root-p (check-root-config-path path) (probe-file path)))))
 
 (declaim (ftype (function () t) read-config))
 
 (defun read-config ()
   "Load config.cl when there is one, make it active, and return it.
-An absent file is not an error: it means the defaults. Environment variables
-override the file, so a container can be injected with no file at all."
+
+An absent file is not an error here: it means the defaults, and environment
+variables override the file, so a container can be injected with no file at all.
+The entry point is where that becomes an error: a command whose capability row
+names :config refuses the defaults, because the shipped configuration does not
+choose a provider."
   (let ((path (config-path)))
     (setf *config-source* (or path :defaults))
     (when path

@@ -147,43 +147,34 @@ set of defaults."
                :send-tool-choice-p nil
                :models-path "api/tags"
                :models-list-shape :ollama))
-    ;; Azure: key in api-key, deployment in the path, api-version in the
-    ;; query, max_completion_tokens instead of the deprecated max_tokens, and
-    ;; the developer role where the system role used to be. The classic path is
-    ;; the default; the newer /openai/v1 shape is a config override.
+    ;; Azure's 2024-06-01 deployment API uses max_tokens and the system role
     (:azure . (:auth-scheme :api-key-header
                :auth-header "api-key"
                :chat-path "openai/deployments/{model}/chat/completions"
                :query-params (("api-version" "2024-06-01"))
-               :max-tokens-field :max-completion-tokens
-               :system-role "developer"))
+               :max-tokens-field :max-tokens
+               :system-role "system"
+               :models-path "openai/models"))
     (:openrouter . (:extra-headers (("X-Title" "enchiridion"))
                     :reasoning-field "reasoning"
                     :cache-read-tokens-field "prompt_tokens_details.cached_tokens"
                     :cache-write-tokens-field "prompt_tokens_details.cache_write_tokens"))
     (:deepseek . (:reasoning-field "reasoning_content"
                  :cache-read-tokens-field "prompt_cache_hit_tokens"))
-    ;; Google's OpenAI-compatibility shim lives under /v1beta/openai and does
-    ;; not accept tool_choice or parallel_tool_calls.
-    (:google-openai . (:send-tool-choice-p nil
-                       :send-parallel-tool-calls-p nil))
-    ;; Qwen's compatible mode silently drops several OpenAI fields, refuses
-    ;; tool_choice "required", defaults parallel_tool_calls to false, and
-    ;; switches thinking on with enable_thinking. Sending only what it honours
-    ;; is cheaper than watching it ignore the rest.
+    ;; Google documents tool_choice but not parallel_tool_calls on this shim
+    (:google-openai . (:send-parallel-tool-calls-p nil))
+    ;; Thinking and parallel tool support vary by model
     (:qwen . (:send-parallel-tool-calls-p nil
-             :extra-body (:enable_thinking t)))
-    (:zai . (:reasoning-field "reasoning_content"
-             :extra-body (:thinking (:type "enabled"))))
-    ;; Groq answers 400 to a body with an unsupported field, so the few it does
-    ;; not implement are simply not sent.
+             :reasoning-field "reasoning_content"))
+    (:zai . (:reasoning-field "reasoning_content"))
+    ;; Optional streaming and parallel-tool fields stay off for model portability
     (:groq . (:send-stream-options-p nil
               :send-parallel-tool-calls-p nil))
     (:cloudflare-gateway . (:auth-scheme :api-key-header
                             :auth-header "cf-aig-authorization"
                             :auth-prefix "Bearer "))
-    ;; Anthropic's own endpoint, unchanged.
-    (:anthropic . ())
+    ;; Anthropic's own endpoint takes x-api-key, not a bearer token.
+    (:anthropic . (:auth-scheme :x-api-key))
     ;; An Anthropic-shaped gateway that authenticates with a bearer token
     ;; instead of x-api-key, as OpenRouter's Messages endpoint does.
     (:anthropic-gateway . (:auth-scheme :bearer))

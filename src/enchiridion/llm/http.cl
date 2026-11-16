@@ -44,6 +44,23 @@ warm. A handler generates one when it is built and reuses it for every turn."
 
 (declaim (ftype (function (list list) list) merge-headers))
 
+(declaim (ftype (function (t) list) beta-list))
+
+(defun beta-list (value)
+  "Return VALUE as a list of feature names.
+
+A configuration file spells a short list as a comma separated string and a Lisp
+caller spells it as a list; both reach a handler as the same list."
+  (cond
+    ((null value) '())
+    ((stringp value)
+     (remove-if #'zerop
+                (mapcar (lambda (beta) (string-trim '(#\Space #\Tab) beta))
+                        (uiop:split-string value :separator ","))
+                :key #'length))
+    ((listp value) (remove-if-not #'stringp value))
+    (t '())))
+
 (declaim (ftype (function (list) list) header-pairs))
 
 (defun header-pairs (headers)
@@ -117,22 +134,73 @@ and cannot smuggle a parenthesised value onto the wire."
 ;; instead of the names it accepts is a style warning about unknown argument
 ;; keywords, and a warning here is an error.
 ;;
-;; No :FORCE-BINARY. A provider reply is JSON text and dexador decodes it using
-;; the charset the reply names, which is the only decoding that is correct for a
-;; reply that is not ASCII. Forcing binary returns a vector of octets instead,
-;; and the first thing that touches the reply is PARSE-JSON, which wants a
-;; string: the error path fails while reporting the error, and the report is a
-;; vector of numbers.
+;; Responses are binary streams until the byte limit has been checked
+(defparameter *request-deadline-factor* 5
+  "The wall-clock deadline as a multiple of one socket timeout.")
+
+(defparameter +http-response-limit+ (* 16 1024 1024)
+  "The maximum response body size in bytes.")
+
+(defparameter *http-request-function* #'dexador:request
+  "The low-level HTTP request function, replaced in transport tests.")
+
+(defun bounded-response-text (body limit)
+  "Return BODY as UTF-8 text, rejecting bodies larger than LIMIT bytes."
+  (labels ((check-size (size)
+             (when (> size limit)
+               (error 'enchiridion.errors:transport-error
+                      :detail (format nil "HTTP response exceeds ~D bytes" limit)))))
+    (typecase body
+      (string
+       (check-size (length (enchiridion.compat:encode-utf8 body)))
+       body)
+      ((vector (unsigned-byte 8))
+       (check-size (length body))
+       (enchiridion.compat:decode-utf8 body))
+      (stream
+       (unwind-protect
+            (let* ((octets (make-array (1+ limit) :element-type '(unsigned-byte 8)))
+                   (count (read-sequence octets body)))
+              (check-size count)
+              (enchiridion.compat:decode-utf8 (subseq octets 0 count)))
+         (close body)))
+      (t (error 'enchiridion.errors:transport-error
+                :detail "HTTP response is not text or a binary stream")))))
+
+(defun bounded-http-request (request &key (method :post)
+                                         (body-limit +http-response-limit+))
+  "Send REQUEST with an overall deadline and a bounded response body."
+  (let ((seconds (* *request-deadline-factor* (http-request-timeout request))))
+    (enchiridion.compat:with-deadline
+        (seconds :on-timeout
+                 (error 'enchiridion.errors:transport-error
+                        :detail (format nil "no reply within ~A seconds" seconds)))
+      (handler-bind
+          ((dexador.error:http-request-failed
+             (lambda (failure)
+               (setf (slot-value failure 'dexador.error::body)
+                     (bounded-response-text (dexador.error:response-body failure)
+                                            body-limit)))))
+        (multiple-value-bind (body status)
+            (funcall *http-request-function* (http-request-url request)
+                     :method method
+                     :headers (http-request-headers request)
+                     :content (http-request-body request)
+                     :read-timeout (http-request-timeout request)
+                     :connect-timeout (http-request-timeout request)
+                     :want-stream t :force-binary t
+                     :keep-alive nil :use-connection-pool nil :max-redirects 0)
+          (let ((text (bounded-response-text body body-limit)))
+            (when (and status (not (<= 200 status 299)))
+              (error 'enchiridion.errors:transport-error
+                     :status status :detail "HTTP endpoint did not return success"))
+            text))))))
+
 (declaim (ftype (function (http-request) string) http-post))
 
 (defun http-post (request)
   "POST REQUEST and return the reply text."
-  (dexador:request (http-request-url request)
-                   :method :post
-                   :headers (http-request-headers request)
-                   :content (http-request-body request)
-                   :read-timeout (http-request-timeout request)
-                   :connect-timeout (http-request-timeout request)))
+  (bounded-http-request request))
 
 ;; The transport is a special so a test can replace it without a network. That
 ;; is also the only way to test the retry path, because the retry path is about
@@ -156,6 +224,8 @@ front of the provider answers HTML."
         (cond
           ((and (listp error-object) (stringp (getf error-object :message)))
            (getf error-object :message))
+          ((stringp (getf parsed :error_description))
+           (getf parsed :error_description))
           ((stringp error-object) error-object)
           ;; AWS and GCP spell the same fact with a capitalized key and no
           ;; wrapper object; reading it here keeps every handler's errors
@@ -164,13 +234,6 @@ front of the provider answers HTML."
           ((stringp (getf parsed :Message)) (getf parsed :Message))
           (t (string-right-trim '(#\Space #\Newline #\Return) (or payload "")))))
     (error () "the provider replied with something that is not JSON")))
-
-(defparameter *request-deadline-factor* 5
-  "How many times a request's TIMEOUT one whole request may take, wall clock.
-TIMEOUT bounds each read and each connect; a reply that keeps a TLS stream
-open without finishing passes both, and a deriver call was seen to wait
-twenty-eight minutes that way. The deadline is the bound the reads cannot give,
-and it is a multiple because a long reply is legitimately slower than one read.")
 
 (declaim (ftype (function (function http-request (integer 0 *)) string)
                 post-with-retries))
@@ -200,7 +263,7 @@ longer wait that a heartbeat tick spends blocked."
           (return (enchiridion.compat:with-deadline
                       (deadline :on-timeout
                                 (error 'enchiridion.errors:transport-error
-                                       :detail (format nil "no reply within ~D seconds"
+                                       :detail (format nil "no reply within ~A seconds"
                                                        deadline)))
                     (funcall transport request)))
         (dexador.error:http-request-failed (failure)
@@ -228,11 +291,20 @@ longer wait that a heartbeat tick spends blocked."
 
 (defun http-get (url &key headers (timeout +http-get-timeout+))
   "GET URL and return the reply text."
-  (dexador:get url
-               :headers headers
-               :read-timeout timeout
-               :connect-timeout timeout))
+  (bounded-http-request (make-http-request :url url :headers headers :timeout timeout)
+                        :method :get))
 
 (defparameter *http-get-function* #'http-get
   "The function the catalog and the model listers use to make one HTTP GET.
 Bound in tests so no catalog test opens a socket.")
+
+(defun get-with-retries (request &optional (retries 2))
+  "GET REQUEST through the shared deadline and retry policy."
+  (post-with-retries
+   (lambda (value)
+     (bounded-response-text
+      (funcall *http-get-function* (http-request-url value)
+               :headers (http-request-headers value)
+               :timeout (http-request-timeout value))
+      +http-response-limit+))
+   request retries))

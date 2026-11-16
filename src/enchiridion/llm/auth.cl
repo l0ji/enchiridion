@@ -42,6 +42,13 @@ request exists, and AUTH-APPLY is what puts it in place."
 
 (declaim (ftype (function (t t) list) auth-query-params))
 
+(defun merge-query-params (base extra)
+  "Return BASE with EXTRA replacing parameters with the same name."
+  (let ((result (header-pairs base)))
+    (dolist (pair (header-pairs extra) result)
+      (setf result (append (remove (car pair) result :key #'car :test #'string=)
+                           (list pair))))))
+
 (defun auth-query-params (dialect key)
   "Return the credential query parameters for DIALECT.
 
@@ -97,10 +104,12 @@ replaced, because the model listers add parameters of their own."
                 ;; (NAME . VALUE), exactly as a header may be written, and the
                 ;; two must not produce different URLs.
                 (loop for parameter in parameters
-                      append (list (car parameter)
-                                   (if (consp (cdr parameter))
-                                       (cadr parameter)
-                                       (cdr parameter)))))
+                      append (list (quri:url-encode (princ-to-string (car parameter)))
+                                    (quri:url-encode
+                                     (princ-to-string
+                                      (if (consp (cdr parameter))
+                                          (cadr parameter)
+                                          (cdr parameter)))))))
         url)))
 
 (defun auth-apply (dialect key request &key extra)
@@ -119,8 +128,9 @@ signing is done here and not when the connection is built."
     (setf (http-request-url request) url)
     (setf (http-request-headers request)
           (merge-headers
-           (append (auth-headers dialect key)
-                   (dialect-field dialect :extra-headers '())
-                   extra)
+           (merge-headers
+            (auth-headers dialect key)
+            (append (dialect-field dialect :extra-headers '())
+                    (http-request-headers request) extra))
            (if signer (funcall signer dialect key request) '())))
     request))

@@ -61,7 +61,8 @@
   (:headers '() :type list)
   (:dialect nil :type t)
   (:timeout 60 :type (integer 1 *))
-  (:retries 2 :type (integer 0 *)))
+  (:retries 2 :type (integer 0 *))
+  (:betas '() :type list))
 
 (defun anthropic-backend (&key (base-url "https://api.anthropic.com/")
                                 api-key
@@ -72,7 +73,8 @@
                                 (headers '())
                                 (dialect nil)
                                 (timeout 60)
-                                (retries 2))
+                                (retries 2)
+                                (betas '()))
   "Return a BACKEND that speaks the Anthropic Messages API.
 
 BASE-URL gains a trailing slash when it lacks one, because every path is
@@ -97,7 +99,8 @@ declaration per keyword costs more than the annotation would catch."
    :headers headers
    :dialect dialect
    :timeout timeout
-   :retries retries))
+   :retries retries
+   :betas (beta-list betas)))
 
 ;; DEFPARAMETER and not DEFCONSTANT, which is deliberate. SBCL evaluates a
 ;; DEFCONSTANT's init form at compile time and again when the fasl loads, and
@@ -526,6 +529,15 @@ input plus output on both wires."
                            "The reply carried no content blocks at all."
                            (format nil "The reply carried no content blocks: ~A"
                                    message)))))
+    (when (and (anthropic-parse-tool-calls content)
+               (vectorp content)
+               (find-if (lambda (block)
+                          (member (json-value block "type")
+                                  '("thinking" "redacted_thinking") :test #'equal))
+                        content))
+      (error 'enchiridion.errors:backend-error
+             :backend "anthropic"
+             :detail "Thinking tool calls require signed thinking-block replay, which this message protocol does not support. Disable thinking or choose a nonthinking model."))
     (let ((usage (json-value data "usage")))
       (%make-completion
        :text (anthropic-content-text content)
@@ -624,18 +636,8 @@ service documents."
 (declaim (ftype (function (t) t) anthropic-auth-scheme))
 
 (defun anthropic-auth-scheme (dialect)
-  "Return the credential scheme this Messages request uses.
-
-ANTHROPIC's own endpoint authenticates with x-api-key, and so does every
-Anthropic-shaped endpoint that does not say otherwise. The DIALECT struct's
-generic default is :bearer and the :anthropic profile overrides no field, so
-the scheme is read from the provider's profile when that profile names one and
-is :x-api-key otherwise. A gateway profile names :bearer, which is what turns
-x-api-key into Authorization: Bearer on the same wire."
-  (if (and dialect
-           (getf (dialect-profile-plist (dialect-profile dialect)) :auth-scheme))
-      (dialect-field dialect :auth-scheme)
-      :x-api-key))
+  "Return the effective credential scheme, defaulting to x-api-key."
+  (or (dialect-field dialect :auth-scheme :x-api-key) :x-api-key))
 
 (declaim (ftype (function (t t (or null string) list http-request) http-request)
                 anthropic-authorize))
@@ -647,24 +649,14 @@ VERSION is the anthropic-version header value, or NIL when the profile carries
 the revision in the body. EXTRA is the connection's own header list, which
 already carries the beta header when the profile wants one in a header.
 
-The Messages API's own wire authenticates with x-api-key, so that branch writes
-the header directly. A profile that names another scheme --- a bearer gateway,
-Amazon SigV4, Google OAuth --- goes through AUTH-APPLY, which is the only code
-that knows where a signed credential goes."
+The effective dialect controls auth and query parameters for every Messages
+request, including the direct x-api-key endpoint and signed gateways."
   (let ((headers (append (anthropic-static-headers)
                          (when version (list (cons :anthropic-version version)))
                          (dialect-field dialect :extra-headers '())
                          extra)))
-    (if (eq (anthropic-auth-scheme dialect) :x-api-key)
-        (progn
-          ;; ANTHROPIC-HEADERS adds the credential and the version. The version
-          ;; is already in HEADERS, and MERGE-HEADERS keeps one of each name,
-          ;; so the merge is a no-op for it and the credential lands in the
-          ;; one place this wire puts it.
-          (setf (http-request-headers request)
-                (anthropic-headers api-key version headers))
-          request)
-        (auth-apply dialect api-key request :extra headers))))
+    (auth-apply (or dialect (make-dialect-for :anthropic))
+                api-key request :extra headers)))
 
 (defun send-anthropic-completion (connection messages model &key tools betas)
   "Return the COMPLETION for MESSAGES from CONNECTION using MODEL.
@@ -737,7 +729,8 @@ max_tokens comes from the connection."
   (declare (ignore budget))
   (send-anthropic-completion connection messages
                              (or model (anthropic-connection-model connection))
-                             :tools tools))
+                             :tools tools
+                             :betas (anthropic-connection-betas connection)))
 
 ;;;; The adapter.
 ;;;;
@@ -762,8 +755,8 @@ would drift from it."
                   :overrides (provider-option provider :dialect-overrides))))
     (setf (dialect-query-params dialect)
           (dialect-query-param-pairs
-           (append (dialect-query-params dialect)
-                   (provider-query-params provider))))
+           (merge-query-params (dialect-query-params dialect)
+                               (provider-query-params provider))))
     dialect))
 
 (declaim (ftype (function (provider) t) build-anthropic-provider))
@@ -783,7 +776,10 @@ two breakpoints are what make a repeated prefix cheap."
    :cache-p (provider-option provider :cache-p t)
    :headers (merge-headers (anthropic-static-headers)
                            (provider-headers provider))
-   :dialect (anthropic-dialect-for provider)))
+   :dialect (anthropic-dialect-for provider)
+   :betas (provider-option provider :betas)
+   :timeout (provider-option provider :timeout 60)
+   :retries (provider-option provider :retries 2)))
 
 ;;;; The model list.
 
@@ -859,11 +855,10 @@ was the offset would skip or repeat rows."
           do (let* ((request (anthropic-authorize
                               dialect (provider-key provider) version extra
                               (make-http-request
-                               :url (anthropic-models-url base after))))
+                               :url (anthropic-models-url base after)
+                               :timeout (provider-option provider :timeout +http-get-timeout+))))
                     (payload (parse-json
-                              (funcall *http-get-function*
-                                       (http-request-url request)
-                                       :headers (http-request-headers request))))
+                              (get-with-retries request (provider-option provider :retries 2))))
                     (entries (getf payload :data)))
                (when (and (listp entries) (every #'consp entries))
                  (dolist (entry entries)

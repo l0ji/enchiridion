@@ -161,7 +161,9 @@ URL that fails later without saying why."
         (write-string (subseq text start open) out)
         (let* ((close (position #\} text :start (+ open 2)))
                (name (and close (subseq text (+ open 2) close)))
-               (value (and name (enchiridion.compat:environment-value name))))
+               (value (and name
+                            (or (enchiridion.llm.secrets:secret-value name)
+                                (enchiridion.compat:environment-value name)))))
           (unless (nonempty-string-p value)
             (return-from expand-environment nil))
           (write-string value out)
@@ -565,7 +567,7 @@ expires, hides a provider's new endpoint forever."
 The transport is a special so that no test opens a socket, exactly like the
 model listers' calls: *HTTP-GET-FUNCTION* is the one door to the network on
 this path."
-  (funcall *http-get-function* url :timeout +http-get-timeout+))
+  (get-with-retries (make-http-request :url url :timeout +http-get-timeout+)))
 
 (declaim (ftype (function (t t) t) write-json-file))
 
@@ -602,6 +604,8 @@ A refusal from the transport becomes a TRANSPORT-ERROR carrying the status, so
 including a body that is not JSON, becomes a CONFIGURATION-ERROR at
 :PROVIDERS-URL, because that is the key whose value named the URL."
   (handler-case (parse-json (fetch-catalog-text url))
+    (enchiridion.errors:transport-error (condition)
+      (error condition))
     (dexador.error:http-request-failed (failure)
       (error 'enchiridion.errors:transport-error
              :status (dexador.error:response-status failure)

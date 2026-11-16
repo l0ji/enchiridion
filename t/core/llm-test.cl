@@ -462,3 +462,91 @@ previous values are always put back."
                     (enchiridion.errors:error-detail condition)))))
     (ok (= 1 calls))
     (ok (< (/ (- (get-internal-real-time) start) internal-time-units-per-second) 10))))
+
+
+(deftest bounded-transport-reads-and-closes-success-and-error-streams ()
+  (dolist (status '(200 503))
+    (let* ((stream (flexi-streams:make-in-memory-input-stream
+                    (enchiridion.compat:encode-utf8 "reply")))
+           (enchiridion.llm::*http-request-function*
+             (lambda (url &rest options)
+               (declare (ignore url))
+               (ok (getf options :want-stream))
+               (ok (getf options :force-binary))
+               (ok (zerop (getf options :max-redirects)))
+               (if (= status 200)
+                   (values stream status)
+                   (error 'dexador.error:http-request-failed
+                          :status status :body stream :headers nil
+                          :uri (quri:uri "https://example.invalid/")
+                          :method :post)))))
+      (handler-case
+          (let ((text (enchiridion.llm::bounded-http-request
+                       (enchiridion.llm::make-http-request) :body-limit 5)))
+            (ok (string= "reply" text)))
+        (dexador.error:http-request-failed (condition)
+          (ok (= status (dexador.error:response-status condition)))
+          (ok (string= "reply" (dexador.error:response-body condition)))))
+      (ng (open-stream-p stream)))))
+
+(deftest bounded-transport-rejects-oversized-success-and-error-bodies ()
+  (dolist (status '(200 503))
+    (let* ((stream (flexi-streams:make-in-memory-input-stream
+                    (enchiridion.compat:encode-utf8 "sixsix")))
+           (enchiridion.llm::*http-request-function*
+             (lambda (url &rest options)
+               (declare (ignore url options))
+               (if (= status 200)
+                   (values stream status)
+                   (error 'dexador.error:http-request-failed :status status
+                          :body stream :headers nil
+                          :uri (quri:uri "https://example.invalid/")
+                          :method :post)))))
+      (ok (handler-case
+              (progn (enchiridion.llm::bounded-http-request
+                       (enchiridion.llm::make-http-request) :body-limit 5)
+                     nil)
+            (enchiridion.errors:transport-error () t)))
+      (ng (open-stream-p stream)))))
+
+(deftest catalog-get-retries-have-a-fixed-budget-and-propagate-status ()
+  (dolist (status '(401 429 503))
+    (let* ((calls 0)
+           (enchiridion.llm::*retry-delay* 0)
+           (enchiridion.llm::*http-get-function*
+             (lambda (url &key headers timeout)
+               (declare (ignore url headers timeout))
+               (incf calls)
+               (error 'dexador.error:http-request-failed :status status
+                      :body "refused" :headers nil
+                      :uri (quri:uri "https://example.invalid/")
+                      :method :get))))
+      (ok (handler-case
+              (progn
+                (enchiridion.llm::fetch-catalog-text "https://example.invalid/")
+                nil)
+            (enchiridion.errors:transport-error (condition)
+              (= status (enchiridion.errors::transport-status condition)))))
+      (ok (= (if (= status 401) 1 3) calls)))))
+
+(deftest catalog-and-oauth-have-overall-deadlines ()
+  (dolist (operation '(:catalog :oauth))
+    (let* ((calls 0)
+           (enchiridion.llm::*request-deadline-factor* 0.01)
+           (enchiridion.llm::*http-get-function*
+             (lambda (url &key headers timeout)
+               (declare (ignore url headers timeout))
+               (incf calls) (sleep 30) "late"))
+           (enchiridion.llm::*http-request-function*
+             (lambda (url &rest options)
+               (declare (ignore url options))
+               (incf calls) (sleep 30) "late")))
+      (ok (handler-case
+              (progn
+                (ecase operation
+                  (:catalog (enchiridion.llm::fetch-catalog-text "https://example.invalid/"))
+                  (:oauth (enchiridion.llm::gcp-token-http-post "https://example.invalid/" "form")))
+                nil)
+            (enchiridion.errors:transport-error (condition)
+              (search "no reply within" (enchiridion.errors:error-detail condition)))))
+      (ok (= 1 calls)))))

@@ -100,6 +100,25 @@ scanners, so that one combined scanner can be built once and cached.")
   "Field names whose value is scrubbed whatever the value looks like. This is
 the filter that catches a secret nobody loaded.")
 
+(defparameter +role-suffixes+
+  '("_secret" "_secrets" "_password" "_passwd" "_api_key" "_apikey"
+    "_private_key" "_access_key" "_token" "_credential" "_credentials")
+  "Compound field-name endings that hold a credential.
+
+A field called client_secret, secret_key, or password_hash is a credential, and
+exact matching missed every one of them. The match is on a whole underscore
+segment, so a word that merely contains these letters, like monkey or secretary,
+keeps its value. The plural usage counters end in _tokens and are deliberately
+absent: an account of tokens read is not a credential.")
+
+(declaim (ftype (function (string string) boolean) string-ends-with-p))
+
+(defun string-ends-with-p (text suffix)
+  "Return T when TEXT ends with SUFFIX."
+  (let ((offset (- (length text) (length suffix))))
+    (and (not (minusp offset))
+         (string= text suffix :start1 offset))))
+
 (defparameter *pattern*
   nil
   "The combined scrub pattern. NIL means it has not been built.")
@@ -534,8 +553,10 @@ role check answered nil and the prompt injection case this filter exists for
 went uncaught."
   (when (or (symbolp name) (stringp name))
     (let ((wanted (normalise-field-name name)))
-      (some (lambda (entry) (string= wanted (normalise-field-name entry)))
-            +role-names+))))
+      (or (some (lambda (entry) (string= wanted (normalise-field-name entry)))
+                +role-names+)
+          (some (lambda (suffix) (string-ends-with-p wanted suffix))
+                +role-suffixes+)))))
 
 (defun scrub-object (object)
   "Return OBJECT with every string inside it scrubbed. Keys are scrubbed too,
@@ -561,12 +582,24 @@ loaded it, which is the prompt injection case the literal filter misses."
     (string (scrub object))
     (cons (let ((head (car object))
                 (tail (cdr object)))
-            (if (and (consp tail)
-                     (role-name-p head)
-                     (stringp (car tail)))
-                ;; The name stays, so the caller can still see that a token
-                ;; was there and that it was removed.
-                (cons head (cons +redaction-marker+ (cdr tail)))
-                (cons (scrub-tree head) (scrub-tree tail)))))
+            (cond
+              ((and (consp tail) (or (symbolp head) (stringp head)))
+               (cons (scrub head)
+                     (cons (if (role-name-p head)
+                               +redaction-marker+
+                               (scrub-tree (car tail)))
+                           (scrub-tree (cdr tail)))))
+              ((and tail (atom tail) (role-name-p head))
+               (cons (scrub head) +redaction-marker+))
+              (t (cons (scrub-tree head) (scrub-tree tail))))))
     (vector (map 'vector #'scrub-tree object))
+    (hash-table
+     (let ((copy (make-hash-table :test (hash-table-test object))))
+       (maphash (lambda (key value)
+                  (setf (gethash (scrub-object key) copy)
+                        (if (role-name-p key)
+                            +redaction-marker+
+                            (scrub-tree value))))
+                object)
+       copy))
     (t object)))

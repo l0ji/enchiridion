@@ -431,20 +431,11 @@ dexador would otherwise send it as text/plain. A 4xx is dexador's condition and
 becomes this tree's TRANSPORT-ERROR with the status and the endpoint's own
 message, so a wrong service account reads as invalid_grant rather than as an
 HTTP status with an HTML body."
-  (handler-case
-      (dexador:request url
-                       :method :post
-                       :headers (list (cons :content-type
-                                            "application/x-www-form-urlencoded"))
-                       :content body
-                       :read-timeout +gcp-token-timeout+
-                       :connect-timeout +gcp-token-timeout+)
-    (dexador.error:http-request-failed (failure)
-      (error 'enchiridion.errors:transport-error
-             :status (dexador.error:response-status failure)
-             :detail (format nil "The Google token endpoint refused the exchange: ~A"
-                             (gcp-token-error-detail
-                              (dexador.error:response-body failure)))))))
+  (post-with-retries
+   (lambda (request) (bounded-http-request request :body-limit 65536))
+   (make-http-request :url url :body body :timeout +gcp-token-timeout+
+                      :headers '((:content-type . "application/x-www-form-urlencoded")))
+   2))
 
 ;; The transport is a special so a test can drive the whole token flow without
 ;; a socket, and so the JWT the exchange produced can be read back off the wire.

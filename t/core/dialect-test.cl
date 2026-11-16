@@ -238,11 +238,11 @@ overrides the default here rather than losing to it."
       (testing "the key travels in api-key and not in an Authorization header"
         (ok (string= "az-key" (header "api-key" headers)))
         (ok (null (header :authorization headers))))
-      (testing "only max_completion_tokens is written"
-        (ok (eql 256 (getf body :max_completion_tokens)))
-        (ok (null (getf body :max_tokens))))
-      (testing "and the system role is the developer role on this wire"
-        (ok (string= "developer" (getf (first (getf body :messages)) :role)))))))
+      (testing "the cap matches the configured API revision"
+        (ok (eql 256 (getf body :max_tokens)))
+        (ok (null (getf body :max_completion_tokens))))
+      (testing "the revision accepts the system role"
+        (ok (string= "system" (getf (first (getf body :messages)) :role)))))))
 
 ;;;; A local server.
 
@@ -314,18 +314,19 @@ overrides the default here rather than losing to it."
      "m" (list (enchiridion.llm:user-message "hi"))
      :tools tools :stream stream :dialect dialect))))
 
-(deftest qwen-drops-parallel-tool-calls-and-merges-enable-thinking ()
+(deftest qwen-keeps-thinking-model-specific ()
   (let ((body (openai-body (dialect :qwen)
                            :tools (list (tool-definition "echo")))))
     (testing "tool_choice is still sent"
       (ok (string= "auto" (getf body :tool_choice))))
-    (testing "parallel_tool_calls is not, because this provider defaults it off"
+    (testing "the optional parallel setting is omitted for model portability"
       (ng (getf body :parallel_tool_calls)))
-    (testing "and the thinking switch is merged in from the profile"
-      (ok (eq t (getf body :enable_thinking))))))
+    (testing "the provider does not force a model-specific thinking mode"
+      (ng (getf body :enable_thinking)))))
 
 (deftest a-nested-extra-body-field-is-an-object-and-not-an-array ()
-  (let* ((body (openai-body (dialect :zai)))
+  (let* ((body (openai-body
+                (dialect :zai :overrides '(:extra-body (:thinking (:type "enabled"))))))
          (thinking (getf body :thinking)))
     (testing "the profile's plist for the thinking switch is written as an object"
       (ok (string= "enabled" (getf thinking :type))))))
@@ -335,7 +336,7 @@ overrides the default here rather than losing to it."
     (let ((body (openai-body (dialect :openai) :stream t)))
       (ok (eq t (getf body :stream)))
       (ok (eq t (getf (getf body :stream_options) :include_usage)))))
-  (testing "Groq rejects the field, so its profile keeps it off the wire"
+  (testing "Groq omits the optional field for model portability"
     (ng (getf (openai-body (dialect :groq) :stream t) :stream_options)))
   (testing "and a plain request never carries it"
     ;; The API accepts stream_options only beside "stream": true, so a
@@ -540,3 +541,119 @@ overrides the default here rather than losing to it."
     (testing "and the display name is the name when there is one"
       (ok (string= "Claude A"
                    (enchiridion.llm:model-info-name (first models)))))))
+
+
+(deftest resolved-options-keep-absence-distinct-from-nil ()
+  (dolist (config '((:provider :anthropic :offline t)
+                    (:llm (:provider :anthropic) (:offline t))))
+    (let ((backend (enchiridion.llm:resolve-backend :config config :api-key "fixture")))
+      (ok (enchiridion.llm::anthropic-connection-cache-p backend))
+      (ok (= 60 (enchiridion.llm::anthropic-connection-timeout backend)))
+      (ok (= 2 (enchiridion.llm::anthropic-connection-retries backend)))))
+  (dolist (config '((:provider :anthropic :offline t :cache-p nil)
+                    (:llm (:provider :anthropic) (:offline t) (:cache-p nil))
+                    (:provider :anthropic :offline t :cache-p t
+                     :providers ((:id :anthropic :cache-p nil)))))
+    (ng (enchiridion.llm::anthropic-connection-cache-p
+         (enchiridion.llm:resolve-backend :config config :api-key "fixture")))))
+
+(deftest resolved-config-reaches-completion-and-model-discovery ()
+  (dolist (kind '(:openai :anthropic))
+    (let* ((post nil) (get nil) (calls 0)
+           (enchiridion.llm::*retry-delay* 0)
+           (config (list :provider kind :offline t :timeout 7 :retries 1
+                         :headers '(("X-Tenant" "tenant") ("Authorization" "custom"))
+                         :query-params '(("tenant" "a &+é"))))
+           (provider (enchiridion.llm:resolve-provider config :api-key "fixture"))
+           (backend (enchiridion.llm:resolve-backend :config config :api-key "fixture"))
+           (enchiridion.llm::*http-post-function*
+             (lambda (request)
+               (setf post request)
+               (when (= 1 (incf calls))
+                 (error 'dexador.error:http-request-failed :status 503
+                        :body "temporary" :headers nil
+                        :uri (quri:uri "https://example.invalid/") :method :post))
+               (if (eq kind :openai) *text-reply* *anthropic-reply*)))
+           (enchiridion.llm::*http-get-function*
+             (lambda (url &key headers timeout)
+               (setf get (list url headers timeout))
+               "{\"data\":[],\"has_more\":false}")))
+      (enchiridion.llm:complete backend (list (enchiridion.llm:user-message "hello")))
+      (funcall (enchiridion.llm::api-handler-list-models
+                (handler (enchiridion.llm:provider-api provider))) provider)
+      (ok (= 2 calls))
+      (ok (= 7 (enchiridion.llm::http-request-timeout post)))
+      (ok (= 7 (third get)))
+      (dolist (wire (list (list (enchiridion.llm::http-request-url post)
+                                (enchiridion.llm::http-request-headers post)) get))
+        (ok (search "tenant=a%20%26%2B%C3%A9" (first wire)))
+        (ok (string= "tenant" (header "X-Tenant" (second wire))))
+        (ok (string= "custom" (header "Authorization" (second wire))))))))
+
+(deftest anthropic-auth-overrides-apply-to-post-and-get ()
+  (let* ((post nil) (get nil)
+         (row (provider :profile :anthropic
+                         :options '(:dialect-overrides (:auth-scheme :query-param
+                                                        :auth-query "credential"))
+                         :key "a&b"))
+         (enchiridion.llm::*http-post-function*
+           (lambda (request) (setf post request) *anthropic-reply*))
+         (enchiridion.llm::*http-get-function*
+           (lambda (url &key headers timeout)
+             (declare (ignore timeout)) (setf get (list url headers))
+             "{\"data\":[],\"has_more\":false}")))
+    (enchiridion.llm:complete (enchiridion.llm::build-anthropic-provider row)
+                              (list (enchiridion.llm:user-message "hello")))
+    (enchiridion.llm::list-anthropic-models row)
+    (dolist (wire (list (list (enchiridion.llm::http-request-url post)
+                              (enchiridion.llm::http-request-headers post)) get))
+      (ok (search "credential=a%26b" (first wire)))
+      (ng (header "x-api-key" (second wire)))
+      (ok (header "anthropic-version" (second wire))))))
+
+(deftest azure-placeholder-and-query-override-reach-the-wire ()
+  (let* ((enchiridion.llm.secrets::*loaded-secrets* (make-hash-table :test #'equal))
+         (seen nil)
+         (enchiridion.llm::*http-post-function*
+           (lambda (request) (setf seen request) *text-reply*)))
+    (setf (gethash "ENCHIRIDION_TEST_RESOURCE" enchiridion.llm.secrets::*loaded-secrets*) "fixture")
+    (let ((backend (enchiridion.llm:resolve-backend
+                    :config '(:provider :fixture :offline t
+                              :providers ((:id :fixture :api :openai-chat :profile :azure
+                                           :base-url "https://${ENCHIRIDION_TEST_RESOURCE}.example/"
+                                           :model "deployment"
+                                           :query-params (("api-version" "2024-10-21")))))
+                    :api-key "fixture")))
+      (enchiridion.llm:complete backend (list (enchiridion.llm:user-message "hello"))))
+    (ok (string= "https://fixture.example/openai/deployments/deployment/chat/completions?api-version=2024-10-21"
+                 (enchiridion.llm::http-request-url seen)))))
+
+
+(deftest required-thinking-replay-is-rejected-before-executing-tools ()
+  (dolist (field '(:reasoning_content))
+    (let ((reply (enchiridion.llm:parse-json *string-arguments-reply*)))
+      (setf (getf (getf (first (getf reply :choices)) :message) field)
+            "private reasoning")
+      (ok (signals (enchiridion.llm:parse-completion reply :dialect (dialect :deepseek))
+                   'enchiridion.errors:backend-error))))
+  (dolist (type '("thinking" "redacted_thinking"))
+    (let ((payload
+            (format nil "{\"content\":[{\"type\":\"~A\",\"thinking\":\"private\"},\
+{\"type\":\"tool_use\",\"id\":\"call\",\"name\":\"echo\",\"input\":{}}]}" type)))
+      (ok (signals (enchiridion.llm:anthropic-parse-completion payload)
+                   'enchiridion.errors:backend-error)))))
+
+
+(deftest configured-betas-reach-the-messages-header ()
+  (dolist (betas '(("beta-one" "beta-two") "beta-one, beta-two"))
+    (let* ((seen (list nil))
+           (enchiridion.llm::*http-post-function*
+             (lambda (request) (setf (car seen) request) *anthropic-reply*))
+           (backend (enchiridion.llm::build-anthropic-provider
+                     (provider :api :anthropic-messages :profile :anthropic
+                               :options (list :betas betas)))))
+      (enchiridion.llm:complete backend (list (enchiridion.llm:user-message "hi")))
+      (ok (string= "beta-one,beta-two"
+                   (header "anthropic-beta"
+                           (enchiridion.llm::http-request-headers
+                            (car seen))))))))

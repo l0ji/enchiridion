@@ -140,26 +140,6 @@ names two protocols, and Bedrock's invoke path rejects the header outright."
                      :version-location :header)
       :body))
 
-(declaim (ftype (function (t) list) bedrock-beta-list))
-
-(defun bedrock-beta-list (value)
-  "Return VALUE as a list of beta feature names.
-
-A comma separated string and a list of strings are both accepted, because a
-configuration file spells a short list as a string and a Lisp caller spells it as
-a list. Anything else is no betas: a beta name that is not a string cannot go on
-the wire, and a malformed one should not stop a turn that does not need it."
-  (cond
-    ((null value) '())
-    ((stringp value)
-     (remove-if #'zerop
-                (mapcar (lambda (beta)
-                          (string-trim '(#\Space #\Tab) beta))
-                        (aws-split #\, value))
-                :key #'length))
-    ((listp value) (remove-if-not #'stringp value))
-    (t '())))
-
 (declaim (ftype (function (t integer &optional integer) integer)
                 bedrock-option-integer))
 
@@ -194,7 +174,7 @@ the secret store are read at that point."
                                          4096)
      :cache-p (not (null (provider-option provider :cache-p t)))
      :cache-ttl (aws-nonempty-string (provider-option provider :cache-ttl))
-     :betas (bedrock-beta-list (provider-option provider :betas))
+     :betas (beta-list (provider-option provider :betas))
      :timeout (bedrock-option-integer (provider-option provider :timeout) 60)
      :retries (bedrock-option-integer (provider-option provider :retries) 2 0))))
 
@@ -523,10 +503,7 @@ read through *HTTP-GET-FUNCTION* so a test can answer from a fixture."
          (signed (bedrock-authorize connection request :method "GET"
                                                       :service "bedrock")))
     (bedrock-model-rows
-     (funcall *http-get-function*
-              (http-request-url signed)
-              :headers (http-request-headers signed)
-              :timeout (bedrock-connection-timeout connection)))))
+     (get-with-retries signed (bedrock-connection-retries connection)))))
 
 ;;;; The operations.
 ;;;;

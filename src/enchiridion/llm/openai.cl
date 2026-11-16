@@ -421,6 +421,14 @@ showing the model's private notes as its answer."
            (reasoning (and reasoning-field
                            (or (openai-field-value reply reasoning-field)
                                (openai-field-value data reasoning-field)))))
+      ;; DeepSeek and Z.AI require reasoning_content to be replayed with tool
+      ;; calls; this protocol keeps no such field, so refuse rather than corrupt.
+      (when (and (getf reply :tool_calls)
+                 (let ((text (getf reply :reasoning_content)))
+                   (and (stringp text) (plusp (length text)))))
+        (error 'enchiridion.errors:backend-error
+               :backend "openai"
+               :detail "Thinking tool calls require reasoning replay, which this message protocol does not support. Disable thinking or choose a nonthinking model."))
       (%make-completion
        :text (or (getf reply :content) "")
        :reasoning-text (if (stringp reasoning) reasoning "")
@@ -608,8 +616,8 @@ would drift from it."
                   :overrides (provider-option provider :dialect-overrides))))
     (setf (dialect-query-params dialect)
           (dialect-query-param-pairs
-           (append (dialect-query-params dialect)
-                   (provider-query-params provider))))
+           (merge-query-params (dialect-query-params dialect)
+                               (provider-query-params provider))))
     dialect))
 (declaim (ftype (function (provider) t) build-openai-provider))
 
@@ -626,7 +634,9 @@ with the primary tier."
    :model (or (provider-model provider) (provider-default-model provider))
    :headers (merge-headers (openai-static-headers) (provider-headers provider))
    :dialect (openai-dialect-for provider)
-   :max-tokens (provider-option provider :max-tokens)))
+   :max-tokens (provider-option provider :max-tokens)
+   :timeout (provider-option provider :timeout 60)
+   :retries (provider-option provider :retries 2)))
 
 ;;;; The model list.
 
@@ -774,13 +784,14 @@ model list must not be the one caller that forgets one of them."
                        :url (concatenate
                              'string
                              (ensure-trailing-slash (provider-base-url provider))
-                             path)))
+                             path)
+                       :timeout (provider-option provider :timeout +http-get-timeout+)))
              (authorized (auth-apply dialect (provider-key provider) request
-                                     :extra (openai-static-headers))))
+                                     :extra (merge-headers (openai-static-headers)
+                                                            (provider-headers provider)))))
         (openai-model-infos
-         (parse-json (funcall *http-get-function*
-                              (http-request-url authorized)
-                              :headers (http-request-headers authorized)))
+         (parse-json (get-with-retries
+                      authorized (provider-option provider :retries 2)))
          shape)))))
 
 ;;;; Registration.

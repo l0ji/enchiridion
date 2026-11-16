@@ -446,7 +446,7 @@ cannot turn that default off."
     (dolist (key +provider-option-keys+ options)
       (let ((value (getf row key :absent)))
         (when (eq value :absent)
-          (setf value (enchiridion:config-value config key)))
+          (setf value (enchiridion:config-value config key :absent)))
         (unless (eq value :absent)
           (setf (getf options key) value))))))
 
@@ -507,8 +507,8 @@ row as written rather than as this process happened to configure it."
                (provider-cache-name id))
      :api handler
      :profile profile
-     :base-url (or (and (nonempty-string-p base-url) base-url)
-                   (and (nonempty-string-p (getf row :base-url)) (getf row :base-url))
+     :base-url (or (expandable-endpoint base-url)
+                   (expandable-endpoint (getf row :base-url))
                    (expandable-endpoint (getf adapter :base-url))
                    "")
      :key (or (row-key env api-key) "")
@@ -1118,7 +1118,9 @@ drifts between runs cannot be compared."
                                                  (when (provider-query-params provider)
                                                    (list :query-params
                                                          (provider-query-params provider)))))
-   :max-tokens (provider-option provider :max-tokens)))
+   :max-tokens (provider-option provider :max-tokens)
+   :timeout (provider-option provider :timeout 60)
+   :retries (provider-option provider :retries 2)))
 
 (declaim (ftype (function (provider) t) anthropic-messages-build))
 
@@ -1129,6 +1131,7 @@ drifts between runs cannot be compared."
    :api-key (provider-key provider)
    :model (or (provider-model provider) (provider-default-model provider))
    :max-tokens (or (provider-option provider :max-tokens) 4096)
+   :betas (provider-option provider :betas)
    :cache-ttl (provider-option provider :cache-ttl)
    :cache-p (provider-option provider :cache-p t)
    :headers (provider-headers provider)
@@ -1150,11 +1153,17 @@ list is asked for nothing rather than for a request that can only fail."
          (shape (dialect-field dialect :models-list-shape :data))
          (path (dialect-field dialect :models-path "models")))
     (when (and shape path)
-      (let* ((url (concatenate 'string
-                               (ensure-trailing-slash (provider-base-url provider))
-                               path))
-             (data (parse-json (funcall *http-get-function* url
-                                        :timeout +http-get-timeout+)))
+      (let* ((request (auth-apply
+                       dialect (provider-key provider)
+                       (make-http-request
+                        :url (concatenate
+                              'string
+                              (ensure-trailing-slash (provider-base-url provider))
+                              path)
+                        :timeout (provider-option provider :timeout
+                                                  +http-get-timeout+))))
+             (data (parse-json (get-with-retries
+                                request (provider-option provider :retries 2))))
              (entries (catalog-field data "data")))
         (loop for entry in (if (consp entries) entries '())
               for id = (catalog-string entry "id")
@@ -1206,12 +1215,15 @@ this is the fallback that only runs if anthropic.cl failed to register at all."
       (let* ((url (concatenate 'string
                                (ensure-trailing-slash (provider-base-url provider))
                                path))
-             (headers (anthropic-headers (provider-key provider)
-                                         +anthropic-version+
-                                         (provider-headers provider)))
-             (data (parse-json (funcall *http-get-function* url
-                                        :headers headers
-                                        :timeout +http-get-timeout+))))
+             (request (anthropic-authorize
+                       dialect (provider-key provider) +anthropic-version+
+                       (provider-headers provider)
+                       (make-http-request
+                        :url url
+                        :timeout (provider-option provider :timeout
+                                                  +http-get-timeout+))))
+             (data (parse-json (get-with-retries
+                                request (provider-option provider :retries 2)))))
         (loop for entry in (let ((entries (catalog-field data "data")))
                              (if (consp entries) entries '()))
               for id = (catalog-string entry "id")

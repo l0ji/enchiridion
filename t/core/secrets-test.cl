@@ -163,6 +163,99 @@ mode, and a mode is not worth reading on a filesystem that refused the write."
                        (enchiridion.llm.secrets:scrub-tree
                         '(:message "kept")))))))
 
+(deftest credential-fields-do-not-stop-the-tree-walk ()
+  (let* ((tree '(:token "first-hidden" :password "second-hidden"
+                :details (:secret "nested-hidden" :message "kept")
+                :tail "Bearer synthetic-bearer-value"))
+         (scrubbed (enchiridion.llm.secrets:scrub-tree tree)))
+    (ok (equal '(:token "[redacted]" :password "[redacted]"
+                 :details (:secret "[redacted]" :message "kept")
+                 :tail "[redacted]")
+               scrubbed))
+    (ok (equal "first-hidden" (getf tree :token)))
+    (ok (equal "second-hidden" (getf tree :password)))))
+
+(deftest credential-values-are-redacted-regardless-of-type ()
+  (dolist (value (list 42 nil (list :message "hidden-container")
+                      (vector "hidden-vector")
+                      (enchiridion.llm::json-object "value" "hidden-object")))
+    (ok (equal '(:credentials "[redacted]" :message "kept")
+               (enchiridion.llm.secrets:scrub-tree
+                (list :credentials value :message "kept"))))))
+
+(deftest credential-words-in-ordinary-values-are-preserved ()
+  (let ((tree '(:message "token" :count 1 :note "password"
+                :items #(42 nil t))))
+    (ok (equalp tree (enchiridion.llm.secrets:scrub-tree tree)))))
+
+(deftest credential-alist-entries-are-redacted ()
+  (let ((tree '(("token" . "first-hidden")
+                ("message" . "kept")
+                ("password" . "second-hidden")
+                ("details" . (("api_key" . "nested-hidden"))))))
+    (ok (equal '(("token" . "[redacted]")
+                 ("message" . "kept")
+                 ("password" . "[redacted]")
+                 ("details" . (("api_key" . "[redacted]"))))
+               (enchiridion.llm.secrets:scrub-tree tree)))
+    (ok (equal "first-hidden" (cdar tree)))))
+
+(deftest credential-hash-tables-are-copied-and-redacted ()
+  (let* ((tree (make-hash-table :test #'equalp))
+         (nested (enchiridion.llm::json-object "password" "nested-hidden"
+                                             "message" "kept")))
+    (setf (gethash "ToKeN" tree) "first-hidden"
+          (gethash "API-KEY" tree) 42
+          (gethash "details" tree) (vector nested)
+          (gethash "Bearer synthetic-key-value" tree) "ordinary value")
+    (let* ((scrubbed (enchiridion.llm.secrets:scrub-tree tree))
+           (child (aref (gethash "details" scrubbed) 0)))
+      (ng (eq tree scrubbed))
+      (ok (eq (hash-table-test tree) (hash-table-test scrubbed)))
+      (ok (= 4 (hash-table-count scrubbed)))
+      (ok (equal "[redacted]" (gethash "token" scrubbed)))
+      (ok (equal "[redacted]" (gethash "api-key" scrubbed)))
+      (ok (equal "[redacted]" (gethash "password" child)))
+      (ok (equal "kept" (gethash "message" child)))
+      (ok (equal "ordinary value" (gethash "[redacted]" scrubbed)))
+      (ok (equal "first-hidden" (gethash "token" tree)))
+      (ok (equal "nested-hidden" (gethash "password" nested))))))
+
+(deftest both-json-container-forms-are-redacted ()
+  (let ((json (concatenate 'string
+                           "{\"token\":\"first-hidden\","
+                           "\"password\":\"second-hidden\","
+                           "\"items\":[{\"api_key\":\"nested-hidden\","
+                           "\"message\":\"kept\"}]}")))
+    (testing "normalised JSON plists and lists"
+      (let* ((scrubbed (enchiridion.llm.secrets:scrub-tree
+                        (enchiridion.llm::parse-json json)))
+             (child (first (getf scrubbed :items))))
+        (ok (equal "[redacted]" (getf scrubbed :token)))
+        (ok (equal "[redacted]" (getf scrubbed :password)))
+        (ok (equal "[redacted]" (getf child :api_key)))
+        (ok (equal "kept" (getf child :message)))))
+    (testing "raw JSON hash tables and vectors"
+      (let* ((scrubbed (enchiridion.llm.secrets:scrub-tree
+                        (com.inuoe.jzon:parse json)))
+             (child (aref (gethash "items" scrubbed) 0)))
+        (ok (equal "[redacted]" (gethash "token" scrubbed)))
+        (ok (equal "[redacted]" (gethash "password" scrubbed)))
+        (ok (equal "[redacted]" (gethash "api_key" child)))
+        (ok (equal "kept" (gethash "message" child)))))))
+
+(deftest broker-shaped-results-redact-every-nested-field ()
+  (let* ((result (list :token "first-hidden" :password "second-hidden"
+                       :items (vector
+                               (enchiridion.llm::json-object
+                                "secret" "nested-hidden" "message" "kept"))))
+         (scrubbed (enchiridion.tools.broker::scrub-value result)))
+    (ok (equal "[redacted]" (getf scrubbed :token)))
+    (ok (equal "[redacted]" (getf scrubbed :password)))
+    (ok (equal "[redacted]"
+               (gethash "secret" (aref (getf scrubbed :items) 0))))
+    (ok (equal "kept" (gethash "message" (aref (getf scrubbed :items) 0))))))
+
 (deftest a-vector-of-messages-is-scrubbed-tree-wide ()
   (let ((messages (vector (list :role "user"
                                 :content (format nil "my key is ~A" +fake-key+)))))

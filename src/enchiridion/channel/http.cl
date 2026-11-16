@@ -644,7 +644,8 @@ when it fails is an API whose caller cannot tell a bug from a shutdown."
 every channel does, because the supervisor calls CHANNEL-START in a restart
 loop and a start that returned at once would bind the port again every second."))
 
-(declaim (ftype (function (&key (:name string) (:service t)) http-channel)
+(declaim (ftype (function (&key (:name string) (:service t))
+                           (values http-channel &rest t))
                 make-http-channel))
 
 (defun make-http-channel (&key (name "http") service)
@@ -741,7 +742,7 @@ unreadable exactly when it is needed."
 (declaim (ftype (function (&key (:turn t) (:health t) (:usage t) (:token t)
                                 (:bind string) (:port integer) (:body-limit integer)
                                 (:name string))
-                          http-channel)
+                          (values http-channel &rest t))
                 start-http))
 
 (defun start-http (&key turn health usage token (bind "127.0.0.1") (port 8787)
@@ -756,7 +757,7 @@ This blocks until STOP-HTTP, exactly as CHANNEL-START does."
     (enchiridion.channel:channel-start channel)
     channel))
 
-(declaim (ftype (function (http-channel) http-channel) stop-http))
+(declaim (ftype (function (http-channel) (values http-channel &rest t)) stop-http))
 
 (defun stop-http (channel)
   "Stop CHANNEL and return it."

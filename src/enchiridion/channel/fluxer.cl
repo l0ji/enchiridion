@@ -748,7 +748,8 @@ so a healthy session starts its next failure with a fresh budget.")
 slow turn queues instead of starving the socket, and the library's read thread
 only ever parses a frame and hands it on."))
 
-(declaim (ftype (function (&key (:turn t) (:config t)) fluxer-channel)
+(declaim (ftype (function (&key (:turn t) (:config t))
+                           (values fluxer-channel &rest t))
                 make-fluxer-channel))
 
 (defun make-fluxer-channel (&key turn config)
@@ -1016,12 +1017,11 @@ one place a url ends up in a log."
 A failure is one line and NIL rather than a condition: the caller is a
 reconnect loop that has a backoff for exactly this."
   (handler-case
-      (let* ((body (dexador:request (concatenate 'string +rest-base+
-                                                 +gateway-path+)
-                                    :method :get
-                                    :headers (bot-headers token)
-                                    :connect-timeout +http-timeout-seconds+
-                                    :read-timeout +http-timeout-seconds+))
+      (let* ((body (enchiridion.llm::bounded-http-request
+                     (enchiridion.llm:make-http-request
+                      :url (concatenate 'string +rest-base+ +gateway-path+)
+                      :headers (bot-headers token) :timeout +http-timeout-seconds+)
+                     :method :get :body-limit 65536))
              (data (enchiridion.llm:parse-json body))
              (url (and (consp data) (gateway-url (getf data :url)))))
         (unless url
@@ -1041,6 +1041,19 @@ reconnect loop that has a backoff for exactly this."
                           (or null string))
                 post-message))
 
+(defvar *send-channel* nil)
+(defvar *send-deadline* nil)
+(defparameter +reply-deadline-seconds+ 30)
+
+(defun wait-to-retry (seconds)
+  "Wait in stop-aware slices within the reply deadline."
+  (let ((end (+ (real-seconds) (min seconds +reply-deadline-seconds+))))
+    (loop while (< (real-seconds) end)
+          do (when (or (and *send-channel* (fluxer-channel-stopping-p *send-channel*))
+                       (and *send-deadline* (>= (real-seconds) *send-deadline*)))
+               (error 'enchiridion.errors:transport-error :detail "reply stopped or timed out"))
+             (sleep (max 0 (min 0.05 (- end (real-seconds))))))))
+
 (defun post-message (token channel-id text &optional (attempt 0))
   "POST TEXT to CHANNEL-ID as one message and return the new message id, or NIL.
 
@@ -1053,12 +1066,11 @@ right by being repeated."
                           "/messages"))
         (body (json-text (message-body text))))
     (handler-case
-        (let ((reply (dexador:request url
-                                      :method :post
-                                      :headers (bot-headers token)
-                                      :content body
-                                      :connect-timeout +http-timeout-seconds+
-                                      :read-timeout +http-timeout-seconds+)))
+        (let ((reply (enchiridion.llm::bounded-http-request
+                      (enchiridion.llm:make-http-request
+                       :url url :headers (bot-headers token) :body body
+                       :timeout +http-timeout-seconds+)
+                      :body-limit 65536)))
           ;; An unreadable reply is not a failed send: the message was
           ;; accepted, and retrying it would post it twice.
           (message-id (ignore-errors (enchiridion.llm:parse-json reply))))
@@ -1067,8 +1079,8 @@ right by being repeated."
               (payload (dexador.error:response-body failure)))
           (if (and (eql status 429) (< attempt +rate-limit-attempts+))
               (progn
-                (sleep (or (retry-after-seconds payload)
-                           (next-backoff (1+ attempt))))
+                (wait-to-retry (or (retry-after-seconds payload)
+                                   (next-backoff (1+ attempt))))
                 (post-message token channel-id text (1+ attempt)))
               (error 'enchiridion.errors:transport-error
                      :status status
@@ -1084,10 +1096,17 @@ right by being repeated."
 
 An empty list means the scrubber left nothing to send, which is a success: the
 reply was empty, so there was nothing to say."
-  (let ((ids '()))
-    (dolist (piece (outbound-chunks text +message-limit+))
-      (let ((id (post-message (fluxer-channel-token channel) target piece)))
-        (when id (push id ids))))
+  (let ((ids '())
+        (*send-channel* channel)
+        (*send-deadline* (+ (real-seconds) +reply-deadline-seconds+)))
+    (enchiridion.compat:with-deadline
+        (+reply-deadline-seconds+
+         :on-timeout (error 'enchiridion.errors:transport-error :detail "reply timed out"))
+      (dolist (piece (outbound-chunks text +message-limit+))
+        (when (fluxer-channel-stopping-p channel)
+          (error 'enchiridion.errors:transport-error :detail "reply stopped"))
+        (let ((id (post-message (fluxer-channel-token channel) target piece)))
+          (when id (push id ids)))))
     (nreverse ids)))
 
 ;;;; The queue between the read thread and the worker.
@@ -1302,7 +1321,9 @@ because an answer is a reply to whoever asked."
      (note "dropped a message that is not a direct message from a person."))
     (t
      (handler-case
-         (check-sender (channel-allowlist channel) (author-id data))
+         (progn
+            (check-sender (channel-allowlist channel) (author-id data))
+            (enqueue-inkbound channel data))
        (enchiridion.errors:unauthorized (condition)
          (note "~A" condition))
        (error (condition)
@@ -1619,7 +1640,8 @@ is the list of message ids the gateway accepted."
   (and (typep channel 'fluxer-channel)
        (eq :live (enchiridion.channel:channel-status channel))))
 
-(declaim (ftype (function (&key (:turn t) (:config t)) fluxer-channel)
+(declaim (ftype (function (&key (:turn t) (:config t))
+                           (values fluxer-channel &rest t))
                 start-fluxer))
 
 (defun start-fluxer (&key turn config)

@@ -470,3 +470,85 @@ message: the frame tests do that once, at the edge.")
              (ng (enchiridion.channel.fluxer::resolve-token :name name))))
       (enchiridion.compat:unset-environment-variable name)
       (enchiridion.llm.secrets:clear-secrets))))
+
+(deftest authorized-dispatch-reaches-worker-and-reply ()
+  (let* ((seen nil)
+         (sent nil)
+         (done (bordeaux-threads:make-semaphore))
+         (channel (enchiridion.channel.fluxer:make-fluxer-channel
+                   :config '(:allowed-users ("u-1"))
+                   :turn (lambda (message)
+                           (push (enchiridion.channel:msg-text message) seen)
+                           (list :ok-p t :reply "answer")))))
+    (unwind-protect
+         (progn
+           (setf (enchiridion.channel.fluxer::fluxer-channel-token channel) "fake-token"
+                 (enchiridion.channel.fluxer::fluxer-channel-worker channel)
+                 (bordeaux-threads:make-thread
+                  (lambda ()
+                    (let ((enchiridion.llm::*http-request-function*
+                            (lambda (url &rest options)
+                              (push (list url (getf options :method)
+                                          (getf options :content)) sent)
+                              (bordeaux-threads:signal-semaphore done)
+                              "{\"id\":\"reply-1\"}")))
+                      (enchiridion.channel.fluxer::run-worker channel)))))
+           (flet ((dispatch (sequence data)
+                    (enchiridion.channel.fluxer::handle-text
+                     channel (make-instance 'enchiridion.channel.fluxer::fluxer-socket
+                                            :url "ws://offline.invalid/")
+                     (enchiridion.channel.fluxer::json-text
+                      (list :op 0 :s sequence :t "MESSAGE_CREATE" :d data)))))
+             (dispatch 1 (list :channel_type 1 :author '(:id "denied") :content "no"))
+             (dispatch 2 +direct-message+)
+             (ok (bordeaux-threads:wait-on-semaphore done :timeout 2))
+             (dispatch 2 +direct-message+)
+             (dispatch 1 +direct-message+)
+             (ok (equal '("hello") seen))
+             (ok (equal '(("https://api.fluxer.app/v1/channels/d-1/messages"
+                           :post "{\"content\":\"answer\"}")) sent))
+             (ok (= 2 (enchiridion.channel.fluxer::fluxer-channel-sequence channel)))
+             (ok (null (enchiridion.channel.fluxer::fluxer-channel-pending channel)))))
+      (enchiridion.channel.fluxer::stop-worker channel))))
+
+(deftest retry-wait-honors-stop-and-deadline ()
+  (let* ((channel (enchiridion.channel.fluxer:make-fluxer-channel))
+         (enchiridion.channel.fluxer::*send-channel* channel)
+         (enchiridion.channel.fluxer::*send-deadline*
+           (enchiridion.channel.fluxer::real-seconds)))
+    (ok (signals (enchiridion.channel.fluxer::wait-to-retry 100000)
+                 'enchiridion.errors:transport-error))
+    (let ((enchiridion.channel.fluxer::*send-deadline* nil))
+      (setf (enchiridion.channel.fluxer::fluxer-channel-stopping-p channel) t)
+      (ok (signals (enchiridion.channel.fluxer::wait-to-retry 100000)
+                   'enchiridion.errors:transport-error)))))
+
+(deftest fake-rest-retries-and-bounds-discovery-and-sends ()
+  (let* ((calls 0)
+         (channel (enchiridion.channel.fluxer:make-fluxer-channel))
+         (enchiridion.llm::*http-request-function*
+           (lambda (url &rest options)
+             (declare (ignore url options))
+             (incf calls)
+             (if (= calls 1)
+                 (error 'dexador.error:http-request-failed :status 429
+                        :body "{\"retry_after\":0}" :headers nil :uri nil :method :post)
+                 "{\"id\":\"sent\"}"))))
+    (setf (enchiridion.channel.fluxer::fluxer-channel-token channel) "fake")
+    (ok (equal '("sent") (enchiridion.channel.fluxer::send-reply channel "target" "reply")))
+    (ok (= 2 calls))
+    (let ((enchiridion.llm::*http-request-function*
+            (lambda (url &rest options)
+              (declare (ignore url options))
+              (make-string 65537 :initial-element #\a))))
+      (ng (enchiridion.channel.fluxer::discover-gateway "fake"))
+      (ok (signals (enchiridion.channel.fluxer::send-reply channel "target" "reply")
+                   'enchiridion.errors:transport-error)))
+    (let ((enchiridion.channel.fluxer::+reply-deadline-seconds+ 0.05)
+          (enchiridion.llm::*http-request-function*
+            (lambda (url &rest options)
+              (declare (ignore url options))
+              (sleep 2)
+              "late")))
+      (ok (signals (enchiridion.channel.fluxer::send-reply channel "target" "reply")
+                   'enchiridion.errors:transport-error)))))

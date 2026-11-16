@@ -117,7 +117,10 @@ scanning a transcript, and a full body would bury the next line."
    (live-p :accessor channel-live-p :initarg :live-p :initform nil :type boolean
            :documentation "True while the channel is accepting traffic.")
    (state :accessor channel-state :initarg :state :initform :stopped :type keyword
-          :documentation "Where the channel is: :stopped, :starting, :live, or :failed.")
+          :documentation "Where the channel is: :stopped, :starting, :live, :unavailable, or :failed.")
+   (start-error :accessor channel-start-error :initform nil :type (or null string)
+                :documentation "The scrubbed condition text from the last refused
+start, or NIL. It is what a lazy enable reports when readiness fails.")
    (thread :accessor channel-thread :initarg :thread :initform nil :type t
            :documentation "The thread the channel runs on, or NIL when it has none."))
   (:documentation

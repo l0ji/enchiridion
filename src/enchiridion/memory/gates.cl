@@ -1,10 +1,4 @@
-;;;; gates.cl --- The canary set, the promotion gates, and the arms they measure.
-;;;;
-;;;; Split from cue.cl because measurement reads retrieval and generations,
-;;;; and both load after the cue layer. The order of record for the gates is
-;;;; docs/design/memory.md: provenance, canary, utility, tail, then volume and
-;;;; cost. The legacy single-pass consolidation they once guarded is gone; a
-;;;; generation becomes live only through PROMOTE-GENERATION.
+;;;; gates.cl --- Checks for promoting a memory generation.
 
 (in-package #:enchiridion.memory)
 
@@ -13,12 +7,7 @@
 ;;;; ------------------------------------------------------------------
 
 (defun register-canary (store name expect &key (family "") (now (get-universal-time)))
-  "Add or replace one canary.  NAME identifies it; EXPECT is what must hold;
-FAMILY is the kind of behaviour it checks.
-
-EXPECT is stored as text because the check is deliberately not fixed here.
-model-unified.md §6.4 requires that the check test BEHAVIOUR rather than
-presence: CANARY-PREDICATE supplies the check for each family."
+  "Add or replace a named behavioral canary."
   (enchiridion.memory.store:exec
    store
    "INSERT INTO canary (name, expect, family, ts) VALUES (?, ?, ?, ?)
@@ -26,8 +15,7 @@ presence: CANARY-PREDICATE supplies the check for each family."
    (list name expect family now expect family now)))
 
 (defparameter +canary-families+ '("retrieval" "update" "safety" "tail")
-  "The four canary families docs/design/memory.md requires: retrieval,
-update or conflict, safety, and degradation or the tail.")
+  "The canary families required for promotion.")
 
 (defun canary-text (canary key)
   "Return CANARY's KEY as a non-empty string, or NIL."
@@ -201,7 +189,7 @@ given, keeps only those tasks."
                                               (task-hashes nil))
   "Return two values: T when GENERATION-ID beats retention-only, and a report.
 
-docs/design/memory.md: candidate versus retention-only on paired tasks at
+Compare candidate and retention-only on paired tasks at
 matched budget, a mean delta of at least MARGIN, at least MIN-N non-tied
 pairs, and a one-sided sign test below ALPHA.  The pairs are read from the
 gate log, which COMPARE-ARMS writes: the step that decides is not the step
@@ -228,7 +216,7 @@ with rare answers, is no more than MARGIN below retention-only's, and a report.
 Fewer than MIN-N scored tail tasks is a failure: a tail nobody measured is not
 a tail that survived.
 
-docs/design/memory.md states the tail as recall, so an outcome counts as one
+Tail recall counts an outcome as one
 when the answer reached the pack at all, whatever its position: the utility
 outcomes are graded, and a rare answer moved down the pack is still recalled."
   (flet ((recall (outcome) (if (plusp outcome) 1 0)))
@@ -504,7 +492,7 @@ good. Scoring the tail is retrieval only and calls no model."
 (defun t2-preflight (store &key (canaries *memory-canaries*))
   "Return a plist saying whether a T2 pass has every instrument it needs.
 
-docs/design/memory.md: a pass with a missing deriver, canary coverage,
+A pass with a missing deriver, canary coverage,
 utility task set, or tail sampler is a reported no-op with reason
 :INSTRUMENT-MISSING, so it never spends tokens on a candidate nobody could
 promote. :MISSING names each absent instrument, so the report says what the
@@ -629,7 +617,7 @@ tasks' hashes, so each gate reads only its own pairs."
                                                (scorer #'answer-scorer))
   "Run GENERATION-ID through the promotion gates in order and return a report.
 
-docs/design/memory.md fixes the order: provenance, canary, utility, tail, then
+The order is provenance, canary, utility, tail, then
 volume and cost.  Every gate writes a generation_checks row, and the first
 that fails quarantines the candidate with its name as the reason and leaves
 the live layer as it was.  A candidate that passes all five is promoted in
@@ -672,8 +660,7 @@ one transaction."
 (defun check-promoted (store generation-id &key (canaries *memory-canaries*)
                                                (scorer #'answer-scorer))
   "Re-run the canary and utility checks on GENERATION-ID, now live, and return
-a report.  A failure rolls it back to its parent: docs/design/memory.md says a
-failed post-promotion check rolls back and freezes the next pass, and the
+a report. A failure rolls back to the parent and freezes the next pass. The
 post-check rows are what the freeze and promotion precision read."
   (let ((row (generation-row store generation-id)))
     (unless (and row (string= (enchiridion.memory.store:field row "status") "live"))
@@ -720,7 +707,7 @@ post-check rows are what the freeze and promotion precision read."
 :CHECKED, those that have had their post-promotion check, :PASSED, those
 whose first canary and utility runs after promotion both passed, and
 :PRECISION, PASSED over CHECKED or NIL when none is checked.
-docs/design/memory.md: precision is the share that pass the next canary and
+Precision is the share that pass the next canary and
 utility run, so a promotion's first post-check is the one that counts."
   (let ((checked 0) (passed 0))
     (dolist (row (enchiridion.memory.store:query-rows
@@ -836,7 +823,7 @@ and T2 would run on every tick."
 (defun t2-due-p (store &key (now (get-universal-time)))
   "Return T when a T2 pass should run on this tick.
 A building candidate always continues, because a pass spans as many ticks as
-its episodes need. Otherwise docs/design/memory.md: daily or after
+its episodes need. Otherwise it runs daily or after
 *T2-EPISODE-THRESHOLD* new episodes, whichever comes first. While the
 quarantine rate is over its ceiling the interval is weekly and the threshold
 is off, or a busy log would make weekly mean nothing."
@@ -895,7 +882,7 @@ of :ROLLED-BACK, :INSTRUMENT-MISSING, :BUILDING, :PROMOTED, :QUARANTINED,
 :HELD, or :SKIPPED. The caller has already asked T2-REFUSAL.
 
 A pass that starts after a promotion first re-checks the live generation:
-docs/design/memory.md says a failed post-promotion check rolls back and
+A failed post-promotion check rolls back and
 freezes the next pass, so a rollback ends this pass with nothing built. A new
 candidate is started only when the preflight finds every instrument, so no
 tokens go to a candidate nobody could promote. LAST_T2_TS is written whenever

@@ -1,13 +1,4 @@
-;;;; episodic-test.cl --- The episodic design properties, as tests.
-;;;;
-;;;; Ported from research/human-like-agent-memory/build/validate.lisp. The
-;;;; properties are the model's own invariants, not a benchmark: they say the
-;;;; log retains, the cue index keys on use, push cannot evict retrieved
-;;;; material, an unchecked canary is not a pass, and the gates default closed.
-;;;;
-;;;; Each helper opens its own store. A helper that asserted an absolute row
-;;;; count would pass only while it ran first, so every count is a delta and
-;;;; every check is independent.
+;;;; episodic-test.cl --- Episodic memory tests.
 
 (defpackage #:enchiridion-episodic-test
   (:use #:cl)

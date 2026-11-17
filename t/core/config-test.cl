@@ -24,6 +24,38 @@
       (ok (null (enchiridion:config-value config :missing)))
       (ok (eq :fallback (enchiridion:config-value config :missing :fallback))))))
 
+(deftest the-example-config-keeps-defaults-for-omitted-settings ()
+  (progv '(enchiridion.user:*enchiridion-config*) '(nil)
+    (load (merge-pathnames "../config.example.cl"
+                           (asdf:system-source-directory "enchiridion-tests"))
+          :verbose nil :print nil)
+    (let* ((config (symbol-value 'enchiridion.user:*enchiridion-config*))
+           (shipped (enchiridion:default-config)))
+      (ok (enchiridion::sectioned-config-p config))
+      (ok (null (enchiridion:config-value config :provider)))
+      (ok (= 4096 (enchiridion:config-value config :max-tokens)))
+      (ok (= 86400 (enchiridion:config-value config :providers-ttl-seconds)))
+      (testing "omitted sections inherit their defaults"
+        (dolist (section '(:memory :sandbox :sleep :budget))
+          (dolist (entry (enchiridion:config-section shipped section))
+            (ok (equal (second entry)
+                       (enchiridion:config-setting
+                        config section (first entry)))))))
+      (testing "channels retain their defaults"
+        (dolist (channel '(:cli :http :fluxer))
+          (ok (equal (enchiridion:channel-config channel shipped)
+                     (enchiridion:channel-config channel config)))))
+      (testing "each shipped provider resolves with the shortened config"
+        (dolist (id '(:openai :opencode :anthropic))
+          (let* ((configured (enchiridion:config-with-llm-value config :provider id))
+                 (provider (enchiridion.llm:resolve-provider
+                            configured :api-key "fixture-key")))
+            (ok (eq id (enchiridion.llm:provider-id provider)))
+            (ok (= 4096
+                   (enchiridion.llm:provider-option provider :max-tokens)))
+            (ok (plusp (length
+                        (enchiridion.llm:provider-base-url provider))))))))))
+
 (deftest a-flat-config-is-read ()
   ;; The first adapter only understood this shape, and a one-line test config
   ;; is still easier to write this way.

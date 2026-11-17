@@ -1486,8 +1486,9 @@ the default, so the table stays one source of command names and handlers."
          '(:default (:config :directory :git)))
    (list "ask" 1 nil #'cmd-ask "One turn in a short lived session"
          '(:default (:config :directory :secrets :store :backend :agent)))
-   (list "check" 0 0 #'cmd-check "Compile every system file and both entry scripts"
-         '(:default ()))
+   (list "check" 0 0 #'cmd-check
+         "Compile system files and three entry scripts (requires Nix)"
+          '(:default ()))
    (list "skills" 0 2 #'cmd-skills "List or show skills"
          '(:default (:directory)))
    (list "tools" 0 2 #'cmd-tools "List or show tools"

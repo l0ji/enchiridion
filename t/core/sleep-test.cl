@@ -339,8 +339,8 @@ countable from the test."
    store "SELECT from_turn, to_turn, rebased_p FROM projections ORDER BY id"))
 
 (deftest every-nth-compaction-rebuilds-from-raw-turns ()
-  ;; A summary of a summary drifts. design/memory.md: every eighth compaction
-  ;; rebases from the last 24 raw turns; here every second, from six.
+  ;; Every eighth compaction rebases from the last 24 raw turns; here
+  ;; every second, from six
   (with-scratch-world (store supervisor)
     (let ((enchiridion.memory:*compaction-rebase-every* 2)
           (enchiridion.memory:*compaction-rebase-turns* 6))

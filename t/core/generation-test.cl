@@ -288,7 +288,7 @@ claims that stand alone and those shown under their episode, in pack order."
            (list generation))))
 
 (deftest a-candidate-copies-the-live-layer-and-derives-only-what-is-new ()
-  ;; design/memory.md: a candidate copies the live semantic rows, then derives
+  ;; A candidate copies the live semantic rows, then derives
   ;; episodes not yet processed. Re-deriving the whole log every pass would
   ;; make a pass cost what the log holds, not what it grew by.
   (with-store (store directory)

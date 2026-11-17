@@ -1,14 +1,4 @@
-;;;; cue.lisp --- The cue, push, and gate layer.
-;;;;
-;;;; Ported from research/human-like-agent-memory/build/cue.lisp.
-;;;; The specification of record is model-unified.md plus
-;;;; docs/design/memory.md. The sketch predates the autonomous-memory
-;;;; amendment and is reference material only.
-;;;;
-;;;; This file adds the cue index, the push channels, the canary set, the
-;;;; promotion gates, and the measurement harness. It rewrites nothing in the
-;;;; core. The package is the core package; the extension is a layer, not a
-;;;; second package, so the two halves share one export list.
+;;;; cue.cl --- Cue retrieval and proactive candidates.
 
 (in-package #:enchiridion.memory)
 
@@ -16,12 +6,7 @@
 ;;;; 0. Constants
 ;;;; ------------------------------------------------------------------
 
-;; The pack budget and the push cap are settings: *MEMORY-PACK-CHARS* and
-;; *PUSH-MAX-FRACTION*, in settings.cl, bound from :pack-chars and
-;; :push-max-fraction. The pack budget is the amended specification's 4,450
-;; characters; the audit showed that number is the host's block sum, so this
-;; profile uses it as the pack budget and states the divergence in
-;; docs/design/memory.md.
+;; Pack and proactive retrieval limits are configured in settings.cl
 
 ;;;; ------------------------------------------------------------------
 ;;;; 1. Schema for the three new stores

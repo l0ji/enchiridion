@@ -1,15 +1,4 @@
 ;;;; enchiridion.asd --- The core system.
-;;;;
-;;;; The core is frozen at run time. It holds the loop, the LLM clients, the
-;;;; plugin loader, the memory engine, and the supervisor, and it never
-;;;; changes shape. The agent rewrites what lives under agents/, never this.
-;;;;
-;;;; Every module carries :default-component-class "cl-source-file.cl". That
-;;;; component class is the one ASDF 3.3 provides for the .cl extension, and
-;;;; the plan fixes the extension. Without it ASDF resolves (:file "packages")
-;;;; to packages.lisp and fails on a missing TRUENAME. It has to be on the
-;;;; module: there is no per-file spelling that works, and
-;;;; asdf::*default-component-class* is not in ASDF/INTERFACE in this version.
 
 (defsystem "enchiridion"
   :description "An autonomous agent harness with a strange memory model"

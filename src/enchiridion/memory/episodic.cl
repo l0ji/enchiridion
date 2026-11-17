@@ -1,18 +1,4 @@
-;;;; episodic.lisp --- The episodic log and derived layer.
-;;;;
-;;;; Ported from the research executable sketch.
-;;;; The specification of record is model-unified.md plus
-;;;; docs/design/memory.md; the sketch this came from predates the
-;;;; autonomous-memory amendment and is not authoritative.
-;;;;
-;;;; This file holds the pure mechanisms: records, text helpers, ACT-R
-;;;; activation, the association graph, the retrieval score, candidate
-;;;; generation, the encoding filter, the write path, conflict detection, the
-;;;; calibrator, and the consolidation skeleton. Schema constants live in
-;;;; episodic-ddl.cl, which loads before the store.
-;;;;
-;;;; The package is defined in packages.cl. It is not defined here because a
-;;;; second definition would fork the export list from the one the system uses.
+;;;; episodic.cl --- Episodic records, retrieval and consolidation.
 
 (in-package #:enchiridion.memory)
 
@@ -25,16 +11,6 @@
 
 (defparameter *memory-parameters*
   (list
-   ;; The score weights. B, S and D are 0 and L is 1 because that is what the
-   ;; LongMemEval-S benchmark measured (bench/README.md): over 470 questions,
-   ;; BM25 alone ranked an answer turn in the top ten for 86.4% of questions
-   ;; against 73.0% for the proposal's blend (McNemar p < 0.0001). Once every
-   ;; episode carried its real age, B at weight 1.00 fell to 42.1%; at 0.05 it
-   ;; changed nothing significant and at 0.20 it cost 7.9 points. S at 0.20
-   ;; lowered NDCG@10 by 2.3 points. The proposal's values are kept in the
-   ;; comments as the prior they replace. The other terms are constant across
-   ;; the benchmark's episodes, so it says nothing about them and they keep
-   ;; their invented values.
    :base-weight        0.00   ; proposal 1.00; the ACT-R base level, recency and frequency
    :spread-weight      0.00   ; proposal 0.80; priming over the lexical link graph
    :temporal-weight    0.60   ; the knowledge-update term the documented systems lose

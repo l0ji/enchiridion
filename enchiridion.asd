@@ -32,11 +32,11 @@
   :components
   ((:module "src"
     :serial t
-    :default-component-class "cl-source-file.cl"
+    :default-component-class "cl-source-file.lsp"
     :components
     ((:module "enchiridion"
       :serial t
-      :default-component-class "cl-source-file.cl"
+      :default-component-class "cl-source-file.lsp"
       :components
       ((:file "packages")
        (:file "compat")
@@ -45,7 +45,7 @@
        (:file "errors")
        (:module "llm"
         :serial t
-        :default-component-class "cl-source-file.cl"
+        :default-component-class "cl-source-file.lsp"
         :components
         ((:file "secrets")
          (:file "protocol")
@@ -73,7 +73,7 @@
          (:file "providers")))
        (:module "memory"
         :serial t
-        :default-component-class "cl-source-file.cl"
+        :default-component-class "cl-source-file.lsp"
         :components
         ((:file "settings")
          (:file "blocks")
@@ -98,7 +98,7 @@
          (:file "state")))
        (:module "tools"
         :serial t
-        :default-component-class "cl-source-file.cl"
+        :default-component-class "cl-source-file.lsp"
         :components
         ((:file "schema")
          (:file "registry")
@@ -106,7 +106,7 @@
          (:file "broker")
          (:module "builtin"
           :serial t
-          :default-component-class "cl-source-file.cl"
+          :default-component-class "cl-source-file.lsp"
           :components
           ((:file "file")
            (:file "shell")
@@ -118,7 +118,7 @@
            (:file "register")))))
        (:module "plugin"
         :serial t
-        :default-component-class "cl-source-file.cl"
+        :default-component-class "cl-source-file.lsp"
         :components
         ((:file "loader")
          (:file "verify")
@@ -130,7 +130,7 @@
        ;; copy of those signatures and a copy is a thing that drifts.
        (:module "channel"
         :serial t
-        :default-component-class "cl-source-file.cl"
+        :default-component-class "cl-source-file.lsp"
         :components
         ((:file "protocol")
          ;; The webhook is a channel like the terminal one, and it needs only
@@ -152,7 +152,7 @@
        (:module "cli"
         :pathname "channel"
         :serial t
-        :default-component-class "cl-source-file.cl"
+        :default-component-class "cl-source-file.lsp"
         :components
         ((:file "cli"))))))))
 
@@ -180,7 +180,7 @@
 
   :in-order-to ((test-op (test-op "enchiridion-tests"))))
 
-;;;; src/main.cl is the script the wrapper runs with --script. It is not a
+;;;; src/main.lsp is the script the wrapper runs with --script. It is not a
 ;;;; system component because loading a system must never start an agent, and
 ;;;; this file's top level form is the program. #check compiles it explicitly,
 ;;;; so it is still covered by the gate.

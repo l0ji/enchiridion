@@ -10,7 +10,7 @@ own user has no split; see [Host checkout](#host-checkout).
 1. Copy the examples and restrict the secret file.
 
    ```sh
-   cp config.example.cl config.cl
+   cp config.example.lsp config.lsp
    cp .env.example .env
    chmod 600 .env
    ```
@@ -24,11 +24,11 @@ own user has no split; see [Host checkout](#host-checkout).
 
    Generate the token with `openssl rand -hex 32`. Use `OPENCODE_API_KEY` or
    `ANTHROPIC_API_KEY` for those providers. With `:provider nil`, the API key
-   selects the provider, and `config.cl` chooses the models. If more than one
+   selects the provider, and `config.lsp` chooses the models. If more than one
    provider key is available, including one exported in your shell, set
    `:provider` explicitly. [Configuration](configuration.md) lists the entries.
 
-3. Edit `config.cl`. The Compose command passes `serve --channel http --bind
+3. Edit `config.lsp`. The Compose command passes `serve --channel http --bind
    0.0.0.0 --port 8787`, so it overrides the bind and port in the `:http`
    section and starts the webhook even when `:enabled` is `nil`.
    [Channels](channels.md) covers the request format.
@@ -82,7 +82,7 @@ own user has no split; see [Host checkout](#host-checkout).
    `ENCHIRIDION_PORT` is set, use that port instead of 8787.
 
 8. Stop the service with `docker compose stop`. The volume remains;
-   `docker compose down -v` deletes it. After editing `config.cl` or `.env`, run
+   `docker compose down -v` deletes it. After editing `config.lsp` or `.env`, run
    `docker compose up -d --force-recreate`.
 
 ## State and backups
@@ -204,7 +204,7 @@ dead process left running.
 | Start as uid 0 | The supervisor holds the secrets and drops every child to the agent uid | The entrypoint exits 1 |
 | A tmpfs at `/run/secrets`, mode 0700 | The secret file is read once and unlinked | The entrypoint exits 1 |
 | `SYS_ADMIN` and `ENCHIRIDION_REQUIRE_HIDEPID=1` | The entrypoint remounts `/proc` with `hidepid=2` | The entrypoint exits 1 |
-| A root-owned `config.cl` | The supervisor refuses a configuration the agent uid can replace | The command exits 2 |
+| A root-owned `config.lsp` | The supervisor refuses a configuration the agent uid can replace | The command exits 2 |
 
 Do not set `user:` in the Compose service or pass `--user` to `docker run`; a
 non-root start fails the first check. The entrypoint creates the `agent` user
@@ -216,8 +216,8 @@ it.
 container. Set `ENCHIRIDION_HIDEPID=0` only when you accept that uid 1000 can
 read the supervisor's process details.
 
-The Compose file mounts `config.cl` read-only at `/opt/enchiridion/config.cl`.
-The entrypoint copies it to a root-owned `/etc/enchiridion/config.cl` and points
+The Compose file mounts `config.lsp` read-only at `/opt/enchiridion/config.lsp`.
+The entrypoint copies it to a root-owned `/etc/enchiridion/config.lsp` and points
 `ENCHIRIDION_CONFIG` there, so a host file owned by your user still passes the
 root path check.
 
@@ -269,7 +269,7 @@ uid 1000 phase fails at the environment check.
 | `entrypoint: /run/secrets is not a mount` | No tmpfs at `/run/secrets` | Add `--tmpfs /run/secrets:mode=0700` |
 | `entrypoint: the supervisor must start as root` | The container runs with `--user` | Remove `--user` |
 | `entrypoint: cannot remount /proc with hidepid=2` | No `SYS_ADMIN`, or the kernel refuses | Add the capability, or set `ENCHIRIDION_HIDEPID=0` |
-| `Configuration is wrong at CONFIG` | No `config.cl` mount, or a path the agent can write | Mount `config.cl` and recreate |
+| `Configuration is wrong at CONFIG` | No `config.lsp` mount, or a path the agent can write | Mount `config.lsp` and recreate |
 | `Configuration is wrong at HTTP-TOKEN` | The bind is not loopback and no token is set | Set the token, or bind `127.0.0.1` |
 | `Configuration is wrong at SECRETS` | The secret file is world readable | Run `chmod 600 .env` |
 | `/health` answers 401 | The bearer token is missing or wrong | Send `Authorization: Bearer <token>` |
@@ -281,5 +281,5 @@ users. The supervisor, broker, tools and agent code all run as you, and agent
 code can read `.env`. The container is the deployment that separates them.
 
 A root-started checkout can use the same split: set `ENCHIRIDION_HOME` to a state
-root the agent uid can reach, install a root-owned `config.cl`, keep secrets in a
+root the agent uid can reach, install a root-owned `config.lsp`, keep secrets in a
 root-owned file at mode 600, and run `init` and `serve` as root.

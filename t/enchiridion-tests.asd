@@ -13,7 +13,7 @@
 ;;;; module named t would resolve the components to t/t and find nothing.
 ;;;;
 ;;;; :default-component-class is on every module for the reason given in
-;;;; enchiridion.asd: it is how ASDF 3.3 is told the extension is .cl.
+;;;; enchiridion.asd: it is how ASDF 3.3 is told the extension is .lsp.
 
 (defsystem "enchiridion-tests"
   :description "Unit tests for enchiridion"
@@ -22,12 +22,12 @@
   :components
   ((:module "support"
     :serial t
-    :default-component-class "cl-source-file.cl"
+    :default-component-class "cl-source-file.lsp"
     :components
     ((:file "rove-bridge")))
    (:module "core"
     :serial t
-    :default-component-class "cl-source-file.cl"
+    :default-component-class "cl-source-file.lsp"
     :components
     ((:file "errors-test")
      (:file "compat-test")
@@ -77,7 +77,7 @@
   ;; Every suite rove collected is run, and the count is checked first. The
   ;; obvious implementation, (rove:run "enchiridion-tests"), finds nothing
   ;; here, because rove maps source files to packages by .lisp extension and
-  ;; this project uses .cl. It would report success having run nothing.
+  ;; this project uses .lsp. It would report success having run nothing.
   :perform
   (test-op (operation component)
     (declare (ignore operation component))
@@ -103,7 +103,7 @@
   :components
   ((:module "property"
     :serial t
-    :default-component-class "cl-source-file.cl"
+    :default-component-class "cl-source-file.lsp"
     :components
     ((:file "seed-property")
      (:file "prompt-property"))))

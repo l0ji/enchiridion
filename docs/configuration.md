@@ -1,10 +1,10 @@
 # Configuration
 
-`config.cl` holds settings. `.env` holds API keys and tokens. Both files are
+`config.lsp` holds settings. `.env` holds API keys and tokens. Both files are
 ignored by Git. Copy the examples before editing them:
 
 ```sh
-cp config.example.cl config.cl
+cp config.example.lsp config.lsp
 cp .env.example .env
 chmod 600 .env
 ```
@@ -16,7 +16,7 @@ the [settings reference](config-reference.md) lists the rest.
 
 Uncomment one API key in `.env`. With `(:provider nil)`, enchiridion selects
 OpenAI, OpenCode Go or Anthropic from the key you supplied. If more than one key
-is present, including exported keys, set the provider explicitly in `config.cl`.
+is present, including exported keys, set the provider explicitly in `config.lsp`.
 
 | Provider | Setting | Key in `.env` | Default model |
 | --- | --- | --- | --- |
@@ -37,7 +37,7 @@ Model names go in quotes. `primary` defaults to the provider's model; leaving
 
 `primary` handles conversations and tools, `cheap` handles memory summaries,
 and `sleep` handles background work. These entries all belong inside the quoted
-list in `config.cl`; do not paste a second `:llm` section into it.
+list in `config.lsp`; do not paste a second `:llm` section into it.
 
 For another provider or a local endpoint, see [LLM providers](llm.md).
 
@@ -99,10 +99,10 @@ Use your provider's spending controls for a monetary limit.
 
 ## Files and secrets
 
-The program looks for `config.cl` at `ENCHIRIDION_CONFIG`, in the current
+The program looks for `config.lsp` at `ENCHIRIDION_CONFIG`, in the current
 directory, then at the source root. A root process skips the current directory
 and requires a root-owned config path. Docker's entrypoint installs that copy.
-`config.cl` is Lisp code, so only load files you trust.
+`config.lsp` is Lisp code, so only load files you trust.
 
 Secrets come from the first existing file among `/run/secrets/.env`,
 `./.env`, and `.env` at the source root. Exported environment values override

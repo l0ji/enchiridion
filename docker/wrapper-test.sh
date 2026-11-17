@@ -13,7 +13,7 @@ set -eu
 [ "$CL_SOURCE_REGISTRY" = "$ENCHIRIDION_SOURCE//:/opt/quicklisp/dists/quicklisp/software//" ]
 [ "$#" -eq 4 ]
 [ "$1" = --script ]
-[ "$2" = "$ENCHIRIDION_SOURCE/src/main.cl" ]
+[ "$2" = "$ENCHIRIDION_SOURCE/src/main.lsp" ]
 [ "$3" = help ]
 [ "$4" = 'argument with spaces' ]
 EOF

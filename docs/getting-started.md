@@ -12,7 +12,7 @@ This page creates an agent and holds the first conversation.
 ```sh
 git clone https://tangled.org/hexmani.ac/enchiridion
 cd enchiridion
-cp config.example.cl config.cl
+cp config.example.lsp config.lsp
 cp .env.example .env
 chmod 600 .env
 ```
@@ -25,7 +25,7 @@ Open `.env`, uncomment one provider line, and replace `add-key` with your key.
 | OpenCode Go | `OPENCODE_API_KEY=add-key` |
 | Anthropic | `ANTHROPIC_API_KEY=add-key` |
 
-You can leave `config.cl` alone for the first run. The key selects the provider,
+You can leave `config.lsp` alone for the first run. The key selects the provider,
 and the provider supplies a default model. If your shell exports another
 provider key, set `:provider` explicitly. See [Configuration](configuration.md)
 for provider, model and channel settings.

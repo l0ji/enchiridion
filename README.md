@@ -18,7 +18,7 @@ nix run .#test      # run both test systems
 ## Run
 
 ```sh
-cp config.example.cl config.cl              # modify these two
+cp config.example.lsp config.lsp              # modify these two
 cp .env.example .env && chmod 600 .env
 
 nix run .#enchiridion                       # create agent folder
@@ -31,7 +31,7 @@ nix run .#enchiridion -- help               # more!
 ## Docker
 
 ```sh
-cp config.example.cl config.cl              # modify these two
+cp config.example.lsp config.lsp              # modify these two
 cp .env.example .env && chmod 600 .env
 
 docker compose build

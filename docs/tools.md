@@ -48,7 +48,7 @@ For write restrictions during setup, see [Bootstrap](memory.md#the-bootstrap).
 | Action | Arguments | Effect |
 | --- | --- | --- |
 | `journey` | `limit` | Last commits in the agent repository |
-| `author` | `name`, `kind`, `text` | Write `tools/NAME.cl` or `skills/NAME.md`; commit when the directory is a repository |
+| `author` | `name`, `kind`, `text` | Write `tools/NAME.lsp` or `skills/NAME.md`; commit when the directory is a repository |
 | `bootstrap-step` | `step` | Record one bootstrap step |
 | `undo` | `confirm` equal to `yes` | Revert the last commit |
 | `reload` | | Ask the running supervisor to reload |

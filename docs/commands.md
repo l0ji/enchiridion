@@ -11,11 +11,11 @@ after `nix run .#enchiridion --`, as in
 `nix run .#enchiridion -- ask "Which port does the webhook use?"`.
 
 In the Compose container, the first `enchiridion` is the service and the second
-is the program. A command that loads `config.cl` needs the path, because the
+is the program. A command that loads `config.lsp` needs the path, because the
 entrypoint exports `ENCHIRIDION_CONFIG` only into the main process:
 
 ```sh
-docker compose exec -e ENCHIRIDION_CONFIG=/etc/enchiridion/config.cl \
+docker compose exec -e ENCHIRIDION_CONFIG=/etc/enchiridion/config.lsp \
   enchiridion enchiridion health
 ```
 
@@ -46,7 +46,7 @@ wrong argument count prints `COMMAND takes ARGUMENTS; got N.`.
 The flags belong to `chat` and `serve` and may come before or after the command.
 `--bind`, `--port` and `--token-env` require `--channel http`. A valid flag
 before another command is accepted and has no effect, and a flag never writes
-`config.cl`. A refused value for one of these flags prints one `enchiridion: `
+`config.lsp`. A refused value for one of these flags prints one `enchiridion: `
 line and exits 2. A flag with no command runs `serve` once the agent is seeded;
 before that it writes the seed files.
 
@@ -92,7 +92,7 @@ An absent action takes the default: `list` for `skills`, `tools`, `channels`,
 First run:
 
 ```sh
-cp config.example.cl config.cl
+cp config.example.lsp config.lsp
 cp .env.example .env && chmod 600 .env
 enchiridion init
 enchiridion chat
@@ -189,7 +189,7 @@ done
 `docker cp` works on a stopped container and keeps the host uid on the copy. The
 entrypoint runs `chown -R` at the next start, so no manual `chown` is needed.
 Start with `docker compose up -d`. Outside a container, the files are under
-`agents/default/` beside `config.cl`.
+`agents/default/` beside `config.lsp`.
 
 `enchiridion --verify-plugin DIRECTORY` verifies the files under `skills/` and
 `tools/`, and exits 1 on a compile error, a warning or a failing self-test.

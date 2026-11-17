@@ -8,7 +8,7 @@ restarts it after one second if it stops.
 
 A channel in the `:channels` section starts with `serve` when its `:enabled`
 value is true. The `--channel` flag starts one for the current process without
-changing `config.cl`. [Commands](commands.md#flags) lists the flags and their
+changing `config.lsp`. [Commands](commands.md#flags) lists the flags and their
 error messages.
 
 `serve` always builds the terminal channel; `chat` runs the REPL in the
@@ -27,7 +27,7 @@ Under `serve` without a terminal, the channel reports `:unavailable` and logs
 
 ## HTTP webhook
 
-Enable it in `config.cl`:
+Enable it in `config.lsp`:
 
 ```lisp
 (:http

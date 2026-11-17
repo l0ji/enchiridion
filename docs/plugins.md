@@ -54,7 +54,7 @@ and no tool is registered.
 
 1. Write the file directly under `agents/default/tools/` or
    `agents/default/skills/`. A subdirectory is not read, and the extension
-   must be `.cl`.
+   must be `.lsp`.
 2. Verify the directory:
 
    ```sh
@@ -77,7 +77,7 @@ The model sees the new tool on the next turn after a successful reload.
 
 ## What verification checks
 
-`--verify-plugin` starts a one-shot child, compiles and loads every `.cl` file
+`--verify-plugin` starts a one-shot child, compiles and loads every `.lsp` file
 under `skills/` and `tools/`, and runs every plugin self-test. The child drops
 to the configured agent uid and gid before it reads a file when the parent runs
 as root. A passing report reads:
@@ -106,14 +106,14 @@ that did load, such as a `defvar`, a written file, or a started thread.
 
 ## Skills
 
-A skill is a file under `agents/default/skills/`. A `.cl` file is an executable
+A skill is a file under `agents/default/skills/`. A `.lsp` file is an executable
 plugin; a `.md` file is reference text. Only the Lisp file is compiled.
 
 | Path | Kind | Compiled | Use |
 | --- | --- | --- | --- |
-| `skills/*.cl` | executable | yes | Registers a tool and loads with a generation |
+| `skills/*.lsp` | executable | yes | Registers a tool and loads with a generation |
 | `skills/*.md` | reference | no | Text the agent reads with `read-file` or `search` |
-| `tools/*.cl` | tool | yes | A plugin that is not a skill |
+| `tools/*.lsp` | tool | yes | A plugin that is not a skill |
 
 Only files directly in `skills/` are read. A subdirectory is not a skill, a
 dot-file is skipped, and the extension is matched case-insensitively.
@@ -131,11 +131,11 @@ A `+trigger+` line records when the skill applies:
 (defparameter +trigger+ "welcome, hello, introduce yourself")
 ```
 
-`enchiridion skills list` reads the first such form as data, numbers the `.cl`
+`enchiridion skills list` reads the first such form as data, numbers the `.lsp`
 files, and prints the trigger beside each name:
 
 ```text
-1. example-welcome.cl -- welcome, hello, introduce yourself
+1. example-welcome.lsp -- welcome, hello, introduce yourself
 ```
 
 `skills show N` prints the file. No prompt includes the trigger today, so the
@@ -145,7 +145,7 @@ line is a listing aid and costs no tokens.
 
 A reference skill is Markdown the agent reads with `read-file` or `search`.
 Nothing compiles it, indexes it, or puts it in a prompt. `skills list` shows
-only `.cl` files, so a reference skill is invisible to the listing. The loader
+only `.lsp` files, so a reference skill is invisible to the listing. The loader
 reports the `.md` files in the generation result, but no command prints them.
 
 There is no front matter format. A `---` block is ordinary text.
@@ -160,7 +160,7 @@ reference skill as data, and keep the ones you trust.
 ### File names
 
 Name a skill file after the skill, in lowercase, so the listing reads as an
-index. `deploy.cl` and `deploy.md` under `skills/` can coexist; nothing refuses
+index. `deploy.lsp` and `deploy.md` under `skills/` can coexist; nothing refuses
 the pair and nothing gives one precedence.
 
 ### Skills commands
@@ -170,7 +170,7 @@ nix run .#enchiridion -- skills list
 nix run .#enchiridion -- skills show 1
 ```
 
-`skills list` prints `no skills yet.` when no `.cl` file exists.
+`skills list` prints `no skills yet.` when no `.lsp` file exists.
 
 ## Shadowing
 
@@ -216,5 +216,5 @@ of 2000 tokens.` See [Tools](tools.md#the-schema-budget).
 | `reload: no supervisor is running, so nothing was asked.` | no live supervisor | start `serve` or `chat` |
 | A tool from the new file is absent | the file is in a subdirectory, has the wrong extension, or names a computed tool | move the file, fix the name, and reload |
 | The tool runs but the model never sees it | the `tool` argument is computed, so the manifest is wrong | write the literal `(tool ...)` form |
-| A Markdown skill is not listed | `skills list` reads `.cl` files only | read the file with `read-file`; there is no listing |
+| A Markdown skill is not listed | `skills list` reads `.lsp` files only | read the file with `read-file`; there is no listing |
 | A trigger is absent from the listing | the file has no top-level `(defparameter +trigger+ "...")` | add the form; the listing reads the file directly |

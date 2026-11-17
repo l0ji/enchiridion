@@ -22,6 +22,7 @@
                 || lib.elem "private" segments);
         in
         lib.elem base [ ".DS_Store" ]
+        || relative == "config.lsp"
         || relative == "config.cl"
         || relative == "PLAN.md"
         || base == ".env"
@@ -39,7 +40,7 @@
           };
         in
         if builtins.pathExists (filtered + "/.env")
-        || builtins.pathExists (filtered + "/config.cl") then
+        || builtins.pathExists (filtered + "/config.lsp") then
           throw "the source filter let a secret or the operator config into the store"
         else filtered;
       lispPackageNames = [
@@ -117,11 +118,11 @@
                 (asdf:load-system "enchiridion")
                 ${compileEntry}
                 (let ((root (uiop:pathname-directory-pathname *default-pathname-defaults*)))
-                  (compile-entry (merge-pathnames "src/main.cl" root)
+                  (compile-entry (merge-pathnames "src/main.lsp" root)
                                  (merge-pathnames "main.fasl" #p"."))
-                  (compile-entry (merge-pathnames "src/git-exec.cl" root)
+                  (compile-entry (merge-pathnames "src/git-exec.lsp" root)
                                  (merge-pathnames "git-exec.fasl" #p"."))
-                  (compile-entry (merge-pathnames "src/broker-exec.cl" root)
+                  (compile-entry (merge-pathnames "src/broker-exec.lsp" root)
                                  (merge-pathnames "broker-exec.fasl" #p"."))))''}'
             runHook postBuild
           '';
@@ -139,7 +140,7 @@
               --set ENCHIRIDION_GIT "${pkgs.gitMinimal}/bin/git" \
               --prefix PATH : "${pkgs.gitMinimal}/bin" \
               --add-flags '--script' \
-              --add-flags "\"$out/lib/src/main.cl\""
+              --add-flags "\"$out/lib/src/main.lsp\""
 
             runHook postInstall
           '';
@@ -196,11 +197,11 @@
                        ${compileEntry}
                        (let* ((root (pathname (format nil "~A/" (uiop:getenv "SOURCE_DIR"))))
                               (out (pathname (uiop:getenv "GATE_DIR"))))
-                         (compile-entry (merge-pathnames "src/main.cl" root)
+                         (compile-entry (merge-pathnames "src/main.lsp" root)
                                         (merge-pathnames "main.fasl" out))
-                         (compile-entry (merge-pathnames "src/git-exec.cl" root)
+                         (compile-entry (merge-pathnames "src/git-exec.lsp" root)
                                         (merge-pathnames "git-exec.fasl" out))
-                         (compile-entry (merge-pathnames "src/broker-exec.cl" root)
+                         (compile-entry (merge-pathnames "src/broker-exec.lsp" root)
                                         (merge-pathnames "broker-exec.fasl" out))))'
 
             ${if run-tests then ''

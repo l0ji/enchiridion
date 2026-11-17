@@ -1,0 +1,636 @@
+;;;; supervisor-test.lsp --- The control file, the status file, and channels.
+;;;;
+;;;; The two files are the whole mechanism that lets a one-shot shell command
+;;;; talk to a process that is already up. The properties under test are the
+;;;; ones a reader depends on: a stale or stopped supervisor is never reported
+;;;; as live, a request is consumed exactly once, and the status file never
+;;;; exists in half a state.
+
+(defpackage #:enchiridion-supervisor-test
+  (:use #:cl)
+  (:import-from #:rove #:deftest #:ok #:ng #:testing)
+  (:export #:run))
+
+(in-package #:enchiridion-supervisor-test)
+
+;;;; A channel that starts and stops at once, so the thread logic can be
+;;;; exercised without a terminal.
+
+(enchiridion.channel:define-channel stub-channel)
+
+(defmethod enchiridion.channel:channel-start ((channel stub-channel) &key config)
+  (declare (ignore config))
+  (setf (enchiridion.channel:channel-live-p channel) t)
+  (setf (enchiridion.channel:channel-state channel) :live)
+  nil)
+
+(defmethod enchiridion.channel:channel-stop ((channel stub-channel))
+  (setf (enchiridion.channel:channel-live-p channel) nil)
+  (setf (enchiridion.channel:channel-state channel) :stopped)
+  nil)
+
+(defmethod enchiridion.channel:channel-send ((channel stub-channel) target text
+                                              &key reply-to)
+  (declare (ignore channel target reply-to))
+  text)
+
+(defmethod enchiridion.channel:channel-status ((channel stub-channel))
+  (enchiridion.channel:channel-state channel))
+
+(defun scratch-directory ()
+  "Return a fresh directory under the directory this build may write."
+  (uiop:ensure-directory-pathname
+   (merge-pathnames
+    (format nil "enchiridion-supervisor-test-~D/" (random most-positive-fixnum))
+    (uiop:ensure-directory-pathname *default-pathname-defaults*))))
+
+(defmacro with-scratch-supervisor ((supervisor &key (channels nil)
+                                                (reload-function nil)
+                                                (tick-function nil))
+                                   &body body)
+  "Bind SUPERVISOR to a started supervisor in a scratch directory, then stop it
+and remove the directory. A failing test must not leave a thread behind."
+  `(let* ((directory (scratch-directory))
+          (run (merge-pathnames "run/" directory))
+          (,supervisor (enchiridion.supervisor:make-supervisor
+                        :directory (namestring (merge-pathnames "agents/default/" directory))
+                        :run-directory (namestring run)
+                        :generation 3
+                        :bootstrap-line "bootstrap step 0 of 8"
+                        :reload-function ,reload-function
+                        :tick-function ,tick-function
+                        :heartbeat-p nil
+                        :channels ,channels)))
+     (unwind-protect
+          (progn
+            (enchiridion.supervisor:supervisor-start ,supervisor)
+            ,@body)
+       (ignore-errors (enchiridion.supervisor:supervisor-stop ,supervisor))
+       (uiop:delete-directory-tree directory
+                                   :validate t
+                                   :if-does-not-exist :ignore))))
+
+(deftest a-supervisor-that-never-ran-is-not-live ()
+  (let ((directory (scratch-directory)))
+    (unwind-protect
+         (let ((run (namestring (merge-pathnames "run/" directory))))
+           (testing "there is no status file and nothing is fresh"
+             (ok (null (enchiridion.supervisor:read-status run)))
+             (ok (null (enchiridion.supervisor:status-fresh-p
+                        (enchiridion.supervisor:read-status run))))
+             (ok (null (enchiridion.supervisor:status-generation
+                        (enchiridion.supervisor:read-status run)))))
+           (testing "a request nobody answers comes back NIL and starts nothing"
+             (ok (null (enchiridion.supervisor:request-control
+                        "reload" :run run :wait 0.2)))
+             (ok (null (enchiridion.supervisor:read-status run)))))
+      (uiop:delete-directory-tree directory
+                                  :validate t
+                                  :if-does-not-exist :ignore))))
+
+(deftest the-status-file-round-trips ()
+  (with-scratch-supervisor (supervisor)
+    (let* ((run (enchiridion.supervisor:supervisor-run-directory supervisor))
+           (status (enchiridion.supervisor:read-status run)))
+      (testing "a running supervisor is live and names its generation"
+        (ok (enchiridion.supervisor:status-fresh-p status))
+        (ok (= 3 (enchiridion.supervisor:status-generation status)))
+        (ok (integerp (enchiridion.supervisor:status-pid status)))
+        (ok (string= "bootstrap step 0 of 8"
+                     (enchiridion.supervisor:status-bootstrap status))))
+      (testing "the write is atomic, so no half file is ever left behind"
+        (ok (null (probe-file (merge-pathnames "enchiridion.status.new" run))))))
+    (testing "a stopped supervisor is not live, even for a moment"
+      (enchiridion.supervisor:supervisor-stop supervisor)
+      (ok (null (enchiridion.supervisor:status-fresh-p
+                 (enchiridion.supervisor:read-status
+                  (enchiridion.supervisor:supervisor-run-directory supervisor))))))))
+
+(deftest a-control-request-is-consumed-once ()
+  (with-scratch-supervisor (supervisor
+                            :channels (list (make-stub-channel))
+                            :tick-function (lambda (supervisor)
+                                             (declare (ignore supervisor))
+                                             (list :ok-p t :report "ticked")))
+    (let ((run (enchiridion.supervisor:supervisor-run-directory supervisor)))
+      (testing "the channel is known by name"
+        (ok (enchiridion.supervisor:find-channel supervisor "stub-channel"))
+        (ok (null (enchiridion.supervisor:find-channel supervisor "nope"))))
+      (enchiridion.supervisor:queue-control "heartbeat on" :run run)
+      (testing "the first poll reads it and the second does not"
+        (ok (= 1 (enchiridion.supervisor:supervisor-poll-control supervisor)))
+        (ok (= 0 (enchiridion.supervisor:supervisor-poll-control supervisor))))
+      (testing "the report reaches the status file"
+        (ok (search "heartbeat on"
+                    (enchiridion.supervisor:status-report
+                     (enchiridion.supervisor:read-status run))))
+        (ok (enchiridion.supervisor:status-report-ok-p
+             (enchiridion.supervisor:read-status run)))
+        (ok (enchiridion.supervisor:supervisor-heartbeat-p supervisor)))
+      (testing "channels list names the channel"
+        (enchiridion.supervisor:queue-control "channels list" :run run)
+        (ok (= 1 (enchiridion.supervisor:supervisor-poll-control supervisor)))
+        (ok (search "stub-channel"
+                    (enchiridion.supervisor:status-report
+                     (enchiridion.supervisor:read-status run)))))
+      (testing "an unknown request is reported and does not stop the poll"
+        (enchiridion.supervisor:queue-control "no-such-request" :run run)
+        (ok (= 1 (enchiridion.supervisor:supervisor-poll-control supervisor)))
+        (ok (search "unknown control request"
+                    (enchiridion.supervisor:status-report
+                     (enchiridion.supervisor:read-status run))))))))
+
+(deftest a-refused-reload-says-so-in-the-status ()
+  ;; The operator script that asked has to be able to tell a refused generation
+  ;; from a loaded one, and the generation number is the same either way.
+  (with-scratch-supervisor
+      (supervisor
+       :reload-function (lambda (supervisor)
+                          (declare (ignore supervisor))
+                          (list :ok-p nil :generation 3
+                                :report "broken.lsp: READ error during LOAD.")))
+    (let ((run (enchiridion.supervisor:supervisor-run-directory supervisor)))
+      (enchiridion.supervisor:queue-control "reload" :run run)
+      (ok (= 1 (enchiridion.supervisor:supervisor-poll-control supervisor)))
+      (let ((status (enchiridion.supervisor:read-status run)))
+        (testing "the report carries the reason and not a success"
+          (ok (search "reload refused" (enchiridion.supervisor:status-report status)))
+          (ok (search "broken.lsp" (enchiridion.supervisor:status-report status)))
+          (ok (null (enchiridion.supervisor:status-report-ok-p status))))
+        (testing "and the generation did not move"
+          (ok (= 3 (enchiridion.supervisor:status-generation status))))))))
+
+(deftest a-loaded-generation-is-reported-as-answered ()
+  (with-scratch-supervisor
+      (supervisor
+       :reload-function (lambda (supervisor)
+                          (declare (ignore supervisor))
+                          (list :ok-p t :generation 4 :report "generation 4 loaded, 2 files")))
+    (let ((run (enchiridion.supervisor:supervisor-run-directory supervisor)))
+      (enchiridion.supervisor:queue-control "reload" :run run)
+      (ok (= 1 (enchiridion.supervisor:supervisor-poll-control supervisor)))
+      (let ((status (enchiridion.supervisor:read-status run)))
+        (ok (enchiridion.supervisor:status-report-ok-p status))
+        (ok (= 4 (enchiridion.supervisor:status-generation status)))))))
+
+;;;; The heartbeat.
+
+(deftest a-tick-runs-the-hook-and-records-what-it-said ()
+  (let* ((directory (scratch-directory))
+         (run (merge-pathnames "run/" directory))
+         (ticks 0)
+         (supervisor (enchiridion.supervisor:make-supervisor
+                      :directory (namestring directory)
+                      :run-directory (namestring run)
+                      :tick-function (lambda (supervisor)
+                                       (declare (ignore supervisor))
+                                       (incf ticks)
+                                       (list :ok-p t :report "one task done")))))
+    (unwind-protect
+         (progn
+           (enchiridion.supervisor:supervisor-start supervisor)
+           (enchiridion.supervisor:supervisor-tick supervisor)
+           (ok (= 1 ticks))
+           (ok (= 1 (enchiridion.supervisor:supervisor-ticks supervisor)))
+           (ok (enchiridion.supervisor:supervisor-tick-ok-p supervisor))
+           (ok (string= "one task done"
+                        (enchiridion.supervisor:supervisor-tick-report supervisor)))
+           (testing "the status file carries a heartbeat object"
+             ;; A tick publishes slots; the poll loop is the only writer of the
+             ;; status file, so a reader sees the tick after the next poll.
+             (enchiridion.supervisor:supervisor-write-status supervisor)
+             (let ((beat (enchiridion.supervisor:status-heartbeat
+                          (enchiridion.supervisor:read-status run))))
+               (ok (hash-table-p beat))
+               (ok (eql 1 (gethash "ticks" beat)))
+               (ok (string= "one task done" (gethash "report" beat)))
+               (ok (integerp (gethash "last-tick" beat)))))
+           (testing "a hook that signals does not take the scheduler with it"
+             (setf (enchiridion.supervisor:supervisor-tick-function supervisor)
+                   (lambda (supervisor)
+                     (declare (ignore supervisor))
+                     (error "the tick exploded")))
+             (let ((report (enchiridion.supervisor:supervisor-tick supervisor)))
+               (ok (null (getf report :ok-p)))
+               (ok (search "the tick exploded" (getf report :report)))
+               (ok (= 2 (enchiridion.supervisor:supervisor-ticks supervisor)))
+               (ok (null (enchiridion.supervisor:supervisor-tick-ok-p supervisor))))))
+      (ignore-errors (enchiridion.supervisor:supervisor-stop supervisor))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(deftest heartbeat-run-asks-for-one-tick-without-waiting ()
+  (let* ((directory (scratch-directory))
+         (run (merge-pathnames "run/" directory))
+         (supervisor (enchiridion.supervisor:make-supervisor
+                      :directory (namestring directory)
+                      :run-directory (namestring run)
+                      :heartbeat-p nil
+                      :heartbeat-interval 3600
+                      :tick-function (lambda (supervisor)
+                                       (declare (ignore supervisor))
+                                       (list :ok-p t :report "ticked")))))
+    (unwind-protect
+         (progn
+           (enchiridion.supervisor:supervisor-start supervisor)
+           (enchiridion.supervisor:queue-control "heartbeat run" :run run)
+           (ok (= 1 (enchiridion.supervisor:supervisor-poll-control supervisor)))
+           (testing "the answer is immediate and names a request, not a result"
+             (ok (enchiridion.supervisor:status-report-ok-p
+                  (enchiridion.supervisor:read-status run)))
+             (ok (search "requested"
+                         (enchiridion.supervisor:status-report
+                          (enchiridion.supervisor:read-status run)))))
+           (testing "and the schedule being off does not refuse the request"
+             (ok (not (enchiridion.supervisor:supervisor-heartbeat-p supervisor))))
+           (testing "the request is honoured within a second"
+             (loop repeat 100
+                   until (plusp (enchiridion.supervisor:supervisor-ticks supervisor))
+                   do (sleep 0.05))
+             (ok (= 1 (enchiridion.supervisor:supervisor-ticks supervisor)))
+             (ok (null (enchiridion.supervisor:supervisor-tick-requested-p supervisor)))
+             (testing "and an hour-long interval is not due a second later"
+               (ok (not (enchiridion.supervisor:supervisor-heartbeat-due-p
+                         supervisor))))))
+      (ignore-errors (enchiridion.supervisor:supervisor-stop supervisor))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(deftest a-fresh-supervisor-waits-an-interval-for-its-first-tick ()
+  ;; A pass at t=0 competes with the first operator turn and spends tokens
+  ;; before anyone asked for anything, so the schedule starts one interval out
+  ;; and only an explicit `heartbeat run` ticks sooner.
+  (let* ((directory (scratch-directory))
+         (run (merge-pathnames "run/" directory))
+         (supervisor (enchiridion.supervisor:make-supervisor
+                      :directory (namestring directory)
+                      :run-directory (namestring run)
+                      :heartbeat-p t
+                      :heartbeat-interval 900
+                      :tick-function (lambda (supervisor)
+                                       (declare (ignore supervisor))
+                                       (list :ok-p t :report "ticked")))))
+    (unwind-protect
+         (progn
+           (enchiridion.supervisor:supervisor-start supervisor)
+           (ok (not (enchiridion.supervisor:supervisor-heartbeat-due-p supervisor)))
+           (testing "and a request still ticks at once"
+             ;; The heartbeat thread is running, so it is the one that answers
+             ;; the request; ticking by hand here races it on a slow host.
+             (setf (enchiridion.supervisor:supervisor-tick-requested-p supervisor) t)
+             (loop repeat 100
+                   until (plusp (enchiridion.supervisor:supervisor-ticks supervisor))
+                   do (sleep 0.05))
+             (ok (= 1 (enchiridion.supervisor:supervisor-ticks supervisor)))))
+      (ignore-errors (enchiridion.supervisor:supervisor-stop supervisor))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(deftest heartbeat-on-starts-a-schedule-the-configuration-disabled ()
+  ;; An operator who starts with :sleep :enabled nil must be able to turn
+  ;; unattended work on, or the command that says it did is lying.
+  (let* ((directory (scratch-directory))
+         (run (merge-pathnames "run/" directory))
+         (supervisor (enchiridion.supervisor:make-supervisor
+                      :directory (namestring directory)
+                      :run-directory (namestring run)
+                      :heartbeat-p nil
+                      :heartbeat-interval 3600
+                      :tick-function (lambda (supervisor)
+                                       (declare (ignore supervisor))
+                                       (list :ok-p t :report "ticked")))))
+    (unwind-protect
+         (progn
+           (enchiridion.supervisor:supervisor-start supervisor)
+           (ok (null (enchiridion.supervisor::supervisor-heartbeat-thread supervisor)))
+           (enchiridion.supervisor:queue-control "heartbeat on" :run run)
+           (enchiridion.supervisor:supervisor-poll-control supervisor)
+           (ok (enchiridion.supervisor:supervisor-heartbeat-p supervisor))
+           (testing "the thread is running now"
+             (ok (enchiridion.supervisor::supervisor-heartbeat-thread supervisor))
+             (ok (bordeaux-threads:thread-alive-p
+                  (enchiridion.supervisor::supervisor-heartbeat-thread supervisor)))))
+      (ignore-errors (enchiridion.supervisor:supervisor-stop supervisor))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(deftest a-tick-request-during-a-tick-is-queued ()
+  ;; The operator asked. Dropping the request makes the command that said
+  ;; "requested" a lie, and the tick it wanted never happens.
+  (let* ((released nil)
+         (directory (scratch-directory))
+         (run (merge-pathnames "run/" directory))
+         (supervisor (enchiridion.supervisor:make-supervisor
+                      :directory (namestring directory)
+                      :run-directory (namestring run)
+                      :heartbeat-p t
+                      :tick-function (lambda (supervisor)
+                                       (declare (ignore supervisor))
+                                       ;; Hold the first tick open so the
+                                       ;; heartbeat thread is busy, not idle and
+                                       ;; free to take the request itself.
+                                       (loop repeat 200 until released
+                                             do (sleep 0.05))
+                                       (list :ok-p t :report "ticked")))))
+    (unwind-protect
+         (progn
+           (enchiridion.supervisor:supervisor-start supervisor)
+           (setf (enchiridion.supervisor:supervisor-tick-requested-p supervisor) t)
+           (loop repeat 100
+                 until (enchiridion.supervisor:supervisor-tick-running-p supervisor)
+                 do (sleep 0.05))
+           (ok (enchiridion.supervisor:supervisor-tick-running-p supervisor))
+           (enchiridion.supervisor:queue-control "heartbeat run" :run run)
+           (ok (= 1 (enchiridion.supervisor:supervisor-poll-control supervisor)))
+           (ok (enchiridion.supervisor:supervisor-tick-requested-p supervisor))
+           (let ((status (enchiridion.supervisor:read-status run)))
+             (ok (enchiridion.supervisor:status-report-ok-p status))
+             (ok (search "queued" (enchiridion.supervisor:status-report status))))
+           (testing "and the queued request runs once the tick ends"
+             (setf released t)
+             (loop repeat 100
+                   until (= 2 (enchiridion.supervisor:supervisor-ticks supervisor))
+                   do (sleep 0.05))
+             (ok (= 2 (enchiridion.supervisor:supervisor-ticks supervisor)))))
+      (setf released t)
+      (ignore-errors (enchiridion.supervisor:supervisor-stop supervisor))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(deftest heartbeat-on-without-a-hook-is-not-a-success ()
+  ;; The operator script that turns the heartbeat on deserves to know that
+  ;; nothing will happen: a channel with no sleep agent attached is a schedule
+  ;; with nothing to run.
+  (let* ((directory (scratch-directory))
+         (run (merge-pathnames "run/" directory))
+         (supervisor (enchiridion.supervisor:make-supervisor
+                      :directory (namestring directory)
+                      :run-directory (namestring run))))
+    (unwind-protect
+         (progn
+           (enchiridion.supervisor:supervisor-start supervisor)
+           (enchiridion.supervisor:queue-control "heartbeat on" :run run)
+           (enchiridion.supervisor:supervisor-poll-control supervisor)
+           (let ((status (enchiridion.supervisor:read-status run)))
+             (ok (enchiridion.supervisor:supervisor-heartbeat-p supervisor))
+             (ok (search "no sleep agent" (enchiridion.supervisor:status-report status)))
+             (ok (null (enchiridion.supervisor:status-report-ok-p status)))))
+      (ignore-errors (enchiridion.supervisor:supervisor-stop supervisor))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(deftest enabling-a-live-channel-does-not-start-it-twice ()
+  ;; A started channel reports :LIVE, not :RUNNING. The check used to read the
+  ;; state, so enable started a second restart loop on the same channel.
+  (let ((channel (make-instance 'stub-channel :name "stub")))
+    (with-scratch-supervisor (supervisor :channels (list channel))
+      (let ((thread (enchiridion.channel:channel-thread channel)))
+        (sleep 0.1)
+        (ok (eq :live (enchiridion.channel:channel-state channel)))
+        (ok (search "already up"
+                    (enchiridion.supervisor::handle-channels
+                     supervisor '("enable" "stub"))))
+        (ok (eq thread (enchiridion.channel:channel-thread channel))
+            "the channel still runs on the thread it started with")))))
+
+(deftest stopping-waits-for-the-tick-in-flight ()
+  ;; The heartbeat thread used to be destroyed mid-tick, which can unwind out
+  ;; of a store write with a transaction open.
+  (let* ((finished nil)
+         (directory (scratch-directory))
+         (supervisor (enchiridion.supervisor:make-supervisor
+                      :directory (namestring directory)
+                      :run-directory (namestring (merge-pathnames "run/" directory))
+                      :heartbeat-p nil
+                      :tick-function (lambda (supervisor)
+                                       (declare (ignore supervisor))
+                                       (sleep 0.5)
+                                       (setf finished t)
+                                       (list :ok-p t :report "slow tick")))))
+    (unwind-protect
+         (progn
+           (enchiridion.supervisor:supervisor-start supervisor)
+           (enchiridion.supervisor::handle-heartbeat supervisor '("run"))
+           (loop repeat 100
+                 until (enchiridion.supervisor:supervisor-tick-running-p supervisor)
+                 do (sleep 0.02))
+           (enchiridion.supervisor:supervisor-stop supervisor)
+           (ok finished "the tick ran to its end before stop returned"))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(deftest lazy-channel-replacement-preserves-healthy-instance ()
+  (with-scratch-supervisor (supervisor)
+    (let ((calls 0))
+      (setf (enchiridion.supervisor:supervisor-channel-factory supervisor)
+            (lambda (name)
+              (incf calls)
+              (if (string= name "stub-channel") (make-stub-channel) nil)))
+      (ok (= calls 0))
+      (multiple-value-bind (report good)
+          (enchiridion.supervisor:supervisor-enable-channel supervisor "stub-channel")
+        (declare (ignore report))
+        (ok good))
+      (let ((old (enchiridion.supervisor:find-channel supervisor "stub-channel")))
+        (ok old)
+        (setf (enchiridion.supervisor:supervisor-channel-factory supervisor)
+              (lambda (name) (declare (ignore name)) (error "factory refused")))
+        (multiple-value-bind (report good)
+            (enchiridion.supervisor:supervisor-enable-channel
+             supervisor "stub-channel" :replace t)
+          (ok (search "factory refused" report))
+          (ng good))
+        (ok (eq old (enchiridion.supervisor:find-channel supervisor "stub-channel")))
+        (ok (enchiridion.channel:channel-live-p old))))))
+
+(deftest simultaneous-control-requests-have-independent-responses ()
+  (with-scratch-supervisor (supervisor)
+    (let* ((run (enchiridion.supervisor:supervisor-run-directory supervisor))
+           (first nil) (second nil)
+           (one (bordeaux-threads:make-thread
+                 (lambda () (setf first (enchiridion.supervisor:request-control
+                                         "channels list" :run run :wait 3)))))
+           (two (bordeaux-threads:make-thread
+                 (lambda () (setf second (enchiridion.supervisor:request-control
+                                          "not-a-command" :run run :wait 3))))))
+      (unwind-protect
+           (progn
+             (loop repeat 100
+                   until (and first second)
+                   do (enchiridion.supervisor:supervisor-poll-control supervisor)
+                      (sleep 0.01))
+             (bordeaux-threads:join-thread one)
+             (bordeaux-threads:join-thread two)
+             (ok first) (ok second)
+             (ok (enchiridion.supervisor:status-report-ok-p first))
+             (ng (enchiridion.supervisor:status-report-ok-p second))
+             (ok (search "no channels" (enchiridion.supervisor:status-report first)))
+             (ok (search "unknown control" (enchiridion.supervisor:status-report second)))
+             (ng (equal (gethash "request-id" first) (gethash "request-id" second)))
+             (ok (= 0 (enchiridion.supervisor:supervisor-poll-control supervisor))))
+        (dolist (thread (list one two))
+          (when (bordeaux-threads:thread-alive-p thread)
+            (bordeaux-threads:destroy-thread thread)))))))
+
+(deftest headless-cli-is-not-restarted ()
+  (let* ((*standard-input* (make-string-input-stream ""))
+         (channel (enchiridion.channel.cli:make-cli-channel))
+         (supervisor (enchiridion.supervisor:make-supervisor)))
+    (setf (enchiridion.supervisor:supervisor-running-p supervisor) t)
+    (let ((start (get-internal-real-time)))
+      (enchiridion.supervisor::restart-channel-loop supervisor channel)
+      (ok (< (- (get-internal-real-time) start) internal-time-units-per-second))
+      (ok (eq :unavailable (enchiridion.channel:channel-state channel))))))
+
+(enchiridion.channel:define-channel stalled-channel)
+(defmethod enchiridion.channel:channel-start ((channel stalled-channel) &key config)
+  (declare (ignore channel config))
+  (sleep 30))
+(defmethod enchiridion.channel:channel-stop ((channel stalled-channel)) channel)
+
+(enchiridion.channel:define-channel conflicting-channel)
+(defmethod enchiridion.channel:channel-start ((channel conflicting-channel) &key config)
+  (declare (ignore channel config))
+  (error "Address already in use"))
+(defmethod enchiridion.channel:channel-stop ((channel conflicting-channel)) channel)
+
+(deftest replacement-timeout-and-listener-conflict-preserve-old-channel ()
+  (with-scratch-supervisor (supervisor :channels (list (make-stub-channel)))
+    (let ((old (enchiridion.supervisor:find-channel supervisor "stub-channel"))
+          (enchiridion.supervisor::+channel-start-seconds+ 0.05))
+      (loop repeat 100 until (enchiridion.channel:channel-live-p old) do (sleep 0.01))
+      (dolist (constructor (list #'make-stalled-channel #'make-conflicting-channel))
+        (setf (enchiridion.supervisor:supervisor-channel-factory supervisor)
+              (lambda (name) (funcall constructor :name name)))
+        (multiple-value-bind (report good)
+            (enchiridion.supervisor:supervisor-enable-channel
+             supervisor "stub-channel" :replace t)
+          (ng good)
+          (ok (search "refused" report)))
+        (ok (eq old (enchiridion.supervisor:find-channel supervisor "stub-channel")))
+        (ok (enchiridion.channel:channel-live-p old))))))
+
+(deftest control-admission-is-bounded-and-expiry-is-explicit ()
+  (with-scratch-supervisor (supervisor)
+    (let* ((run (enchiridion.supervisor:supervisor-run-directory supervisor))
+           (enchiridion.supervisor::+control-file-limit+ 1)
+           (path (enchiridion.supervisor:queue-control "heartbeat off" :run run)))
+      (ok (handler-case
+              (progn (enchiridion.supervisor:queue-control "heartbeat on" :run run) nil)
+            (error () t)))
+      (let ((enchiridion.supervisor::+control-retention-seconds+ -1))
+        (ok (= 1 (enchiridion.supervisor:supervisor-poll-control supervisor)))
+        (let ((reply (com.inuoe.jzon:parse
+                      (uiop:read-file-string (make-pathname :type "response" :defaults path)))))
+          (ng (enchiridion.supervisor:status-report-ok-p reply))
+          (ok (string= (pathname-name path) (gethash "request-id" reply)))
+          (ok (search "expired" (enchiridion.supervisor:status-report reply)))))
+      (ok (handler-case
+              (progn (enchiridion.supervisor:queue-control (make-string 4097) :run run) nil)
+            (error () t))))))
+
+(deftest concurrent-admission-reserves-one-slot-and-recovers-abandoned-claims ()
+  (with-scratch-supervisor (supervisor)
+    (let* ((run (enchiridion.supervisor:supervisor-run-directory supervisor))
+           (success 0)
+           (lock (bordeaux-threads:make-lock))
+           (threads
+             (loop repeat 12 collect
+                   (bordeaux-threads:make-thread
+                    (lambda ()
+                      (let ((enchiridion.supervisor::+control-file-limit+ 1))
+                        (handler-case
+                            (progn
+                              (enchiridion.supervisor:queue-control "channels list" :run run)
+                              (bordeaux-threads:with-lock-held (lock) (incf success)))
+                          (error () nil))))))))
+      (dolist (thread threads) (bordeaux-threads:join-thread thread))
+      (ok (= 1 success))
+      (ok (= 1 (enchiridion.supervisor:supervisor-poll-control supervisor)))
+      (let ((enchiridion.supervisor::+control-retention-seconds+ -1))
+        (enchiridion.supervisor::clean-control-spool run))
+      (ok (null (uiop:directory-files (enchiridion.supervisor::control-spool run))))
+      (let ((enchiridion.supervisor::+control-file-limit+ 1))
+        (let ((claim (enchiridion.supervisor::reserve-control-slot run)))
+          (ok (probe-file claim))
+          (let ((enchiridion.supervisor::+control-retention-seconds+ -1))
+            (enchiridion.supervisor::clean-control-spool run))
+          (ng (probe-file claim)))))))
+
+(deftest malformed-control-never-runs-a-command ()
+  (with-scratch-supervisor (supervisor)
+    (let* ((run (enchiridion.supervisor:supervisor-run-directory supervisor))
+           (path (enchiridion.supervisor:queue-control "channels list" :run run)))
+      (with-open-file (stream path :direction :output :if-exists :supersede)
+        (write-line "reload " stream)
+        (write-line "channels list" stream))
+      (ok (= 1 (enchiridion.supervisor:supervisor-poll-control supervisor)))
+      (ok (= 3 (enchiridion.supervisor:supervisor-generation supervisor)))
+      (ng (enchiridion.supervisor::supervisor-report-ok-p supervisor)))))
+
+(deftest pending-requests-survive-a-restart-and-fresh-responses-are-retained ()
+  (let* ((directory (scratch-directory))
+         (run (namestring (merge-pathnames "run/" directory))))
+    (unwind-protect
+         (progn
+           (let ((first (enchiridion.supervisor:make-supervisor
+                         :directory (namestring (merge-pathnames "agents/default/" directory))
+                         :run-directory run)))
+             (enchiridion.supervisor:supervisor-start first)
+             (enchiridion.supervisor:queue-control "channels list" :run run)
+             (enchiridion.supervisor:supervisor-stop first))
+           (let ((second (enchiridion.supervisor:make-supervisor
+                          :directory (namestring (merge-pathnames "agents/default/" directory))
+                          :run-directory run)))
+             (enchiridion.supervisor:supervisor-start second)
+             (ok (= 1 (enchiridion.supervisor:supervisor-poll-control second)))
+             (let ((response (first (remove-if-not
+                                     (lambda (path)
+                                       (string= "response" (pathname-type path)))
+                                     (uiop:directory-files
+                                      (enchiridion.supervisor::control-spool run))))))
+               (ok response)
+               (ok (string= "response" (pathname-type response)))
+               (enchiridion.supervisor::clean-control-spool run)
+               (ok (probe-file response)))
+             (enchiridion.supervisor:supervisor-stop second)))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(deftest unrecognized-spool-files-are-bounded ()
+  (with-scratch-supervisor (supervisor)
+    (let* ((run (enchiridion.supervisor:supervisor-run-directory supervisor))
+           (spool (enchiridion.supervisor::control-spool run))
+           (junk (merge-pathnames "operator-notes.txt" spool))
+           (enchiridion.supervisor::+control-retention-seconds+ -1))
+      (ensure-directories-exist junk)
+      (with-open-file (stream junk :direction :output :if-exists :supersede)
+        (write-line "not a request" stream))
+      (enchiridion.supervisor::clean-control-spool run)
+      (ng (probe-file junk)))))
+
+(deftest the-replace-control-verb-publishes-a-fresh-channel ()
+  (with-scratch-supervisor (supervisor :channels (list (make-stub-channel)))
+    (let* ((old (enchiridion.supervisor:find-channel supervisor "stub-channel"))
+           (built nil))
+      (setf (enchiridion.supervisor:supervisor-channel-factory supervisor)
+            (lambda (name) (setf built (make-stub-channel :name name))))
+      (multiple-value-bind (report ok)
+          (enchiridion.supervisor::handle-control
+           supervisor "channels replace stub-channel")
+        (ok (not (null ok)))
+        (ok (search "is up" report)))
+      (ok built)
+      (ok (not (eq old built)))
+      (ok (eq built (enchiridion.supervisor:find-channel supervisor "stub-channel")))
+      (ok (enchiridion.channel:channel-live-p built)))))
+
+(deftest polling-an-idle-supervisor-does-no-work ()
+  (with-scratch-supervisor (supervisor)
+    (ok (= 0 (enchiridion.supervisor:supervisor-poll-control supervisor)))
+    (ok (= 0 (enchiridion.supervisor:supervisor-poll-control supervisor)))))
+
+(deftest legacy-lines-rotate-without-being-truncated-under-a-reader ()
+  (with-scratch-supervisor (supervisor)
+    (let* ((run (enchiridion.supervisor:supervisor-run-directory supervisor))
+           (path (enchiridion.supervisor:control-file run)))
+      (with-open-file (stream path :direction :output :if-exists :supersede
+                                   :if-does-not-exist :create)
+        (write-line "heartbeat off" stream)
+        (write-line "channels list" stream))
+      (ok (= 2 (enchiridion.supervisor:supervisor-poll-control supervisor)))
+      (ng (probe-file path))
+      (ng (probe-file (make-pathname :type "batch" :defaults path)))
+      (ok (= 0 (enchiridion.supervisor:supervisor-poll-control supervisor))))))

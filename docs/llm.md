@@ -2,7 +2,7 @@
 
 enchiridion talks to OpenAI-compatible chat APIs, the Anthropic Messages API,
 Amazon Bedrock and Google Vertex. One provider row is active at a time. Every
-LLM setting belongs under `:llm` in `config.cl`; the full key list is in the
+LLM setting belongs under `:llm` in `config.lsp`; the full key list is in the
 [settings reference](config-reference.md).
 
 ## Built-in providers
@@ -82,7 +82,7 @@ LOCAL_API_KEY=dummy
 ```
 
 The `:openai-local` profile never sends it. Keep credential values in `.env`,
-never in `:headers` in `config.cl`.
+never in `:headers` in `config.lsp`.
 
 For a hosted endpoint with no catalog entry, `:custom` reads the same facts
 from top-level keys and uses the OpenAI-shaped wire unless `:backend` names

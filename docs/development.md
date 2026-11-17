@@ -9,16 +9,16 @@ a file-access restriction: tools can write anything their UNIX user can.
 | Path | Contents |
 | --- | --- |
 | `enchiridion.asd` | The core system and its load order |
-| `src/main.cl` | The program: argument handling and the entry point |
-| `src/broker-exec.cl` | The agent side of the broker, run as a child process |
-| `src/git-exec.cl` | Drops to the agent identity before Git touches the agent repository |
+| `src/main.lsp` | The program: argument handling and the entry point |
+| `src/broker-exec.lsp` | The agent side of the broker, run as a child process |
+| `src/git-exec.lsp` | Drops to the agent identity before Git touches the agent repository |
 | `src/enchiridion/` | The core, one file or directory per subsystem |
 | `t/` | The two test systems and the suites |
 | `flake.nix` | The build, the checks, the shells and the package |
 | `docker/` | The image, the entrypoint, the wrapper and the isolation test |
 | `docs/` | This documentation |
 
-`src/main.cl`, `src/broker-exec.cl` and `src/git-exec.cl` are programs, not system
+`src/main.lsp`, `src/broker-exec.lsp` and `src/git-exec.lsp` are programs, not system
 components. Loading a system must never start an agent, so the gate compiles all
 three explicitly.
 
@@ -56,11 +56,11 @@ Commit `flake.lock` with the update.
 ## Packages
 
 Each subsystem owns a package, and every package is declared in
-`src/enchiridion/packages.cl`. A symbol carries the name of its thing, so a call
+`src/enchiridion/packages.lsp`. A symbol carries the name of its thing, so a call
 reads as `enchiridion.llm:complete` and the source of the symbol is visible at the
 call site. Imports are explicit; no file uses another package wholesale.
 
-A configuration file is read in `enchiridion.user`, so every `config.cl` begins
+A configuration file is read in `enchiridion.user`, so every `config.lsp` begins
 with `(in-package #:enchiridion.user)`.
 
 ## Code style
@@ -78,7 +78,7 @@ The code follows the [lisp-lang.org style guide](https://lisp-lang.org/style-gui
   A CLOS slot gets a `:type`, and its options read `:accessor`, `:initarg`,
   `:initform`, `:type`, `:documentation`.
 - A failure is a condition with a `:report` method, not a formatted string.
-- `src/enchiridion/compat.cl` is the only core file with implementation-specific
+- `src/enchiridion/compat.lsp` is the only core file with implementation-specific
   code. The three entry scripts run under `--script`, before the system loads,
   so they may call SBCL directly.
 
@@ -134,14 +134,14 @@ scoped to one system, so a dependency's warning does not stop this build.
 ### The bridge
 
 Running a test system through `rove:run` would find nothing. rove maps source
-files to packages by the `.lisp` extension, these files use `.cl`, and a run
-started that way reports success after zero tests. `t/support/rove-bridge.cl`
+files to packages by the `.lisp` extension, these files use `.lsp`, and a run
+started that way reports success after zero tests. `t/support/rove-bridge.lsp`
 runs what rove collected instead, and fails when it collected nothing. A count
 comes from `run-suites`; a failure signals, so the SBCL process exits non-zero.
 
 ### Writing a test
 
-1. Create a file under `t/core/` whose name ends in `-test.cl`. Define a package
+1. Create a file under `t/core/` whose name ends in `-test.lsp`. Define a package
    that uses `#:cl`, imports `deftest`, `ok`, `ng` and `testing` from `#:rove`,
    and exports `run`; then `(in-package #:enchiridion-example-test)`.
 

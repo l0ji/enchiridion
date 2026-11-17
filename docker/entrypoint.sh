@@ -93,15 +93,15 @@ AGENT_GID=$(id -g agent)
 # insisted on root ownership would reject the documented Compose run line. The
 # copy is root-owned, mode 600, in a root-owned directory, and the supervisor is
 # pointed at it explicitly.
-if [ -f /opt/enchiridion/config.cl ]; then
+if [ -f /opt/enchiridion/config.lsp ]; then
   mkdir -p /etc/enchiridion
-  if ! cmp -s /opt/enchiridion/config.cl /etc/enchiridion/config.cl 2>/dev/null; then
-    cp /opt/enchiridion/config.cl /etc/enchiridion/config.cl
+  if ! cmp -s /opt/enchiridion/config.lsp /etc/enchiridion/config.lsp 2>/dev/null; then
+    cp /opt/enchiridion/config.lsp /etc/enchiridion/config.lsp
   fi
-  chown 0:0 /etc/enchiridion /etc/enchiridion/config.cl
+  chown 0:0 /etc/enchiridion /etc/enchiridion/config.lsp
   chmod 700 /etc/enchiridion
-  chmod 600 /etc/enchiridion/config.cl
-  export ENCHIRIDION_CONFIG=/etc/enchiridion/config.cl
+  chmod 600 /etc/enchiridion/config.lsp
+  export ENCHIRIDION_CONFIG=/etc/enchiridion/config.lsp
   log "configuration copied to $ENCHIRIDION_CONFIG and closed to the agent"
 fi
 

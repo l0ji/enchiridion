@@ -4,7 +4,7 @@ For provider, model and channel setup, see [Configuration](configuration.md).
 
 ## File format
 
-`config.cl` defines `enchiridion.user:*enchiridion-config*`. It is a quoted list
+`config.lsp` defines `enchiridion.user:*enchiridion-config*`. It is a quoted list
 of section names followed by `(key value)` entries:
 
 ```lisp
@@ -71,7 +71,7 @@ and shipped row field by field.
 `:headers`, `:query-params`, `:profile` and the request options
 `:cache-p`, `:cache-ttl`, `:betas`, `:timeout` and `:retries` can also go under
 `:llm`; a provider row's value wins. `:custom` also takes `:models` under
-`:llm`. Keep credential values in `.env`, not in headers in `config.cl`.
+`:llm`. Keep credential values in `.env`, not in headers in `config.lsp`.
 
 ## Channels
 

@@ -1,0 +1,603 @@
+;;;; broker.lsp --- The supervisor side of the privilege boundary.
+;;;;
+;;;; The supervisor holds the secrets and the model. Agent-authored code runs
+;;;; in a child process as uid 1000. The only thing that crosses the line is a
+;;;; length prefixed JSON request and its response. The supervisor never loads
+;;;; the child's code and never sends a secret in a request.
+;;;;
+;;;; The socket path is the whole configuration. PRODUCTION spawns
+;;;; broker-exec.lsp; tests pass :IN-PROCESS T so the framing and dispatch can
+;;;; be proved without a container. The in-process mode is not the security
+;;;; boundary and is not used by the daemon.
+
+(in-package #:enchiridion.tools.broker)
+
+;; BROKER-CALL is defined after the helpers that use it, and a forward
+;; reference inside one file needs a declaration or the compiler warns, which
+;; this tree makes fatal. The declaration is a bare FUNCTION, and it is the
+;; only proclamation for that name anywhere.
+(declaim (ftype function broker-call))
+
+;; The child's loader hook. The broker loads before the plugin module, because
+;; the plugin module registers the tools the broker dispatches, so a direct
+;; call from here would be a cycle. The child sets this to the plugin loader;
+;; a broker with no hook answers the op with a clear error instead of loading
+;; something in the wrong process.
+(defparameter *load-generation-function* nil
+  "A function of (directory generation) returning (values ok-p report), or NIL.
+BROKER-EXEC sets it to the plugin loader. The supervisor never calls it: the
+load happens in the child, as the agent user.
+
+A hook may return two more values: the digest string of the source it published,
+and the generation number that is live after the call. Both travel back in the
+reply, so the supervisor can refuse a publication that does not match what it
+verified and what it asked for. A hook that returns only the first two keeps
+working and reports neither, which leaves those two checks with nothing to
+compare and therefore failing.
+
+The snapshot the supervisor verified arrives through *LOAD-SOURCE-DIGESTS*
+rather than a third argument, so the two-argument shape every hook already has
+does not change.")
+
+(defparameter *load-source-digests* nil
+  "The digest string the supervisor verified for the load in flight, or NIL.
+LOAD-GENERATION-RESPONSE binds it from the request, and the child's hook reads
+it from here. It is bound rather than passed so that a hook stays a function of
+two arguments.")
+
+;; The supervisor's progress hook. The broker module does not print: the CLI
+;; decides what an operator sees while the child starts.
+(defvar *start-progress-function* nil
+  "A function of one argument, the whole seconds spent waiting for the child's
+socket, or NIL. WAIT-FOR-CONNECTION calls it about once a second.")
+
+(defstruct (broker (:constructor %make-broker))
+  (socket #p"/run/enchiridion/broker.sock" :type pathname)
+  (uid 1000 :type (integer 0 *))
+  (gid 1000 :type (integer 0 *))
+  (timeout 30 :type real)
+  (log nil :type (or null pathname))
+  (stream nil :type t)
+  (server nil :type t)
+  (server-thread nil :type t)
+  (child nil :type t)
+  (running-p nil :type boolean)
+  (broken-p nil :type boolean)
+  (call-timeout 660 :type (or null real))
+  (last-load nil :type list)
+  (call-lock nil :type t))
+
+(defparameter +broker-call-timeout+ 660
+  "Seconds one broker call may take before the child is restarted. Longer than
+the shell tool's own ceiling, so a command that honours its timeout is never
+cut short here: this is the limit for a tool that hangs.")
+
+(defun make-broker (&key (socket #p"/run/enchiridion/broker.sock")
+                           (uid 1000) (gid 1000) (timeout 30) (log nil)
+                           (call-timeout +broker-call-timeout+))
+  "Return a BROKER descriptor. Nothing starts until BROKER-START.
+
+The descriptor carries a lock because it carries one socket. A request is a
+frame out and a frame back on the same stream, and two threads doing that at
+once interleave the writes and one of them reads the other's answer. The REPL
+and the reload poll could already collide; a second channel and the heartbeat
+make it certain.
+
+LOG is a file for the child's standard output and error, or NIL to discard
+them. A child that dies before it binds the socket explains why there.
+
+TIMEOUT is how long the child may take to start. CALL-TIMEOUT is how long one
+call may take, or NIL for no limit."
+  (%make-broker :socket (pathname socket) :uid uid :gid gid :timeout timeout
+                :log (and log (pathname log))
+                :call-timeout call-timeout
+                :call-lock (bordeaux-threads:make-lock "enchiridion broker call")))
+
+(defun json-object (&rest pairs)
+  "Return PAIRS as the JSON object shape JZON writes."
+  (let ((table (make-hash-table :test #'equal)))
+    (loop for (key value) on pairs by #'cddr
+          do (setf (gethash (string-downcase (string key)) table) value))
+    table))
+
+(declaim (ftype (function (stream string) null) write-frame))
+
+(defun write-frame (stream text)
+  "Write TEXT as a four byte big endian length and UTF-8 bytes."
+  (let* ((octets (enchiridion.compat:encode-utf8 text))
+         (length (length octets)))
+    (write-byte (ldb (byte 8 24) length) stream)
+    (write-byte (ldb (byte 8 16) length) stream)
+    (write-byte (ldb (byte 8 8) length) stream)
+    (write-byte (ldb (byte 8 0) length) stream)
+    (write-sequence octets stream)
+    (finish-output stream)
+    nil))
+
+(declaim (ftype (function (stream) (or null string)) read-frame))
+
+(defun read-frame (stream)
+  "Read one frame, or return NIL at a clean end of stream."
+  (let ((header (make-array 4 :element-type '(unsigned-byte 8))))
+    (let ((read (read-sequence header stream)))
+      (cond
+        ((zerop read) nil)
+        ((< read 4) (error 'enchiridion.errors:transport-error
+                           :detail "The broker closed during a frame header."))
+        (t
+         (let ((length (logior (ash (aref header 0) 24)
+                               (ash (aref header 1) 16)
+                               (ash (aref header 2) 8)
+                               (aref header 3))))
+           (when (> length (* 16 1024 1024))
+             (error 'enchiridion.errors:transport-error
+                    :detail "The broker frame is larger than 16 MiB."))
+           (let ((octets (make-array length :element-type '(unsigned-byte 8))))
+             (unless (= length (read-sequence octets stream))
+               (error 'enchiridion.errors:transport-error
+                      :detail "The broker closed during a frame body."))
+             (enchiridion.compat:decode-utf8 octets))))))))
+
+(defun scrub-value (value)
+  "Return VALUE with secret text and credential fields redacted."
+  (enchiridion.llm.secrets:scrub-tree value))
+
+(defun error-response (condition)
+  ;; A detail may be a plist rather than text, and a structured detail is where
+  ;; a credential field would survive a string scrub. Walk it as a tree.
+  (json-object "ok" nil
+               "error" (enchiridion.llm.secrets:scrub
+                        (princ-to-string condition))
+               "detail" (let ((detail (enchiridion.errors:error-detail condition)))
+                          (cond ((null detail) "")
+                                ((stringp detail)
+                                 (enchiridion.llm.secrets:scrub detail))
+                                (t (enchiridion.llm.secrets:scrub-tree detail))))))
+
+(declaim (ftype (function (t t &optional t) t) request-value))
+
+(defun request-value (request name &optional default)
+  "Return NAME from REQUEST, a parsed JSON object, or DEFAULT. JZON keys an
+object by the string as it was written, so the two sides agree on lowercase."
+  (let ((value (and (hash-table-p request) (gethash name request))))
+    (or value default)))
+
+(declaim (ftype (function (t) t) load-generation-response))
+
+(defun load-generation-response (arguments)
+  "Load a generation in this process from ARGUMENTS and return the report.
+
+This runs in the child, as the agent user, and it is the only place agent code
+is loaded for real. The supervisor asks for it over the socket, so the process
+that holds the secrets never compiles what the agent wrote. The loader itself
+arrives through *LOAD-GENERATION-FUNCTION*, which keeps this file free of the
+plugin module it would otherwise have to load before.
+
+The reply carries the digest string the child published and the generation that
+is live after the call, and both are null when the hook did not report them. The
+supervisor compares them with what it verified and what it asked for, so a hook
+that reports neither fails that check instead of passing it by default."
+  (let ((function *load-generation-function*)
+        (directory (request-value arguments "directory"))
+        (generation (request-value arguments "generation"))
+        (digests (request-value arguments "digests")))
+    (unless function
+      (error 'enchiridion.errors:configuration-error
+             :key :plugin
+             :detail "This process has no plugin loader attached."))
+    (multiple-value-bind (ok-p report source-digests live-generation)
+        (let ((*load-source-digests* digests))
+          (funcall function (pathname directory) generation))
+      (json-object "ok" ok-p
+                   "report" report
+                   "digests" source-digests
+                   "generation" live-generation))))
+
+(defun serve-connection (stream)
+  "Answer requests on STREAM until the peer closes it.
+
+One connection carries every call the supervisor makes. Closing it after one
+response would make each BROKER-CALL pay a reconnect and would turn a normal
+second call into a race with the accept loop."
+  (loop for frame = (read-frame stream)
+        while frame
+        do (let* ((request (com.inuoe.jzon:parse frame))
+                  (op (gethash "op" request))
+                  (arguments (gethash "arguments" request)))
+             (handler-case
+                 (let ((result (cond ((and (stringp op) (string= op "ping")) "ok")
+                                     ((and (stringp op) (string= op "load-generation"))
+                                      (load-generation-response arguments))
+                                     (t (enchiridion.tools:dispatch op arguments)))))
+                   (write-frame stream
+                                (com.inuoe.jzon:stringify
+                                 (json-object "ok" t "result" (scrub-value result)))))
+               (enchiridion.errors:enchiridion-error (condition)
+                 (write-frame stream
+                              (com.inuoe.jzon:stringify
+                               (error-response condition))))
+               (error (condition)
+                 (write-frame stream
+                              (com.inuoe.jzon:stringify
+                               (json-object "ok" nil
+                                            "error" (enchiridion.llm.secrets:scrub
+                                                     (princ-to-string condition))
+                                            "detail" ""))))))))
+
+(defun accept-loop (server)
+  "Accept connections until SERVER is closed.
+
+A connection that fails ends that connection and not the loop. The supervisor
+drops its connection when a call is interrupted, and the reply to that call is
+then written to a closed socket; if that error ended the loop, the reconnect
+that follows would find nothing listening."
+  (loop
+    (let ((connection (handler-case
+                          (usocket:socket-accept server
+                                                 :element-type '(unsigned-byte 8))
+                        (error () (return nil)))))
+      (unwind-protect
+           (handler-case (serve-connection (usocket:socket-stream connection))
+             (error () nil))
+        (ignore-errors (usocket:socket-close connection))))))
+
+(defun serve-broker (socket &key (uid nil) (gid nil))
+  "Bind SOCKET and serve requests. This is the child entry point.
+
+When UID is non-NIL and this process is root, drop to it before the socket is
+bound and before any agent file is loaded by the caller. The group id drops
+first, the supplementary groups are cleared, and the user drop is SETUID, so
+the child cannot return to root. A non-root test process stays where it is,
+because dropping to a uid it does not own would only fail."
+  (when (and uid (plusp uid) (zerop (enchiridion.compat:process-uid)))
+    (enchiridion.compat:clear-supplementary-groups)
+    (when (and gid (plusp gid))
+      (enchiridion.compat:set-process-gid gid))
+    (enchiridion.compat:set-process-uid uid))
+  (let ((server (usocket:socket-listen socket nil :backlog 5 :reuse-address t)))
+    (unwind-protect
+         (accept-loop server)
+      (usocket:socket-close server))))
+
+(defun broker-exec-path ()
+  "Return the child script path beside the installed source."
+  (merge-pathnames "src/broker-exec.lsp"
+                   (asdf:system-source-directory "enchiridion")))
+
+(defun child-environment ()
+  "Return the minimal environment the child gets. Nothing is inherited: a
+secret in the supervisor's environment must not be one of these strings."
+  (let ((entries (list (format nil "PATH=~A" "/usr/local/bin:/usr/bin:/bin")
+                       (format nil "HOME=~A" (or (uiop:getenv "ENCHIRIDION_HOME") "/tmp")))))
+    ;; ASDF_OUTPUT_TRANSLATIONS points the child at the fasls the supervisor
+    ;; already loaded. Without it the child compiles the whole system into
+    ;; HOME's cache before it binds the socket, which outlasts the timeout.
+    (dolist (name '("SBCL_HOME" "CL_SOURCE_REGISTRY" "ASDF_OUTPUT_TRANSLATIONS"
+                    "ENCHIRIDION_HOME"
+                    "ENCHIRIDION_SOURCE" "ENCHIRIDION_SBCL" "ENCHIRIDION_GIT"
+                    "LD_LIBRARY_PATH" "XDG_CACHE_HOME" "XDG_CONFIG_HOME"))
+      (let ((value (uiop:getenv name)))
+        (when value
+          (push (format nil "~A=~A" name value) entries))))
+    entries))
+
+(declaim (ftype (function (pathname &key (:uid t) (:gid t) (:timeout t)
+                                       (:digests t)) t)
+                broker-verify-plugin))
+
+(defun broker-verify-plugin (directory &key (uid 1000) (gid 1000) (timeout 120)
+                                          (digests nil))
+  "Verify DIRECTORY in a one-shot child that runs as UID, and return two
+values: whether the child exited zero, and the child's combined output.
+
+A separate process, and not the serving child, because a file that kills the
+compiler must not take the agent's running generation with it. The child gets
+the same minimal environment as the broker, so nothing this process holds
+crosses the boundary in either direction.
+
+DIGESTS is the digest string of the source the supervisor read. The child
+refuses a directory that no longer matches it, so the tree it compiles is the
+tree the supervisor has the manifests of."
+  (let ((program (or (uiop:getenv "ENCHIRIDION_SBCL")
+                      (enchiridion.compat:lisp-runtime-path)))
+        (arguments (append (list "--script" (namestring (broker-exec-path))
+                                 "--verify-plugin"
+                                 (namestring (uiop:ensure-directory-pathname directory))
+                                 "--uid" (princ-to-string uid)
+                                 "--gid" (princ-to-string gid))
+                           (when digests (list "--digests" digests)))))
+    (multiple-value-bind (output status)
+        (enchiridion.compat:run-program-capture program arguments
+                                                :timeout timeout
+                                                :environment (child-environment))
+      (values (eql 0 status) output))))
+
+(declaim (ftype (function (broker t &key (:generation integer) (:digests t)) t)
+                broker-load-generation))
+
+(defun broker-load-generation (broker directory &key generation (digests nil))
+  "Ask BROKER's child to load GENERATION from DIRECTORY and return the child's
+report, a hash table with the keys ok, report, digests, and generation.
+
+DIGESTS is the digest string the verification child was held to. The serving
+child refuses a tree that no longer matches it, and the reply says which digest
+it published and which generation is live, so the caller can refuse a
+publication that is not the one it asked for."
+  (let* ((arguments (list :directory (namestring
+                                      (uiop:ensure-directory-pathname directory))
+                          :generation generation))
+         (request (if digests (append arguments (list :digests digests)) arguments))
+         (reply (broker-call broker "load-generation" request)))
+    ;; Remembered so that a child restarted after a hang serves the same
+    ;; generation and not only the builtins. The digest stays out of it: it
+    ;; belonged to the verification this call carried, and a remembered digest
+    ;; would refuse the replay as soon as the agent wrote one more file, which
+    ;; would leave the child serving the builtins while the supervisor still
+    ;; records the generation as live.
+    (when (and (hash-table-p reply) (gethash "ok" reply))
+      (setf (broker-last-load broker) arguments))
+    reply))
+
+(defun log-tail (broker &optional (lines 20))
+  "Return the last LINES lines of BROKER's log, or NIL when there are none."
+  (let ((log (broker-log broker)))
+    (when (and log (probe-file log))
+      (let ((text (ignore-errors (uiop:read-file-lines log))))
+        (when text
+          (format nil "~{~A~^~%~}" (last text lines)))))))
+
+(defun wait-for-connection (broker &optional child)
+  "Try to connect to BROKER's socket until it answers or the timeout expires.
+When CHILD is given and exits first, stop at once: a dead child never binds."
+  (let* ((start (get-internal-real-time))
+         (deadline (+ start (* (broker-timeout broker)
+                               internal-time-units-per-second)))
+         (reported 0))
+    (loop
+      (handler-case
+          (return (usocket:socket-connect (broker-socket broker) nil
+                                          :element-type '(unsigned-byte 8)
+                                          :nodelay nil))
+        (error ()
+          (let ((code (and child (enchiridion.compat:process-exit-code child))))
+            (when code
+              (error 'enchiridion.errors:transport-error
+                     :detail (format nil "The broker exited with status ~A before it started.~@[~%~A~]"
+                                     code (log-tail broker)))))
+          (let ((now (get-internal-real-time)))
+            (when (> now deadline)
+              (error 'enchiridion.errors:transport-error
+                     :detail (format nil "The broker did not start before the timeout.~@[~%~A~]"
+                                     (log-tail broker))))
+            (let ((elapsed (floor (- now start) internal-time-units-per-second)))
+              (when (and *start-progress-function* (> elapsed reported))
+                (setf reported elapsed)
+                (funcall *start-progress-function* elapsed))))
+          (sleep 0.05))))))
+
+(defun start-local (broker)
+  (ensure-directories-exist (broker-socket broker))
+  (uiop:delete-file-if-exists (broker-socket broker))
+  (let ((server (usocket:socket-listen (broker-socket broker) nil
+                                       :backlog 5 :reuse-address t)))
+    (setf (broker-server broker) server)
+    (setf (broker-server-thread broker)
+          (bordeaux-threads:make-thread
+           (lambda () (accept-loop server))
+           :name "enchiridion broker test server"))
+    (let ((connection (wait-for-connection broker)))
+      (setf (broker-stream broker) (usocket:socket-stream connection))
+      (setf (broker-running-p broker) t))
+    broker))
+
+(defun start-child (broker)
+  (ensure-directories-exist (broker-socket broker))
+  (uiop:delete-file-if-exists (broker-socket broker))
+  (when (broker-log broker)
+    (ensure-directories-exist (broker-log broker)))
+  (let* ((program (or (uiop:getenv "ENCHIRIDION_SBCL")
+                      (enchiridion.compat:lisp-runtime-path)))
+         (arguments (list "--script" (namestring (broker-exec-path))
+                          "--socket" (namestring (broker-socket broker))
+                          "--uid" (princ-to-string (broker-uid broker))
+                          "--gid" (princ-to-string (broker-gid broker))))
+         ;; A file, not the default pipe: nothing reads a pipe, and a child
+         ;; that fills one blocks before it binds the socket.
+         (child (enchiridion.compat:run-program program arguments
+                                                :output (broker-log broker)
+                                                :if-output-exists :supersede
+                                                :error-output :output
+                                                :wait nil
+                                                :environment (child-environment))))
+    (setf (broker-child broker) child)
+    (handler-case
+        (let ((connection (wait-for-connection broker child)))
+          (setf (broker-stream broker) (usocket:socket-stream connection))
+          (setf (broker-running-p broker) t)
+          broker)
+      (error (condition)
+        (ignore-errors (enchiridion.compat:process-kill child :sigterm))
+        (error condition)))))
+
+(defun broker-start (broker &key (in-process nil))
+  "Start BROKER. IN-PROCESS is for tests only; production starts the child.
+Return BROKER."
+  (when (broker-running-p broker)
+    (return-from broker-start broker))
+  (if in-process
+      (start-local broker)
+      (start-child broker)))
+
+(defun broker-stop (broker)
+  "Close BROKER, stop its thread or child, and remove the socket."
+  (when (broker-stream broker)
+    (ignore-errors (close (broker-stream broker)))
+    (setf (broker-stream broker) nil))
+  (when (broker-server broker)
+    (ignore-errors (usocket:socket-close (broker-server broker)))
+    (setf (broker-server broker) nil))
+  (when (broker-server-thread broker)
+    (ignore-errors (bordeaux-threads:destroy-thread (broker-server-thread broker)))
+    (setf (broker-server-thread broker) nil))
+  (when (broker-child broker)
+    ;; The group, so a tool the child started stops with it, and reaped, so
+    ;; the child does not stay a zombie for the life of the supervisor.
+    (ignore-errors (enchiridion.compat:process-kill (broker-child broker)
+                                                    :sigterm :process-group))
+    (ignore-errors (enchiridion.compat:process-reap (broker-child broker)))
+    (setf (broker-child broker) nil))
+  (ignore-errors (delete-file (broker-socket broker)))
+  (setf (broker-running-p broker) nil
+        (broker-broken-p broker) nil)
+  broker)
+
+(defun arguments-object (arguments)
+  "Return ARGUMENTS as a hash table so JZON writes an object, not an array.
+A plist reaches BROKER-CALL from Lisp callers; a hash table reaches it from a
+parsed model call. Both become one object on the wire."
+  (cond
+    ((null arguments) (make-hash-table :test #'equal))
+    ((hash-table-p arguments) arguments)
+    ((listp arguments)
+     (let ((table (make-hash-table :test #'equal)))
+       (loop for (key value) on arguments by #'cddr
+             do (setf (gethash (string-downcase (string key)) table) value))
+       table))
+    (t arguments)))
+
+(defun mark-broker-broken (broker)
+  "Drop BROKER's connection after a call that did not finish its exchange.
+
+A call left between its request and its reply leaves the reply, or half a
+frame, in the socket, and the next call would read it as its own answer. The
+connection is closed instead, and the next call opens a fresh one."
+  (let ((stream (shiftf (broker-stream broker) nil)))
+    (when stream
+      (ignore-errors (close stream :abort t))))
+  (setf (broker-broken-p broker) t)
+  broker)
+
+(defun reconnect-broker (broker)
+  "Open a fresh connection to BROKER's socket and return BROKER.
+
+The child accepts one connection at a time, so this connect waits in the
+backlog until the child has finished the call that was abandoned. A child that
+has exited signals a transport error here, as it does at start."
+  (let ((connection (wait-for-connection broker (broker-child broker))))
+    (setf (broker-stream broker) (usocket:socket-stream connection)
+          (broker-broken-p broker) nil)
+    broker))
+
+(defun exchange (broker operation arguments limit)
+  "Write one request to BROKER and return the parsed reply, a hash table.
+
+LIMIT is seconds, or NIL. A call that outlasts it returns :TIMEOUT. Any way
+out between the first byte written and the last byte read, a Ctrl-C or the
+deadline included, leaves the stream out of step, so the connection is marked
+broken. The caller holds the call lock."
+  (let ((request (com.inuoe.jzon:stringify
+                  (json-object "op" (string operation)
+                               "arguments" (arguments-object arguments))))
+        (response nil)
+        (exchanged nil)
+        (outcome nil))
+    (unwind-protect
+         (setf outcome
+               (enchiridion.compat:with-deadline (limit :on-timeout :timeout)
+                 (let ((stream (broker-stream broker)))
+                   (write-frame stream request)
+                   (setf response (read-frame stream))
+                   (when response
+                     (setf exchanged t))
+                   :done)))
+      (unless exchanged
+        (mark-broker-broken broker)))
+    (cond
+      (exchanged (com.inuoe.jzon:parse response))
+      ((eq outcome :timeout) :timeout)
+      (t (error 'enchiridion.errors:transport-error
+                :detail "The broker closed without a response.")))))
+
+(defun restart-child (broker)
+  "Replace BROKER's child with a fresh one and return BROKER.
+
+The old child is killed with its whole process group, so a tool it started
+dies with it. The new child loads the generation the old one last loaded, so a
+restart costs the call that hung and not every agent tool. A reload that fails
+here is reported and leaves the builtins serving: the next `reload` fixes it."
+  (let ((child (broker-child broker)))
+    (when child
+      (ignore-errors (enchiridion.compat:process-kill child :sigkill :process-group))
+      (ignore-errors (enchiridion.compat:process-reap child))))
+  (mark-broker-broken broker)
+  (setf (broker-running-p broker) nil)
+  (start-child broker)
+  (setf (broker-broken-p broker) nil)
+  (let ((load (broker-last-load broker)))
+    (when load
+      (let ((reply (ignore-errors
+                    (exchange broker "load-generation" load (broker-call-timeout broker)))))
+        (unless (and (hash-table-p reply) (gethash "ok" reply))
+          (format *error-output*
+                  "~&enchiridion: the restarted broker did not reload generation ~A.~%"
+                  (getf load :generation))
+          (finish-output *error-output*)))))
+  broker)
+
+(defun recover-broker (broker)
+  "Make BROKER's connection usable again after a broken call.
+A child that is still alive gets a new connection. A child that has exited is
+replaced."
+  (let ((child (broker-child broker)))
+    (if (and child (enchiridion.compat:process-exit-code child))
+        (restart-child broker)
+        (reconnect-broker broker))))
+
+(defun broker-call (broker operation arguments &key timeout)
+  "Send one operation to BROKER and return its result.
+
+TIMEOUT is seconds, and defaults to the broker's CALL-TIMEOUT. A call that
+outlasts it is a hung tool: the child is restarted, the call signals a
+transport error, and the agent lock is free for the next turn. The frame itself
+is capped at 16 MiB by READ-FRAME.
+
+The whole call holds the broker's lock. A request is one frame written and one
+frame read on one stream, so two callers at once would interleave their writes
+and one would read the other's answer, which is a wrong answer and not a
+visible error."
+  (unless (broker-running-p broker)
+    (error 'enchiridion.errors:configuration-error
+           :key :broker
+           :detail "The broker is not running."))
+  (let ((lock (broker-call-lock broker))
+        (limit (or timeout (broker-call-timeout broker))))
+    (when lock
+      (bordeaux-threads:acquire-lock lock))
+    (unwind-protect
+         (progn
+           (when (broker-broken-p broker)
+             (recover-broker broker))
+           (let ((data (exchange broker operation arguments limit)))
+             (when (eq data :timeout)
+               ;; Only a child can be replaced. The in-process test broker
+               ;; reconnects on the next call instead.
+               (when (broker-child broker)
+                 (ignore-errors (restart-child broker)))
+               (error 'enchiridion.errors:transport-error
+                      :detail (format nil "The tool ~A did not answer within ~A seconds, so the broker was restarted."
+                                      operation limit)))
+             (if (gethash "ok" data)
+                 (gethash "result" data)
+                 (error 'enchiridion.errors:tool-error
+                        :tool operation
+                        :detail (or (gethash "detail" data)
+                                    (gethash "error" data)
+                                    "The broker reported an error.")))))
+      (when lock
+        (bordeaux-threads:release-lock lock)))))
+
+(defun broker-health (broker)
+  "Return T when BROKER answers a ping."
+  (handler-case
+      (string= "ok" (broker-call broker "ping" nil))
+    (error () nil)))

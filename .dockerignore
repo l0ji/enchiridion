@@ -14,8 +14,8 @@ t
 PLAN.md
 README.md
 LICENSE
-config.cl
-config.example.cl
+config.lsp
+config.example.lsp
 flake.nix
 flake.lock
 compose.yml
@@ -26,3 +26,5 @@ scratch
 *.fasl
 .docker-config
 .docker-build.log
+
+config.cl

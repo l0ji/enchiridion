@@ -552,3 +552,194 @@ message: the frame tests do that once, at the edge.")
               "late")))
       (ok (signals (enchiridion.channel.fluxer::send-reply channel "target" "reply")
                    'enchiridion.errors:transport-error)))))
+
+;;;; The session cursor, the reconnect budget, and a socket that goes quiet.
+;;;;
+;;;; A session and its dispatch sequence are one object: the gateway numbers
+;;;; from one again in every new session, so a cursor kept across an Identify
+;;;; leaves a channel connected and silent.
+
+(deftest an-identify-forgets-the-session-and-its-cursor ()
+  (let ((channel (enchiridion.channel.fluxer:make-fluxer-channel
+                  :config '(:allowed-users ("u-1"))))
+        (socket (make-instance 'enchiridion.channel.fluxer::fluxer-socket
+                               :url "ws://offline.invalid/")))
+    (setf (enchiridion.channel.fluxer::fluxer-channel-sequence channel) 500
+          (enchiridion.channel.fluxer::fluxer-channel-session-id channel) "s-a"
+          (enchiridion.channel.fluxer::fluxer-channel-token channel) "1234.secret")
+    (enchiridion.channel.fluxer::send-identify channel socket)
+    (testing "the id and the cursor of the session it leaves are gone"
+      (ok (null (enchiridion.channel.fluxer::fluxer-channel-sequence channel)))
+      (ok (null (enchiridion.channel.fluxer::fluxer-channel-session-id channel))))
+    (testing "and an Identify is what went on the wire"
+      (let ((sent (car (aref (websocket-driver.ws.base::queue socket) 0))))
+        (ok (search "\"op\":2" sent))))
+    (testing "so the READY of the new session is new work and arms the echo guard"
+      (enchiridion.channel.fluxer::handle-dispatch
+       channel
+       (enchiridion.channel.fluxer::parse-frame
+        "{\"op\":0,\"t\":\"READY\",\"s\":1,\"d\":{\"session_id\":\"s-b\",\"user\":{\"id\":\"u-9\"}}}"))
+      (ok (eql 1 (enchiridion.channel.fluxer::fluxer-channel-sequence channel)))
+      (ok (string= "s-b"
+                   (enchiridion.channel.fluxer::fluxer-channel-session-id channel)))
+      (ok (string= "u-9"
+                   (enchiridion.channel.fluxer::fluxer-channel-self-id channel))))
+    (testing "and a message in that session is delivered rather than dropped as a replay"
+      (enchiridion.channel.fluxer::handle-dispatch
+       channel
+       (enchiridion.channel.fluxer::parse-frame
+        (enchiridion.channel.fluxer::json-text
+         (list :op 0 :s 2 :t "MESSAGE_CREATE" :d +direct-message+))))
+      (ok (eql 2 (enchiridion.channel.fluxer::fluxer-channel-sequence channel)))
+      (ok (eql 1 (length (enchiridion.channel.fluxer::fluxer-channel-pending channel)))))))
+
+(deftest an-invalid-session-identifies-again-on-the-same-socket ()
+  (let ((channel (enchiridion.channel.fluxer:make-fluxer-channel
+                  :config '(:allowed-users ("u-1"))))
+        (socket (make-instance 'enchiridion.channel.fluxer::fluxer-socket
+                               :url "ws://offline.invalid/")))
+    (setf (enchiridion.channel.fluxer::fluxer-channel-sequence channel) 500
+          (enchiridion.channel.fluxer::fluxer-channel-session-id channel) "s-a"
+          (enchiridion.channel.fluxer::fluxer-channel-token channel) "1234.secret")
+    (enchiridion.channel.fluxer::note-invalid-session channel socket)
+    (testing "the session is abandoned, cursor and all"
+      (ok (null (enchiridion.channel.fluxer::fluxer-channel-sequence channel)))
+      (ok (null (enchiridion.channel.fluxer::fluxer-channel-session-id channel))))
+    (testing "and op 2 is what went out, because op 9 says a resume cannot work"
+      (let ((sent (car (aref (websocket-driver.ws.base::queue socket) 0))))
+        (ok (search "\"op\":2" sent))))))
+
+(deftest a-ready-for-another-session-recovers-a-stale-cursor ()
+  (testing "a numbering that restarted is recognised from the READY alone"
+    (let ((channel (enchiridion.channel.fluxer:make-fluxer-channel
+                    :config '(:allowed-users ("u-1")))))
+      (setf (enchiridion.channel.fluxer::fluxer-channel-sequence channel) 500
+            (enchiridion.channel.fluxer::fluxer-channel-session-id channel) "s-a")
+      (enchiridion.channel.fluxer::handle-dispatch
+       channel
+       (enchiridion.channel.fluxer::parse-frame
+        "{\"op\":0,\"t\":\"READY\",\"s\":1,\"d\":{\"session_id\":\"s-b\",\"user\":{\"id\":\"u-9\"}}}"))
+      (ok (eql 1 (enchiridion.channel.fluxer::fluxer-channel-sequence channel)))
+      (ok (string= "s-b"
+                   (enchiridion.channel.fluxer::fluxer-channel-session-id channel)))
+      (ok (string= "u-9"
+                   (enchiridion.channel.fluxer::fluxer-channel-self-id channel)))))
+  (testing "a resumed session keeps the cursor it already had"
+    (let ((channel (enchiridion.channel.fluxer:make-fluxer-channel
+                    :config '(:allowed-users ("u-1")))))
+      (setf (enchiridion.channel.fluxer::fluxer-channel-sequence channel) 500
+            (enchiridion.channel.fluxer::fluxer-channel-session-id channel) "s-a")
+      (enchiridion.channel.fluxer::handle-dispatch
+       channel
+       (enchiridion.channel.fluxer::parse-frame
+        "{\"op\":0,\"t\":\"READY\",\"s\":501,\"d\":{\"session_id\":\"s-a\",\"user\":{\"id\":\"u-9\"}}}"))
+      (ok (eql 501 (enchiridion.channel.fluxer::fluxer-channel-sequence channel)))
+      (ok (string= "s-a"
+                   (enchiridion.channel.fluxer::fluxer-channel-session-id channel))))))
+
+;;;; The reconnect budget.
+
+(deftest a-gateway-that-closes-after-ready-does-not-reset-the-budget ()
+  (testing "a connection shorter than the stable window is one more attempt"
+    (ok (eql 1 (enchiridion.channel.fluxer::next-attempt 0 0)))
+    (ok (eql 2 (enchiridion.channel.fluxer::next-attempt 1 0)))
+    (testing "so a gateway that flaps is given up on, and not retried forever"
+      (ok (eql 6 (enchiridion.channel.fluxer::next-attempt 5 29)))))
+  (testing "a connection that stayed up earns a fresh budget"
+    (ok (eql 1 (enchiridion.channel.fluxer::next-attempt 5 30)))
+    (ok (eql 1 (enchiridion.channel.fluxer::next-attempt 4 3600))))
+  (testing "READY is not what resets the count"
+    (let ((channel (enchiridion.channel.fluxer:make-fluxer-channel
+                    :config '(:allowed-users ("u-1")))))
+      (setf (enchiridion.channel.fluxer::fluxer-channel-attempt channel) 3)
+      (enchiridion.channel.fluxer::handle-dispatch
+       channel
+       (enchiridion.channel.fluxer::parse-frame
+        "{\"op\":0,\"t\":\"READY\",\"s\":1,\"d\":{\"session_id\":\"s-1\"}}"))
+      (ok (eql 3 (enchiridion.channel.fluxer::fluxer-channel-attempt channel))))))
+
+;;;; A socket that goes quiet without closing.
+
+(deftest a-socket-that-stops-answering-heartbeats-is-replaced ()
+  (testing "a beat is overdue once the window passes without an answer"
+    (ok (enchiridion.channel.fluxer::heartbeat-ack-overdue-p 100 nil 146))
+    (ok (enchiridion.channel.fluxer::heartbeat-ack-overdue-p 100 99 146)))
+  (testing "an answered beat is not overdue"
+    (ng (enchiridion.channel.fluxer::heartbeat-ack-overdue-p 100 100 146))
+    (ng (enchiridion.channel.fluxer::heartbeat-ack-overdue-p 100 130 146)))
+  (testing "an answer to an earlier beat does not answer this one"
+    (ng (enchiridion.channel.fluxer::heartbeat-ack-overdue-p 140 130 146))
+    (ok (enchiridion.channel.fluxer::heartbeat-ack-overdue-p 140 130 186)))
+  (testing "nothing is overdue before the first beat"
+    (ng (enchiridion.channel.fluxer::heartbeat-ack-overdue-p nil nil 100000)))
+  (testing "and the loop closes the socket rather than waiting on a dead transport"
+    (let* ((channel (enchiridion.channel.fluxer:make-fluxer-channel))
+           (socket (make-instance 'enchiridion.channel.fluxer::fluxer-socket
+                                  :url "ws://offline.invalid/"))
+           ;; A closed window: the test is about the close, not about the wait
+           (enchiridion.channel.fluxer::+heartbeat-ack-timeout-seconds+ -1))
+      (setf (enchiridion.channel.fluxer::fluxer-socket-heartbeat-interval socket) 1)
+      (enchiridion.channel.fluxer::run-heartbeats channel socket)
+      (ok (eq :closed (websocket-driver.ws.base:ready-state socket))))))
+
+;;;; A frame from a socket the channel has already left.
+
+(deftest a-frame-from-a-socket-the-channel-has-left-is-dropped ()
+  (labels ((channel-with-socket (socket)
+             (let ((channel (enchiridion.channel.fluxer:make-fluxer-channel
+                             :config '(:allowed-users ("u-1")))))
+               (setf (enchiridion.channel.fluxer::fluxer-channel-socket channel) socket)
+               channel))
+           (dispatch (channel socket sequence)
+             (enchiridion.channel.fluxer::handle-text
+              channel socket
+              (enchiridion.channel.fluxer::json-text
+               (list :op 0 :s sequence :t "MESSAGE_CREATE" :d +direct-message+)))))
+    (let* ((live (make-instance 'enchiridion.channel.fluxer::fluxer-socket
+                                :url "ws://offline.invalid/live"))
+           (stale (make-instance 'enchiridion.channel.fluxer::fluxer-socket
+                                 :url "ws://offline.invalid/stale"))
+           (channel (channel-with-socket live)))
+      (testing "a frame from the socket the channel has left moves nothing"
+        (dispatch channel stale 900)
+        (ok (null (enchiridion.channel.fluxer::fluxer-channel-sequence channel)))
+        (ok (null (enchiridion.channel.fluxer::fluxer-channel-pending channel))))
+      (testing "a frame from the live socket is delivered"
+        (dispatch channel live 901)
+        (ok (eql 901 (enchiridion.channel.fluxer::fluxer-channel-sequence channel)))
+        (ok (eql 1 (length (enchiridion.channel.fluxer::fluxer-channel-pending channel)))))
+      (testing "and a channel that has recorded no socket yet accepts the first one"
+        (let ((channel (channel-with-socket nil)))
+          (dispatch channel stale 1)
+          (ok (eql 1 (enchiridion.channel.fluxer::fluxer-channel-sequence channel))))))))
+
+;;;; The loop that uses all of the above.
+
+(deftest the-reconnect-loop-gives-up-after-the-budget ()
+  (let* ((channel (enchiridion.channel.fluxer:make-fluxer-channel
+                   :config '(:allowed-users ("u-1")
+                             :token-env "ENCHIRIDION_FLUXER_BUDGET_TOKEN")
+                   :turn (lambda (message)
+                           (declare (ignore message))
+                           (list :ok-p t :reply "answer"))))
+         (enchiridion.channel.fluxer::+reconnect-base-seconds+ 0.01)
+         (enchiridion.llm::*http-request-function*
+           (lambda (url &rest options)
+             (declare (ignore options))
+             (if (search "/gateway/bot" url)
+                 ;; A gateway that cannot be reached fails before READY, the
+                 ;; fastest way to exercise the count
+                 "{\"url\":\"ws://127.0.0.1:1/\"}"
+                 "{\"id\":\"x\"}"))))
+    (unwind-protect
+         (progn
+           (enchiridion.llm.secrets:register-secret
+            "ENCHIRIDION_FLUXER_BUDGET_TOKEN" "1234.secret")
+           (enchiridion.channel:channel-start channel)
+           (testing "the channel stops rather than retrying forever"
+             (ok (eql (1+ enchiridion.channel.fluxer::+max-reconnect-attempts+)
+                      (enchiridion.channel.fluxer::fluxer-channel-attempt channel)))
+             (ok (eq :failed (enchiridion.channel:channel-status channel)))
+             (ok (null (enchiridion.channel:channel-live-p channel)))))
+      (enchiridion.llm.secrets:clear-secrets)
+      (ignore-errors (enchiridion.channel:channel-stop channel)))))

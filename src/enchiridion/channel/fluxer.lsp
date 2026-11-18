@@ -46,6 +46,15 @@ string of its own.")
   "The heartbeat interval in milliseconds to assume before Hello arrives. It is
 the number the live gateway sent, and it is only a fallback: Hello decides.")
 
+(defparameter +heartbeat-ack-timeout-seconds+ 45
+  "How long a heartbeat may stay unacknowledged before the socket is treated as
+closed.
+
+The gateway closes 4009 after 45 seconds without an acknowledgement, so a socket
+that stopped acknowledging is already dropped. A half open transport never says
+so: writes still succeed and nothing arrives, which is why the check is here and
+not a close code.")
+
 (defparameter +identify-wait-seconds+ 10
   "How long to wait for Hello after the handshake. A gateway that accepts the
 socket and then says nothing is not a gateway to sit and wait on.")
@@ -68,6 +77,14 @@ busy loop, and the supervisor restarts the channel a second later anyway.")
 (defparameter +reconnect-max-seconds+ 60
   "The longest reconnect wait, in seconds, so a gateway that is down is not
 hammered once a minute forever.")
+
+(defparameter +reconnect-stable-seconds+ 30
+  "How long one connection must last before it earns a fresh reconnect budget.
+
+A gateway that completes the handshake and closes again reaches READY too, so a
+reset on READY alone would retry it once a second for the life of the process.
+Thirty seconds is most of one heartbeat interval, long enough that a connection
+which lasted it has shown the transport works.")
 
 (defparameter +resume-window-seconds+ 60
   "How long the gateway keeps a session after a transport ends, in seconds. A
@@ -569,6 +586,20 @@ loop and a gateway that is up is rejoined quickly."
   (min +reconnect-max-seconds+
        (* +reconnect-base-seconds+ (expt 2 (max 0 (1- attempt))))))
 
+(declaim (ftype (function (integer integer) integer) next-attempt))
+
+(defun next-attempt (attempt connection-seconds)
+  "Return the reconnect attempt number after a connection that lasted
+CONNECTION-SECONDS, where ATTEMPT is the number that connection was tried on.
+
+A connection that lasted +RECONNECT-STABLE-SECONDS+ proved the transport works,
+so the count starts again at one. Anything shorter is one more attempt on the
+same budget, which stops a gateway that accepts a socket and closes it at once
+from being retried once a second forever."
+  (if (>= connection-seconds +reconnect-stable-seconds+)
+      1
+      (1+ attempt)))
+
 (declaim (ftype (function (t) (or null real)) retry-after-seconds))
 
 (defun retry-after-seconds (body)
@@ -739,8 +770,8 @@ guard compares against.")
                   :documentation "When the last transport ended, as a
 universal time. The resume window is counted from it.")
    (attempt :accessor fluxer-channel-attempt :initform 0 :type integer
-            :documentation "Reconnects since the last READY. READY resets it,
-so a healthy session starts its next failure with a fresh budget.")
+            :documentation "Reconnects since the last connection that stayed
+up. NEXT-ATTEMPT decides which connections earn a fresh budget.")
    (dropped :accessor fluxer-channel-dropped :initform 0 :type integer
             :documentation "How many messages a full queue has dropped."))
   (:documentation
@@ -878,6 +909,21 @@ GET-UNIVERSAL-TIME has one second resolution, which is too coarse to send a
 heartbeat on time or to measure a backoff that starts at one second."
   (/ (get-internal-real-time) internal-time-units-per-second))
 
+(declaim (ftype (function (t t integer) boolean) heartbeat-ack-overdue-p))
+
+(defun heartbeat-ack-overdue-p (sent acked now)
+  "Return T when the heartbeat sent at SENT was still unacknowledged at NOW.
+
+SENT and NOW are universal times, and ACKED is the last acknowledgement the
+gateway sent, or NIL when it has sent none; an ACKED older than SENT answers for
+an earlier beat. The gateway answers every beat it receives, so a window with no
+answer means the frames are not arriving."
+  (and (integerp sent)
+       (integerp now)
+       (> (- now sent) +heartbeat-ack-timeout-seconds+)
+       (or (not (integerp acked))
+           (< acked sent))))
+
 (declaim (ftype (function (integer integer &optional t) real) heartbeat-delay))
 
 (defun heartbeat-delay (beat interval &optional jitter)
@@ -979,10 +1025,28 @@ and the gateway reads that as one corrupt frame and closes 4002."
   (send-frame channel socket
               (heartbeat-frame (fluxer-channel-sequence channel))))
 
+(declaim (ftype (function (fluxer-channel) null) note-fresh-session))
+
+(defun note-fresh-session (channel)
+  "Forget the session the last transport carried, and its cursor. Return NIL.
+
+A dispatch sequence belongs to one session, and a new session numbers its
+dispatches from one again. A cursor kept across an Identify comes from a
+numbering that has ended, so the monotonic filter would drop every dispatch of
+the new session as a replay: the channel stays connected, heartbeats, and never
+answers another message. This is the one place that forgets."
+  (setf (fluxer-channel-sequence channel) nil
+        (fluxer-channel-session-id channel) nil)
+  nil)
+
 (declaim (ftype (function (fluxer-channel fluxer-socket) string) send-identify))
 
 (defun send-identify (channel socket)
-  "Send op 2 Identify, the frame that authenticates a fresh session."
+  "Send op 2 Identify, the frame that authenticates a fresh session.
+
+The old session's id and cursor go first: identifying abandons them, and
+resuming a session this channel has left is answered with op 9."
+  (note-fresh-session channel)
   (send-frame channel socket (identify-frame (fluxer-channel-token channel))))
 
 (declaim (ftype (function (fluxer-channel fluxer-socket) string) send-resume))
@@ -1242,10 +1306,10 @@ protocol uses: every gateway frame is JSON."
   "Identify again on the same socket after op 9.
 
 The socket stays open and unauthenticated after an invalid session, so closing
-it and reconnecting would throw away a working transport. The session id goes
-with it: a resume after an invalid session is answered with op 9 again, and op
-9 is never sent with d true, so the only frame that can work is an Identify."
-  (setf (fluxer-channel-session-id channel) nil)
+it and reconnecting would throw away a working transport. SEND-IDENTIFY drops
+the session id and the cursor: a resume after an invalid session is answered
+with op 9 again, and op 9 is never sent with d true, so an Identify is the only
+frame that can work."
   (unless (fluxer-channel-stopping-p channel)
     (send-identify channel socket))
   nil)
@@ -1281,15 +1345,15 @@ answering itself in a loop that costs tokens and never ends."
 (defun note-ready (channel frame)
   "Record who the agent is and which session this socket is, from READY.
 
-The reconnect budget resets here: a session that reached READY is a connection
-that worked, and the next failure deserves a fresh count rather than the remains
-of an earlier outage's."
+The reconnect budget is not reset here. A gateway that completes the handshake
+and closes again reaches READY as well, so a reset here would retry it once a
+second for the life of the process; only the reconnect loop can measure a
+connection that stayed up. See NEXT-ATTEMPT."
   (let ((data (frame-data frame)))
     (when (consp data)
       (setf (fluxer-channel-self-id channel) (ready-user-id data))
       (setf (fluxer-channel-session-id channel)
             (non-blank-string (getf data :session_id))))
-    (setf (fluxer-channel-attempt channel) 0)
     (note "connected as ~A." (or (fluxer-channel-self-id channel)
                                  "an unknown user")))
   nil)
@@ -1330,6 +1394,24 @@ because an answer is a reply to whoever asked."
          (note "dropped a message that could not be checked: ~A" condition)))))
   nil)
 
+(declaim (ftype (function (fluxer-channel t) null) note-session-start))
+
+(defun note-session-start (channel frame)
+  "Forget the old cursor when READY names a session the channel has not been in.
+
+A READY whose session id differs from the one in hand is a new numbering that
+starts at one. Dropping the cursor here recovers a stale one even on a path that
+never sent an Identify, and the READY then passes the filter and records the new
+session. A resume answers with the session id already in hand, so a resumed
+session keeps its cursor and keeps dropping what it has answered."
+  (let* ((data (frame-data frame))
+         (session (non-blank-string (and (consp data) (getf data :session_id)))))
+    (when (and session
+               (non-blank-string (fluxer-channel-session-id channel))
+               (not (string= session (fluxer-channel-session-id channel))))
+      (note-fresh-session channel)))
+  nil)
+
 (declaim (ftype (function (fluxer-channel t) null) handle-dispatch))
 
 (defun handle-dispatch (channel frame)
@@ -1338,7 +1420,12 @@ because an answer is a reply to whoever asked."
 The sequence advances for every dispatch, including the ones dropped, because
 it is what a heartbeat reports and what a resume replays from. A replayed
 dispatch keeps its old number, so a redelivery is dropped here rather than
-answered twice."
+answered twice.
+
+READY is read before the filter: it is the one frame that says the numbering
+restarted, and a cursor from the old numbering would drop it."
+  (when (ready-p frame)
+    (note-session-start channel frame))
   (multiple-value-bind (sequence fresh-p)
       (advance-sequence (fluxer-channel-sequence channel) (frame-seq frame))
     (setf (fluxer-channel-sequence channel) sequence)
@@ -1347,6 +1434,20 @@ answered twice."
         ((ready-p frame) (note-ready channel frame))
         ((message-create-p frame) (offer-message channel (frame-data frame))))))
   nil)
+
+(declaim (ftype (function (fluxer-channel t) boolean) current-socket-p))
+
+(defun current-socket-p (channel socket)
+  "Return T when SOCKET is the socket CHANNEL is working on.
+
+The library closes a socket from another thread by destroying its read thread,
+and a frame that thread had already read can still arrive afterwards. It carries
+the sequence of a session that is over, so letting it through would move the
+cursor the live session reads from and turn real dispatches into replays. NIL,
+the state before the first socket is recorded, accepts a frame: that is a new
+connection's Hello arriving before the channel records the socket."
+  (let ((current (fluxer-channel-socket channel)))
+    (or (null current) (eq current socket))))
 
 (declaim (ftype (function (fluxer-channel fluxer-socket t) null) handle-text))
 
@@ -1360,7 +1461,7 @@ ending the read loop, because the library's loop would treat a signal as the
 end of the connection."
   (handler-case
       (let ((text (message-text message)))
-        (when text
+        (when (and text (current-socket-p channel socket))
           (let ((frame (parse-frame text)))
             (cond
               ((null frame)
@@ -1427,20 +1528,33 @@ inside START-CONNECTION and a listener attached afterwards would miss it."
 Every beat is due one interval after the last one was written, measured from
 the clock rather than accumulated, so a slow send cannot make the beats drift
 late. The wait is sliced at one second, which is what makes a stop or a close
-take effect at once instead of one interval later."
+take effect at once instead of one interval later.
+
+A half open transport looks like a quiet one: writes still succeed and no frame
+arrives again. This is the only place that can tell them apart, so a beat left
+unanswered for +HEARTBEAT-ACK-TIMEOUT-SECONDS+ closes the socket here and lets
+the reconnect loop do the rest."
   (let* ((beat 0)
          (interval (or (fluxer-socket-heartbeat-interval socket)
                        +default-heartbeat-interval+))
+         (sent nil)
          (due (+ (real-seconds) (heartbeat-delay 0 interval))))
     (loop
       (when (or (fluxer-channel-stopping-p channel)
                 (fluxer-socket-closed-p socket))
+        (return))
+      (when (heartbeat-ack-overdue-p sent (fluxer-socket-last-ack socket)
+                                    (get-universal-time))
+        (note "no heartbeat acknowledged for ~D seconds, so this socket is gone."
+              +heartbeat-ack-timeout-seconds+)
+        (close-socket socket)
         (return))
       (let ((now (real-seconds)))
         (if (< now due)
             (wait-for-close socket (min 1.0 (- due now)))
             (progn
               (send-heartbeat channel socket)
+              (setf sent (get-universal-time))
               (setf interval (or (fluxer-socket-heartbeat-interval socket)
                                  interval))
               (incf beat)
@@ -1563,6 +1677,9 @@ down over a mis-set variable."
         (fluxer-channel-attempt channel) 0
         (fluxer-channel-dropped channel) 0
         (fluxer-channel-pending channel) nil
+        ;; A socket left over from a stop is not the one the next connection
+        ;; will read, and CURRENT-SOCKET-P would take its frames for another's
+        (fluxer-channel-socket channel) nil
         (enchiridion.channel:channel-live-p channel) t
         (enchiridion.channel:channel-state channel) :live)
   (setf (fluxer-channel-worker channel)
@@ -1574,10 +1691,11 @@ down over a mis-set variable."
                (loop
                  (when (fluxer-channel-stopping-p channel)
                    (return :stopped))
-                 (let ((code (handler-case (connect-once channel)
-                               (error (condition)
-                                 (note "the connection failed: ~A" condition)
-                                 nil))))
+                 (let* ((started (get-universal-time))
+                        (code (handler-case (connect-once channel)
+                                (error (condition)
+                                  (note "the connection failed: ~A" condition)
+                                  nil))))
                    (when (fluxer-channel-stopping-p channel)
                      (return :stopped))
                    (cond
@@ -1589,8 +1707,10 @@ down over a mis-set variable."
                       (return :failed))
                      (t
                       (note "the gateway connection ended: ~A."
-                            (close-code-note code)))))
-                 (incf (fluxer-channel-attempt channel))
+                            (close-code-note code))))
+                   (setf (fluxer-channel-attempt channel)
+                         (next-attempt (fluxer-channel-attempt channel)
+                                       (- (get-universal-time) started))))
                  (when (> (fluxer-channel-attempt channel)
                           +max-reconnect-attempts+)
                    (note "gave up after ~D reconnects."

@@ -33,12 +33,8 @@ own user has no split; see [Host checkout](#host-checkout).
    section and starts the webhook even when `:enabled` is `nil`.
    [Channels](channels.md) covers the request format.
 
-   > [!warning]
-   > The `ports` mapping publishes plain HTTP on every host interface. For a
-   > private server, change it to
-   > `"127.0.0.1:${ENCHIRIDION_PORT:-8787}:8787"` and put a TLS reverse proxy in
-   > front, or restrict the port with a firewall or VPN. The bearer token
-   > authenticates callers; it does not encrypt traffic.
+   Compose publishes HTTP on host loopback only. Use Tailscale Serve or a TLS
+   proxy for remote access. The bearer token does not encrypt traffic.
 
 4. Build the image and create the seed files.
 
@@ -65,27 +61,49 @@ own user has no split; see [Host checkout](#host-checkout).
 
    A healthy start logs `entrypoint: /proc remounted with hidepid=2`,
    `entrypoint: supervisor uid 0, agent uid 1000`, and the state and secrets
-   paths.
+   paths. The HTTP channel logs `enchiridion: webhook listening on
+   0.0.0.0:8787.` when it binds.
 
-7. Check health and send one message.
+7. Check readiness and send one message.
 
    ```sh
    token=$(sed -n 's/^ENCHIRIDION_HTTP_TOKEN=//p' .env)
-   curl -fsS -H "Authorization: Bearer $token" http://127.0.0.1:8787/health
+   curl -sS -H "Authorization: Bearer $token" http://127.0.0.1:8787/health
    curl -fsS -X POST http://127.0.0.1:8787/message \
      -H "Authorization: Bearer $token" \
      -H "Content-Type: application/json" \
      -d '{"text":"Say hello."}'
    ```
 
-   `/health` answers with `ok`, `uptime`, and one row per channel. If
-   `ENCHIRIDION_PORT` is set, use that port instead of 8787.
+   Retry if the listener is still starting. `/health` returns 200 when ready
+   and 503 otherwise. See [response fields](channels.md#responses). Replace
+   8787 with `ENCHIRIDION_PORT` if set.
 
 8. Stop the service with `docker compose stop`. The volume remains;
    `docker compose down -v` deletes it. After editing `config.lsp` or `.env`, run
    `docker compose up -d --force-recreate`.
 
+## Private access with Tailscale Serve
+
+[Install Tailscale](https://tailscale.com/download) on the Docker host and join
+the host to the tailnet. Serve terminates TLS on the host's tailnet name and
+proxies to the loopback port:
+
+```sh
+tailscale serve --bg 8787
+tailscale serve status
+```
+
+Use `https://<host>.<tailnet>.ts.net/` and the same bearer token from other
+tailnet devices. Enable tailnet HTTPS certificates if prompted. Use the published
+port if it differs from 8787. Restrict access with [Tailscale grants](https://tailscale.com/kb/1623/grants).
+Do not use Funnel for private access. `tailscale serve reset` removes the proxy.
+
 ## State and backups
+
+The image declares no anonymous volume, so a bare `docker run` without `-v`
+writes state into the container layer and loses it with the container. The
+Compose named volume is the supported route.
 
 The volume holds `agents/default` (seed files, `memory.db`, `skills/`, `tools/`,
 `state.json`), `run` (control and status files, broker socket), and `tmp`. Stop
@@ -128,26 +146,17 @@ in front. [Commands](commands.md#the-live-supervisor) lists the commands; this
 section covers what to expect from them.
 
 `enchiridion health` reads `run/enchiridion.status` and exits 0 only when the
-file is live: `running` is true and `updated` is at most 10 seconds old. A
-process that ends without a clean stop can leave an old file, so age matters as
-much as the flag. `GET /health` reads the live process instead. A tick still
-running prints its age, which is how a stuck tick becomes visible. The status
-file is world readable, and its reports are scrubbed.
+file says `running` and was updated within 10 seconds. It reports the age of
+an active tick. The file is world readable and reports are scrubbed.
+[HTTP readiness](channels.md#responses) reads the live supervisor instead.
 
-`reload`, `channels` and `heartbeat` publish a request under `run/control/` and
-wait up to five seconds. Reload and channel requests are handled even during
-a tick; `heartbeat run` queues another tick until the current one finishes. A
-request older than 60 seconds gets `control request expired.` Applying a
-request and publishing its response are separate steps, so a crash between them leaves an
-uncertain outcome. `run/enchiridion.control` is the legacy input and is
-deprecated.
+Control commands queue under `run/control/`. Pending requests expire after
+15 minutes. A timeout does not cancel the request. See
+[Commands](commands.md#the-live-supervisor) for reload and channel behavior.
+`run/enchiridion.control` is deprecated.
 
-A refused reload keeps the last good generation serving. `channels replace`
-waits up to 20 seconds for a fresh channel and stops the old one only after the
-new one is live; a failure leaves the old channel running. A replacement
-listener on the same address and port can fail with address in use. A channel
-whose start returns is restarted after one second; one that reports
-`:unavailable` is not.
+A channel whose start returns retries after one second unless it reports
+`:unavailable`.
 
 ### Unattended work
 
@@ -157,45 +166,21 @@ tick waits one interval. `last-tick` is measured from the end of a tick, so a
 pass longer than the interval does not overlap itself. `heartbeat off` stops the
 schedule, not a forced tick.
 
-Each tick runs seven phases in order:
+A tick runs memory maintenance and at most one queued task. Pending tasks
+survive restart. An interrupted task is marked failed and is not retried.
+Only the first 4000 characters of a task are sent to the sleep model.
 
-| Order | Phase | Work |
+The cheap model compacts the session after four eligible turns. An unusable
+summary leaves the session unchanged. After two failed attempts, compaction
+waits for another eligible turn.
+
+| Setting under `:budget` | Default | Applies to |
 | --- | --- | --- |
-| 1 | Task recovery | Marks every `running` task `failed` |
-| 2 | Memory maintenance | Copies new turns into the episodic log and derives scalars |
-| 3 | Memory embedding | Embeds pending episodes when configured and the budget has room |
-| 4 | Memory T2 | Runs a due candidate build or gate pass under the day cap |
-| 5 | Harness blocks | Writes the ledger block and the session fallback |
-| 6 | Sleep agent | Claims one task, or runs one maintenance pass, or does nothing |
-| 7 | Compaction | Rewrites the session block when four turns are due |
+| `:max-tokens-per-tick` | 4000 | Sleep and embedding calls in one tick |
+| `:max-tokens-per-day` | 400000 | Sleep and embedding calls over 24 hours |
 
-Every phase is guarded on its own. A failed phase adds a note and the later
-phases still run. The notes are joined with `;`, and a tick with no notes reports
-`idle`. A refusal reads `sleep skipped: <reason>`, `memory embedding skipped:
-<reason>`, `T2 skipped: <reason>`, or `compaction skipped: <reason>`. The sleep
-agent refuses with `no memory store is open`, `no agent is attached`, `no model
-backend is configured`, or `bootstrap has not handed over, so the identity files
-are still the operator's`.
-
-The sleep agent claims the oldest pending task and runs one pass, or runs one
-maintenance pass when a turn newer than its last pass exists. A task body reaches
-the prompt cut at 4000 characters; the stored row keeps the whole body and the
-report says when it was cut. Compaction uses the cheap model and rewrites the
-session block when four eligible turns are past the last compacted turn;
-sleep-agent turns do not count. A pass that returns no text spends the call,
-reports `compaction produced no text`, and does not move the cursor.
-
-`:budget :max-tokens-per-tick` defaults to 4000 and bounds spend since the tick
-started over the `sleep` and `embed` channels. `:budget :max-tokens-per-day`
-defaults to 400000 and bounds the rolling 24 hours the ledger uses. Leaving a key
-out keeps its default; an explicit `nil` removes that cap. A phase stops when its
-window is spent, so an in-flight phase can finish over the cap. The caps do not
-limit chat or provider charges; use the provider's spending controls for money.
-
-The task queue is a table in the memory store, so a task survives a restart. One
-task runs per tick. A task is `pending`, `running`, `done` or `failed`. A failed
-task is not requeued: unattended work is at-most-once. Phase 1 fails every task a
-dead process left running.
+Set either cap to `nil` to disable it. A call in progress can exceed a cap.
+These limits do not cover chat or provider charges.
 
 ## Container requirements
 
@@ -273,6 +258,8 @@ uid 1000 phase fails at the environment check.
 | `Configuration is wrong at HTTP-TOKEN` | The bind is not loopback and no token is set | Set the token, or bind `127.0.0.1` |
 | `Configuration is wrong at SECRETS` | The secret file is world readable | Run `chmod 600 .env` |
 | `/health` answers 401 | The bearer token is missing or wrong | Send `Authorization: Bearer <token>` |
+| `/health` answers 503 | A wanted channel is failed or stopped, or the heartbeat thread is gone | Read `reasons`, then `docker compose logs enchiridion` |
+| `curl` from another host times out | The published port is on loopback | Use Tailscale Serve, an SSH tunnel, or change the mapping |
 
 ## Host checkout
 

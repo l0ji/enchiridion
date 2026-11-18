@@ -873,6 +873,21 @@ pass, so T2 runs on the first tick the backlog is clear."
   (and (plusp generation-id)
        (null (first-check-result store generation-id "post-canary"))))
 
+(defun gate-t2-candidate (store generation-id &key canaries scorer now (recovered nil))
+  "Gate GENERATION-ID, end the pass, and return the plist RUN-T2-PASS returns.
+RECOVERED says the candidate was built by an earlier pass and never gated."
+  (let ((gate (gate-candidate store generation-id :canaries canaries :scorer scorer)))
+    (mark-t2-pass store :now now)
+    (list :outcome (cond ((getf gate :promoted) :promoted)
+                         ((eq (getf gate :reason) :held) :held)
+                         ((eq (getf gate :reason) :quarantined) :quarantined)
+                         (t :skipped))
+          :generation-id generation-id
+          :failed (getf gate :failed)
+          :freeze (getf gate :freeze)
+          :reason (getf gate :reason)
+          :recovered recovered)))
+
 (defun run-t2-pass (store &key (canaries *memory-canaries*)
                                (scorer #'answer-scorer)
                                (limit *memory-t2-episodes-per-tick*)
@@ -885,8 +900,10 @@ A pass that starts after a promotion first re-checks the live generation:
 A failed post-promotion check rolls back and
 freezes the next pass, so a rollback ends this pass with nothing built. A new
 candidate is started only when the preflight finds every instrument, so no
-tokens go to a candidate nobody could promote. LAST_T2_TS is written whenever
-a pass ends, and not while a candidate is still building."
+tokens go to a candidate nobody could promote. A candidate an earlier pass built
+and never gated is gated before a new build starts, so a crash between building
+and gating does not waste its derivations. LAST_T2_TS is written whenever a
+pass ends, and not while a candidate is still building."
   (let ((live (live-generation-id store))
         (building (current-building-generation store)))
     (when (and (null building) (live-unchecked-p store live))
@@ -900,9 +917,23 @@ a pass ends, and not while a candidate is still building."
         (unless (getf preflight :ready-p)
           (mark-t2-pass store :now now)
           (return-from run-t2-pass
-            (list :outcome :instrument-missing :missing (getf preflight :missing))))))
+            (list :outcome :instrument-missing :missing (getf preflight :missing))))
+        ;; A candidate an earlier pass built is judged before a new one is
+        ;; built: its derivations are paid for, and the instruments must still
+        ;; be present so it is not quarantined for a check the schedule lost.
+        (let ((stranded (complete-candidate-generation store)))
+          (when stranded
+            (return-from run-t2-pass
+              (gate-t2-candidate store stranded :canaries canaries
+                                 :scorer scorer :now now
+                                 :recovered t))))))
     (let ((build (build-candidate store :limit limit)))
       (cond
+        ((eq (getf build :reason) :claimed)
+         (list :outcome :building
+               :generation-id (getf build :generation-id)
+               :remaining (getf build :remaining)
+               :claimed t))
         ((not (getf build :built))
          (list :outcome :skipped :reason (getf build :reason)))
         ((eq (getf build :status) :building)
@@ -912,15 +943,5 @@ a pass ends, and not while a candidate is still building."
                :skipped (getf build :skipped)
                :failed (getf build :failed)))
         (t
-         (let* ((generation-id (getf build :generation-id))
-                (gate (gate-candidate store generation-id
-                                      :canaries canaries :scorer scorer)))
-           (mark-t2-pass store :now now)
-           (list :outcome (cond ((getf gate :promoted) :promoted)
-                                ((eq (getf gate :reason) :held) :held)
-                                ((eq (getf gate :reason) :quarantined) :quarantined)
-                                (t :skipped))
-                 :generation-id generation-id
-                 :failed (getf gate :failed)
-                 :freeze (getf gate :freeze)
-                 :reason (getf gate :reason))))))))
+         (gate-t2-candidate store (getf build :generation-id)
+                            :canaries canaries :scorer scorer :now now))))))

@@ -152,6 +152,36 @@ A name that is not a string, or has no slash, is returned unchanged."
   (say "generation ~A." (enchiridion.supervisor:status-generation status))
   0)
 
+(declaim (ftype (function (string t) integer) report-unanswered))
+
+(defun report-unanswered (command detail)
+  "Say that COMMAND was sent and not answered within the wait, and return 1.
+
+The request is still queued or being handled, so this is not the absence of a
+supervisor; an operator who reads it that way starts a second one. The answer
+that eventually lands is in the status file."
+  (say "~A: the supervisor did not answer within ~D second~:P."
+       (command-label command)
+       enchiridion.supervisor:+control-wait-seconds+)
+  (when (and (stringp detail) (plusp (length detail)))
+    (say "  ~A" detail))
+  (say "  the answer lands in the status file; `enchiridion health` prints it.")
+  1)
+
+(declaim (ftype (function (string t t t) integer) report-control-state))
+
+(defun report-control-state (command status state detail)
+  "Print the outcome of a control request and return its exit status.
+
+STATUS and STATE are REQUEST-CONTROL's first two values. A refused generation is
+an answer, so it is reported and the status is 1."
+  (case state
+    (:no-supervisor (no-supervisor command))
+    (:answered (if (enchiridion.supervisor:status-report-ok-p status)
+                   (report-control status)
+                   (progn (report-control status) 1)))
+    (t (report-unanswered command detail))))
+
 (declaim (ftype (function (t) string) status-channel-line))
 
 (defun status-channel-line (row)
@@ -1310,6 +1340,44 @@ of the entry script and a test can supply its own check.")
       (progn (say "This surface has no health check; run `enchiridion doctor` in a shell.")
              1)))
 
+(declaim (ftype (function (t) null) report-health))
+
+(defun report-health (status)
+  "Print what STATUS says about a running supervisor.
+
+Separate from CMD-HEALTH so a status table can be printed in a test without a
+process."
+  (say "supervisor pid ~A, generation ~A."
+       (enchiridion.supervisor:status-pid status)
+       (enchiridion.supervisor:status-generation status))
+  (let ((report (enchiridion.supervisor:status-report status)))
+    (when report (say "~A" report)))
+  (let ((writes (enchiridion.supervisor:status-writes status)))
+    (when (and (hash-table-p writes) (not (gethash "ok" writes)))
+      (say "status writes failing: ~A (~D second~:P ago)."
+           (or (gethash "report" writes) "no detail")
+           (or (gethash "age" writes) 0))))
+  (let ((beat (enchiridion.supervisor:status-heartbeat status)))
+    (when (hash-table-p beat)
+      (say "heartbeat ~:[off~;on~], ~D tick~:P, last at ~A~@[: ~A~]"
+           (gethash "enabled" beat)
+           (or (gethash "ticks" beat) 0)
+           (or (gethash "last-tick" beat) 0)
+           (let ((line (gethash "report" beat)))
+             (if (and (stringp line) (plusp (length line))) line nil)))
+      ;; A schedule with no thread runs nothing and still looks configured.
+      (when (and (gethash "enabled" beat) (not (gethash "alive" beat)))
+        (say "  the schedule has no live thread, so nothing will tick."))
+      ;; A tick that never returns stops unattended work and leaves the status
+      ;; file looking healthy; how long it has run is the only visible sign.
+      (when (gethash "running" beat)
+        (let ((started (gethash "started" beat)))
+          (say "  a tick has been running for ~D second~:P."
+               (if (integerp started) (max 0 (- (get-universal-time) started)) 0))))))
+  (dolist (row (enchiridion.supervisor:status-channels status))
+    (say "channel ~A" (status-channel-line row)))
+  nil)
+
 (declaim (ftype (function (list) integer) cmd-health))
 
 (defun cmd-health (arguments)
@@ -1322,28 +1390,7 @@ answer before: unattended work either happened, or said why it did not."
     (unless status
       (say "no supervisor is running.")
       (return-from cmd-health 1))
-    (say "supervisor pid ~A, generation ~A."
-         (enchiridion.supervisor:status-pid status)
-         (enchiridion.supervisor:status-generation status))
-    (let ((report (enchiridion.supervisor:status-report status)))
-      (when report (say "~A" report)))
-    (let ((beat (enchiridion.supervisor:status-heartbeat status)))
-      (when (hash-table-p beat)
-        (say "heartbeat ~:[off~;on~], ~D tick~:P, last at ~A~@[: ~A~]"
-             (gethash "enabled" beat)
-             (or (gethash "ticks" beat) 0)
-             (or (gethash "last-tick" beat) 0)
-             (let ((line (gethash "report" beat)))
-               (if (and (stringp line) (plusp (length line))) line nil)))
-        ;; A tick that never returns stops unattended work and leaves the
-        ;; status file looking healthy. How long it has been running is the one
-        ;; thing that makes it visible.
-        (when (gethash "running" beat)
-          (let ((started (gethash "started" beat)))
-            (say "  a tick has been running for ~D second~:P."
-                 (if (integerp started) (max 0 (- (get-universal-time) started)) 0))))))
-    (dolist (row (enchiridion.supervisor:status-channels status))
-      (say "channel ~A" (status-channel-line row)))
+    (report-health status)
     0))
 
 (declaim (ftype (function (list) integer) cmd-reload))
@@ -1356,14 +1403,9 @@ last good code serving, which is the right behaviour and the wrong exit status:
 an operator script that reloads and carries on has to be able to see that the
 agent is still running the old code."
   (declare (ignore arguments))
-  (let ((status (enchiridion.supervisor:request-control "reload")))
-    (cond
-      ((null status) (no-supervisor "reload"))
-      ((enchiridion.supervisor:status-report-ok-p status)
-       (report-control status))
-      (t
-       (report-control status)
-       1))))
+  (multiple-value-bind (status state detail)
+      (enchiridion.supervisor:request-control "reload")
+    (report-control-state "reload" status state detail)))
 
 (declaim (ftype (function (list) integer) cmd-channels))
 
@@ -1376,12 +1418,12 @@ agent is still running the old code."
     (let* ((line (if (rest arguments)
                      (format nil "channels ~A ~A" action (second arguments))
                      (format nil "channels ~A" action)))
-           (status (enchiridion.supervisor:request-control line)))
-      (cond
-        ((null status) (no-supervisor "channels"))
-        ((enchiridion.supervisor:status-report-ok-p status)
-         (report-control status))
-        (t (report-control status) 1)))))
+           (status nil)
+           (state nil)
+           (detail nil))
+      (setf (values status state detail)
+            (enchiridion.supervisor:request-control line))
+      (report-control-state "channels" status state detail))))
 
 (declaim (ftype (function (list) integer) cmd-heartbeat))
 
@@ -1391,9 +1433,9 @@ agent is still running the old code."
     (unless (member action '("on" "off" "run") :test #'string=)
       (say "heartbeat takes on, off or run.")
       (return-from cmd-heartbeat 2))
-    (let ((status (enchiridion.supervisor:request-control
-                   (format nil "heartbeat ~A" action))))
-      (if status (report-control status) (no-supervisor "heartbeat")))))
+    (multiple-value-bind (status state detail)
+        (enchiridion.supervisor:request-control (format nil "heartbeat ~A" action))
+      (report-control-state "heartbeat" status state detail))))
 
 (declaim (ftype (function (list) integer) cmd-chat))
 

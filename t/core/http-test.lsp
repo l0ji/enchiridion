@@ -27,10 +27,12 @@ reads them from one place rather than from three return values."
   (handler-case (progn (funcall function) nil)
     (enchiridion.channel.http:http-error (condition) condition)))
 
-(defun service-with (&key turn health usage token (bind "127.0.0.1") (port 8787))
+(defun service-with (&key turn health usage token (bind "127.0.0.1") (port 8787)
+                          (body-limit enchiridion.channel.http:+http-body-limit+))
   "Return a service whose routes are the given functions."
   (enchiridion.channel.http:make-http-service
-   :turn turn :health health :usage usage :token token :bind bind :port port))
+   :turn turn :health health :usage usage :token token :bind bind :port port
+   :body-limit body-limit))
 
 (defun get-request (path &key query authorization)
   "Return a GET request value for PATH."
@@ -141,6 +143,120 @@ before this is reached"
   (ok (null (enchiridion.channel.http:declared-length "")))
   (ok (null (enchiridion.channel.http:declared-length "twelve"))))
 
+(deftest a-length-that-frames-nothing-is-no-body ()
+  ;; Hunchentoot bounds the stream it hands back by the header whatever this
+  ;; returns, so the number decides whether a connection may be kept alive, not
+  ;; what bounds the read.
+  (testing "zero and a negative count frame no body"
+    (ok (null (enchiridion.channel.http:declared-length "0")))
+    (ok (null (enchiridion.channel.http:declared-length "-5"))))
+  (testing "and a positive one still does"
+    (ok (eql 12 (enchiridion.channel.http:declared-length " 12")))))
+
+(deftest only-a-framed-body-is-read ()
+  (testing "a declared length frames a body"
+    (ok (enchiridion.channel.http::body-declared-p 12 nil)))
+  (testing "a chunked encoding frames one without a length"
+    (ok (enchiridion.channel.http::body-declared-p nil "chunked"))
+    (ok (enchiridion.channel.http::body-declared-p nil "gzip, Chunked")))
+  (testing "neither header frames nothing, so nothing is read"
+    (ng (enchiridion.channel.http::body-declared-p nil nil))
+    (ng (enchiridion.channel.http::body-declared-p 0 nil))
+    (ng (enchiridion.channel.http::body-declared-p nil "gzip"))))
+
+(deftest a-body-is-refused-before-it-is-read ()
+  (let ((service (enchiridion.channel.http:make-http-service :body-limit 16)))
+    (testing "a declared length over the limit is a 413, and no stream is asked for"
+      (let ((condition (http-error-of
+                        (lambda ()
+                          (enchiridion.channel.http::read-request-body
+                           service nil 70000 nil)))))
+        (ok (eql 413 (enchiridion.channel.http:http-error-status condition)))))
+    (testing "a body framed both ways is refused for the framing, not for its size"
+      (let ((condition (http-error-of
+                        (lambda ()
+                          (enchiridion.channel.http::read-request-body
+                           service nil 12 t)))))
+        (ok (eql 400 (enchiridion.channel.http:http-error-status condition)))
+        (ok (search "chunked"
+                    (enchiridion.channel.http:http-error-message condition)))))))
+
+;; A request object, built without a socket. The reply and acceptor are bound
+;; because hunchentoot's request initialiser writes a return code when it cannot
+;; parse the URI or verify a session.
+(defun request-object-with (headers &key content-stream)
+  "Return a hunchentoot request carrying HEADERS and CONTENT-STREAM."
+  (let ((hunchentoot:*reply* (make-instance 'hunchentoot:reply))
+        (hunchentoot:*acceptor* (make-instance 'hunchentoot:acceptor :port 0)))
+    (make-instance 'enchiridion.channel.http::http-request-object
+                   :headers-in headers
+                   :method :post
+                   :uri "/message"
+                   :server-protocol :http/1.1
+                   :content-stream content-stream)))
+
+(deftest a-request-body-is-sealed-until-the-bounded-read-opens-it ()
+  ;; HUNCHENTOOT:START-OUTPUT calls (RAW-POST-DATA :FORCE-BINARY T) before every
+  ;; answer, and an empty slot makes that call allocate the declared
+  ;; Content-Length. The constructor seals the slot; only the bounded read opens
+  ;; it.
+  (testing "a fresh request is sealed"
+    (let ((request (request-object-with (list (cons :content-length "999999999")))))
+      (ok (eq t (slot-value request 'hunchentoot::raw-post-data)))
+      (testing "so the answer has nothing to read into memory"
+        (ok (null (hunchentoot:raw-post-data :request request :force-binary t)))))
+    (testing "and the bounded read opens it"
+      (let ((request (request-object-with (list (cons :content-length "4")))))
+        (enchiridion.channel.http::open-request-body request)
+        (ok (null (slot-value request 'hunchentoot::raw-post-data))))))
+  (testing "a refusal seals it again"
+    (let ((request (request-object-with (list (cons :content-length "999999999")))))
+      (enchiridion.channel.http::seal-request-body request)
+      (ok (eq t (slot-value request 'hunchentoot::raw-post-data)))
+      (ok (null (hunchentoot:raw-post-data :request request :force-binary t)))))
+  (testing "a body that was read is not sealed"
+    (let ((request (request-object-with (list (cons :content-length "4"))))
+          (stream (make-string-input-stream "body")))
+      (setf (slot-value request 'hunchentoot::raw-post-data) stream)
+      (ok (eq stream (hunchentoot:raw-post-data :request request :force-binary t)))))
+  (testing "a request of the library's own class is left alone"
+    (let* ((hunchentoot:*reply* (make-instance 'hunchentoot:reply))
+           (hunchentoot:*acceptor* (make-instance 'hunchentoot:acceptor :port 0))
+           (request (make-instance 'hunchentoot:request
+                                   :headers-in (list (cons :content-length "4"))
+                                   :method :post :uri "/" :server-protocol :http/1.1
+                                   :content-stream nil)))
+      (ok (null (enchiridion.channel.http::seal-request-body request))))))
+
+(deftest a-chunked-body-is-framed-without-a-length ()
+  ;; A chunked body declares no length, so the framing test has to take the
+  ;; transfer encoding itself. Passing a boolean where the header belongs made
+  ;; every chunked request look unframed: the body was skipped and refused.
+  (let* ((service (enchiridion.channel.http:make-http-service :body-limit 16))
+         (request (request-object-with
+                   (list (cons :transfer-encoding "chunked"))
+                   :content-stream (flex:make-in-memory-input-stream
+                                    (make-array 0 :element-type '(unsigned-byte 8)))))
+         (parsed (enchiridion.channel.http::request-from-hunchentoot service request)))
+    (ok (string= "" (enchiridion.channel.http:http-request-body parsed)))
+    (testing "and the body counts as read, not abandoned"
+      (ng (enchiridion.channel.http::body-abandoned-p request)))))
+
+(deftest a-zero-length-and-a-chunked-encoding-are-still-two-framings ()
+  ;; Hunchentoot bounds a chunked stream by the Content-Length it finds, so a
+  ;; zero leaves every chunk on the connection: the refusal is for the header's
+  ;; presence, not for its number.
+  (let* ((service (enchiridion.channel.http:make-http-service :body-limit 16))
+         (request (request-object-with (list (cons :content-length "0")
+                                             (cons :transfer-encoding "chunked"))))
+         (condition (http-error-of
+                     (lambda ()
+                       (enchiridion.channel.http::request-from-hunchentoot
+                        service request)))))
+    (ok (eql 400 (enchiridion.channel.http:http-error-status condition)))
+    (ok (search "chunked"
+                (enchiridion.channel.http:http-error-message condition)))))
+
 (deftest only-a-json-content-type-is-json ()
   (ok (enchiridion.channel.http:json-content-type-p "application/json"))
   (ok (enchiridion.channel.http:json-content-type-p "application/json; charset=utf-8"))
@@ -181,6 +297,63 @@ before this is reached"
         (enchiridion.channel.http:handle-http-request (service-with) (get-request "/health"))
       (ok (eql 503 status))
       (ok (null (gethash "ok" (json-of body)))))))
+
+(deftest health-carries-readiness-beside-the-process-facts ()
+  (testing "a live but degraded supervisor is a 503 that names why"
+    (let ((service
+            (service-with
+             :health
+             (lambda ()
+               (list :ok-p nil :ready nil :uptime 12
+                     :reasons #("channel fluxer is failed")
+                     :channels (vector (list :name "http" :state "live" :enabled t))
+                     :heartbeat (list :enabled t :alive nil :ticks 3 :last-tick 1
+                                      :ok t :running nil :report "")
+                     :persistence (list :failures 2
+                                        :last (list :kind "usage"
+                                                    :detail "disk full"))
+                     :providers (list :state :done :report "")
+                     :writes (list :ok t :report "" :age nil))))))
+      (multiple-value-bind (status body)
+          (enchiridion.channel.http:handle-http-request service (get-request "/health"))
+        (ok (eql 503 status))
+        (let ((data (json-of body)))
+          (ok (null (gethash "ok" data)))
+          (ok (null (gethash "ready" data)))
+          (ok (equal "channel fluxer is failed"
+                     (aref (gethash "reasons" data) 0)))
+          (testing "the heartbeat is an object, not an array"
+            (let ((heartbeat (gethash "heartbeat" data)))
+              (ok (hash-table-p heartbeat))
+              (ok (null (gethash "alive" heartbeat)))
+              (ok (eql 3 (gethash "ticks" heartbeat)))))
+          (testing "persistence reports its count and the last refusal"
+            (let ((persistence (gethash "persistence" data)))
+              (ok (eql 2 (gethash "failures" persistence)))
+              (ok (equal "disk full"
+                         (gethash "detail" (gethash "last" persistence))))))
+          (testing "the provider refresh reports what it finished with"
+            (ok (equal "done" (gethash "state" (gethash "providers" data)))))))))
+  (testing "no persistence failure is null rather than false"
+    (let ((service (service-with
+                    :health (lambda ()
+                              (list :ok-p t :uptime 1
+                                    :persistence (list :failures 0 :last :null))))))
+      (multiple-value-bind (status body)
+          (enchiridion.channel.http:handle-http-request service (get-request "/health"))
+        (declare (ignore status))
+        (ok (search "\"last\":null" body)))))
+  (testing "a ready supervisor answers 200"
+    (let ((service
+            (service-with
+             :health
+             (lambda ()
+               (list :ok-p t :uptime 1 :reasons #()
+                     :channels (list (list :name "http" :state "live" :enabled t)))))))
+      (multiple-value-bind (status body)
+          (enchiridion.channel.http:handle-http-request service (get-request "/health"))
+        (ok (eql 200 status))
+        (ok (eq t (gethash "ok" (json-of body))))))))
 
 (deftest usage-answers-from-the-ledger-or-says-there-is-none ()
   (testing "rows come back with every column the ledger holds"
@@ -306,6 +479,24 @@ before this is reached"
                          (service-with) (post-request "{\"text\":\"hi\"}"))))))
       (ok (eql 502 (enchiridion.channel.http:http-error-status condition))))))
 
+(deftest a-turn-that-signals-is-the-upstream-failing ()
+  ;; The caller reads one status and acts on it. A condition escaping the turn
+  ;; reaches the acceptor's catch-all as a 500, which reads as a bug in the
+  ;; webhook rather than a model that went away.
+  (let* ((service (service-with
+                   :turn (lambda (message)
+                           (declare (ignore message))
+                           (error "the model went away"))))
+         (condition (http-error-of
+                     (lambda ()
+                       (enchiridion.channel.http:handle-http-request
+                        service (post-request "{\"text\":\"hi\"}"))))))
+    (ok (eql 502 (enchiridion.channel.http:http-error-status condition)))
+    (ok (search "the model went away"
+                (enchiridion.channel.http:http-error-message condition)))
+    (testing "and the failed turn is not left counted as in flight"
+      (ok (zerop (enchiridion.channel.http::turns-running service))))))
+
 (deftest an-unknown-route-and-a-wrong-method-are-refused ()
   (let ((service (service-with)))
     (testing "a known path with the wrong method is 405 and names the right one"
@@ -412,3 +603,267 @@ before this is reached"
       (enchiridion.channel:channel-stop channel)
       (when (and thread (bordeaux-threads:thread-alive-p thread))
         (bordeaux-threads:join-thread thread)))))
+
+;;;; The connection.
+
+;; A refused body takes its connection with it: hunchentoot reads the next
+;; request from the same socket. These helpers speak HTTP/1.1 by hand, so the
+;; test holds the socket and not a client library's connection pool.
+
+(defun read-http-line (stream)
+  "Return one CRLF terminated line from STREAM, or :EOF when it ends first."
+  (let ((line (make-array 0 :element-type 'character :adjustable t :fill-pointer 0)))
+    (loop for octet = (read-byte stream nil :eof)
+          do (cond ((eq octet :eof) (return :eof))
+                   ((= octet 10) (return (coerce line 'string)))
+                   ((= octet 13) nil)
+                   (t (vector-push-extend (code-char octet) line))))))
+
+(defun read-http-response (stream)
+  "Return one response as a plist of :STATUS, :HEADERS and :BODY, or NIL at EOF.
+The body is read by its content length, so the next byte read is the first byte
+of whatever comes next on the connection."
+  (let ((status (read-http-line stream)))
+    (when (and (stringp status) (plusp (length status)))
+      (let ((headers '()))
+        (loop for line = (read-http-line stream)
+              until (or (eq line :eof) (zerop (length line)))
+              do (let ((colon (position #\: line)))
+                   (when colon
+                     (push (cons (string-downcase (subseq line 0 colon))
+                                 (string-trim '(#\Space) (subseq line (1+ colon))))
+                           headers))))
+        (let* ((size (let ((value (cdr (assoc "content-length" headers :test #'string=))))
+                       (and value (parse-integer value))))
+               (body (make-array 0 :element-type 'character
+                                   :adjustable t :fill-pointer 0)))
+          (loop repeat (or size 0)
+                for octet = (read-byte stream nil :eof)
+                until (eq octet :eof)
+                do (vector-push-extend (code-char octet) body))
+          (list :status status :headers headers :body (coerce body 'string)))))))
+
+(defun write-http-request (stream text)
+  "Write TEXT to STREAM as UTF-8 octets and flush it."
+  (write-sequence (enchiridion.compat:encode-utf8 text) stream)
+  (finish-output stream))
+
+(defun request-text (method path &key content-length content-type authorization body)
+  "Return one HTTP/1.1 request as text. No body is written unless one is given."
+  (with-output-to-string (out)
+    (format out "~A ~A HTTP/1.1~C~C" method path #\Return #\Newline)
+    (format out "Host: 127.0.0.1~C~C" #\Return #\Newline)
+    (when authorization
+      (format out "Authorization: ~A~C~C" authorization #\Return #\Newline))
+    (when content-type
+      (format out "Content-Type: ~A~C~C" content-type #\Return #\Newline))
+    (when content-length
+      (format out "Content-Length: ~D~C~C" content-length #\Return #\Newline))
+    (format out "~C~C~A" #\Return #\Newline (or body ""))))
+
+(defun next-response (socket seconds)
+  "Return the next response on SOCKET, :CLOSED at end of file, or :TIMEOUT.
+
+The read runs on its own thread with a deadline, because the interesting failure
+is a server that neither answers nor closes. The socket is closed underneath an
+overrunning read, which wakes it."
+  (let* ((stream (usocket:socket-stream socket))
+         (outcome :timeout)
+         (answered nil)
+         (reader (bordeaux-threads:make-thread
+                  (lambda ()
+                    (setf outcome (handler-case (or (read-http-response stream) :closed)
+                                    (error () :closed))
+                          answered t))
+                  :name "enchiridion http test reader")))
+    (loop repeat (round (/ seconds 0.02))
+          until answered
+          do (sleep 0.02))
+    (cond
+      (answered (bordeaux-threads:join-thread reader) outcome)
+      (t (ignore-errors (usocket:socket-close socket)) :timeout))))
+
+(defun open-connection (port)
+  "Return a socket connected to the webhook on PORT."
+  (usocket:socket-connect "127.0.0.1" port :element-type '(unsigned-byte 8)))
+
+(defun start-channel-in-thread (channel)
+  "Start CHANNEL on its own thread. Return the thread and the port it bound."
+  (let ((thread (bordeaux-threads:make-thread
+                 (lambda () (enchiridion.channel:channel-start channel))
+                 :name "enchiridion http test")))
+    (loop repeat 100
+          for acceptor = (enchiridion.channel.http:http-channel-acceptor channel)
+          for port = (and (enchiridion.channel:channel-live-p channel)
+                          acceptor
+                          (hunchentoot:acceptor-port acceptor))
+          do (if port
+                 (return (values thread port))
+                 (sleep 0.05)))))
+
+(deftest a-refused-body-takes-its-connection-with-it ()
+  ;; Two answers depend on what happened to the body. One that read it may keep
+  ;; the connection; one that refused before reading cannot, because the bytes
+  ;; it never read would be read as the next request. Both requests are ordinary:
+  ;; a message, and one whose size or token is refused.
+  (let* ((body "{\"text\":\"hello\"}")
+         (service (service-with
+                   :bind "127.0.0.1" :port 0 :body-limit 64 :token "s3cret"
+                   :health (lambda () (list :ok-p t :uptime 1 :channels '()))
+                   :turn (lambda (message)
+                           (declare (ignore message))
+                           (list :ok-p t :reply "taken" :error "" :reason nil
+                                 :usage (list :model "fake" :input 1 :output 1
+                                              :rounds 1 :total 2)))))
+         (channel (enchiridion.channel.http:make-http-channel :service service)))
+    (unwind-protect
+         (handler-case
+             (multiple-value-bind (thread port) (start-channel-in-thread channel)
+               (declare (ignore thread))
+               (ok port "the acceptor reported the port it chose")
+               (when port
+                 (testing "a body that was read keeps the connection"
+                   (let ((socket (open-connection port)))
+                     (unwind-protect
+                          (progn
+                            (write-http-request
+                             (usocket:socket-stream socket)
+                             (request-text "POST" "/message"
+                                           :authorization "Bearer s3cret"
+                                           :content-type "application/json"
+                                           :content-length (length body)
+                                           :body body))
+                            (let ((first (next-response socket 5)))
+                              (ok (listp first) "the message was answered")
+                              (when (listp first)
+                                (ok (search " 200 " (getf first :status)))
+                                (ok (null (assoc "connection" (getf first :headers)
+                                                 :test #'string=))
+                                    "and the answer does not ask for a close")))
+                            (write-http-request (usocket:socket-stream socket)
+                                                (request-text "GET" "/health"
+                                                              :authorization "Bearer s3cret"))
+                            (let ((second (next-response socket 5)))
+                              (ok (listp second)
+                                  "the same connection answered a second request")
+                              (when (listp second)
+                                (ok (search " 200 " (getf second :status))))))
+                       (ignore-errors (usocket:socket-close socket)))))
+                 (testing "a refusal that read no body closes it"
+                   ;; A complete request whose body is never read: the token is
+                   ;; missing, or the declared size is refused before a byte is
+                   ;; taken. The answer has to say the connection is done, because
+                   ;; those bytes are what the next read would call a request.
+                   (flet ((refusal (authorization body notice)
+                            (let ((socket (open-connection port)))
+                              (unwind-protect
+                                   (progn
+                                     (write-http-request
+                                      (usocket:socket-stream socket)
+                                      (request-text "POST" "/message"
+                                                    :authorization authorization
+                                                    :content-type "application/json"
+                                                    :content-length (length body)
+                                                    :body body))
+                                     (let ((response (next-response socket 5)))
+                                       (ok (listp response)
+                                           (format nil "the ~A was answered" notice))
+                                       (when (listp response)
+                                         (ok (search (format nil " ~A " notice)
+                                                     (getf response :status)))
+                                         (ok (string= "close"
+                                                      (cdr (assoc "connection"
+                                                                  (getf response :headers)
+                                                                  :test #'string=)))
+                                             "and the answer asks for the close")))
+                                     (ok (eq :closed (next-response socket 2))
+                                         (format nil "the ~A closed the connection" notice)))
+                                (ignore-errors (usocket:socket-close socket))))))
+                     (refusal nil body "401")
+                     (refusal "Bearer s3cret" (make-string 200 :initial-element #\a) "413")))))
+           (error (condition)
+             (if (enchiridion.compat:environment-value "ENCHIRIDION_NO_SOCKET_TESTS")
+                 (progn
+                   (format *error-output*
+                           "~&enchiridion-http-test: connection test skipped: ~A~%" condition)
+                   (finish-output *error-output*)
+                   (ok t "skipped by ENCHIRIDION_NO_SOCKET_TESTS"))
+                 (ok nil (format nil "a loopback connection failed: ~A" condition)))))
+      (enchiridion.channel:channel-stop channel))))
+
+;;;; The stop.
+
+;; A fake acceptor makes the budget the only thing under test: no socket, no
+;; handler, only a stop that returns at once and a stop that does not.
+
+(defclass quiet-acceptor (hunchentoot:acceptor) ())
+
+(defmethod hunchentoot:stop ((acceptor quiet-acceptor) &key soft)
+  (declare (ignore soft))
+  acceptor)
+
+(defclass sluggish-acceptor (quiet-acceptor)
+  ((slowed-p :accessor sluggish-acceptor-slowed-p :initform nil :type boolean))
+  (:documentation "An acceptor whose first stop outlasts any sane budget."))
+
+(defmethod hunchentoot:stop ((acceptor sluggish-acceptor) &key soft)
+  (declare (ignore soft))
+  (unless (sluggish-acceptor-slowed-p acceptor)
+    (setf (sluggish-acceptor-slowed-p acceptor) t)
+    (sleep 1))
+  acceptor)
+
+(defun channel-over (service &key acceptor)
+  "Return a channel over SERVICE whose acceptor slot holds ACCEPTOR."
+  (let ((channel (enchiridion.channel.http:make-http-channel :service service)))
+    (setf (enchiridion.channel.http:http-channel-acceptor channel) acceptor)
+    channel))
+
+(defun elapsed-seconds (started)
+  "Return the seconds since STARTED, a GET-INTERNAL-REAL-TIME value."
+  (/ (- (get-internal-real-time) started) internal-time-units-per-second))
+
+(deftest a-stop-spends-its-budget-and-no-more ()
+  (testing "nothing running is nothing waited for"
+    (let* ((channel (channel-over (service-with) :acceptor (make-instance 'quiet-acceptor)))
+           (started (get-internal-real-time)))
+      (enchiridion.channel.http::stop-http-acceptor channel :seconds 5)
+      (ok (< (elapsed-seconds started) 1.0))
+      (testing "and the acceptor is released"
+        (ok (null (enchiridion.channel.http:http-channel-acceptor channel))))))
+  (testing "the wait ends when the turn does"
+    (let* ((service (service-with))
+           (channel (channel-over service :acceptor (make-instance 'quiet-acceptor))))
+      (enchiridion.channel.http::enter-turn service)
+      (bordeaux-threads:make-thread
+       (lambda ()
+         (sleep 0.1)
+         (enchiridion.channel.http::leave-turn service))
+       :name "enchiridion http test turn")
+      (let* ((started (get-internal-real-time))
+             (waited (progn (enchiridion.channel.http::stop-http-acceptor
+                             channel :seconds 5)
+                            (elapsed-seconds started))))
+        (ok (>= waited 0.05) "the drain waited for the turn")
+        (ok (< waited 1.5) "and did not spend the whole budget on it"))))
+  (testing "a turn that outlasts the budget is reported and the stop returns"
+    (let* ((service (service-with))
+           (channel (channel-over service :acceptor (make-instance 'quiet-acceptor))))
+      (enchiridion.channel.http::enter-turn service)
+      (let* ((started (get-internal-real-time))
+             (waited (progn (enchiridion.channel.http::stop-http-acceptor
+                             channel :seconds 0.2)
+                            (elapsed-seconds started))))
+        (ok (>= waited 0.15) "the drain was entered")
+        (ok (< waited 1.0) "and the budget ended it"))))
+  (testing "an acceptor that does not stop in budget keeps its handle"
+    (let* ((acceptor (make-instance 'sluggish-acceptor))
+           (channel (channel-over (service-with) :acceptor acceptor))
+           (started (get-internal-real-time)))
+      (enchiridion.channel.http::stop-http-acceptor channel :seconds 0.2)
+      (ok (< (elapsed-seconds started) 0.6)
+          "HUNCHENTOOT:STOP is bounded by the same deadline")
+      (testing "so a later stop can retry it"
+        (ok (eq acceptor (enchiridion.channel.http:http-channel-acceptor channel)))
+        (enchiridion.channel.http::stop-http-acceptor channel :seconds 5)
+        (ok (null (enchiridion.channel.http:http-channel-acceptor channel)))))))

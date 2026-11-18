@@ -118,23 +118,28 @@ operator has to be able to see."
 ;;;; The sleep agent.
 
 (declaim (ftype (function (&key (:directory t) (:backend t) (:budget t)
-                                (:broker t) (:store t))
+                                (:broker t) (:store t) (:lock t))
                           agent)
                 sleep-agent))
 
-(defun sleep-agent (&key directory backend budget broker store)
+(defun sleep-agent (&key directory backend budget broker store (lock nil))
   "Return an agent for one sleep pass.
 
 It is built fresh on every tick so that the prompt is compiled from the block
 files as the last pass left them. The three seed-backed blocks are writable
 here, which is the one difference from the operator's agent: this agent owns
-identity after handover and the operator's agent only reads it."
+identity after handover and the operator's agent only reads it.
+
+LOCK is the operator agent's lock when a tick has one. The sleep pass shares
+the store, the directory, and the repository with an operator turn, so it must
+share their lock; otherwise the two write in an order neither chose."
   (let ((agent (make-agent :name "sleep"
                            :backend backend
                            :directory directory
                            :budget budget
                            :broker broker
-                           :store store)))
+                           :store store
+                           :lock lock)))
     (dolist (block (agent-blocks agent))
       (when (member (enchiridion.memory:block-label block)
                     '(:persona :operator :world)
@@ -156,7 +161,10 @@ a capability the pass does not use."
                              :label :persona
                              :text brief))
               :tools-p nil
-              :budget (agent-budget agent)))
+              :budget (agent-budget agent)
+              ;; Compaction reads the transcript an operator turn writes and
+              ;; rewrites the session block, so it takes the same lock.
+              :lock (agent-lock agent)))
 
 ;;;; One sleep pass.
 
@@ -205,12 +213,13 @@ turn under the channel that made it."
 
 ;;;; Compaction.
 
-(declaim (ftype (function (agent t &key (:model t) (:rebase-p t)) (or null string))
+(declaim (ftype (function (agent t &key (:model t) (:rebase-p t))
+                          (values (or null string) (or null string)))
                 compact-session))
 
 (defun compact-session (agent store &key (model (enchiridion:model-for :cheap))
                                          (rebase-p nil))
-  "Rewrite the session block from the recent transcript and return it.
+  "Rewrite the session block from the recent transcript and return the text.
 
 The previous block is the summary so far and the last few turns are verbatim:
 that is the whole design, and it is why the prompt does not grow with the
@@ -218,7 +227,8 @@ transcript. A REBASE-P pass reads the last *COMPACTION-REBASE-TURNS* turns and
 no previous summary, so a summary of a summary cannot drift forever. The answer
 is scrubbed, scanned and checked against the block limit by the store before it
 lands, so a model that answers with something oversized or injected changes
-nothing and is reported instead. A pass that lands records a projections row."
+nothing and is reported instead. A pass that lands records a projections row.
+A refused block returns NIL and the refusal."
   (let* ((previous (if rebase-p "" (enchiridion.memory.store:session-block store)))
          (recent (enchiridion.memory.store:recent-turns
                   store
@@ -251,19 +261,28 @@ nothing and is reported instead. A pass that lands records a projections row."
                 (text (enchiridion.llm.secrets:scrub
                        (enchiridion.llm:completion-text completion))))
            (when (plusp (length text))
-             (enchiridion.memory.store:set-session-block store text)
-             (when recent
-               (record-projection store
-                                  :from-turn (enchiridion.memory.store:turn-row-id
-                                              (car (last recent)))
-                                  :to-turn (enchiridion.memory.store:turn-row-id
-                                            (first recent))
-                                  :rebase-p rebase-p
-                                  :model (or (enchiridion.llm:completion-model completion)
-                                             "")
-                                  :text text))
-             text))
-      (ignore-errors (end-session session)))))
+             ;; A summary the store refuses (over the block limit or tripping
+             ;; the scan) is a reported no-op, and it records no projection.
+             (multiple-value-bind (stored refusal)
+                 (handler-case (enchiridion.memory.store:set-session-block store text)
+                   (enchiridion.errors:block-overflow (condition)
+                     (values nil (enchiridion.errors:condition-report-line condition)))
+                   (enchiridion.errors:configuration-error (condition)
+                     (values nil (enchiridion.errors:condition-report-line condition))))
+               (if stored
+                   (progn
+                     (when recent
+                       (record-projection store
+                                          :from-turn (enchiridion.memory.store:turn-row-id
+                                                      (car (last recent)))
+                                          :to-turn (enchiridion.memory.store:turn-row-id
+                                                    (first recent))
+                                          :rebase-p rebase-p
+                                          :model (enchiridion.llm:completion-model completion)
+                                          :text text))
+                     (values text nil))
+                   (values nil refusal)))))
+      (ignore-errors (progn (end-session session) nil)))))
 
 (defun record-projection (store &key from-turn to-turn rebase-p model text
                                      (now (get-universal-time)))
@@ -454,6 +473,19 @@ not happen is never silent."
 
 ;;;; The tick.
 
+(declaim (ftype (function (agent t t) agent) sleep-pass-agent))
+
+(defun sleep-pass-agent (agent directory store)
+  "Return the sleep agent one tick runs, carrying AGENT's turn lock.
+The lock is the operator's: the tick and a turn share the store, the directory,
+and the repository."
+  (sleep-agent :directory directory
+               :backend (agent-backend agent)
+               :budget (agent-budget agent)
+               :broker (agent-broker agent)
+               :store store
+               :lock (agent-lock agent)))
+
 (declaim (ftype (function (enchiridion.supervisor:supervisor t agent t) string)
                 run-sleep-phase))
 
@@ -469,11 +501,7 @@ nothing, and the honest report for it is one word."
                                                               :not-channel :sleep))
          (newest (and recent (enchiridion.memory.store:turn-row-id (first recent)))))
     (flet ((pass (&key task)
-             (run-sleep-pass (sleep-agent :directory directory
-                                          :backend (agent-backend agent)
-                                          :budget (agent-budget agent)
-                                          :broker (agent-broker agent)
-                                          :store store)
+             (run-sleep-pass (sleep-pass-agent agent directory store)
                              store :task task)))
       (cond
         (task
@@ -492,54 +520,120 @@ nothing, and the honest report for it is one word."
                           (or null string))
                 compact-when-due))
 
+(defparameter +compaction-attempts-per-window+ 2
+  "How many times one window of turns may be offered to the summariser.
+A blank or over-limit answer is often transient, so one retry is worth paying.
+After that the window waits for a newer turn, and the cursor does not advance,
+so no turn is dropped.")
+
+(defvar *compaction-window* nil
+  "The window compaction last tried: (STORE-PATH NEWEST-TURN ATTEMPTS), or NIL.
+Process local, like the cursor on the supervisor; a restart re-reads once.")
+
+(defun compaction-window-key (store)
+  "Return the key a compaction window is remembered under.
+A reopened store is the same transcript; a test's scratch store is not."
+  (let ((path (ignore-errors (enchiridion.memory.store:store-path store))))
+    (if (pathnamep path) (namestring path) "")))
+
+(defun compaction-window-attempts (store newest)
+  "Return how many times the window ending at NEWEST has been offered."
+  (let ((remembered *compaction-window*))
+    (if (and remembered
+             (equal (first remembered) (compaction-window-key store))
+             (= (second remembered) newest))
+        (third remembered)
+        0)))
+
+(defun note-compaction-attempt (store newest)
+  "Record one attempt at the window ending at NEWEST and return the count."
+  (let ((attempts (1+ (compaction-window-attempts store newest))))
+    (setf *compaction-window* (list (compaction-window-key store) newest attempts))
+    attempts))
+
+(defun compaction-window-exhausted-p (store newest)
+  "Return T when the window ending at NEWEST has used its attempts."
+  (>= (compaction-window-attempts store newest) +compaction-attempts-per-window+))
+
 (defun compact-when-due (supervisor store agent &key (rebase-p nil))
   "Rewrite the session block when enough new turns have arrived, else NIL.
 REBASE-P makes the pass a rebase from raw turns.
 
 The cursor lives on the supervisor rather than in a file: it is a position in
 this process's reading of the transcript, and a restart re-reads the last few
-turns once, which is harmless and bounded."
-  (let ((cursor (enchiridion.supervisor:supervisor-last-compacted-turn supervisor))
-        (recent (enchiridion.memory.store:recent-turns store
-                                                       :limit +compaction-turns+
-                                                       :not-channel :sleep)))
+turns once, which is harmless and bounded. A window that produced nothing is
+offered at most +COMPACTION-ATTEMPTS-PER-WINDOW+ times."
+  (let* ((cursor (enchiridion.supervisor:supervisor-last-compacted-turn supervisor))
+         (recent (enchiridion.memory.store:recent-turns store
+                                                        :limit +compaction-turns+
+                                                        :not-channel :sleep))
+         (newest (if recent (enchiridion.memory.store:turn-row-id (first recent)) 0)))
     (when (and (= (length recent) +compaction-turns+)
-               (> (enchiridion.memory.store:turn-row-id (car (last recent))) cursor))
-      (let ((compacted (compact-session (compactor-agent agent (if rebase-p
-                                                                     +rebase-brief+
-                                                                     +compaction-brief+))
-                                        store
-                                        :rebase-p rebase-p)))
+               (> (enchiridion.memory.store:turn-row-id (car (last recent))) cursor)
+               (not (compaction-window-exhausted-p store newest)))
+      (note-compaction-attempt store newest)
+      (multiple-value-bind (compacted refusal)
+          (compact-session (compactor-agent agent (if rebase-p
+                                                      +rebase-brief+
+                                                      +compaction-brief+))
+                           store
+                           :rebase-p rebase-p)
         (cond
-          ;; A blank answer spends the call and summarises nothing. The cursor
-          ;; stays where it was, so the next tick offers the same window and the
-          ;; operator sees the paid retry instead of four silently dropped rows.
-          ((null compacted) "compaction produced no text")
+          ;; A blank or refused answer spends the call and summarises nothing.
+          ;; The cursor stays where it was, so the turns are not dropped and
+          ;; the operator sees the paid retry.
+          ((null compacted)
+           (if refusal
+               (format nil "compaction produced nothing usable: ~A" refusal)
+               "compaction produced no text"))
           (t
            (setf (enchiridion.supervisor:supervisor-last-compacted-turn supervisor)
                  (enchiridion.memory.store:turn-row-id (first recent)))
+           ;; The block moved: the next window is a new question.
+           (setf *compaction-window* nil)
            (if rebase-p
                "the session block was rebuilt from raw turns"
                "the session block was compacted")))))))
 
+(defun t2-refusal-line (refusal)
+  "Return the sentence one T2 refusal is reported with.
+A keyword is a reason and not a sentence: printing one with its leading colon
+puts a Lisp symbol in a line the operator reads."
+  (case refusal
+    (:not-due "not due")
+    (:disabled "memory is switched off")
+    (:maintenance-pending "maintenance has a backlog to derive first")
+    (:frozen-precision "promotion precision is frozen; reset it to lift the freeze")
+    (:pass-budget-spent "the pass budget is spent")
+    (:no-store "no memory store is open")
+    (:no-deriver "no assertion deriver is installed")
+    (t (string-downcase (string refusal)))))
+
 (defun t2-report-line (report)
   "Return the heartbeat's sentence for one T2 pass REPORT."
   (let ((id (getf report :generation-id)))
-    (ecase (getf report :outcome)
-      (:building (format nil "T2 building generation ~D (~D episode~:P remaining~@[; ~D skipped after two failed calls~]~@[; a deriver call failed: ~A~])"
-                         id (getf report :remaining)
-                         (let ((skipped (getf report :skipped))) (and skipped (plusp skipped) skipped))
-                         (getf report :failed)))
-      (:promoted (format nil "T2 generation ~D promoted" id))
-      (:quarantined (format nil "T2 generation ~D quarantined at the ~A gate"
-                            id (getf report :failed)))
-      (:held (format nil "T2 generation ~D held: promotion is frozen (~(~A~))"
-                     id (getf report :freeze)))
-      (:rolled-back (format nil "T2 rolled back generation ~D: its ~A check failed"
-                            id (getf report :failed)))
-      (:instrument-missing (format nil "T2 skipped: instruments missing (~{~(~A~)~^, ~})"
-                                   (getf report :missing)))
-      (:skipped (format nil "T2 skipped: ~(~A~)" (getf report :reason))))))
+    (let ((line
+            (ecase (getf report :outcome)
+              (:building (format nil "T2 building generation ~D (~D episode~:P remaining~@[; ~D skipped after two failed calls~]~@[; a deriver call failed: ~A~]~:[~;; another builder holds it~])"
+                                 id (getf report :remaining)
+                                 (let ((skipped (getf report :skipped)))
+                                   (and skipped (plusp skipped) skipped))
+                                 (getf report :failed)
+                                 (getf report :claimed)))
+              (:promoted (format nil "T2 generation ~D promoted" id))
+              (:quarantined (format nil "T2 generation ~D quarantined at the ~A gate"
+                                    id (getf report :failed)))
+              (:held (format nil "T2 generation ~D held: promotion is frozen (~(~A~))"
+                             id (getf report :freeze)))
+              (:rolled-back (format nil "T2 rolled back generation ~D: its ~A check failed"
+                                    id (getf report :failed)))
+              (:instrument-missing (format nil "T2 skipped: instruments missing (~{~(~A~)~^, ~})"
+                                           (getf report :missing)))
+              (:skipped (format nil "T2 skipped: ~A"
+                                (t2-refusal-line (getf report :reason)))))))
+      (if (getf report :recovered)
+          (format nil "~A (a candidate an earlier pass built and never gated)" line)
+          line))))
 
 (defun run-t2-phase (store agent start-total tick-index)
   "Run one tick of T2 when it is due and allowed, and return the report line,
@@ -553,8 +647,84 @@ operator switched T2 off, would say so."
     (cond
       ((member refusal '(:not-due :disabled)) nil)
       ((consp refusal) (format nil "T2 skipped: ~A" (first refusal)))
-      (refusal (format nil "T2 skipped: ~(~A~)" refusal))
+      (refusal (format nil "T2 skipped: ~A" (t2-refusal-line refusal)))
       (t (t2-report-line (enchiridion.memory:run-t2-pass store))))))
+
+;;;; The store's own health and size.
+
+(defparameter +store-report-interval-seconds+ 86400
+  "How often a tick says how large the store is and how old its log is.
+Once a day is enough to see growth.")
+
+(defparameter +store-report-bytes+ (* 256 1024 1024)
+  "How large the store must be before a tick reports its size.
+Below this it is not a disk problem; `enchiridion memory status' answers on
+demand.")
+
+(defvar *store-reported-ts* 0
+  "When this process last reported the store's size, or 0 for not yet.")
+
+(defvar *store-failure-watermark* nil
+  "The persistence-failure count this process last reported, or NIL before its
+first tick. Earlier failures were reported when they happened, so counting them
+here would make an idle tick look broken.")
+
+(defun byte-count-line (bytes)
+  "Return BYTES as a short decimal with its unit, or a phrase when unknown."
+  (cond ((null bytes) "an unknown size")
+        ((< bytes 1024) (format nil "~D B" bytes))
+        ((< bytes (* 1024 1024)) (format nil "~D KB" (round bytes 1024)))
+        ((< bytes (* 1024 1024 1024))
+         (format nil "~,1F MB" (/ bytes (* 1024.0 1024))))
+        (t (format nil "~,2F GB" (/ bytes (* 1024.0 1024 1024))))))
+
+(defun age-line (seconds)
+  "Return SECONDS as a short age, or a phrase when unknown."
+  (cond ((null seconds) "of unknown age")
+        ((>= seconds 172800) (format nil "~D days old" (floor seconds 86400)))
+        ((>= seconds 86400) "a day old")
+        ((>= seconds 7200) (format nil "~D hours old" (floor seconds 3600)))
+        ((>= seconds 3600) "an hour old")
+        (t "under an hour old")))
+
+(defun store-report-line (store &key (now (get-universal-time)))
+  "Return a line about the store's health and size, or NIL when there is
+nothing to say.
+
+A write that failed since the last tick is reported here: on a full volume
+turns still answer and the only sign is that the history stopped growing. The
+size line appears once a day, once the store is past +STORE-REPORT-BYTES+, with
+the age of the oldest episode and the space a VACUUM would return. It never
+deletes."
+  (when store
+    (let* ((failures (persistence-failures))
+           (previous (or *store-failure-watermark* failures))
+           (fresh (- failures previous))
+           (latest (last-persistence-failure))
+           (lines '()))
+      (setf *store-failure-watermark* failures)
+      (when (and (plusp fresh) latest)
+        (push (format nil "~D memory write~:P failed since the last tick; last: could not persist ~(~A~): ~A"
+                      fresh (car latest) (cdr latest))
+              lines))
+      (let ((usage (ignore-errors (enchiridion.memory.store::store-usage store))))
+        (when (and usage
+                   (let ((bytes (getf usage :bytes)))
+                     (and bytes (>= bytes +store-report-bytes+)))
+                   (or (zerop *store-reported-ts*)
+                       (>= (- now *store-reported-ts*)
+                           +store-report-interval-seconds+)))
+          (setf *store-reported-ts* now)
+          (push (format nil "the memory store holds ~A over ~D episode~:P~@[, oldest ~A~]~@[; ~A is reclaimable~]; nothing is deleted automatically"
+                        (byte-count-line (getf usage :bytes))
+                        (getf usage :episodes)
+                        (and (plusp (getf usage :episodes))
+                             (age-line (getf usage :oldest-age)))
+                        (let ((reclaimable (getf usage :reclaimable-bytes)))
+                          (and reclaimable (plusp reclaimable)
+                               (byte-count-line reclaimable))))
+                lines)))
+      (when lines (format nil "~{~A~^; ~}" (nreverse lines))))))
 
 (declaim (ftype (function (enchiridion.supervisor:supervisor) list) heartbeat))
 
@@ -566,13 +736,13 @@ reported and the later ones still run, because a store that refuses one write
 should not also stop the queue. Nothing here signals, for the reason
 SUPERVISOR-TICK gives.
 
-Phase order is the design. Recovery first, so a task a dead process left
-running is failed before anything looks at the queue. Then memory
-maintenance and embedding, then T2, which reads the rarity maintenance just
-wrote and may build or gate a candidate. Then the ledger, so the
-sleep agent's own prompt carries the spend of the pass before it. Then the
-sleep agent. Then compaction, which is the only phase that may rewrite the
-session block."
+Phase order is the design. The store's health comes first, because a failing
+write looks like nothing from every other surface. Then recovery, so a task a
+dead process left running is failed before anything looks at the queue. Then memory maintenance and embedding, then T2,
+which reads the rarity maintenance just wrote and may build or gate a candidate.
+Then the ledger, so the sleep agent's own prompt carries the spend of the pass
+before it. Then the sleep agent. Then compaction, which is the only phase that
+may rewrite the session block."
   (let* ((store (enchiridion.supervisor:supervisor-store supervisor))
          (agent (enchiridion.supervisor:supervisor-agent supervisor))
          (directory (enchiridion.supervisor:supervisor-directory supervisor))
@@ -590,6 +760,8 @@ session block."
                    (setf ok-p nil)
                    (say "~A failed: ~A" name
                         (enchiridion.errors:condition-report-line condition))))))
+      (when store
+        (attempt "the memory store" (lambda () (store-report-line store))))
       (when store
         (attempt "task recovery"
                  (lambda ()

@@ -412,6 +412,77 @@ from that."
                             (and (stringp detail) (plusp (length detail)) detail)))))
         (values text 0 t)))))
 
+;;;; Persistence.
+;;;;
+;;;; Transcript and usage rows are written after the model answers. A store
+;;;; that refuses one is reported through a bounded line and a counter, never
+;;;; by replacing the reply.
+
+(defparameter +persistence-detail-limit+ 400
+  "How many characters of a persistence failure reach the reporter.")
+
+(defparameter *persistence-failure-reporter*
+  (lambda (kind detail)
+    (format *error-output* "~&enchiridion: could not persist ~(~A~): ~A~%"
+            kind detail)
+    (finish-output *error-output*))
+  "Called with :TURN or :USAGE and a one line detail when a store write fails.
+The default writes one line to *ERROR-OUTPUT* and never signals.")
+
+(defvar *persistence-failure-lock*
+  (bordeaux-threads:make-lock "enchiridion persistence failures"))
+
+(defvar *persistence-failures* 0
+  "How many turn and usage writes this process failed to persist.")
+
+(defvar *last-persistence-failure* nil
+  "The (KIND . DETAIL) of the newest failed write, or NIL.")
+
+(declaim (ftype (function () integer) persistence-failures))
+
+(defun persistence-failures ()
+  "Return how many turn and usage writes this process failed to persist."
+  (bordeaux-threads:with-lock-held (*persistence-failure-lock*)
+    *persistence-failures*))
+
+(declaim (ftype (function () t) last-persistence-failure))
+
+(defun last-persistence-failure ()
+  "Return (KIND . DETAIL) for the newest failed write, or NIL."
+  (bordeaux-threads:with-lock-held (*persistence-failure-lock*)
+    *last-persistence-failure*))
+
+(defun one-line-text (text)
+  "Return TEXT with line breaks flattened and the length bounded."
+  (let* ((flat (map 'string (lambda (character)
+                              (if (member character '(#\Newline #\Return #\Tab))
+                                  #\Space
+                                  character))
+                    text))
+         (trimmed (string-trim '(#\Space) flat)))
+    (if (> (length trimmed) +persistence-detail-limit+)
+        (concatenate 'string
+                     (subseq trimmed 0 (- +persistence-detail-limit+ 3))
+                     "...")
+        trimmed)))
+
+(defun condition-summary (condition)
+  "Return CONDITION as one bounded line, even when it cannot be printed."
+  (one-line-text
+   (handler-case (enchiridion.errors:condition-report-line condition)
+     (error () "an unprintable condition"))))
+
+(defun note-persistence-failure (kind detail)
+  "Count one failed store write and give KIND and DETAIL to the reporter."
+  (bordeaux-threads:with-lock-held (*persistence-failure-lock*)
+    (incf *persistence-failures*)
+    (setf *last-persistence-failure* (cons kind detail)))
+  (let ((reporter *persistence-failure-reporter*))
+    (when reporter
+      (handler-case (funcall reporter kind detail)
+        (error () nil))))
+  nil)
+
 (declaim (ftype (function (t t t) t) persist-usage))
 
 (defun persist-usage (store session row)
@@ -434,8 +505,13 @@ broken reply."
          :channel (spend-row-channel row)
          :ts (spend-row-time row))
       (error (condition)
-        (format *error-output* "~&enchiridion: could not write the usage row: ~A~%"
-                condition)))))
+        (note-persistence-failure
+         :usage
+         (format nil "store ~A, session ~A, channel ~A: ~A"
+                 (ignore-errors (enchiridion.memory.store:store-path store))
+                 (or (and session (session-id session)) "default")
+                 (string-downcase (string (spend-row-channel row)))
+                 (condition-summary condition)))))))
 
 ;; No F-TYPE on PERSIST-TURN, for the reason RESOLVE-BACKEND has none: SBCL
 ;; wants every keyword of an F-TYPE lambda list declared in an earlier one, and
@@ -467,8 +543,13 @@ surface the turn arrived on, so the usage report can group by it."
           ;; search surface, and the cue candidates are the same log now.
           row)
       (error (condition)
-        (format *error-output* "~&enchiridion: could not record a turn: ~A~%"
-                condition)))))
+        (note-persistence-failure
+         :turn
+         (format nil "store ~A, session ~A, role ~A, channel ~A: ~A"
+                 (ignore-errors (enchiridion.memory.store:store-path store))
+                 (or (and session (session-id session)) "default")
+                 role (string-downcase (string channel))
+                 (condition-summary condition)))))))
 
 (declaim (ftype (function (agent t) t) commit-agent-turn))
 

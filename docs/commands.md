@@ -142,9 +142,13 @@ enchiridion channels list
 enchiridion heartbeat run
 ```
 
-`health` prints the pid, generation, last report, heartbeat state and one line
-per channel. `reload` keeps the last good code when a generation is refused.
-`channels replace NAME` keeps the old channel when the new one fails to start.
+After five seconds the command exits 1 if no answer has arrived. The request
+may still run. Check `health` for the latest result.
+
+`health` reports channels, heartbeat and status-file writes. A refused `reload`
+keeps the previous generation. If a replacement cannot start beside the old
+channel, `channels replace NAME` stops the old one and retries. If that fails,
+it attempts to restore the old channel.
 [Deployment](deployment.md#supervisor-and-schedule) covers the schedule and the queue.
 
 ## The REPL

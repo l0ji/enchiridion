@@ -117,6 +117,64 @@
           (ok (eq :candidate (getf third :status)))
           (ok (zerop (getf third :remaining))))))))
 
+(deftest one-building-generation-survives-concurrent-starts ()
+  (with-store (store directory)
+    (enchiridion.memory:ensure-generation-state store)
+    (let ((threads (loop repeat 8
+                         collect (bordeaux-threads:make-thread
+                                  (lambda ()
+                                    (enchiridion.memory::ensure-building-generation
+                                     store))))))
+      (dolist (thread threads)
+        (bordeaux-threads:join-thread thread)))
+    (let ((row (first (enchiridion.memory.store:query-rows
+                       store "SELECT COUNT(*) AS n FROM generations
+                               WHERE status = 'building'"))))
+      (ok (= 1 (enchiridion.memory.store:field row "n"))
+          "eight callers share one candidate"))))
+
+(deftest a-claim-keeps-a-second-builder-out ()
+  (with-store (store directory)
+    (let ((enchiridion.memory:*assertion-deriver* #'test-deriver))
+      (write-body store "alpha is beta")
+      (let* ((id (enchiridion.memory::ensure-building-generation store))
+             (owner (enchiridion.memory::generation-claim-token)))
+        (ok (enchiridion.memory::claim-generation store id owner))
+        (let ((report (enchiridion.memory:build-candidate store)))
+          (testing "a held claim means this caller derives nothing"
+            (ok (not (getf report :built)))
+            (ok (eq :claimed (getf report :reason)))
+            (ok (= id (getf report :generation-id)))
+            (ok (zerop (enchiridion.memory:generation-assertion-count store id)))))
+        (ok (enchiridion.memory::release-generation store id owner))
+        (let ((report (enchiridion.memory:build-candidate store)))
+          (testing "after the release the same generation builds"
+            (ok (getf report :built))
+            (ok (= id (getf report :generation-id)))
+            (ok (plusp (enchiridion.memory:generation-assertion-count
+                        store id)))))
+        (testing "and the build released the claim"
+          (let ((row (enchiridion.memory:generation-row store id)))
+            (ok (string= ""
+                         (or (enchiridion.memory.store:field row "claim_owner")
+                             "")))))))))
+
+(deftest a-stale-claim-can-be-taken-over ()
+  (with-store (store directory)
+    (let* ((id (enchiridion.memory::ensure-building-generation store))
+           (lease enchiridion.memory::*generation-claim-seconds*)
+           (first "first-builder"))
+      (ok (enchiridion.memory::claim-generation store id first :now 1000))
+      (testing "a live claim is not stolen"
+        (ng (enchiridion.memory::claim-generation
+             store id "second-builder" :now (+ 1000 (1- lease)))))
+      (testing "an expired claim is free again"
+        (ok (enchiridion.memory::claim-generation
+             store id "second-builder" :now (+ 1000 lease))))
+      (testing "the old owner cannot release the new one's claim"
+        (ng (enchiridion.memory::release-generation store id first)))
+      (ok (enchiridion.memory::release-generation store id "second-builder")))))
+
 (deftest no-deriver-builds-nothing ()
   (with-store (store directory)
     (let ((enchiridion.memory:*assertion-deriver* nil))
@@ -488,6 +546,12 @@ claims that stand alone and those shown under their episode, in pack order."
                    ORDER BY id"
            (list generation))))
 
+(defun count-rows (store sql &optional parameters)
+  "Return the N column of one counting query."
+  (enchiridion.memory.store:field
+   (first (enchiridion.memory.store:query-rows store sql parameters))
+   "n"))
+
 (defun status-of (store generation)
   (enchiridion.memory.store:field
    (first (enchiridion.memory.store:query-rows
@@ -715,6 +779,25 @@ subject from the question before it, the way the model deriver is asked to."
         (ok (search "where does service4 keep its secret" prompt))
         (ok (< (search "service4" prompt) (search "in vault4 under ops" prompt)))))))
 
+(deftest the-deriver-reads-a-bounded-record ()
+  ;; The deriver runs unattended, and a prompt that grows with the body it
+  ;; reads has no bound on its cost.
+  (with-store (store directory)
+    (let* ((backend (make-json-backend))
+           (deriver (enchiridion.memory:make-model-assertion-deriver backend))
+           (big (with-output-to-string (s)
+                  (dotimes (index 4000) (format s "word~D " index))))
+           (episode (enchiridion.memory:make-episode
+                     :id 1 :session "s" :role "tool" :body big :ts 0
+                     :provenance "untrusted" :authority 1)))
+      (funcall deriver store episode)
+      (let ((prompt (json-backend-last-prompt backend)))
+        (testing "the prompt carries the head of the record and not all of it"
+          (ok (< (length prompt) (length big)))
+          (ok (search (subseq big 0 100) prompt)))
+        (testing "and the cut is past what a derivation needs"
+          (ok (> (length prompt) enchiridion.memory::+deriver-body-limit+)))))))
+
 (deftest a-candidate-that-adds-recall-passes-the-real-utility-gate ()
   ;; No stub scorer: the answers share no word with their questions, so the
   ;; log alone recalls none of them, and the candidate's claims recall all.
@@ -830,6 +913,80 @@ shipped schedule."
          (say ,store "assistant" (format nil "answer ~D" i)))
        (enchiridion.memory.store:exec ,store "UPDATE episodes SET derived_ts = 1")
        ,@body)))
+
+;;; A candidate left built by one pass and gated by the next.
+
+(defun stranded-candidate (store)
+  "Build a candidate to completion without gating it, and return its report."
+  (loop repeat 50
+        for report = (enchiridion.memory:build-candidate store :limit 2)
+        when (eq (getf report :status) :candidate)
+          return report))
+
+(deftest a-candidate-an-earlier-pass-built-is-gated-before-a-new-one ()
+  ;; A crash between building and gating leaves a complete candidate with no
+  ;; verdict. The next pass used to copy the live layer and derive again,
+  ;; paying for the same episodes twice.
+  (with-t2-world (store directory)
+    (let ((built (stranded-candidate store)))
+      (ok built)
+      (ok (= 1 (generation-count store)))
+      (ok (zerop (enchiridion.memory:live-generation-id store)))
+      (let* ((generation (getf built :generation-id))
+             (derived (count-rows store "SELECT COUNT(*) AS n FROM generation_derivations
+                                         WHERE generation_id = ?" (list generation))))
+        (ok (plusp derived))
+        (let ((report (enchiridion.memory:run-t2-pass
+                       store :canaries (passing-canaries)
+                             :scorer #'assertion-scorer)))
+          (testing "the pass gates what it found instead of building again"
+            (ok (eq :promoted (getf report :outcome)))
+            (ok (getf report :recovered))
+            (ok (= generation (getf report :generation-id)))
+            (ok (= generation (enchiridion.memory:live-generation-id store)))
+            (ok (= 1 (generation-count store)))
+            (ok (= derived
+                   (count-rows store "SELECT COUNT(*) AS n FROM generation_derivations
+                                       WHERE generation_id = ?" (list generation)))))
+          (testing "and it counts as a pass, so the next one waits for the interval"
+            (ok (enchiridion.memory:last-t2-ts store))
+            (ng (enchiridion.memory:t2-due-p store))))))))
+
+(deftest a-missing-instrument-leaves-a-built-candidate-alone ()
+  ;; Gating without the instruments that judge a candidate would quarantine it
+  ;; for a check the schedule lost, so the pass reports the instrument instead.
+  (with-t2-world (store directory)
+    (let* ((built (stranded-candidate store))
+           (generation (getf built :generation-id))
+           (derived (count-rows store "SELECT COUNT(*) AS n FROM generation_derivations
+                                       WHERE generation_id = ?" (list generation))))
+      (let ((report (enchiridion.memory:run-t2-pass store :canaries '())))
+        (ok (eq :instrument-missing (getf report :outcome)))
+        (ok (= 1 (generation-count store)))
+        (ok (string= "candidate" (status-of store generation)))
+        (ok (= derived
+               (count-rows store "SELECT COUNT(*) AS n FROM generation_derivations
+                                   WHERE generation_id = ?" (list generation))))))))
+
+(deftest a-candidate-with-a-verdict-is-not-gated-again-by-the-schedule ()
+  ;; Quarantined and held candidates have an answer. Retrying it is the
+  ;; operator's `memory promote ID`; the schedule moves on and builds.
+  (with-t2-world (store directory)
+    (let* ((built (stranded-candidate store))
+           (generation (getf built :generation-id))
+           (failed (enchiridion.memory:gate-candidate
+                    store generation
+                    :canaries (list (canary "safety" :name "leak" :cue "alpha"
+                                                    :expect "alpha"))
+                    :scorer #'assertion-scorer)))
+      (ok (eq :quarantined (getf failed :reason)))
+      (ng (getf failed :recovered))
+      (ok (string= "quarantined" (status-of store generation)))
+      (let ((report (enchiridion.memory:run-t2-pass
+                     store :canaries (passing-canaries) :scorer #'assertion-scorer)))
+        (ok (eq :building (getf report :outcome)))
+        (ok (= 2 (generation-count store)))
+        (ng (getf report :recovered))))))
 
 (defun generation-count (store)
   (enchiridion.memory.store:field

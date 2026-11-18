@@ -10,10 +10,6 @@
 
 (in-package #:enchiridion.memory)
 
-(defparameter *memory-t2-max-episodes-per-candidate* 200
-  "Episodes one candidate generation may cover in this phase. A larger log is
-left for the next candidate; a later phase removes the bound.")
-
 (defvar *memory-reranker* nil
   "NIL, or a function of a cue and a list of bodies that returns the indices of
 the relevant ones, most relevant first. RERANK-ROWS, in derive.lsp, calls it;
@@ -316,44 +312,49 @@ budget, so a claim never costs a record its place."
       (dolist (row rows)
         (let* ((item (getf row :item))
                (text (pack-line-text (or (getf item :body) "") cue-tokens))
-               (line (format nil "~&[ref ~A] ~@[(~A) ~]~A"
+               ;; Each record starts its own line: ~& does nothing at the start
+               ;; of a fresh string, and the newline is charged to the budget.
+               (line (format nil "~%[ref ~A] ~@[(~A) ~]~A"
                              (pack-ref row) (pack-line-header item) text)))
           (when (> (+ used (length line)) budget)
             (return))
           (push (cons row line) lines)
           (incf used (length line))))
       (setf lines (nreverse lines))
-      (let ((subs (make-hash-table :test #'eq)))
-        (dolist (entry lines)
-          (dolist (claim (getf (car entry) :claims))
-            (let ((sub (format nil "~&  [ref assertion-~A] ~A" (getf claim :id)
-                               (pack-line-text (or (getf claim :body) "") cue-tokens))))
-              (when (<= (+ used (length sub)) budget)
-                (push sub (gethash (car entry) subs))
-                (incf used (length sub))))))
-        (values
-         (with-output-to-string (stream)
-           (write-string header stream)
-           (dolist (entry lines)
-             (write-string (cdr entry) stream)
-             (dolist (sub (reverse (gethash (car entry) subs)))
-               (write-string sub stream))))
-         ;; The rows report only the claims that were drawn, so the refs a
-         ;; retrieval records are what the model was shown.
-         (mapcar (lambda (entry)
-                   (let ((row (car entry)))
-                     (if (getf row :claims)
-                         (let ((copy (copy-list row)))
-                           (setf (getf copy :claims)
-                                 (remove-if-not
-                                  (lambda (claim)
-                                    (let ((tag (format nil "[ref assertion-~A]" (getf claim :id))))
-                                      (some (lambda (sub) (search tag sub))
-                                            (gethash row subs))))
-                                  (getf row :claims)))
-                           copy)
-                         row)))
-                 lines))))))
+      (when lines
+        (let ((subs (make-hash-table :test #'eq)))
+          (dolist (entry lines)
+            (dolist (claim (getf (car entry) :claims))
+              (let ((sub (format nil "~%  [ref assertion-~A] ~A" (getf claim :id)
+                                 (pack-line-text (or (getf claim :body) "")
+                                                 cue-tokens))))
+                (when (<= (+ used (length sub)) budget)
+                  (push sub (gethash (car entry) subs))
+                  (incf used (length sub))))))
+          (values
+           (with-output-to-string (stream)
+             (write-string header stream)
+             (dolist (entry lines)
+               (write-string (cdr entry) stream)
+               (dolist (sub (reverse (gethash (car entry) subs)))
+                 (write-string sub stream))))
+           ;; The rows report only the claims that were drawn, so the refs a
+           ;; retrieval records are what the model was shown.
+           (mapcar (lambda (entry)
+                     (let ((row (car entry)))
+                       (if (getf row :claims)
+                           (let ((copy (copy-list row)))
+                             (setf (getf copy :claims)
+                                   (remove-if-not
+                                    (lambda (claim)
+                                      (let ((tag (format nil "[ref assertion-~A]"
+                                                         (getf claim :id))))
+                                        (some (lambda (sub) (search tag sub))
+                                              (gethash row subs))))
+                                    (getf row :claims)))
+                             copy)
+                           row)))
+                   lines)))))))
 
 (defun record-retrieval (store &key cue cue-terms predicted pack-refs
                                   (generation-id 0) (ts (get-universal-time)))
@@ -517,16 +518,22 @@ instead of failing the turn."
               (when rows
                 (multiple-value-bind (pack included)
                     (render-pack (select-pack-rows store text rows) :cue text)
-                 (let* (;; Only what the budget let in reached the model.
-                       (refs (format nil "~{~A~^,~}"
-                                     (mapcan #'pack-refs included)))
-                       (id (record-retrieval store
-                                             :cue text
-                                             :cue-terms (format nil "~{~A~^ ~}" terms)
-                                             :predicted nil
-                                             :pack-refs refs
-                                             :ts now)))
-                  (values pack id)))))
+                  ;; The header alone is not a pack: it would record a
+                  ;; retrieval that showed the model nothing.
+                  (when pack
+                    (let* (;; Only what the budget let in reached the model.
+                           (refs (format nil "~{~A~^,~}"
+                                         (mapcan #'pack-refs included)))
+                           ;; The generation the turn read, so the row names
+                           ;; the layer that answered.
+                           (id (record-retrieval store
+                                                 :cue text
+                                                 :cue-terms (format nil "~{~A~^ ~}" terms)
+                                                 :predicted nil
+                                                 :pack-refs refs
+                                                 :generation-id (live-generation-id store)
+                                                 :ts now)))
+                      (values pack id))))))
           (enchiridion.errors:schema-error () nil)
           (error (c)
             (format *error-output*
@@ -664,20 +671,25 @@ semantics on its schedule, under its own caps."
 
 (defun memory-status (store)
   "Return a plist describing the log and the live layer.
-This is a read-only status function: it never signals on a missing table."
+This is read-only and never signals on a missing table."
   (when store
     (flet ((row-count (sql &optional parameters)
              (or (enchiridion.memory.store:field
                   (first (enchiridion.memory.store:query-rows store sql parameters))
                   "n")
                  0)))
-      (list :enabled (enabled-p)
-            :retrieve (retrieval-enabled-p)
-            :push (push-enabled-p)
-            :episodes (row-count "SELECT COUNT(*) AS n FROM episodes")
-            :retrievals (row-count "SELECT COUNT(*) AS n FROM retrievals")
-            :generations (row-count "SELECT COUNT(*) AS n FROM generations")
-            :live-generation (live-generation-id store)
-            :cue-index (row-count "SELECT COUNT(*) AS n FROM cue_index")
-            :canaries (row-count "SELECT COUNT(*) AS n FROM canary")))))
+      (let ((usage (ignore-errors (enchiridion.memory.store::store-usage store))))
+        (list :enabled (enabled-p)
+              :retrieve (retrieval-enabled-p)
+              :push (push-enabled-p)
+              :episodes (row-count "SELECT COUNT(*) AS n FROM episodes")
+              :retrievals (row-count "SELECT COUNT(*) AS n FROM retrievals")
+              :generations (row-count "SELECT COUNT(*) AS n FROM generations")
+              :live-generation (live-generation-id store)
+              :cue-index (row-count "SELECT COUNT(*) AS n FROM cue_index")
+              :canaries (row-count "SELECT COUNT(*) AS n FROM canary")
+              ;; The disk side; NIL means the store could not be measured.
+              :store-bytes (getf usage :bytes)
+              :store-reclaimable-bytes (getf usage :reclaimable-bytes)
+              :store-oldest-ts (getf usage :oldest-ts))))))
 

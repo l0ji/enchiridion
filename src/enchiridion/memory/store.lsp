@@ -381,7 +381,7 @@ that, because it is not text to a parser and NOT a term to match."
 
 ;;;; Opening and closing.
 
-(defparameter +schema-version+ 7
+(defparameter +schema-version+ 8
   "The schema version a store records in PRAGMA user_version once it is built.
 
 Every statement in +SCHEMA+ is CREATE ... IF NOT EXISTS, which adds a missing
@@ -412,12 +412,17 @@ ADD-MISSING-COLUMNS.
 Version 7 keys EPISODE_VECTORS by episode, model and size instead of by episode
 alone, so one dense cache per model is kept rather than each model replacing
 the last. MIGRATE-EPISODE-VECTORS copies every row into the new shape; the
-vectors are a cache, but a switch back to a model is free only if they survive.")
+vectors are a cache, but a switch back to a model is free only if they survive.
+
+Version 8 adds GENERATIONS.CLAIM_OWNER and CLAIM_TS, the lease a builder holds.
+They are in ADD-MISSING-COLUMNS and need no copy.")
 
 (defparameter +added-columns+
   '(("memory_state" "precision_reset_generation" "INTEGER")
     ("memory_state" "last_t2_episode" "INTEGER")
-    ("generations" "episodes_derived" "INTEGER NOT NULL DEFAULT 0"))
+    ("generations" "episodes_derived" "INTEGER NOT NULL DEFAULT 0")
+    ("generations" "claim_owner" "TEXT NOT NULL DEFAULT ''")
+    ("generations" "claim_ts" "INTEGER"))
   "Columns added to an existing table after it shipped: table, column, type.
 CREATE TABLE IF NOT EXISTS never adds one to a table that exists, so
 ADD-MISSING-COLUMNS does.")
@@ -432,6 +437,26 @@ ADD-MISSING-COLUMNS does.")
   (loop for (table column type) in +added-columns+
         unless (column-exists-p store table column)
           do (exec store (format nil "ALTER TABLE ~A ADD COLUMN ~A ~A" table column type))))
+
+(defun added-columns-present-p (store)
+  "Return T when every column in +ADDED-COLUMNS+ is in STORE."
+  (every (lambda (entry)
+           (column-exists-p store (first entry) (second entry)))
+         +added-columns+))
+
+(defun tables-present-p (store)
+  "Return T when every table +STORE-TABLES+ names exists in STORE.
+A store missing one is rebuilt from the schema list."
+  (let* ((names +store-tables+)
+         (placeholders (format nil "~{~A~^,~}"
+                               (make-list (length names) :initial-element "?")))
+         (row (first (query-rows
+                      store
+                      (format nil "SELECT COUNT(*) AS n FROM sqlite_master
+                                     WHERE type = 'table' AND name IN (~A)"
+                              placeholders)
+                      names))))
+    (= (or (field row "n") 0) (length names))))
 
 (defun episode-vector-key-p (store)
   "Return T when EPISODE_VECTORS is keyed by episode, model and size."
@@ -485,17 +510,22 @@ the number is written into the statement, and only an integer is accepted."
   (exec store (format nil "PRAGMA user_version = ~D" version)))
 
 (defun schema-current-p (store)
-  "Return T when STORE was built at the current schema version and still has
-its tables. DROP-STORE resets the version, and the table check covers a store
-whose tables went some other way."
-  (and (>= (schema-version store) +schema-version+)
-       (sqlite-table-exists-p store "episodes")))
+  "Return T when STORE is at the current schema version and has its shape.
+The version alone is not the shape: a migration that stopped before its
+version write, a hand edit, or a copy can leave the current number without a
+table or an added column. Reading the shape on every open turns a later query
+failure into one repair at the open."
+  (and (= (schema-version store) +schema-version+)
+       (tables-present-p store)
+       (added-columns-present-p store)))
 
 (defun open-store (&key path (mode nil) (busy-timeout 15000))
   "Open, and create when absent, the store at PATH. Return the store.
 
 PATH defaults to *STORE-PATH* and then to DEFAULT-STORE-PATH. The schema is
-created only when it is missing, so every start may call this.
+created only when it is missing, so every start may call this. A store whose
+version is newer than this build is refused, and one whose shape is incomplete
+is rebuilt from the schema list.
 
 The whole schema is created in one transaction, foreign keys are on, and the
 busy timeout is fifteen seconds: the episodic memory generation promotion and the
@@ -536,8 +566,20 @@ not an exposure."
                  :key :memory
                  :detail (format nil "Cannot open the memory store ~A: ~A"
                                  path condition))))
-      ;; A current store skips the schema and the merge. Both take the write
-      ;; lock, and the search tool opens the store on every call.
+      ;; A store from a newer build is not one this code can serve: its columns
+      ;; and meanings may not match, and a refusal is better than a running
+      ;; agent that loses rows quietly.
+      (let ((version (schema-version store)))
+        (when (> version +schema-version+)
+          (ignore-errors (dbi:disconnect connection))
+          (error 'enchiridion.errors:configuration-error
+                 :key :memory
+                 :detail (format nil "The memory store ~A has schema ~D, but this build knows schema ~D. Run the newer image or restore a backup."
+                                 path version +schema-version+))))
+      ;; A current store skips the schema and the merge, which both take the
+      ;; write lock on an open the search tool makes on every call. The checks
+      ;; behind "current" read the shape, so one repair covers a lost table or
+      ;; column.
       (unless (schema-current-p store)
         (handler-case
             (with-store-transaction (store)
@@ -615,6 +657,13 @@ not an exposure."
                   :channel (normalise-channel (field row "channel"))
                   :ts (field row "ts")))
 
+(defun turn-context-key (session channel)
+  "Return the context key a transcript row is stored with.
+The transcript has no project, so its first component is empty. CONTEXT-KEY-FOR
+in the memory layer writes the same triple, and a test pins the two spellings
+because two write paths share the column."
+  (format nil ",~A,~A" session (string-downcase (string channel))))
+
 (defun record-turn (store &key session (role "user") (body "") model
                               (channel :cli) (ts (get-universal-time)))
   "Store one raw message and return it as a TURN-ROW.
@@ -651,8 +700,7 @@ secret that reached a turn must not reach the disk, whatever field it sits in."
             (list session role body model ts (string-downcase (string channel))
                   role
                   role
-                  (format nil "~A,~A,~A" session session
-                          (string-downcase (string channel)))))
+                  (turn-context-key session channel)))
       (%make-turn-row :id (last-row-id store)
                       :session session
                       :role role
@@ -761,7 +809,7 @@ and insert share a transaction across connections."
                VALUES (?, 'memory', ?, '', ?, ?, 'cli', 'owner', 5,
                        'semantic', 0, '', ?, 2592000, NULL, NULL)"
             (list session body name ts
-                  (scrubbed (format nil "~A,~A,cli" session session))))
+                  (scrubbed (turn-context-key session :cli))))
       (last-row-id store))))
 
 (defun list-memories (store &key (limit 100))
@@ -1049,6 +1097,47 @@ limit does not load a whole tool result to show four hundred characters."
                                           "body"))
                               (list limit)))))
     (mapcar #'turn-row-from rows)))
+
+;;;; The store as a file.
+;;;;
+;;;; The log is append-only and nothing removes from it, so the size and age
+;;;; need an answer that does not need sqlite3. Read-only, and silent on a
+;;;; missing table.
+
+(declaim (ftype (function (t &key (:now t)) list) store-usage))
+
+(defun store-usage (store &key (now (get-universal-time)))
+  "Return what STORE occupies on disk and how old its log is, or NIL.
+RECLAIMABLE-BYTES is the space a VACUUM would return. Nothing here deletes or
+compacts: retention is the operator's decision."
+  (when store
+    (flet ((first-value (sql)
+             ;; A missing table or unreadable pragma is NIL, not an error.
+             (ignore-errors
+               (let ((row (first (query-rows store sql))))
+                 (and row (second row))))))
+      (let* ((page-size (or (first-value "PRAGMA page_size") 0))
+             (page-count (or (first-value "PRAGMA page_count") 0))
+             (free-pages (or (first-value "PRAGMA freelist_count") 0))
+             (oldest (first-value "SELECT MIN(ts) FROM episodes"))
+             (newest (first-value "SELECT MAX(ts) FROM episodes"))
+             (path (store-path store))
+             (bytes (ignore-errors
+                      (with-open-file (stream path :direction :input
+                                                   :element-type '(unsigned-byte 8)
+                                                   :if-does-not-exist nil)
+                        (and stream (file-length stream))))))
+        (list :path (and (pathnamep path) (namestring path))
+              :bytes bytes
+              :page-size page-size
+              :page-count page-count
+              :reclaimable-bytes (* page-size free-pages)
+              :episodes (or (first-value "SELECT COUNT(*) FROM episodes") 0)
+              :usage-rows (or (first-value "SELECT COUNT(*) FROM usage") 0)
+              :retrievals (or (first-value "SELECT COUNT(*) FROM retrievals") 0)
+              :oldest-ts oldest
+              :newest-ts newest
+              :oldest-age (and oldest (- now oldest)))))))
 
 ;;;; Dropping everything.
 

@@ -75,6 +75,48 @@
                                   :validate t
                                   :if-does-not-exist :ignore))))
 
+(deftest a-failed-store-write-is-reported-once-and-counted ()
+  (let* ((directory (uiop:ensure-directory-pathname
+                     (merge-pathnames
+                      (format nil "enchiridion-kernel-test-~D/"
+                              (random most-positive-fixnum))
+                      (uiop:ensure-directory-pathname *default-pathname-defaults*))))
+         (store (enchiridion.memory.store:open-store
+                 :path (merge-pathnames "memory.db" directory))))
+    (unwind-protect
+         (progn
+           (enchiridion.memory.store:close-store store)
+           (let ((reported '())
+                 (before (enchiridion.kernel:persistence-failures)))
+             (let ((enchiridion.kernel:*persistence-failure-reporter*
+                     (lambda (kind detail) (push (cons kind detail) reported))))
+               (enchiridion.kernel::persist-turn store nil "user" "hello"
+                                                 :channel :cli)
+               (enchiridion.kernel::persist-usage
+                store nil
+                (enchiridion.kernel::%make-spend-row :model "m" :channel :http)))
+             (testing "both losses are counted"
+               (ok (= (+ before 2) (enchiridion.kernel:persistence-failures))))
+             (testing "each report is one bounded line with the row's context"
+               (ok (= 2 (length reported)))
+               (let ((turn (cdr (assoc :turn reported)))
+                     (usage (cdr (assoc :usage reported))))
+                 (ok (search "role user" turn))
+                 (ok (search "channel cli" turn))
+                 (ok (search "channel http" usage))
+                 (ok (not (find #\Newline turn)))
+                 (ok (not (find #\Newline usage)))
+                 (ok (<= (length turn)
+                         enchiridion.kernel::+persistence-detail-limit+)))))
+             (testing "the newest failure is readable without the log"
+               (let ((last (enchiridion.kernel:last-persistence-failure)))
+                 (ok (eq :usage (car last)))
+                 (ok (search "channel http" (cdr last))))))
+      (ignore-errors (enchiridion.memory.store:close-store store))
+      (uiop:delete-directory-tree directory
+                                  :validate t
+                                  :if-does-not-exist :ignore))))
+
 (deftest a-prompt-is-compiled-once-and-flagged-frozen ()
   (let* ((blocks (list (make-test-block "voice")))
          (prompt (enchiridion.kernel:compile-prompt blocks))

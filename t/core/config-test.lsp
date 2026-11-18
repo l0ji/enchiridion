@@ -146,6 +146,25 @@
       (ok (equal '("SAME_NAME" "FLUXER_BOT_TOKEN" "OPENAI_API_KEY")
                  (enchiridion:configured-secret-names config))))))
 
+(deftest a-key-variable-list-is-collected-for-the-loader ()
+  ;; A row may name more than one variable for its key, and the top level key
+  ;; takes the same two shapes. Only the string was collected, so a list read
+  ;; neither name and the provider was built with no key.
+  (ok (equal '("FIRST_KEY" "SECOND_KEY" "FLUXER_BOT_TOKEN"
+               "ENCHIRIDION_HTTP_TOKEN" "OPENAI_API_KEY")
+             (enchiridion:configured-secret-names
+              '(:llm (:api-key-env ("FIRST_KEY" "SECOND_KEY"))))))
+  (testing "an unusable member is dropped rather than loaded"
+    (ok (equal '("FIRST_KEY" "FLUXER_BOT_TOKEN" "ENCHIRIDION_HTTP_TOKEN"
+                 "OPENAI_API_KEY")
+               (enchiridion:configured-secret-names
+                '(:llm (:api-key-env ("FIRST_KEY" "" 42)))))))
+  (testing "and a single name still reads the way it always did"
+    (ok (equal '("ONE_KEY" "FLUXER_BOT_TOKEN" "ENCHIRIDION_HTTP_TOKEN"
+                 "OPENAI_API_KEY")
+               (enchiridion:configured-secret-names
+                '(:llm (:api-key-env "ONE_KEY")))))))
+
 (deftest a-channel-entry-inherits-what-it-does-not-name ()
   (let ((config '(:llm (:backend :openai)
                   :channels (:http (:enabled t) (:port 9999)))))

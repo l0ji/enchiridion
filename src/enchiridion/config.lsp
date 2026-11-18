@@ -373,6 +373,22 @@ the network channels ship disabled, so a network surface never starts because
 nobody mentioned it."
   (not (null (channel-value name :enabled))))
 
+(declaim (ftype (function (t) list) config-api-key-env-list))
+
+(defun config-api-key-env-list (config)
+  "Return the configured :API-KEY-ENV as a list of names.
+
+The key may be one name or a list, because a provider can accept its key under
+more than one variable. The provider table and CONFIGURED-SECRET-NAMES both read
+this list, so they agree on what a configured key is called."
+  (let ((value (config-value config :api-key-env)))
+    (cond ((and (stringp value) (plusp (length value))) (list value))
+          ((listp value)
+           (remove-if-not (lambda (name)
+                            (and (stringp name) (plusp (length name))))
+                          value))
+          (t '()))))
+
 (declaim (ftype (function (t) list) configured-secret-names))
 
 (defun configured-secret-names (config)
@@ -385,12 +401,12 @@ one place to audit: a channel whose token variable is missing from this list
 is a token that never reaches the scrubber, and an unregistered token is the
 one kind the shape filter cannot catch."
   (let ((names '()))
-    (dolist (name (list (config-value config :api-key-env)
-                        (getf (channel-config :fluxer config) :token-env)
-                        (getf (channel-config :http config) :token-env)
-                        ;; Dense retrieval's key, which may belong to a
-                        ;; provider other than the chat one.
-                        (config-setting config :memory :embed-key-env)))
+    (dolist (name (append (config-api-key-env-list config)
+                          (list (getf (channel-config :fluxer config) :token-env)
+                                (getf (channel-config :http config) :token-env)
+                                ;; Dense retrieval's key, which may belong to a
+                                ;; provider other than the chat one.
+                                (config-setting config :memory :embed-key-env))))
       (when (and (stringp name) (plusp (length name)))
         (pushnew name names :test #'string=)))
     (nreverse names)))

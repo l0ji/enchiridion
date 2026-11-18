@@ -34,6 +34,8 @@
    ;; twenty. It is exported because the LLM module reads provider defaults
    ;; through it.
    #:config-lookup
+   ;; The provider table and the secret loader read one key-name list.
+   #:config-api-key-env-list
    #:configured-secret-names #:config-memory-db)
   (:documentation
    "Configuration. Paths and behaviour only; a secret never comes from here,
@@ -49,7 +51,9 @@ because a file in the repository is a file that ends up in a store path."))
    #:process-uid #:set-process-uid #:process-gid #:set-process-gid
    #:clear-supplementary-groups
    #:process-user #:set-process-user #:implementation-dependency-p
-   #:process-id #:process-kill #:process-reap #:with-deadline
+   #:process-id #:process-pid #:process-kill #:process-reap #:with-deadline
+   ;; Process trees, for stopping a child's own children: each leads a group.
+   #:signal-process #:process-alive-p #:process-descendants
    #:process-exit-code #:lisp-runtime-path
    #:script-arguments #:exit-with #:backtrace-string
    #:encode-utf8 #:decode-utf8 #:decode-utf8-lenient #:run-program-capture
@@ -68,7 +72,7 @@ able to rewrite itself without rewriting the porting layer."))
    #:git-available-p #:git-program #:repository-p #:git-init #:git-commit-all
    #:git-log #:git-show #:git-diff #:git-revert #:git-head
    #:git-run #:git-current-branch #:git-test-environment #:*commit-environment*
-    #:*git-identity* #:*history-failure-reporter*)
+    #:*git-identity* #:*history-failure-reporter* #:*stale-lock-reporter*)
   (:documentation
    "The agent directory is its own git repository, so personality evolution and
 authored code are a diff the operator can read and revert. Every call goes
@@ -520,6 +524,10 @@ reactions are all out, so the allowlist is the whole authorisation story."))
    #:supervisor-run-directory
    #:supervisor-generation #:supervisor-channels #:supervisor-running-p
     #:supervisor-enable-channel #:supervisor-channel-factory
+   ;; Health reads: channel rows including disabled ones, heartbeat liveness,
+   ;; and the write report.
+   #:supervisor-channel-rows #:supervisor-disabled-channels
+   #:supervisor-heartbeat-live-p #:supervisor-write-report
    #:supervisor-heartbeat-p #:supervisor-heartbeat-interval
    #:supervisor-poll-control #:supervisor-poll-loop
    #:supervisor-write-status #:supervisor-started #:channel-row
@@ -532,10 +540,10 @@ reactions are all out, so the allowlist is the whole authorisation story."))
    ;; The two files that let a one-shot shell command talk to a process that is
    ;; already up. A file, not a socket, so tail and grep work on it.
    #:control-file #:status-file #:read-status #:status-fresh-p #:request-control
-   #:queue-control
+   #:+control-wait-seconds+ #:queue-control
    #:status-generation #:status-channels #:status-bootstrap #:status-pid
    #:status-updated #:status-report #:status-handled #:status-report-ok-p
-   #:status-heartbeat)
+   #:status-writes #:status-heartbeat)
   (:documentation
    "The process that owns the channels, and the two run/ files it exchanges with
 the shell. It is the only writer of run/enchiridion.status, which is what lets
@@ -554,7 +562,10 @@ the shell. It is the only writer of run/enchiridion.status, which is what lets
    #:budget-exhausted-p #:spend-row
    #:session #:make-session #:session-id #:session-turns #:end-session
    #:heartbeat #:task-queue #:enqueue-task #:dequeue-task #:task-queue-length
-   #:sleep-agent #:run-sleep-pass)
+   #:sleep-agent #:run-sleep-pass
+   ;; What a failed transcript or usage write leaves for a health reader.
+   #:*persistence-failure-reporter* #:persistence-failures
+   #:last-persistence-failure)
   (:documentation
    "The agent loop, the prompt compiler, the frozen snapshot, and the ledger.
 This is the frozen core: it holds the shape of the system and it does not

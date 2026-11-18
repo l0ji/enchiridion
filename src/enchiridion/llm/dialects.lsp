@@ -92,7 +92,10 @@
   ;; --- model listing ----------------------------------------------------
   ;; :DATA ({"data":[{"id"}]}), :OLLAMA ({"models":[{"name"}]}),
   ;; :OPENROUTER (data with pricing), or NIL for no listing at all.
-  (models-list-shape :data))
+  (models-list-shape :data)
+
+  ;; Distinguish omitted keys from explicit NIL
+  (explicit '() :type list))
 
 (declaim (ftype (function (t) symbol) dialect-slot))
 
@@ -114,14 +117,20 @@ to work."
 (declaim (ftype (function (t t &optional t) t) dialect-field))
 
 (defun dialect-field (dialect key &optional default)
-  "Return KEY from DIALECT, or DEFAULT when DIALECT is NIL.
+  "Return KEY from DIALECT, or DEFAULT when DIALECT is NIL or does not state KEY.
 
 A NIL dialect is the generic wire, so every caller can read a field without a
 guard and the generic path is the absence of an override rather than a second
-set of defaults."
+set of defaults.
+
+A field the dialect states as NIL answers NIL rather than DEFAULT: config.lsp
+spells `this endpoint has no model list' as :models-path nil, and a reader that
+answered the generic path would send a request the endpoint does not have."
   (if dialect
       (let ((value (slot-value dialect (dialect-slot key))))
-        (if (null value) default value))
+        (if (or value (member key (dialect-explicit dialect) :test #'eq))
+            value
+            default))
       default))
 
 ;;;; The profiles.
@@ -228,5 +237,6 @@ so)."
                                  :key #'symbol-name))))
   (let ((dialect (%make-dialect :protocol protocol :profile profile)))
     (loop for (key value) on (append (dialect-profile-plist profile) overrides) by #'cddr
-          do (setf (slot-value dialect (dialect-slot key)) value))
+          do (setf (slot-value dialect (dialect-slot key)) value)
+             (pushnew key (dialect-explicit dialect) :test #'eq))
     dialect))

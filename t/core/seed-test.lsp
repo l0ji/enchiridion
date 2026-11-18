@@ -242,7 +242,7 @@ demands :VALIDATE T, and signals unless the directory is really there, so
         (enchiridion.memory:write-state directory state)
         (enchiridion.memory:write-state directory state))
       (ok (probe-file (merge-pathnames "state.json" directory)))
-      (ng (probe-file (merge-pathnames "state.json.new" directory))))))
+      (ok (null (directory (merge-pathnames "state.json.new*" directory)))))))
 
 (deftest a-missing-or-corrupt-state-file-reads-as-defaults ()
   (with-scratch-directory (scratch)
@@ -262,6 +262,49 @@ demands :VALIDATE T, and signals unless the directory is really there, so
               (ng (getf (enchiridion.memory:bootstrap-status directory) :complete))))))
       (delete-file (merge-pathnames "state.json" directory))
       (ok (zerop (enchiridion.memory:state-generation directory))))))
+
+(deftest state-keeps-fields-this-version-does-not-know ()
+  (with-scratch-directory (scratch)
+    (let* ((directory (merge-pathnames "agents/default/" scratch))
+           (path (merge-pathnames "state.json" directory)))
+      (ensure-directories-exist path)
+      (with-open-file (stream path :direction :output
+                                   :if-exists :supersede
+                                   :if-does-not-exist :create
+                                   :external-format :utf-8)
+        (write-string
+         "{\"schema\":1,\"generation\":3,\"future\":{\"a\":1},\"bootstrap\":{\"step\":1,\"done\":[1],\"complete\":false,\"future\":9}}"
+         stream))
+      (let ((state (enchiridion.memory:read-state directory)))
+        (ok (= 3 (enchiridion.memory:state-generation state)))
+        (enchiridion.memory:write-state directory state))
+      (let ((text (uiop:read-file-string path :external-format :utf-8)))
+        (testing "a younger build does not delete a newer file's fields"
+          (ok (search "\"a\":1" text))
+          (ok (search "\"future\":9" text)))
+        (testing "and the field this version owns still reads back"
+          (ok (= 3 (enchiridion.memory:state-generation directory))))))))
+
+(deftest a-state-with-invalid-numbers-reads-as-defaults ()
+  (with-scratch-directory (scratch)
+    (let* ((directory (merge-pathnames "agents/default/" scratch))
+           (path (merge-pathnames "state.json" directory)))
+      (ensure-directories-exist path)
+      (with-open-file (stream path :direction :output
+                                   :if-exists :supersede
+                                   :if-does-not-exist :create
+                                   :external-format :utf-8)
+        (write-string
+         "{\"schema\":-2,\"generation\":-9,\"bootstrap\":{\"step\":-1,\"done\":[-1,2,2],\"complete\":false}}"
+         stream))
+      (let* ((state (enchiridion.memory:read-state directory))
+             (record (gethash "bootstrap" state)))
+        (testing "a negative schema and generation are a fresh start"
+          (ok (= 1 (gethash "schema" state)))
+          (ok (zerop (gethash "generation" state))))
+        (testing "a step that cannot exist is not counted"
+          (ok (zerop (gethash "step" record)))
+          (ok (equalp #(2) (gethash "done" record))))))))
 
 ;;;; Bootstrap.
 

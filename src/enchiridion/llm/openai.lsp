@@ -420,11 +420,17 @@ showing the model's private notes as its answer."
            (reasoning-field (dialect-field dialect :reasoning-field nil))
            (reasoning (and reasoning-field
                            (or (openai-field-value reply reasoning-field)
-                               (openai-field-value data reasoning-field)))))
+                               (openai-field-value data reasoning-field))))
+           ;; A profile that names no field still reads DeepSeek and Z.AI's,
+           ;; because the reply carries thinking the next request cannot replay.
+           (generic-reasoning (and (null reasoning-field)
+                                   (getf reply :reasoning_content))))
       ;; DeepSeek and Z.AI require reasoning_content to be replayed with tool
       ;; calls; this protocol keeps no such field, so refuse rather than corrupt.
+      ;; The field is the dialect's, so a profile reporting under `reasoning' is
+      ;; refused too.
       (when (and (getf reply :tool_calls)
-                 (let ((text (getf reply :reasoning_content)))
+                 (let ((text (or reasoning generic-reasoning)))
                    (and (stringp text) (plusp (length text)))))
         (error 'enchiridion.errors:backend-error
                :backend "openai"

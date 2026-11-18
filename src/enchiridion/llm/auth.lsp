@@ -25,7 +25,8 @@
 A signed scheme returns nothing here: its header cannot be written until the
 request exists, and AUTH-APPLY is what puts it in place."
   (let ((scheme (dialect-field dialect :auth-scheme :bearer))
-        (name (dialect-field dialect :auth-header "api-key"))
+        ;; A row may state :auth-header NIL, so the default applies here.
+        (name (or (dialect-field dialect :auth-header nil) "api-key"))
         ;; A vendor-named header sometimes carries a scheme word in its value:
         ;; Cloudflare's gateway wants `cf-aig-authorization: Bearer <token>`,
         ;; and the credential itself is the token. The prefix is data so that

@@ -371,6 +371,80 @@ change is not in the history.")
         (subseq detail 0 400)
         detail)))
 
+(defparameter +stale-index-lock-seconds+ 600
+  "How old .git/index.lock must be before an opted-in commit moves it aside.
+Ten minutes is longer than the thirty second commit timeout, and the age is the
+only evidence Git leaves about the writer. Age is not proof: recovery is off
+unless the operator opts in (see *STALE-LOCK-RECOVERY-P*).")
+
+(defparameter *stale-lock-recovery-p* nil
+  "Whether a refused commit may move a stale index lock aside and retry.
+Default NIL: another process, container, or hand-run Git command can hold a
+lock longer than any threshold. An operator who knows this process is the
+repository's only writer binds it to T; otherwise the refusal is reported
+through *HISTORY-FAILURE-REPORTER*.")
+
+(defparameter *stale-lock-reporter*
+  (lambda (lock quarantine age)
+    (format *error-output*
+            "~&enchiridion: moved a ~D second~:P old Git index lock aside (~A -> ~A) and retried the commit.~%  Restore it with mv if a Git command in this repository was still running.~%"
+            age lock quarantine)
+    (finish-output *error-output*))
+  "Called with the lock path, where it was moved, and its age in seconds.
+The default writes two lines to *ERROR-OUTPUT* and never signals.")
+
+(defun note-stale-lock (lock quarantine age)
+  (when *stale-lock-reporter*
+    (handler-case (funcall *stale-lock-reporter* lock quarantine age)
+      (error () nil))))
+
+(defun git-index-lock (directory)
+  "Return the index lock path of DIRECTORY's repository."
+  (merge-pathnames ".git/index.lock" (uiop:ensure-directory-pathname directory)))
+
+(defun stale-git-lock-p (path &key (now (get-universal-time)))
+  "Return PATH's age in seconds when it is old enough that its writer may be
+gone. A directory or a vanished file answers NIL. The report shows the age."
+  (let ((written (ignore-errors (file-write-date path))))
+    (when (and (integerp written)
+               (not (uiop:directory-exists-p path)))
+      (let ((age (- now written)))
+        (and (>= age +stale-index-lock-seconds+) age)))))
+
+(defun git-lock-quarantine-path (lock &key (now (get-universal-time)))
+  "Return a path beside LOCK where a stale lock can be kept."
+  (pathname (format nil "~A.stale-~D" (namestring lock) now)))
+
+(defun recover-stale-git-lock (directory)
+  "Move DIRECTORY's index lock aside when it is stale, and return its new path.
+The lock is renamed, not deleted, so a live writer's lock can be restored and a
+crash leaves evidence. A directory, a young lock, recovery not opted in, and a
+failed rename all answer NIL, and the caller keeps the original refusal."
+  (when *stale-lock-recovery-p*
+    (let ((lock (git-index-lock directory)))
+      (when (probe-file lock)
+        (let ((age (stale-git-lock-p lock)))
+          (when age
+            (let ((quarantine (git-lock-quarantine-path lock)))
+              (handler-case
+                  (progn (rename-file lock quarantine)
+                         (note-stale-lock lock quarantine age)
+                         quarantine)
+                (error () nil)))))))))
+
+(defun git-lock-failure-p (output)
+  "Return T when OUTPUT is a refusal about the repository index lock."
+  (and (stringp output) (search "index.lock" output)))
+
+(defun git-lock-hint (detail)
+  "Return DETAIL with the stale-lock opt-in named, when recovery is off.
+Otherwise the operator sees a fatal Git line and no name for the setting."
+  (if (and (stringp detail) (not *stale-lock-recovery-p*))
+      (concatenate 'string
+                   detail
+                   " (stale-lock recovery is off: bind *STALE-LOCK-RECOVERY-P* to retry past a stale lock)")
+      detail))
+
 (declaim (ftype (function (t string &key (:environment t)) t) git-commit-all))
 
 (defun git-commit-all (directory message &key (environment *commit-environment*))
@@ -385,33 +459,55 @@ nothing.
 
 The whole stage-and-commit pair is one unit under *COMMIT-LOCK*: another
 thread's `git add` between this one's add and commit would commit the wrong
-set of files."
+set of files. A refusal about .git/index.lock gets one retry after a lock older
+than +STALE-INDEX-LOCK-SECONDS+ is moved aside; a younger lock is left alone,
+because another command may hold it."
   (let (result detail)
     (bordeaux-threads:with-lock-held (*commit-lock*)
       (let ((path (uiop:ensure-directory-pathname directory)))
         (unless (repository-p path)
           (return-from git-commit-all nil))
-        (multiple-value-setq (result detail)
-          (handler-case
-              (multiple-value-bind (add-output add-status)
-                  (git-run path (list "add" "-A") :environment environment)
-                (if (not (eql 0 add-status))
-                    (values nil (git-failure-detail add-output add-status))
-                    (multiple-value-bind (output status)
-                        (git-run path (list "commit" "-m" message)
-                                 :environment environment)
-                      (cond
-                        ((eql 0 status)
-                         (let ((head (git-head path :environment environment)))
-                           (if head
-                               (values head nil)
-                               (values nil +unreadable-hash-detail+))))
-                        ((search "nothing to commit" output)
-                         (values :none nil))
-                        (t
-                         (values nil (git-failure-detail output status)))))))
-            (error (condition)
-              (values nil (condition-failure-detail condition)))))))
+        (labels ((attempt ()
+                   (handler-case
+                       (multiple-value-bind (add-output add-status)
+                           (git-run path (list "add" "-A") :environment environment)
+                         (if (not (eql 0 add-status))
+                             (values nil
+                                     (git-failure-detail add-output add-status)
+                                     (git-lock-failure-p add-output))
+                             (multiple-value-bind (output status)
+                                 (git-run path (list "commit" "-m" message)
+                                          :environment environment)
+                               (cond
+                                 ((eql 0 status)
+                                  (let ((head (git-head path :environment environment)))
+                                    (if head
+                                        (values head nil nil)
+                                        (values nil +unreadable-hash-detail+ nil))))
+                                 ((search "nothing to commit" output)
+                                  (values :none nil nil))
+                                 (t
+                                  (values nil
+                                          (git-failure-detail output status)
+                                          (git-lock-failure-p output)))))))
+                     (error (condition)
+                       (values nil (condition-failure-detail condition) nil)))))
+          ;; One retry, and only for a lock refusal: moving a stale lock lets
+          ;; the next tick record the change instead of repeating the refusal.
+          ;; A younger lock may belong to another command and is left alone.
+          (multiple-value-bind (first-result first-detail first-lock-p)
+              (attempt)
+            (multiple-value-bind (final-result final-detail)
+                (if (and (null first-result)
+                         first-lock-p
+                         (recover-stale-git-lock path))
+                    (attempt)
+                    (values first-result
+                            (if (and first-lock-p (null first-result))
+                                (git-lock-hint first-detail)
+                                first-detail)))
+              (setf result final-result
+                    detail final-detail))))))
     (note-history-failure detail)
     (values result detail)))
 

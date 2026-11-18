@@ -706,3 +706,65 @@ here the way the operator would see it."
     (multiple-value-bind (text status) (captured-run "undo" '())
       (ok (eql 2 status))
       (ok (search "exactly 1 argument" text)))))
+
+;;;; The control commands.
+
+(deftest an-unanswered-request-is-not-reported-as-a-missing-supervisor ()
+  ;; Running out of the wait answered "no supervisor is running, so nothing was
+  ;; asked", which sends the operator to start a second one.
+  (with-empty-context
+    (let* ((status nil)
+           (text (with-output-to-string (*standard-output*)
+                   (setf status
+                         (enchiridion.channel.cli::report-control-state
+                          "reload" nil :timeout
+                          "the request is still queued and runs when the supervisor reaches it.")))))
+      (ok (eql 1 status))
+      (ok (search "did not answer within 5 seconds" text))
+      (ok (search "still queued" text))
+      (ng (search "no supervisor is running" text)))))
+
+(deftest a-missing-supervisor-is-still-reported-as-one ()
+  (with-empty-context
+    (let* ((status nil)
+           (text (with-output-to-string (*standard-output*)
+                  (setf status
+                        (enchiridion.channel.cli::report-control-state
+                         "reload" nil :no-supervisor nil)))))
+      (ok (eql 1 status))
+      (ok (search "no supervisor is running" text)))))
+
+(deftest health-prints-the-states-a-reader-could-not-see ()
+  ;; A channel configured and off, a status write failing, a schedule with no
+  ;; thread: none of the three was visible in `health`.
+  (let* ((directory (uiop:ensure-directory-pathname
+                     (merge-pathnames
+                      (format nil "enchiridion-cli-test-~D/" (random most-positive-fixnum))
+                      (uiop:ensure-directory-pathname *default-pathname-defaults*))))
+         (run (merge-pathnames "run/" directory))
+         (supervisor (enchiridion.supervisor:make-supervisor
+                      :directory (namestring directory)
+                      :run-directory (namestring run)
+                      :heartbeat-p nil
+                      :channels '())))
+    (unwind-protect
+         (progn
+           (enchiridion.supervisor:supervisor-write-status supervisor)
+           (let* ((status (enchiridion.supervisor:read-status run))
+                  (beat (enchiridion.supervisor:status-heartbeat status))
+                  (writes (enchiridion.supervisor:status-writes status)))
+             ;; The table is edited rather than provoked: this test is the
+             ;; printer's, and the supervisor tests write the two states.
+             (setf (gethash "enabled" beat) t
+                   (gethash "alive" beat) nil)
+             (setf (gethash "ok" writes) nil
+                   (gethash "report" writes) "the disk is full"
+                   (gethash "age" writes) 3)
+             (with-empty-context
+               (let ((text (with-output-to-string (*standard-output*)
+                             (enchiridion.channel.cli::report-health status))))
+                 (ok (search "no live thread" text))
+                 (ok (search "status writes failing: the disk is full" text))
+                 (ok (search "channel http disabled" text))))))
+      (ignore-errors (enchiridion.supervisor:supervisor-stop supervisor))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))

@@ -20,7 +20,7 @@
   (when (zerop (sb-posix:geteuid))
     (flet ((without-inheritance (configuration)
              (append (remove-if (lambda (entry)
-                                  (member entry
+                                  (member (if (consp entry) (car entry) entry)
                                           '(:inherit-configuration
                                             :ignore-inherited-configuration)))
                                 configuration)
@@ -391,7 +391,8 @@ stream and not a stopped supervisor."
   (agent nil :type t)
   (session nil :type t)
   (generation 0 :type integer)
-  (started-p nil :type boolean))
+  (started-p nil :type boolean)
+  (provider-refresh nil :type t))
 
 (declaim (ftype (function (t) list) agent-budget-plist))
 
@@ -418,10 +419,15 @@ interval: an interval of zero is a tick loop and a string is a mistyped key."
         (enchiridion:config-setting (enchiridion:default-config)
                                     :sleep :interval-seconds))))
 
-(declaim (ftype (function (t) null) refresh-provider-knowledge))
+(declaim (ftype (function (t) boolean) refresh-provider-knowledge))
 
 (defun refresh-provider-knowledge (config)
-  "Refresh what this process knows about providers, once, before it serves.
+  "Refresh what this process knows about providers.
+Return T when both refreshes ran and NIL when one was reported and skipped.
+
+ASK calls this before its turn. CHAT and SERVE reach it from
+START-PROVIDER-REFRESH on a thread of its own, so a stalled provider delays the
+answer and not the listener.
 
 TWO THINGS ARE REFRESHED, and only on the commands that run a turn. The
 models.dev catalog is fetched when the cached copy is missing or older than
@@ -437,22 +443,66 @@ looks at the configuration cannot fetch models.dev or write a cache file.
 :OFFLINE T stops both. A failure is one warning line and never stops the
 process: a provider whose endpoint is down is still a provider whose configured
 model can be asked for, and the cache from the last successful run is still the
-best answer available."
-  (unless (enchiridion:config-value config :offline)
-    (let ((ttl (enchiridion:config-value config :providers-ttl-seconds)))
-      (when (enchiridion.llm::catalog-expired-p
-             (enchiridion.llm::catalog-path) ttl)
-        (handler-case (enchiridion.llm:refresh-catalog)
-          (enchiridion.errors:enchiridion-error (condition)
-            (format *error-output* "~&enchiridion: ~A~%" condition)
-            (finish-output *error-output*)))))
-    (handler-case
-        (let ((provider (enchiridion.llm:resolve-provider config)))
-          (enchiridion.llm:provider-models provider :refresh t))
-      (enchiridion.errors:enchiridion-error (condition)
-        (format *error-output* "~&enchiridion: ~A~%" condition)
-        (finish-output *error-output*))))
-  nil)
+best answer available. The value says whether anything was skipped, which the
+health report repeats."
+  (let ((complete-p t))
+    (unless (enchiridion:config-value config :offline)
+      (let ((ttl (enchiridion:config-value config :providers-ttl-seconds)))
+        (when (enchiridion.llm::catalog-expired-p
+               (enchiridion.llm::catalog-path) ttl)
+          (handler-case (enchiridion.llm:refresh-catalog)
+            (enchiridion.errors:enchiridion-error (condition)
+              (setf complete-p nil)
+              (format *error-output* "~&enchiridion: ~A~%" condition)
+              (finish-output *error-output*)))))
+      (handler-case
+          (let ((provider (enchiridion.llm:resolve-provider config)))
+            (enchiridion.llm:provider-models provider :refresh t))
+        (enchiridion.errors:enchiridion-error (condition)
+          (setf complete-p nil)
+          (format *error-output* "~&enchiridion: ~A~%" condition)
+          (finish-output *error-output*))))
+    complete-p))
+
+(declaim (ftype (function (t) t) start-provider-refresh))
+
+(defun start-provider-refresh (context)
+  "Start the provider refresh on its own thread and return a reader for it.
+
+A provider that stalls rather than refuses would otherwise hold up the listener
+for minutes, with the container up and no socket open. The refresh runs beside
+the server instead.
+
+The reader returns (:state STATE :report TEXT) with STATE one of :pending,
+:done, :failed or :skipped. A failed refresh changes nothing: the cache from the
+last successful run is still the best answer, and the next start tries again.
+
+A process with no backend has no key and no account whose model list could be
+learned, so the refresh is skipped."
+  (let* ((config (context-config context))
+         (state (list :pending "")))
+    (flet ((record (new report)
+             (setf (first state) new (second state) report)))
+      (cond
+        ((null config) (record :skipped "no configuration"))
+        ((enchiridion:config-value config :offline) (record :skipped "offline"))
+        ((null (context-backend context)) (record :skipped "no API key"))
+        (t
+         (bordeaux-threads:make-thread
+          (lambda ()
+            (handler-case
+                (if (refresh-provider-knowledge config)
+                    (record :done "")
+                    (record :failed "a refresh was skipped; the cache is in use"))
+              (error (condition)
+                (let ((report (enchiridion.llm.secrets:scrub
+                               (princ-to-string condition))))
+                  (record :failed report)
+                  (format *error-output*
+                          "~&enchiridion: provider refresh failed: ~A~%" report)
+                  (finish-output *error-output*)))))
+          :name "enchiridion provider refresh"))))
+    (lambda () (list :state (first state) :report (second state)))))
 
 (defparameter +turn-requirements+
   '(:config :directory :secrets :store :backend :agent)
@@ -518,10 +568,10 @@ it needs.
 The store is opened before the agent because the agent's prompt is compiled from
 the blocks, and two of those blocks are rows in the store.
 
-REFRESH-MODELS is T for the commands that run a turn (`ask`, `chat`, `serve`)
-and NIL for every other command. It is the one thing here that can open a
-socket, it is bounded, it honours :OFFLINE, and it is the reason the docstring
-of the old full builder said no socket rather than no network."
+REFRESH-MODELS is T for ASK, the one-shot command about to spend a turn, and NIL
+for every other command; CHAT and SERVE refresh on their own thread through
+START-PROVIDER-REFRESH, after the listener can bind. The refresh is the one
+thing here that can open a socket: it is bounded, and it honours :OFFLINE."
   (let ((config (when (requirement-p requirements :config) (load-config))))
     ;; One ownership pass, before anything reads or writes the agent tree. A
     ;; command that only reads the tree still needs it when this process is
@@ -1105,19 +1155,95 @@ path is the last gate."
       (error (condition)
         (channel-failure :failed (condition-line condition))))))
 
-(declaim (ftype (function (t) t) make-http-health))
+(declaim (ftype (function (t) list) heartbeat-health))
 
-(defun make-http-health (supervisor)
+(defun heartbeat-health (supervisor)
+  "Return the heartbeat row GET /health reports.
+
+ENABLED requires a tick function, as the status file's row does: a schedule with
+no hook is off. ALIVE is the thread, so a heartbeat that died while the flag
+stayed true is visible rather than looking like a quiet schedule."
+  (let ((enabled (and (enchiridion.supervisor:supervisor-heartbeat-p supervisor)
+                      (not (null (enchiridion.supervisor:supervisor-tick-function
+                                  supervisor))))))
+    (list :enabled enabled
+          :alive (not (null (enchiridion.supervisor:supervisor-heartbeat-live-p supervisor)))
+          :requested (enchiridion.supervisor:supervisor-tick-requested-p supervisor)
+          :ticks (enchiridion.supervisor:supervisor-ticks supervisor)
+          :last-tick (enchiridion.supervisor:supervisor-last-tick supervisor)
+          :ok (enchiridion.supervisor:supervisor-tick-ok-p supervisor)
+          :running (enchiridion.supervisor:supervisor-tick-running-p supervisor)
+          :report (enchiridion.llm.secrets:scrub
+                   (enchiridion.supervisor:supervisor-tick-report supervisor)))))
+
+(declaim (ftype (function () list) persistence-health))
+
+(defun persistence-health ()
+  "Return the persistence row GET /health reports.
+
+Failures are reported and not gated on readiness: the counter belongs to the
+process and never resets, so one transient failed write would keep readiness red
+for the rest of the run. A growing count is the signal, and the last detail says
+what the store refused. :NULL rather than NIL, which the route would write as
+false and read like a real answer."
+  (let ((last (enchiridion.kernel:last-persistence-failure)))
+    (list :failures (enchiridion.kernel:persistence-failures)
+          :last (if (consp last)
+                    (list :kind (string-downcase (string (car last)))
+                          :detail (enchiridion.llm.secrets:scrub
+                                   (or (cdr last) "")))
+                    :null))))
+
+(declaim (ftype (function (t) list) provider-health))
+
+(defun provider-health (context)
+  "Return the provider refresh row GET /health reports."
+  (let ((reader (context-provider-refresh context)))
+    (or (and reader (funcall reader))
+        (list :state :none :report ""))))
+
+(declaim (ftype (function (t t) t) make-http-health))
+
+(defun make-http-health (supervisor context)
   "Return the function GET /health reads.
+
 The answer comes from the live supervisor rather than from the status file: a
-file left by a process that stopped reports an uptime that grows forever."
+file left by a process that stopped reports an uptime that grows forever.
+
+READY is not the running flag alone. A channel the process wants on that is
+failed or stopped degrades it, and so does an enabled heartbeat whose thread is
+gone: a surface that is not answering, and unattended work that silently
+stopped. A channel that is disabled, or cannot run here, is a choice and does
+not count.
+
+Persistence and provider refreshes are reported and not gated: a process-lifetime
+counter and a refresh that finishes after the listener starts do not belong in a
+readiness answer."
   (lambda ()
     (when (enchiridion.supervisor:supervisor-running-p supervisor)
-      (list :ok-p t
-            :uptime (max 0 (- (get-universal-time)
-                              (enchiridion.supervisor:supervisor-started supervisor)))
-            :channels (mapcar #'enchiridion.supervisor:channel-row
-                              (enchiridion.supervisor:supervisor-channels supervisor))))))
+      (let* ((rows (enchiridion.supervisor:supervisor-channel-rows supervisor))
+             (heartbeat (heartbeat-health supervisor))
+             (unready (loop for row across rows
+                            for state = (gethash "state" row)
+                            when (and (gethash "enabled" row)
+                                      (member state '("failed" "stopped")
+                                              :test #'string=))
+                              collect (format nil "channel ~A is ~A"
+                                              (gethash "name" row) state))))
+        (when (and (getf heartbeat :enabled)
+                   (not (getf heartbeat :alive)))
+          (push "the heartbeat thread is not running" unready))
+        (let ((ready-p (null unready)))
+          (list :ok-p ready-p
+                :ready ready-p
+                :reasons (coerce (nreverse unready) 'vector)
+                :uptime (max 0 (- (get-universal-time)
+                                  (enchiridion.supervisor:supervisor-started supervisor)))
+                :channels rows
+                :heartbeat heartbeat
+                :persistence (persistence-health)
+                :providers (provider-health context)
+                :writes (enchiridion.supervisor:supervisor-write-report)))))))
 
 (declaim (ftype (function (t) t) make-ledger-reader))
 
@@ -1214,7 +1340,7 @@ the network channels."
            (enchiridion.channel.http:make-http-channel
             :service (enchiridion.channel.http:make-http-service
                       :turn (make-channel-turn context)
-                      :health (make-http-health supervisor)
+                      :health (make-http-health supervisor context)
                       :usage (make-ledger-reader (context-store context))
                       :token (http-token entry)
                       :bind bind
@@ -1351,6 +1477,25 @@ spends a turn."
   "Return T for the two commands that own a supervisor process."
   (not (null (member name '("chat" "serve") :test #'string=))))
 
+(declaim (ftype (function (t &key (:seconds real)) null) stop-control-poll))
+
+(defun stop-control-poll (poll &key (seconds 2))
+  "Wait up to SECONDS for POLL, the control thread, to leave, then destroy it.
+Return NIL.
+
+The supervisor has already cleared its running flag, so the loop exits after the
+control request in flight. Waiting lets that request publish its answer instead
+of dying mid reload or channel stop."
+  (when (and poll (bordeaux-threads:thread-alive-p poll))
+    (let ((deadline (+ (get-internal-real-time)
+                       (* seconds internal-time-units-per-second))))
+      (loop while (and (bordeaux-threads:thread-alive-p poll)
+                       (< (get-internal-real-time) deadline))
+            do (sleep 0.02)))
+    (when (bordeaux-threads:thread-alive-p poll)
+      (ignore-errors (bordeaux-threads:destroy-thread poll))))
+  nil)
+
 (declaim (ftype (function (string list &optional list) integer) run-supervised-command))
 
 (defun run-supervised-command (name arguments &optional options)
@@ -1363,12 +1508,26 @@ foreground itself.
 
 The channels are built and handed over before the supervisor starts. It starts
 whatever is in its list, and an empty list is why `serve` used to come up with
-no channels at all."
-  (let ((context (make-command-state +turn-requirements+ :refresh-models t)))
+no channels at all.
+
+The provider refresh runs on its own thread, after the context is built and
+beside the supervisor: a provider that stalls delays the answer, not the
+listener, and GET /health reports the refresh's state."
+  (when (and (string= name "serve")
+             (not (enchiridion.memory:agent-seeded-p (agent-directory))))
+    (error 'enchiridion.errors:configuration-error
+           :key :agent-directory
+           :detail "Run enchiridion init and edit the identity files before serving."))
+  (let ((context (make-command-state +turn-requirements+)))
     (unwind-protect
          (progn
+           (when (and (string= name "serve") (not (context-store context)))
+             (error 'enchiridion.errors:configuration-error
+                    :key :memory-db :detail "Serving requires a usable memory store."))
            (require-git)
            (ensure-started context)
+           (setf (context-provider-refresh context)
+                 (start-provider-refresh context))
            (let* ((supervisor (make-application-supervisor context))
                   (cancelled (list nil))
                   (poll nil)
@@ -1401,10 +1560,12 @@ no channels at all."
                                  (error () nil)))
                              :name "enchiridion control poll")))
                     (enchiridion.channel.cli:run-command name arguments))
-               (when poll
-                 (ignore-errors (bordeaux-threads:destroy-thread poll)))
                (ignore-errors
-                 (enchiridion.supervisor:supervisor-stop supervisor)))))
+                 (enchiridion.supervisor:supervisor-stop supervisor))
+               ;; The supervisor clears its running flag before its own drains,
+               ;; so the loop leaves after a control request in flight; killing
+               ;; the thread first truncated a reload or a channel stop
+               (stop-control-poll poll))))
       (close-context context))))
 
 (declaim (ftype (function (list) t) split-options))

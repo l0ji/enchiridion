@@ -127,7 +127,11 @@
     (let ((status (enchiridion.memory:memory-status store)))
       (ok (getf status :enabled))
       (ok (= 0 (getf status :live-generation)))
-      (ok (= 0 (getf status :episodes))))))
+      (ok (= 0 (getf status :episodes)))
+      (testing "and the disk side is part of the status"
+        (ok (plusp (getf status :store-bytes)))
+        (ok (integerp (getf status :store-reclaimable-bytes)))
+        (ng (getf status :store-oldest-ts))))))
 
 
 (deftest configuration-binds-the-switches ()
@@ -242,6 +246,34 @@
              (rows (enchiridion.memory:retrieve-rows-for-turn store "zebra stripes")))
         (ok (search "stripes" (getf (getf (first rows) :item) :body)))))))
 
+(deftest the-asking-session-is-the-context-term-a-turn-was-written-for ()
+  ;; Every live row used to score zero on the context term: the store wrote
+  ;; "alpha,alpha,cli" while retrieval compares ",alpha,cli". Two identical
+  ;; bodies in two sessions are the smallest case the term can decide.
+  (with-store (store directory)
+    (enchiridion.memory.store:record-turn store :session "alpha" :role "user"
+                                          :body "the deploy key lives in vault ops"
+                                          :ts 3900000000)
+    (enchiridion.memory.store:record-turn store :session "beta" :role "user"
+                                          :body "the deploy key lives in vault ops"
+                                          :ts 3900000060)
+    (let ((rows (enchiridion.memory:retrieve-rows-for-turn store "deploy key"
+                                                          :session "alpha")))
+      (testing "both rows match, and the one from this session comes first"
+        (ok (= 2 (length rows)))
+        (ok (string= "alpha" (getf (getf (first rows) :item) :session))))
+      (testing "the context term is what separates identical text"
+        (let ((first-terms (getf (first rows) :terms))
+              (second-terms (getf (second rows) :terms)))
+          (ok (> (enchiridion.memory::terms-context first-terms)
+                 (enchiridion.memory::terms-context second-terms)))
+          (ok (= (enchiridion.memory::terms-lexical first-terms)
+                 (enchiridion.memory::terms-lexical second-terms)))))
+      (testing "a legacy key is read as the current form"
+        (ok (= 1.0 (enchiridion.memory:context-match
+                    (enchiridion.memory::split-context-key "alpha,alpha,cli")
+                    '("" "alpha" "cli"))))))))
+
 (deftest a-cue-excerpt-shows-the-matching-middle-of-a-long-record ()
   (let* ((filler (format nil "~{~A~^ ~}" (make-list 120 :initial-element "weather")))
          (body (format nil "~A I graduated with a degree in Business Administration. ~A"
@@ -313,6 +345,36 @@
           (ok (equal rows (enchiridion.memory:pack-rows store rows)))
           (ok (search "[ref episode-2] the blue garage"
                       (enchiridion.memory:render-pack rows :cue "blue garage"))))))))
+
+(deftest every-record-in-a-pack-starts-its-own-line ()
+  ;; The header used to run straight into the first record, and a claim into
+  ;; its episode's line, because ~& does nothing at the start of a built string.
+  (with-store (store directory)
+    (enchiridion.memory.store:record-turn store :session "s" :role "user"
+                                          :body "where is the deploy key kept"
+                                          :ts 3900000000)
+    (enchiridion.memory.store:record-turn store :session "s" :role "assistant"
+                                          :body "the deploy key is in vault ops"
+                                          :ts 3900000060)
+    (multiple-value-bind (pack included)
+        (enchiridion.memory:render-pack
+         (enchiridion.memory:retrieve-rows-for-turn store "deploy key")
+         :cue "deploy key")
+      (let ((lines (uiop:split-string pack :separator '(#\Newline))))
+        (testing "the header keeps a line of its own"
+          (ok (eql 0 (search "Retrieved records" (first lines)))))
+        (testing "and every record after it starts a line with its ref"
+          (ok (= 2 (length (rest lines))))
+          (ok (every (lambda (line) (eql 0 (search "[ref " line)))
+                     (rest lines)))))
+      (ok (= 2 (length included))))
+    (testing "a budget no record fits in shows nothing, not a bare header"
+      (multiple-value-bind (pack id)
+          (let ((enchiridion.memory:*memory-pack-chars* 10))
+            (enchiridion.memory:retrieve-for-turn store "deploy key" :session "s"))
+        (ok (null pack))
+        (ok (null id)))
+      (ok (zerop (count-rows store "SELECT COUNT(*) AS n FROM retrievals"))))))
 
 (deftest a-vector-survives-the-blob-round-trip ()
   (let* ((v (enchiridion.memory::normalise-vector #(3.0 4.0 0.0 -1.5)))

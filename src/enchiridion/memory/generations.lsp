@@ -130,6 +130,72 @@ too, which is what makes the candidate derive only what FROM never saw."
     (copy-generation-rows store "generation_derivations" from to)
     (hash-table-count assertions)))
 
+(defparameter *generation-claim-seconds* 1800
+  "How long a builder's claim on a generation lasts without renewal.
+A build derives one bounded batch and ends, so half an hour is longer than any
+live batch. A process that dies holding a claim blocks the generation for this
+long, then the next pass resumes it.")
+
+(defun generation-claim-token ()
+  "Return a value that names one builder for one build."
+  (format nil "~D-~36R-~36R"
+          (enchiridion.compat:process-id)
+          (get-universal-time)
+          (random most-positive-fixnum)))
+
+(defun claim-generation (store generation-id owner
+                         &key (now (get-universal-time))
+                           (lease *generation-claim-seconds*))
+  "Claim GENERATION-ID for OWNER and return T when the claim was taken.
+A free generation and one whose lease has expired are claimable; one another
+builder holds is not. The conditional update lets only one caller win."
+  (plusp (enchiridion.memory.store:exec
+          store
+          "UPDATE generations SET claim_owner = ?, claim_ts = ?
+             WHERE id = ? AND (claim_ts IS NULL OR claim_ts <= ?)"
+          (list owner now generation-id (- now lease)))))
+
+(defun release-generation (store generation-id owner)
+  "Release OWNER's claim on GENERATION-ID and return T when a row changed.
+A build whose lease expired and was taken over must not clear the new claim."
+  (plusp (enchiridion.memory.store:exec
+          store
+          "UPDATE generations SET claim_owner = '', claim_ts = NULL
+             WHERE id = ? AND claim_owner = ?"
+          (list generation-id owner))))
+
+(defun %start-candidate (store &key (parser-version *memory-parser-version*)
+                                   (config-hash *memory-config-hash*)
+                                   (rebuild nil))
+  "Create a building generation in the caller's transaction and return its id."
+  (let* ((parent (live-generation-id store))
+         (copy-p (and (plusp parent) (not rebuild)))
+         (from (if copy-p
+                   (or (enchiridion.memory.store:field
+                        (generation-row store parent) "to_episode")
+                       0)
+                   0))
+         (number (or (enchiridion.memory.store:field
+                      (first (enchiridion.memory.store:query-rows
+                              store
+                              "SELECT COALESCE(MAX(number), 0) + 1 AS n
+                                 FROM generations"))
+                      "n")
+                     1))
+         (now (get-universal-time)))
+    (enchiridion.memory.store:exec
+     store
+     "INSERT INTO generations
+        (number, parent_id, status, created_ts, from_episode, to_episode,
+         parser_version, config_hash)
+        VALUES (?, ?, 'building', ?, ?, ?, ?, ?)"
+     (list number (and (plusp parent) parent) now from from
+           parser-version config-hash))
+    (let ((id (enchiridion.memory.store:last-row-id store)))
+      (when copy-p
+        (copy-live-generation store parent id))
+      id)))
+
 (defun start-candidate (store &key (parser-version *memory-parser-version*)
                                    (config-hash *memory-config-hash*)
                                    (rebuild nil))
@@ -143,33 +209,37 @@ generation starts empty. REBUILD starts empty even with a live parent, so the
 whole log is derived again; it is the operator's choice, never the schedule's."
   (ensure-generation-state store)
   (enchiridion.memory.store:with-store-transaction (store)
-    (let* ((parent (live-generation-id store))
-           (copy-p (and (plusp parent) (not rebuild)))
-           (from (if copy-p
-                     (or (enchiridion.memory.store:field
-                          (generation-row store parent) "to_episode")
-                         0)
-                     0))
-           (number (or (enchiridion.memory.store:field
-                        (first (enchiridion.memory.store:query-rows
-                                store
-                                "SELECT COALESCE(MAX(number), 0) + 1 AS n
-                                   FROM generations"))
-                        "n")
-                       1))
-           (now (get-universal-time)))
-      (enchiridion.memory.store:exec
-       store
-       "INSERT INTO generations
-          (number, parent_id, status, created_ts, from_episode, to_episode,
-           parser_version, config_hash)
-          VALUES (?, ?, 'building', ?, ?, ?, ?, ?)"
-       (list number (and (plusp parent) parent) now from from
-             parser-version config-hash))
-      (let ((id (enchiridion.memory.store:last-row-id store)))
-        (when copy-p
-          (copy-live-generation store parent id))
-        id))))
+    (%start-candidate store :parser-version parser-version
+                             :config-hash config-hash
+                             :rebuild rebuild)))
+
+(defun ensure-building-generation (store &key (parser-version *memory-parser-version*)
+                                          (config-hash *memory-config-hash*)
+                                          (rebuild nil))
+  "Return the newest building generation, starting one when none exists.
+The lookup and the insert are one transaction, so two callers cannot both see
+no candidate and both insert one."
+  (ensure-generation-state store)
+  (enchiridion.memory.store:with-store-transaction (store)
+    (or (current-building-generation store)
+        (%start-candidate store :parser-version parser-version
+                                 :config-hash config-hash
+                                 :rebuild rebuild))))
+
+(defun complete-candidate-generation (store)
+  "Return the oldest generation that was fully built and never gated, or NIL.
+A crash between building and gating leaves status 'candidate' with no
+promotion_checked_ts. A candidate the gates have already judged is not answered
+here: retrying a verdict is the operator's `memory promote ID`, not the
+schedule's."
+  (enchiridion.memory.store:field
+   (first (enchiridion.memory.store:query-rows
+           store "SELECT id FROM generations
+                   WHERE status = 'candidate'
+                     AND promotion_checked_ts IS NULL
+                   ORDER BY id ASC
+                   LIMIT 1"))
+   "id"))
 
 (defun generation-row (store generation-id)
   "Return one generation row as a plist, or NIL."
@@ -487,85 +557,116 @@ With no deriver installed the function reports :no-deriver and writes nothing.
 The build is resumable: a limited batch leaves the generation in :building and
 the next call continues the same generation. A new candidate copies the live
 layer and derives what is new; REBUILD starts it empty instead, and has no
-effect on a build already under way."
+effect on a build already under way.
+
+The builder takes a lease on the generation before it derives. A caller that
+finds the lease held returns :REASON :CLAIMED and derives nothing, so two
+processes cannot pay for the same batch or count it twice."
   (cond
     ((null store) (list :built nil :reason :no-store))
     ((not (enabled-p)) (list :built nil :reason :disabled))
     ((null *assertion-deriver*) (list :built nil :reason :no-deriver))
     (t
-     (ensure-generation-state store)
-     (let* ((generation-id (or (current-building-generation store)
-                               (start-candidate store
-                                                :parser-version parser-version
-                                                :config-hash config-hash
-                                                :rebuild rebuild)))
-            (episodes (candidate-episodes store generation-id limit))
-            (now (get-universal-time))
-            (accepted 0) (rejected 0) (conflicts 0) (closed 0)
-            (tokens 0) (derived '()) (failure nil) (failure-note nil) (skipped 0))
-       ;; A failed deriver call ends the batch, and the counters below still
-       ;; record the episodes derived before it: they have their rows and their
-       ;; marks, and a gate that read counters without them would undercount.
-       ;; The failed episode is not marked, so the next tick tries it again.
-       ;; The model calls run concurrently; the results are applied here, in
-       ;; episode order, and every call's tokens count. A failed call is tried
-       ;; once more. An episode that fails twice is marked derived with nothing
-       ;; written, so it stays an episode and the batch goes on: stopping at
-       ;; the first failure threw away every paid result after it, which on a
-       ;; trial batch of 96 was 98 of 105 calls, and an episode that always
-       ;; fails would stop every batch at the same place. When most of a batch
-       ;; fails the provider is the problem and not the episodes, so nothing
-       ;; past the first failure is applied or marked, and the next tick tries.
-       (let ((results (derive-concurrently store episodes)))
-         (dolist (result results) (incf tokens (or (getf result :tokens) 0)))
-         ;; Billing survives an apply failure: these calls already happened
-         (when (plusp tokens)
-           (enchiridion.memory.store:exec
-            store "UPDATE generations SET tokens_used = tokens_used + ? WHERE id = ?"
-            (list tokens generation-id)))
-         (let ((outage (> (* 2 (count-if (lambda (r) (or (null r) (getf r :error))) results))
-                          (length results))))
-           (loop for episode in episodes
-                 for result in results
-                 for error = (or (null result) (getf result :error))
-                 do (cond
-                      (failure)
-                      ((and error outage)
-                       (setf failure (or (getf result :error) "the deriver returned nothing")))
-                      (error
-                       (unless failure-note
-                         (setf failure-note (or (getf result :error) "the deriver returned nothing")))
-                       (incf skipped)
-                       (when (getf (apply-derivation store episode generation-id
-                                                   parser-version now nil nil)
-                                   :applied)
-                         (push episode derived)))
-                      (t
-                       (let ((report (apply-derivation store episode generation-id
-                                                       parser-version now
-                                                       (getf result :assertions)
-                                                       (getf result :events))))
-                         (when (getf report :applied) (push episode derived))
-                         (incf accepted (getf report :assertions))
-                         (incf rejected (getf report :rejected))
-                         (incf conflicts (getf report :conflicts))
-                         (incf closed (getf report :closed))))))))
-       (setf derived (nreverse derived))
-       (let ((remaining (unprocessed-episode-count store generation-id)))
-         (when (zerop remaining)
-           (set-generation-status store generation-id "candidate"))
-         (list :built t
-               :generation-id generation-id
-               :processed (length derived)
-               :failed (or failure failure-note)
-               :skipped skipped
-               :remaining remaining
-               :assertions accepted
-               :rejected rejected
-               :conflicts conflicts
-               :closed closed
-               :tokens tokens
-               :status (if (zerop remaining) :candidate :building)))))))
+     (let* ((generation-id (ensure-building-generation
+                            store
+                            :parser-version parser-version
+                            :config-hash config-hash
+                            :rebuild rebuild))
+            (owner (generation-claim-token))
+            (claim-now (get-universal-time)))
+       (if (not (claim-generation store generation-id owner :now claim-now))
+           ;; Another builder holds the lease. The candidate is not abandoned:
+           ;; its next batch is due on the next tick, after the holder's lease
+           ;; ends or its release lands.
+           (list :built nil
+                 :reason :claimed
+                 :generation-id generation-id
+                 :remaining (unprocessed-episode-count store generation-id))
+           (unwind-protect
+                (let ((episodes (candidate-episodes store generation-id limit))
+                      (now (get-universal-time))
+                      (accepted 0) (rejected 0) (conflicts 0) (closed 0)
+                      (tokens 0) (derived '()) (failure nil) (failure-note nil)
+                      (skipped 0))
+                  ;; A failed deriver call ends the batch, and the counters below
+                  ;; still record the episodes derived before it: they have their
+                  ;; rows and their marks, and a gate that read counters without
+                  ;; them would undercount. The failed episode is not marked, so
+                  ;; the next tick tries it again. The model calls run
+                  ;; concurrently; the results are applied here, in episode
+                  ;; order, and every call's tokens count. A failed call is tried
+                  ;; once more. An episode that fails twice is marked derived
+                  ;; with nothing written, so it stays an episode and the batch
+                  ;; goes on: stopping at the first failure threw away every paid
+                  ;; result after it, which on a trial batch of 96 was 98 of 105
+                  ;; calls, and an episode that always fails would stop every
+                  ;; batch at the same place. When most of a batch fails the
+                  ;; provider is the problem and not the episodes, so nothing
+                  ;; past the first failure is applied or marked, and the next
+                  ;; tick tries.
+                  (let ((results (derive-concurrently store episodes)))
+                    (dolist (result results)
+                      (incf tokens (or (getf result :tokens) 0)))
+                    ;; Billing survives an apply failure: these calls happened
+                    (when (plusp tokens)
+                      (enchiridion.memory.store:exec
+                       store
+                       "UPDATE generations SET tokens_used = tokens_used + ? WHERE id = ?"
+                       (list tokens generation-id)))
+                    (let ((outage (> (* 2 (count-if (lambda (r)
+                                                      (or (null r) (getf r :error)))
+                                                    results))
+                                     (length results))))
+                      (loop for episode in episodes
+                            for result in results
+                            for error = (or (null result) (getf result :error))
+                            do (cond
+                                 (failure)
+                                 ((and error outage)
+                                  (setf failure
+                                        (or (getf result :error)
+                                            "the deriver returned nothing")))
+                                 (error
+                                  (unless failure-note
+                                    (setf failure-note
+                                          (or (getf result :error)
+                                              "the deriver returned nothing")))
+                                  (incf skipped)
+                                  (when (getf (apply-derivation store episode
+                                                                generation-id
+                                                                parser-version now
+                                                                nil nil)
+                                              :applied)
+                                    (push episode derived)))
+                                 (t
+                                  (let ((report (apply-derivation
+                                                 store episode generation-id
+                                                 parser-version now
+                                                 (getf result :assertions)
+                                                 (getf result :events))))
+                                    (when (getf report :applied)
+                                      (push episode derived))
+                                    (incf accepted (getf report :assertions))
+                                    (incf rejected (getf report :rejected))
+                                    (incf conflicts (getf report :conflicts))
+                                    (incf closed (getf report :closed))))))))
+                  (setf derived (nreverse derived))
+                  (let ((remaining (unprocessed-episode-count store generation-id)))
+                    (when (zerop remaining)
+                      (set-generation-status store generation-id "candidate"))
+                    (list :built t
+                          :generation-id generation-id
+                          :processed (length derived)
+                          :failed (or failure failure-note)
+                          :skipped skipped
+                          :remaining remaining
+                          :assertions accepted
+                          :rejected rejected
+                          :conflicts conflicts
+                          :closed closed
+                          :tokens tokens
+                          :status (if (zerop remaining) :candidate :building))))
+             (release-generation store generation-id owner)))))))
 
 (defun promote-generation (store generation-id)
   "Promote GENERATION-ID to live in one transaction and return a report plist.

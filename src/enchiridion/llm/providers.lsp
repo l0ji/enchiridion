@@ -192,12 +192,16 @@ write :bedrock-invoke in either key."
 (declaim (ftype (function (t) boolean) provider-key-present-p))
 
 (defun provider-key-present-p (name)
-  "Return T when NAME is in the environment or the secret loader holds it.
+  "Return T when NAME holds a non-empty key in the loader or the environment.
 The loader runs before this in the CLI, so a key in .env selects a provider the
-same way an exported variable does."
+same way an exported variable does, and it never stores an empty value.
+
+ENVIRONMENT-BOUND-P is not the question: a shell that clears a key with
+`OPENAI_API_KEY=` leaves the name set, and that must not select OpenAI and send
+an empty credential."
   (and (nonempty-string-p name)
-       (or (enchiridion.compat:environment-bound-p name)
-           (enchiridion.llm.secrets:secret-present-p name))))
+       (or (enchiridion.llm.secrets:secret-present-p name)
+           (nonempty-string-p (enchiridion.compat:environment-value name)))))
 
 (declaim (ftype (function (t) boolean) provider-has-key-p))
 
@@ -408,15 +412,6 @@ so. The walk is over the raw plist rather than GETF for exactly that reason."
     :cache-p :cache-ttl :betas :timeout :retries)
   "Row and configuration keys copied into a provider's options plist.")
 
-(declaim (ftype (function (t) list) config-api-key-env-list))
-
-(defun config-api-key-env-list (config)
-  "Return the configured :API-KEY-ENV as a list, or NIL."
-  (let ((value (enchiridion:config-value config :api-key-env)))
-    (cond ((nonempty-string-p value) (list value))
-          ((listp value) (remove-if-not #'nonempty-string-p value))
-          (t '()))))
-
 (declaim (ftype (function (t) (or null string)) expandable-endpoint))
 
 (defun expandable-endpoint (url)
@@ -431,6 +426,32 @@ of sending the request to a hole."
         (ignore-errors (enchiridion.llm::expand-environment url))
         url)))
 
+(defparameter +option-integer-floors+
+  '((:max-tokens . 1) (:timeout . 1) (:retries . 0) (:models-ttl-seconds . 0))
+  "The numeric options and the smallest value each can take.
+A config.lsp value is text, so a quoted number reaches a structure slot as a
+string and stops the process. PROVIDER-OPTIONS-FROM drops a value below its
+floor, so a typo costs that option, not the command.")
+
+(declaim (ftype (function (t t) boolean) usable-option-integer-p))
+
+(defun usable-option-integer-p (value floor)
+  "Return T when VALUE is a whole number FLOOR accepts."
+  (and (integerp value) (>= value floor)))
+
+(declaim (ftype (function (t keyword t) null) note-unusable-option))
+
+(defun note-unusable-option (id key floor)
+  "Report an ignored option and its floor on the error stream, and return NIL.
+The value is not printed, because it comes from a configuration file. The error
+stream keeps `providers list' output clean."
+  (format *error-output*
+          "~&enchiridion: ignoring ~S for ~A: it is not a whole number of at least ~D.~
+           ~&  The adapter's own default is used instead.~%"
+          key id floor)
+  (finish-output *error-output*)
+  nil)
+
 (declaim (ftype (function (t t) list) provider-options-from))
 
 (defun provider-options-from (row config)
@@ -438,17 +459,30 @@ of sending the request to a hole."
 
 An option the row names with a NIL value is kept as NIL: :cache-p and friends
 have a default in the handler, and a NIL that does not reach the options plist
-cannot turn that default off."
+cannot turn that default off. The numeric options are the exception: a handler
+writes them into a structure slot, so a value that is not a whole number above
+the floor is dropped with one line on the error stream."
   (let ((options (list :npm (getf row :npm)
                        :protocol (getf row :protocol)
                        :backend (getf row :backend)
                        :dialect-overrides (row-dialect-overrides row))))
     (dolist (key +provider-option-keys+ options)
-      (let ((value (getf row key :absent)))
+      (let* ((value (getf row key :absent))
+             (floor (assoc key +option-integer-floors+ :test #'eq)))
         (when (eq value :absent)
           (setf value (enchiridion:config-value config key :absent)))
-        (unless (eq value :absent)
-          (setf (getf options key) value))))))
+        (cond
+          ((eq value :absent))
+          ((null floor) (setf (getf options key) value))
+          ((usable-option-integer-p value (cdr floor))
+           (setf (getf options key) value))
+          ;; An explicit NIL is a value: it means `unset', which is the
+          ;; handler's default, so it is not a typo and gets no line.
+          ((null value))
+          (t (note-unusable-option (or (provider-id-keyword (getf row :id))
+                                       (getf row :id)
+                                       :provider)
+                                   key (cdr floor))))))))
 
 (declaim (ftype (function (t t) (or null string)) row-key))
 
@@ -494,7 +528,7 @@ row as written rather than as this process happened to configure it."
                       (handler-profile handler)
                       (protocol-profile protocol)
                       :openai))
-         (env (let ((names (config-api-key-env-list config)))
+         (env (let ((names (enchiridion:config-api-key-env-list config)))
                 (dolist (name (row-env-names row))
                   (unless (member name names :test #'string=)
                     (setf names (append names (list name)))))
@@ -761,7 +795,9 @@ supplied.
 :ANTHROPIC gets the Anthropic row even when an OpenAI or OpenCode key is the
 one that is present, and :PROVIDER :ANTHROPIC without a :BACKEND selects the
 Anthropic protocol as well, because a row and a request shape have to agree
-before the endpoint means anything.
+before the endpoint means anything. A wire the selected row cannot speak is
+refused when neither :PROVIDER nor :BASE-URL names the endpoint: the override
+applies only to an endpoint the operator chose.
 
 CASE and not ECASE. ECASE is the better construct here in principle, because it
 refuses to run if a backend is added without a clause here, but SBCL
@@ -779,12 +815,30 @@ reported as a missing function."
              :key :backend
              :detail (format nil "No backend for ~S. :BACKEND is :OPENAI or :ANTHROPIC, or one of the adapter ids this build registered: ~{~A~^, ~}."
                              backend (registered-api-handlers))))
-    (let* ((provider (%resolve-provider config (backend-provider-id config)
+    (let* ((wanted (backend-provider-id config))
+           (configured (or base-url
+                           (enchiridion:config-value config :base-url)))
+           (provider (%resolve-provider config wanted
                                         :api-key api-key
-                                        :base-url (or base-url
-                                                      (enchiridion:config-value config :base-url))
+                                        :base-url configured
                                         :api declared))
            (handler (find-api-handler (provider-api provider))))
+      ;; :BACKEND replaced the detected row's adapter, so `:BACKEND :OPENAI'
+      ;; posted chat completions to api.anthropic.com. Naming a row or endpoint
+      ;; makes the wire the operator's choice; neither present is the case to
+      ;; refuse.
+      (when (and declared (null configured)
+                 (null (enchiridion:config-value config :provider)))
+        (let ((native (provider-api (%resolve-provider config wanted
+                                                       :api-key api-key))))
+          (unless (eq native (provider-api provider))
+            (error 'enchiridion.errors:configuration-error
+                   :key :backend
+                   :detail (format nil ":BACKEND ~S asks for the ~A wire, but the provider this configuration selects (~A) speaks ~A. Name the row that serves that wire with :provider, or the endpoint that does with :base-url."
+                                   backend
+                                   (provider-api provider)
+                                   (provider-id provider)
+                                   native)))))
       (unless (and handler (api-handler-build handler))
         (unsupported-provider-error provider))
       ;; A provider with no endpoint is not a provider: the request would be
@@ -817,9 +871,10 @@ callers of this one are asking a question that must not open a socket."
   "Return the name of the variable that holds the key for the active provider.
 An explicit :API-KEY-ENV in config wins; otherwise the provider the backend
 resolution would select decides, so the name the operator is told to export is
-the name the request will look for."
+the name the request will look for. A list answers with its first name, which
+is the one the request tries first."
   (let ((config (or config '())))
-    (or (enchiridion:config-value config :api-key-env)
+    (or (first (enchiridion:config-api-key-env-list config))
         (first (provider-env-for-id config (backend-provider-id config))))))
 
 (declaim (ftype (function (&optional t) list) provider-key-names))
@@ -849,7 +904,7 @@ at all."
              (when (and (nonempty-string-p name)
                         (not (member name names :test #'string=)))
                (setf names (append names (list name))))))
-      (note (enchiridion:config-value config :api-key-env))
+      (dolist (name (enchiridion:config-api-key-env-list config)) (note name))
       (dolist (row (shipped-provider-rows))
         (dolist (name (row-env-names row)) (note name)))
       (dolist (row (operator-provider-rows config))

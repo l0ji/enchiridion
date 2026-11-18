@@ -298,6 +298,146 @@ stuck in the kernel after SIGKILL is not a reason to hang the caller."
     (declare (ignore process))
     (error "No process reaper is available in ~A." +implementation+)))
 
+(declaim (ftype (function (t) integer) process-pid))
+
+(defun process-pid (process)
+  "Return PROCESS's pid. PROCESS is a process object or a pid."
+  #+sbcl (if (integerp process) process (sb-ext:process-pid process))
+  #-sbcl (progn
+           (declare (ignore process))
+           (error "No process id is available in ~A." +implementation+)))
+
+(declaim (ftype (function (integer t) boolean) signal-process))
+
+(defun signal-process (pid signal)
+  "Send SIGNAL to PID and return T when the call succeeded.
+
+PID is a number because a descendant whose parent was killed has no process
+object here. A negative PID names the process group, as kill(2) does."
+  #+sbcl
+  (let ((number (if (integerp signal)
+                    signal
+                    (or (cdr (assoc signal +signal-numbers+)) 15))))
+    (handler-case (progn (sb-posix:kill pid number) t)
+      (error () nil)))
+  #-sbcl
+  (progn
+    (declare (ignore pid signal))
+    (error "No process signal sender is available in ~A." +implementation+)))
+
+(declaim (ftype (function (integer) boolean) process-alive-p))
+
+(defun process-alive-p (pid)
+  "Return T when PID can be signalled.
+
+A zombie answers T until it is reaped, so a caller that killed it waits for the
+answer."
+  (signal-process pid 0))
+
+(declaim (ftype (function (string) (or null integer)) proc-stat-parent))
+
+(defun proc-stat-parent (text)
+  "Return the parent pid in TEXT, one /proc/PID/stat, or NIL.
+
+The command name may contain a space or a closing parenthesis, so the fields
+after it are read from the last parenthesis."
+  (let ((close (position #\) text :from-end t)))
+    (when close
+      (let* ((fields (remove-if (lambda (part) (zerop (length part)))
+                                (uiop:split-string (subseq text (1+ close))
+                                                   :separator '(#\Space #\Newline))))
+             (parent (second fields)))
+        (and parent (parse-integer parent :junk-allowed t))))))
+
+(declaim (ftype (function () list) process-table-from-proc))
+
+(defun process-table-from-proc ()
+  "Return /proc as (PID . PPID) pairs, or NIL.
+A process that exits between two reads is absent."
+  (let ((entries '()))
+    (dolist (directory (uiop:subdirectories #p"/proc/") entries)
+      (let ((name (car (last (pathname-directory directory)))))
+        (when (and name (every #'digit-char-p name))
+          (let ((parent (ignore-errors
+                          (proc-stat-parent
+                           (uiop:read-file-string (merge-pathnames "stat" directory))))))
+            (when parent (push (cons (parse-integer name) parent) entries))))))))
+
+(defparameter +ps-programs+ '("ps" "/bin/ps" "/usr/bin/ps")
+  "Where to look for ps, in order.
+
+The bare name goes through PATH, which is where a host finds it. The absolute
+names are for a build sandbox whose PATH holds only its inputs.")
+
+(declaim (ftype (function (string) list) process-table-from-program))
+
+(defun process-table-from-program (program)
+  "Return the process table as (PID . PPID) pairs from PROGRAM, or NIL.
+
+Only the two columns asked for are read, so a command line with spaces cannot
+shift a field."
+  (handler-case
+      (multiple-value-bind (output status)
+          (run-program-blocking program '("-axo" "pid=,ppid="))
+        (when (eql 0 status)
+          (loop for line in (uiop:split-string output :separator '(#\Newline))
+                for fields = (remove-if (lambda (part) (zerop (length part)))
+                                        (uiop:split-string line
+                                                           :separator '(#\Space #\Tab)))
+                for pid = (and fields (parse-integer (first fields) :junk-allowed t))
+                for parent = (and pid (second fields)
+                                  (parse-integer (second fields) :junk-allowed t))
+                when (and pid parent) collect (cons pid parent))))
+    (error () nil)))
+
+(declaim (ftype (function () list) process-table-from-ps))
+
+(defun process-table-from-ps ()
+  "Return the process table as (PID . PPID) pairs from ps, or NIL.
+
+For a platform without /proc. Each place ps can be is tried until one answers."
+  (loop for program in +ps-programs+
+        for table = (process-table-from-program program)
+        when table return table))
+
+(declaim (ftype (function () list) process-table))
+
+(defun process-table ()
+  "Return every process as (PID . PPID) pairs, or NIL when this system has none.
+
+/proc first, ps for a kernel that does not export one."
+  (or (and (probe-file #p"/proc/self/stat") (process-table-from-proc))
+      (process-table-from-ps)))
+
+(declaim (ftype (function (t) list) process-descendants))
+
+(defun process-descendants (process)
+  "Return the pids PROCESS started, deepest first.
+
+PROCESS is a process object or a pid. The walk follows parent links and not
+process groups: a child started with RUN-PROGRAM leads a group of its own, and a
+tool it spawns with RUN-PROGRAM-CAPTURE leads another below that, so a group
+signal leaves the tool's children running.
+
+A system with neither /proc nor ps gets NIL, which is what a caller had before:
+the process group and no more."
+  (let ((root (process-pid process))
+        (children (make-hash-table :test #'eql)))
+    (dolist (entry (process-table))
+      (push (car entry) (gethash (cdr entry) children)))
+    (let ((found '())
+          (stack (list root))
+          (mine (process-id)))
+      (loop while stack
+            do (let ((pid (pop stack)))
+                 (dolist (child (gethash pid children))
+                   (push child found)
+                   (push child stack))))
+      ;; FOUND is a preorder walk read backwards, so every descendant comes
+      ;; before its parent: a caller signalling in order reaches the leaves
+      ;; while their own children are still its children.
+      (remove-if (lambda (pid) (or (= pid mine) (= pid root) (<= pid 1))) found))))
+
 (defmacro with-deadline ((seconds &key on-timeout) &body body)
   "Run BODY, and when it runs longer than SECONDS, unwind it and return the
 value of ON-TIMEOUT instead. SECONDS NIL means no limit.
@@ -409,6 +549,17 @@ and to switch signing off without writing any configuration file."
                  (return (values (captured) :timeout)))
                (sleep 0.01))))
       (when process
+        ;; A caller leaving through an interrupt, a throw or an error still
+        ;; owns its child: reaping alone leaves it running, with its output
+        ;; going to a stream about to close. The group is signalled because
+        ;; /bin/sh leaves its own children behind.
+        (unless (sb-ext:process-exit-code process)
+          (ignore-errors (process-kill process :sigterm :process-group))
+          (loop repeat 20
+                until (sb-ext:process-exit-code process)
+                do (sleep 0.01))
+          (unless (sb-ext:process-exit-code process)
+            (ignore-errors (process-kill process :sigkill :process-group))))
         (ignore-errors (process-reap process)))
       (when stream
         (ignore-errors (close stream)))))

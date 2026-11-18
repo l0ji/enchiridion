@@ -483,17 +483,17 @@ unsafe."
                   FROM activation"))
         (dormant '()) (live 0) (exempt 0))
     (dolist (row rows)
-      (let* ((record (activation-from-row row))
-             (base (decay-update record now :parameters parameters))
-             (candidate (nth-value 1 (decay-update record now
-                                                  :parameters parameters))))
-        (cond ((member (activation-kind record)
-                       (parameter :retained-kinds parameters) :test #'string=)
-               (incf exempt))
-              (candidate
-               (push (list (activation-kind record) (activation-id record) base)
-                     dormant))
-              (t (incf live)))))
+      (let ((record (activation-from-row row)))
+        ;; One call per row: it returns the base level and the prune verdict.
+        (multiple-value-bind (base candidate)
+            (decay-update record now :parameters parameters)
+          (cond ((member (activation-kind record)
+                         (parameter :retained-kinds parameters) :test #'string=)
+                 (incf exempt))
+                (candidate
+                 (push (list (activation-kind record) (activation-id record) base)
+                       dormant))
+                (t (incf live))))))
     (list :scanned (length rows) :live live :exempt exempt
           :dormant (nreverse dormant))))
 
@@ -1130,9 +1130,18 @@ generation is read, so a candidate is invisible to the live layer."
 
 (defun split-context-key (key)
   "Return a stored context key as a list.  The column holds a comma-joined
-triple of project, session, and channel."
+triple of project, session, and channel.
+
+A key whose first two components are the same non-empty session is one the old
+transcript writer stored, with the session in the project slot. Reading it as
+no-project lets those rows rank on the context term."
   (when (and (stringp key) (plusp (length key)))
-    (uiop:split-string key :separator ",")))
+    (let ((parts (uiop:split-string key :separator ",")))
+      (if (and (rest parts)
+               (plusp (length (first parts)))
+               (string= (first parts) (second parts)))
+          (cons "" (rest parts))
+          parts))))
 
 ;;;; ---------------------------------------------------------------------
 ;;;; 11. The encoding filter: two filters, not one.
@@ -1231,6 +1240,18 @@ count once the index has it."
        "n")
       0))
 
+(defparameter *hint-token-limit* 64
+  "The most distinct tokens one lexical hint reads from a body.
+RARITY-OF runs one index count per token and LINK-CO-OCCURRENCES one query per
+token, so the tokens are the body's first and the limit keeps a hint a hint.")
+
+(defun hint-tokens (body)
+  "Return the distinct content tokens the lexical hints read from BODY."
+  (let ((tokens (remove-duplicates (tokenise body) :test #'string=)))
+    (if (> (length tokens) *hint-token-limit*)
+        (subseq tokens 0 *hint-token-limit*)
+        tokens)))
+
 (defun rarity-of (store body &key before-id)
   "Return a cheap lexical rarity hint for BODY, in 0..1, with no model call.
 
@@ -1243,8 +1264,9 @@ the insert order alone, not on the batch a maintenance pass happened to use.
 
 This is a proxy for the distinctiveness claim and it is INVENTED-DESIGN: the
 original distinctiveness studies were not retrieved, so only the relative form
-of the claim is used."
-  (let ((tokens (remove-duplicates (tokenise body) :test #'string=)))
+of the claim is used. It weighs at most *HINT-TOKEN-LIMIT* of BODY's distinct
+tokens."
+  (let ((tokens (hint-tokens body)))
     (if (null tokens)
         0.0
         (let ((commonness 0.0))
@@ -1271,7 +1293,10 @@ retrieval term and the design forbids presenting it as an affective mechanism."
     (min 1.0 (/ (float markers) 12.0))))
 
 (defun context-key-for (&key project session channel)
-  "Return the context key the write path stores: a comma-joined triple."
+  "Return the context key the write path stores: a comma-joined triple.
+A transcript row has no project, and its empty first component is what
+retrieval compares a live turn against. TURN-CONTEXT-KEY writes the same
+triple."
   (format nil "~A,~A,~A"
           (or project "")
           (or session "")
@@ -1359,7 +1384,7 @@ purpose: they are the seed of the association graph and they are derived, so a
 later consolidation run may rebuild them, which is what makes the graph
 disposable."
   (let ((written 0))
-    (dolist (token (remove-duplicates (tokenise body) :test #'string=))
+    (dolist (token (hint-tokens body))
       (dolist (row (enchiridion.memory.store:query-rows
                     store
                     "SELECT e.id FROM episodes_fts

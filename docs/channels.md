@@ -43,12 +43,14 @@ a token. Generate one with `openssl rand -hex 32` and put it in `.env`. The
 `--channel`, `--bind` and `--port` flags override the section for one process,
 as in `enchiridion serve --channel http --bind 0.0.0.0 --port 8787`.
 
+Provider discovery runs in the background. `/health` reports its status.
+
 ### Routes
 
-| Method | Path | Success | Runs |
+| Method | Path | Status | Answers |
 | --- | --- | --- | --- |
 | `POST` | `/message` | 200 | One synchronous turn |
-| `GET` | `/health` | 200 | The live process, uptime, and channels |
+| `GET` | `/health` | 200, or 503 when not ready | The live process, its readiness, and why not |
 | `GET` | `/usage` | 200 | Ledger rows, oldest first, at most `?limit=` |
 
 A known path with the wrong method answers 405 with an `Allow` header; any
@@ -70,14 +72,14 @@ curl -sS -X POST http://127.0.0.1:8787/message \
 The body is a JSON object. `text` must be non-empty after trimming, and
 `author` is optional and defaults to `webhook`. The content type must contain
 `application/json`, or the route answers 415. A body over the 65536-byte
-default answers 413; a chunked body is counted as it arrives.
+default answers 413; a chunked body is counted as it arrives, and a request
+that declares both a `Content-Length` and a chunked encoding answers 400.
 
-Authentication runs before the body is read. The only accepted scheme is
-`Bearer`, compared without an early exit. A missing or wrong token answers 401
-with `WWW-Authenticate: Bearer`, and the body is never read. A loopback bind may
-omit the token; if one is set, it is required. A non-loopback bind without a
-token fails before the socket opens with `Configuration is wrong at
-HTTP-TOKEN.` and a detail naming the bind.
+The server closes connections with unread request bodies without draining them.
+
+A missing or incorrect bearer token returns 401 with
+`WWW-Authenticate: Bearer`. A loopback listener may omit the token. A
+non-loopback listener requires it to start.
 
 ### Responses
 
@@ -88,27 +90,48 @@ HTTP-TOKEN.` and a detail naming the bind.
 ```
 
 `usage` sums every model call in the turn, so `rounds` can be greater than one.
-`GET /health` answers `ok`, `uptime` and rows of `name`, `state` and `enabled`
-from the live process. `GET /usage` answers `count` and `rows` of `id`, `session`,
-`model`, `input`, `output`, `cache-read`, `cache-write`, `channel` and `ts`,
-oldest first. `?limit=` defaults to 50 and caps at 1000.
+
+`GET /health` returns readiness and diagnostics:
+
+```json
+{"ok":true,"ready":true,"uptime":812,"reasons":[],
+ "channels":[{"name":"http","state":"live","enabled":true}],
+ "heartbeat":{"enabled":true,"alive":true,"requested":false,"ticks":3,
+              "last-tick":1794966000,"ok":true,"running":false,"report":"idle"},
+ "persistence":{"failures":0,"last":null},
+ "providers":{"state":"done","report":""},
+ "writes":{"ok":true,"report":"","age":0}}
+```
+
+`ok` and `ready` match. A failed or stopped enabled channel, a dead enabled
+heartbeat, or a missing supervisor returns 503. Disabled and unavailable
+channels do not count. `reasons` lists readiness failures when the supervisor
+is running.
+
+`persistence` counts failed transcript and ledger writes in this process.
+`providers.state` is `pending`, `done`, `failed`, or `skipped`. `writes` reports
+status-file errors. These fields do not change readiness.
+
+`GET /usage` answers `count` and `rows` of `id`, `session`, `model`, `input`,
+`output`, `cache-read`, `cache-write`, `channel` and `ts`, oldest first.
+`?limit=` defaults to 50 and caps at 1000.
 
 An error body is `{"ok":false,"error":"..."}`. The two `/usage` refusals carry
-only `error`.
+only `error`; a degraded `/health` carries the full report with `ok:false`.
 
 | Status | Cause | Error text |
 | --- | --- | --- |
-| 400 | The body is not UTF-8, not JSON, not a JSON object, or has blank `text` | `The body is not UTF-8 text.`, `The body is not JSON.`, `The body must be a JSON object.`, or `The body needs a non-empty text field.` |
+| 400 | The body is not UTF-8, not JSON, not a JSON object, has blank `text`, or declares both a length and chunked encoding | `The body is not UTF-8 text.`, `The body is not JSON.`, `The body must be a JSON object.`, `The body needs a non-empty text field.`, or `The body declares both a length and a chunked encoding.` |
 | 401 | The token is missing or wrong | `A bearer token is required.` |
 | 404 | The path has no route | `There is no route <path>.` |
 | 405 | The method is wrong | `<path> takes POST.` or `GET.` |
 | 413 | The body is over the limit | `The body is larger than 65536 bytes.` |
 | 415 | `/message` has no JSON content type | `POST /message needs a JSON body.` |
 | 502 | The turn failed, or no turn function is attached | The condition text, or `no agent is attached to this webhook.` |
-| 503 | A turn is running, `/health` has no supervisor, or `/usage` has no store or unreadable ledger | The busy text with `Retry-After: 1`, `the supervisor is not running`, `no memory store is open`, or `the ledger is unreadable` |
+| 503 | A turn is running, `/usage` has no store or an unreadable ledger, or `/health` has no supervisor or is not ready | The busy text with `Retry-After: 1`, `no memory store is open`, `the ledger is unreadable`, `the supervisor is not running`, or a health report with `ok:false` and `reasons` |
 
 The body limit is 65536 bytes, the read and write timeout is 5 seconds, and a
-stop drains for 30 seconds. A turn that outlasts the drain says so in one line.
+stop drains for 6 seconds. A turn that outlasts the drain says so in one line.
 
 ## Fluxer
 
@@ -150,4 +173,5 @@ The queue holds 32 messages. A missing token logs one line per second:
 | `/message` answers 415 | No `Content-Type: application/json` | Set the content type |
 | `/message` answers 413 | The body is over 65536 bytes | Send less, or raise `:max-body-bytes` |
 | `/message` answers 503 with `Retry-After: 1` | Another turn is running | Retry after one second |
+| `/health` answers 503 | A channel the process wants on is failed or stopped, the heartbeat thread is gone, or no supervisor runs | Read `reasons`, then `docker compose logs` |
 | Fluxer answers no direct message | The sender is not on the allowlist, or the event is not a direct message | Add the user id; check the channel type |

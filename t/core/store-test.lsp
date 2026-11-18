@@ -625,6 +625,64 @@ itself is what proves the trigger ran."
                  (enchiridion.memory.store:close-store rebuilt)))))
       (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
 
+(deftest a-store-from-a-newer-schema-is-refused ()
+  (let* ((directory (scratch-directory))
+         (path (merge-pathnames "memory.db" directory))
+         (store (enchiridion.memory.store:open-store :path path)))
+    (unwind-protect
+         (progn
+           (enchiridion.memory.store::set-schema-version
+            store (1+ enchiridion.memory.store::+schema-version+))
+           (enchiridion.memory.store:close-store store)
+           (let ((condition
+                   (handler-case
+                       (progn (enchiridion.memory.store:open-store :path path) nil)
+                     (enchiridion.errors:configuration-error (condition) condition))))
+             (testing "a store this build cannot read is not served"
+               (ok condition)
+               (ok (search "newer image" (enchiridion.errors:error-detail condition))))))
+      (ignore-errors (enchiridion.memory.store:close-store store))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(deftest a-current-store-missing-a-table-is-repaired-on-open ()
+  (let* ((directory (scratch-directory))
+         (path (merge-pathnames "memory.db" directory))
+         (store (enchiridion.memory.store:open-store :path path)))
+    (unwind-protect
+         (progn
+           (enchiridion.memory.store::exec store "DROP TABLE tasks")
+           (enchiridion.memory.store:close-store store)
+           (let ((again (enchiridion.memory.store:open-store :path path)))
+             (testing "the version alone did not make the store current"
+               (ok (enchiridion.memory.store::sqlite-table-exists-p again "tasks"))
+               (ok (enchiridion.memory.store::schema-current-p again)))
+             (testing "and the table works"
+               (enchiridion.memory.store:enqueue-task again "repaired")
+               (ok (= 1 (enchiridion.memory.store:count-tasks again :status :pending)))
+               (enchiridion.memory.store:close-store again))))
+      (ignore-errors (enchiridion.memory.store:close-store store))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(deftest a-current-store-missing-an-added-column-is-repaired-on-open ()
+  (let* ((directory (scratch-directory))
+         (path (merge-pathnames "memory.db" directory))
+         (store (enchiridion.memory.store:open-store :path path)))
+    (unwind-protect
+         (progn
+           (enchiridion.memory.store::exec
+            store "ALTER TABLE generations DROP COLUMN claim_owner")
+           (enchiridion.memory.store:close-store store)
+           (let ((again (enchiridion.memory.store:open-store :path path)))
+             (testing "a column added after the table was built comes back"
+               (ok (enchiridion.memory.store::column-exists-p
+                    again "generations" "claim_owner"))
+               (ok (enchiridion.memory.store::column-exists-p
+                    again "generations" "claim_ts"))
+               (ok (enchiridion.memory.store::schema-current-p again)))
+             (enchiridion.memory.store:close-store again)))
+      (ignore-errors (enchiridion.memory.store:close-store store))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
 (deftest an-unstemmed-index-is-rebuilt-with-the-stemmer ()
   (let* ((directory (scratch-directory))
          (path (merge-pathnames "memory.db" directory))
@@ -673,12 +731,15 @@ itself is what proves the trigger ran."
                                 "DROP TRIGGER assertions_au" "DROP TABLE assertions_fts"
                                 "ALTER TABLE memory_state DROP COLUMN precision_reset_generation"
                                 "ALTER TABLE memory_state DROP COLUMN last_t2_episode"
-                                "ALTER TABLE generations DROP COLUMN episodes_derived"))
+                                "ALTER TABLE generations DROP COLUMN episodes_derived"
+                                "ALTER TABLE generations DROP COLUMN claim_owner"
+                                "ALTER TABLE generations DROP COLUMN claim_ts"))
              (enchiridion.memory.store::exec store statement))
            (enchiridion.memory.store::set-schema-version store 3)
            (enchiridion.memory.store:close-store store)
            (setf store (enchiridion.memory.store:open-store :path path))
-           (ok (= 7 (enchiridion.memory.store::schema-version store)))
+           (ok (= enchiridion.memory.store::+schema-version+
+                  (enchiridion.memory.store::schema-version store)))
            (testing "the existing claim is indexed"
              (ok (= 1 (length (enchiridion.memory.store::query-rows
                                store "SELECT rowid FROM assertions_fts
@@ -691,9 +752,40 @@ itself is what proves the trigger ran."
                   store "memory_state" "last_t2_episode")))
            (testing "and the derived-episode count the volume gate reads"
              (ok (enchiridion.memory.store::column-exists-p
-                  store "generations" "episodes_derived"))))
+                  store "generations" "episodes_derived")))
+           (testing "and the claim a builder holds"
+             (ok (enchiridion.memory.store::column-exists-p
+                  store "generations" "claim_owner"))
+             (ok (enchiridion.memory.store::column-exists-p
+                  store "generations" "claim_ts"))))
       (ignore-errors (enchiridion.memory.store:close-store store))
       (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(deftest the-store-can-report-its-own-size-and-age ()
+  (with-scratch-store (store)
+    (enchiridion.memory.store:record-turn store :session "s" :role "user"
+                                          :body "the oldest turn" :ts 100)
+    (enchiridion.memory.store:record-turn store :session "s" :role "user"
+                                          :body "the newest turn" :ts 300)
+    (let ((usage (enchiridion.memory.store::store-usage store :now 1000)))
+      (testing "the file and the page header both have a size"
+        (ok (plusp (getf usage :bytes)))
+        (ok (plusp (getf usage :page-size)))
+        (ok (plusp (getf usage :page-count)))
+        (ok (integerp (getf usage :reclaimable-bytes))))
+      (testing "the age is read from the oldest record"
+        (ok (= 100 (getf usage :oldest-ts)))
+        (ok (= 300 (getf usage :newest-ts)))
+        (ok (= 900 (getf usage :oldest-age))))
+      (testing "the counts are the ones the log holds"
+        (ok (= 2 (getf usage :episodes)))
+        (ok (= 0 (getf usage :usage-rows)))
+        (ok (= 0 (getf usage :retrievals))))
+      (testing "and asking deleted nothing"
+        (ok (= 2 (enchiridion.memory.store:field
+                  (first (enchiridion.memory.store:query-rows
+                          store "SELECT COUNT(*) AS n FROM episodes"))
+                  "n")))))))
 
 (deftest saved-memory-scrubs-session-and-context ()
   (with-scratch-store (store)
@@ -707,6 +799,49 @@ itself is what proves the trigger ran."
              (dolist (column '("name" "body" "session" "context_key"))
                (ng (search +fake-key+ (enchiridion.memory.store:field row column))))))
       (enchiridion.llm.secrets:clear-secrets))))
+
+(deftest a-stored-row-carries-the-context-key-retrieval-compares ()
+  ;; The write path put the session in the project slot ("alpha,alpha,cli")
+  ;; while retrieval compares against an empty project, so the context term
+  ;; scored every live row zero. The form is pinned because two write paths
+  ;; share the column.
+  (with-scratch-store (store)
+    (enchiridion.memory.store:record-turn store :session "alpha" :role "user"
+                                          :body "the build failed" :channel :http)
+    (enchiridion.memory.store:save-memory store "note" "the linker missed a library"
+                                          :session "alpha")
+    (flet ((context-key (role)
+             (enchiridion.memory.store:field
+              (first (enchiridion.memory.store:query-rows
+                      store "SELECT context_key FROM episodes WHERE role = ?"
+                      (list role)))
+              "context_key")))
+      (testing "a turn stores no project, its session, and its channel"
+        (ok (string= ",alpha,http" (context-key "user"))))
+      (testing "a saved memory stores the same triple"
+        (ok (string= ",alpha,cli" (context-key "memory"))))
+      (testing "and both are the form the memory layer writes"
+        (ok (string= (enchiridion.memory::context-key-for :session "alpha"
+                                                         :channel :http)
+                     (context-key "user")))
+        (ok (string= (enchiridion.memory::context-key-for :session "alpha"
+                                                         :channel :cli)
+                     (context-key "memory")))))))
+
+(deftest a-legacy-transcript-key-reads-without-a-project ()
+  ;; The store wrote the session into the project slot before the fix. Reading
+  ;; such a key as no-project lets a log's older rows rank like its newer ones.
+  (let ((split (lambda (key) (enchiridion.memory::split-context-key key))))
+    (testing "a key whose project repeats its session is the old writer's"
+      (ok (equal '("" "alpha" "cli") (funcall split "alpha,alpha,cli"))))
+    (testing "a key that names a different project is left alone"
+      (ok (equal '("ops" "alpha" "cli") (funcall split "ops,alpha,cli"))))
+    (testing "an empty project is already the current form"
+      (ok (equal '("" "alpha" "cli") (funcall split ",alpha,cli"))))
+    (testing "and a session that happens to name a project is the one cost"
+      ;; "alpha,alpha,cli" is indistinguishable from the old writer's spelling,
+      ;; so a project deliberately named after its session reads as no project.
+      (ok (string= (first (funcall split "alpha,alpha,cli")) "")))))
 
 (deftest saved-memory-dedup-serializes-independent-connections ()
   ;; The two writers must both be inside the check when one of them wins, or the
@@ -770,7 +905,8 @@ itself is what proves the trigger ran."
       (enchiridion.memory.store:exec store "PRAGMA user_version = 6")
       (enchiridion.memory.store:close-store store)
       (setf store (enchiridion.memory.store:open-store :path path))
-      (ok (= 7 (enchiridion.memory.store::schema-version store)))
+      (ok (= enchiridion.memory.store::+schema-version+
+             (enchiridion.memory.store::schema-version store)))
       (testing "the stored vector survived the upgrade"
         (ok (= 1 (length (enchiridion.memory.store:query-rows
                           store "SELECT * FROM episode_vectors

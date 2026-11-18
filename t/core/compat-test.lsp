@@ -197,3 +197,89 @@
              "/bin/sh" (list "-c" (format nil "kill -0 ~D 2>/dev/null" pid)))
           (declare (ignore ignored))
           (ok (not (eql 0 alive)) "the background job is gone"))))))
+
+;;;; Leaving a capture early.
+;;;;
+;;;; A shell command starts a child, and the caller can leave through an
+;;;; interrupt, a throw or an error. The child leaves with it: a command that
+;;;; outlives the turn keeps writing to a stream this process is about to close.
+
+(deftest an-interrupted-capture-stops-the-child-it-started ()
+  (let* ((directory (merge-pathnames
+                     (format nil "enchiridion-compat-test-~D/"
+                             (random most-positive-fixnum))
+                     (uiop:ensure-directory-pathname
+                      (enchiridion.compat:temp-directory))))
+         (marker (merge-pathnames "marker" directory))
+         (thread nil))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist directory)
+           (setf thread
+                 (bordeaux-threads:make-thread
+                  (lambda ()
+                    (catch 'abandon
+                      (enchiridion.compat:run-program-capture
+                       "/bin/sh"
+                       (list "-c" (format nil "sleep 1; touch ~A"
+                                          (uiop:native-namestring marker))))))))
+           (sleep 0.2)
+           (bordeaux-threads:interrupt-thread thread
+                                             (lambda () (throw 'abandon :abandoned)))
+           (loop repeat 200
+                 while (bordeaux-threads:thread-alive-p thread)
+                 do (sleep 0.01))
+           (sleep 2)
+           (ng (probe-file marker)
+               "the child was stopped with the capture that started it"))
+      (when (and thread (bordeaux-threads:thread-alive-p thread))
+        (ignore-errors (bordeaux-threads:destroy-thread thread)))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+;;;; Process trees.
+;;;;
+;;;; A hung tool is stopped by signalling its tree, which is not a process
+;;;; group: RUN-PROGRAM gives every child a session of its own.
+
+(deftest the-process-table-knows-this-process ()
+  (let ((table (enchiridion.compat::process-table)))
+    (ok table "this system exports a process table")
+    (ok (find (enchiridion.compat:process-id) table :key #'car)
+        "and it holds the process reading it")
+    (ok (every (lambda (entry)
+                 (and (integerp (car entry)) (integerp (cdr entry))))
+               table))))
+
+(deftest a-childs-descendants-are-found-through-parent-links ()
+  (let ((process (enchiridion.compat:run-program
+                  "/bin/sh" (list "-c" "sleep 30 & wait")
+                  :output #p"/dev/null" :if-output-exists :supersede :wait nil)))
+    (unwind-protect
+         (let ((found nil))
+           (loop repeat 300
+                 do (setf found (enchiridion.compat:process-descendants process))
+                    (when found (return))
+                    (sleep 0.01))
+           (ok found "the background job is a descendant of the shell")
+           (ok (not (member (enchiridion.compat:process-id) found))
+               "and this process is not one of them"))
+      (ignore-errors (enchiridion.compat:process-kill process :sigkill :process-group))
+      (ignore-errors (enchiridion.compat:process-reap process)))))
+
+(deftest a-signalled-process-stops-being-alive ()
+  (let* ((process (enchiridion.compat:run-program
+                   "/bin/sh" (list "-c" "sleep 30")
+                   :output #p"/dev/null" :if-output-exists :supersede :wait nil))
+         (pid (enchiridion.compat:process-pid process)))
+    (unwind-protect
+         (progn
+           (ok (enchiridion.compat:process-alive-p pid))
+           (ok (enchiridion.compat:signal-process pid :sigkill))
+           ;; A killed child is a zombie until reaped, and a zombie still
+           ;; answers a signal.
+           (enchiridion.compat:process-reap process)
+           (loop repeat 300 while (enchiridion.compat:process-alive-p pid)
+                 do (sleep 0.01))
+           (ng (enchiridion.compat:process-alive-p pid)))
+      (ignore-errors (enchiridion.compat:process-kill process :sigkill :process-group))
+      (ignore-errors (enchiridion.compat:process-reap process)))))

@@ -330,6 +330,23 @@ query string and the signature without a control plane."
                      (header (enchiridion.llm::http-request-headers request)
                              :authorization)))))))
 
+(deftest a-loaded-token-wins-over-a-loaded-signature ()
+  ;; The supervisor unsets a credential shaped variable once the loader holds
+  ;; it, so the token that wins outright is read from the loader.
+  (with-environment ("AWS_BEARER_TOKEN_BEDROCK" nil)
+    (let ((enchiridion.llm.secrets::*loaded-secrets* (make-hash-table :test #'equal))
+          (enchiridion.llm::*aws-credentials-function*
+            (constantly *test-credential*)))
+      (setf (gethash "AWS_BEARER_TOKEN_BEDROCK"
+                     enchiridion.llm.secrets::*loaded-secrets*)
+            "the-loaded-token")
+      (multiple-value-bind (completion request)
+          (run-completion :bedrock-invoke (bedrock-provider :key "provider-key"))
+        (declare (ignore completion))
+        (ok (string= "Bearer the-loaded-token"
+                     (header (enchiridion.llm::http-request-headers request)
+                             :authorization)))))))
+
 (deftest a-provider-key-is-not-used-while-there-is-a-key-to-sign-with ()
   (with-environment ("AWS_BEARER_TOKEN_BEDROCK" nil)
     (let ((enchiridion.llm::*aws-credentials-function*
@@ -522,6 +539,31 @@ query string and the signature without a control plane."
                   (signaled-key
                    (enchiridion.llm::bedrock-list-models
                     (bedrock-provider :region nil))))))))))
+
+(deftest a-loaded-region-wins-over-the-environment ()
+  ;; .env is not the process environment, and a served process has the values
+  ;; in memory. The region did not read the loader, so a placement in .env was
+  ;; ignored.
+  (with-environment ("AWS_REGION" "eu-central-1")
+    (enchiridion.llm.secrets:register-secret "AWS_REGION" "us-west-2")
+    (unwind-protect
+         (let ((enchiridion.llm::*aws-credentials-function* (constantly nil)))
+           (multiple-value-bind (completion request)
+               (run-completion :bedrock-invoke
+                               (bedrock-provider :region nil :key "a-bearer-token"))
+             (declare (ignore completion))
+             (testing "the loaded region decides the host"
+               (ok (search "bedrock-runtime.us-west-2.amazonaws.com"
+                           (enchiridion.llm::http-request-url request))))
+             (testing "and the provider's own option still wins"
+               (multiple-value-bind (completion request)
+                   (run-completion :bedrock-invoke
+                                   (bedrock-provider :region "ap-south-1"
+                                                     :key "a-bearer-token"))
+                 (declare (ignore completion))
+                 (ok (search "bedrock-runtime.ap-south-1.amazonaws.com"
+                             (enchiridion.llm::http-request-url request)))))))
+      (enchiridion.llm.secrets:clear-secrets))))
 
 (deftest the-region-falls-back-to-the-environment ()
   (with-environment ("AWS_REGION" "eu-central-1")

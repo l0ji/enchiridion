@@ -100,12 +100,26 @@ call may take, or NIL for no limit."
           do (setf (gethash (string-downcase (string key)) table) value))
     table))
 
+(defparameter +frame-limit+ (* 16 1024 1024)
+  "The largest frame either side will write or read.
+
+One constant for both directions: a writer that allowed more would hand the
+peer a message it must reject, and the connection, not the message, would
+fail.")
+
 (declaim (ftype (function (stream string) null) write-frame))
 
 (defun write-frame (stream text)
-  "Write TEXT as a four byte big endian length and UTF-8 bytes."
+  "Write TEXT as a four byte big endian length and UTF-8 bytes.
+
+A frame over +FRAME-LIMIT+ is refused before a byte is written: a header and a
+failed write leave half a frame that the next call reads as its answer."
   (let* ((octets (enchiridion.compat:encode-utf8 text))
          (length (length octets)))
+    (when (> length +frame-limit+)
+      (error 'enchiridion.errors:transport-error
+             :detail (format nil "A frame of ~D bytes is larger than the ~D byte limit."
+                             length +frame-limit+)))
     (write-byte (ldb (byte 8 24) length) stream)
     (write-byte (ldb (byte 8 16) length) stream)
     (write-byte (ldb (byte 8 8) length) stream)
@@ -129,9 +143,10 @@ call may take, or NIL for no limit."
                                (ash (aref header 1) 16)
                                (ash (aref header 2) 8)
                                (aref header 3))))
-           (when (> length (* 16 1024 1024))
+           (when (> length +frame-limit+)
              (error 'enchiridion.errors:transport-error
-                    :detail "The broker frame is larger than 16 MiB."))
+                    :detail (format nil "The broker frame is larger than ~D MiB."
+                                    (floor +frame-limit+ (* 1024 1024)))))
            (let ((octets (make-array length :element-type '(unsigned-byte 8))))
              (unless (= length (read-sequence octets stream))
                (error 'enchiridion.errors:transport-error
@@ -185,6 +200,14 @@ that reports neither fails that check instead of passing it by default."
       (error 'enchiridion.errors:configuration-error
              :key :plugin
              :detail "This process has no plugin loader attached."))
+    (unless (and (stringp directory) (plusp (length directory)))
+      (error 'enchiridion.errors:tool-error
+             :tool "load-generation"
+             :detail "The request has no directory to load."))
+    (unless (and (integerp generation) (plusp generation))
+      (error 'enchiridion.errors:tool-error
+             :tool "load-generation"
+             :detail "The request has no usable generation number."))
     (multiple-value-bind (ok-p report source-digests live-generation)
         (let ((*load-source-digests* digests))
           (funcall function (pathname directory) generation))
@@ -390,6 +413,36 @@ When CHILD is given and exits first, stop at once: a dead child never binds."
       (setf (broker-running-p broker) t))
     broker))
 
+(defparameter +child-stop-grace-seconds+ 0.5
+  "How long a stopped child has to leave before it is killed outright.
+
+A tool that hung will not answer; this is the time SIGTERM needs to reach the
+group and the kernel to finish.")
+
+(declaim (ftype (function (t &key (:grace real)) t) stop-child))
+
+(defun stop-child (child &key (grace +child-stop-grace-seconds+))
+  "Stop CHILD and everything it started, and reap it. Return CHILD.
+
+The descendants are read before anything is signalled: once the child is dead
+they are reparented and the links that say they belong to this tree are gone.
+Each is signalled one by one because a tool command leads its own process group,
+which the child's group does not contain.
+
+SIGKILL is last: a tool that ignored SIGTERM is why a caller replaces a child."
+  (let ((descendants (enchiridion.compat:process-descendants child)))
+    (ignore-errors (enchiridion.compat:process-kill child :sigterm :process-group))
+    (dolist (pid descendants)
+      (enchiridion.compat:signal-process pid :sigterm))
+    (loop repeat (ceiling (* grace 100))
+          until (enchiridion.compat:process-exit-code child)
+          do (sleep 0.01))
+    (dolist (pid descendants)
+      (enchiridion.compat:signal-process pid :sigkill))
+    (ignore-errors (enchiridion.compat:process-kill child :sigkill :process-group))
+    (enchiridion.compat:process-reap child)
+    child))
+
 (defun start-child (broker)
   (ensure-directories-exist (broker-socket broker))
   (uiop:delete-file-if-exists (broker-socket broker))
@@ -412,11 +465,20 @@ When CHILD is given and exits first, stop at once: a dead child never binds."
     (setf (broker-child broker) child)
     (handler-case
         (let ((connection (wait-for-connection broker child)))
-          (setf (broker-stream broker) (usocket:socket-stream connection))
-          (setf (broker-running-p broker) t)
+          (setf (broker-stream broker) (usocket:socket-stream connection)
+                (broker-running-p broker) t
+                ;; A fresh connection is not the broken one, and leaving the
+                ;; flag set sent the first call through RECOVER-BROKER for a
+                ;; connection this start had already replaced.
+                (broker-broken-p broker) nil)
           broker)
       (error (condition)
-        (ignore-errors (enchiridion.compat:process-kill child :sigterm))
+        ;; A child that failed to bind may have started helpers, so the whole
+        ;; tree goes and is reaped: SBCL keeps the process object on its active
+        ;; list otherwise. The slot is cleared for the next start.
+        (stop-child child)
+        (when (eq child (broker-child broker))
+          (setf (broker-child broker) nil))
         (error condition)))))
 
 (defun broker-start (broker &key (in-process nil))
@@ -429,7 +491,13 @@ Return BROKER."
       (start-child broker)))
 
 (defun broker-stop (broker)
-  "Close BROKER, stop its thread or child, and remove the socket."
+  "Close BROKER, stop its thread or child, and remove the socket.
+
+The running flag is cleared first. A call that this function cut off sees a
+broken connection and asks for a replacement child; with the flag still set it
+would spawn one after the socket was removed, and nothing in the process would
+ever stop it."
+  (setf (broker-running-p broker) nil)
   (when (broker-stream broker)
     (ignore-errors (close (broker-stream broker)))
     (setf (broker-stream broker) nil))
@@ -440,11 +508,8 @@ Return BROKER."
     (ignore-errors (bordeaux-threads:destroy-thread (broker-server-thread broker)))
     (setf (broker-server-thread broker) nil))
   (when (broker-child broker)
-    ;; The group, so a tool the child started stops with it, and reaped, so
-    ;; the child does not stay a zombie for the life of the supervisor.
-    (ignore-errors (enchiridion.compat:process-kill (broker-child broker)
-                                                    :sigterm :process-group))
-    (ignore-errors (enchiridion.compat:process-reap (broker-child broker)))
+    ;; Tools can run in separate process groups
+    (stop-child (broker-child broker))
     (setf (broker-child broker) nil))
   (ignore-errors (delete-file (broker-socket broker)))
   (setf (broker-running-p broker) nil
@@ -521,18 +586,24 @@ broken. The caller holds the call lock."
 (defun restart-child (broker)
   "Replace BROKER's child with a fresh one and return BROKER.
 
-The old child is killed with its whole process group, so a tool it started
-dies with it. The new child loads the generation the old one last loaded, so a
-restart costs the call that hung and not every agent tool. A reload that fails
-here is reported and leaves the builtins serving: the next `reload` fixes it."
+The old child is stopped with everything it started, so a hung tool dies with
+it. The new child loads the generation the old one last loaded, so a restart
+costs the call that hung and not every agent tool. A reload that fails here is
+reported and leaves the builtins serving: the next `reload` fixes it.
+
+A broker that is stopping is not restarted: the call would otherwise spawn a
+child after BROKER-STOP removed the socket, and nothing would stop it."
+  (unless (broker-running-p broker)
+    (error 'enchiridion.errors:transport-error
+           :detail "The broker is not running, so no child was started."))
   (let ((child (broker-child broker)))
     (when child
-      (ignore-errors (enchiridion.compat:process-kill child :sigkill :process-group))
-      (ignore-errors (enchiridion.compat:process-reap child))))
+      (stop-child child :grace 0.2)
+      (when (eq child (broker-child broker))
+        (setf (broker-child broker) nil))))
   (mark-broker-broken broker)
   (setf (broker-running-p broker) nil)
   (start-child broker)
-  (setf (broker-broken-p broker) nil)
   (let ((load (broker-last-load broker)))
     (when load
       (let ((reply (ignore-errors
@@ -546,12 +617,24 @@ here is reported and leaves the builtins serving: the next `reload` fixes it."
 
 (defun recover-broker (broker)
   "Make BROKER's connection usable again after a broken call.
-A child that is still alive gets a new connection. A child that has exited is
-replaced."
+
+A child that has exited is replaced. A child that is still alive gets a new
+connection, and one that will not accept it is replaced too: a live child
+refuses only while it is still in the abandoned call, and the broker cannot tell
+a tool that is nearly finished from one that will run ten more minutes. Every
+call behind it would fail until it returned.
+
+The in-process test broker has no child to replace and reconnects."
+  (unless (broker-running-p broker)
+    (error 'enchiridion.errors:transport-error
+           :detail "The broker is not running, so there was nothing to recover."))
   (let ((child (broker-child broker)))
-    (if (and child (enchiridion.compat:process-exit-code child))
-        (restart-child broker)
-        (reconnect-broker broker))))
+    (cond
+      ((null child) (reconnect-broker broker))
+      ((enchiridion.compat:process-exit-code child) (restart-child broker))
+      (t (handler-case (reconnect-broker broker)
+           (enchiridion.errors:transport-error ()
+             (restart-child broker)))))))
 
 (defun broker-call (broker operation arguments &key timeout)
   "Send one operation to BROKER and return its result.
@@ -564,7 +647,8 @@ is capped at 16 MiB by READ-FRAME.
 The whole call holds the broker's lock. A request is one frame written and one
 frame read on one stream, so two callers at once would interleave their writes
 and one would read the other's answer, which is a wrong answer and not a
-visible error."
+visible error. The lock has no deadline, so a call queued behind a hung one
+starts its own TIMEOUT when the child answers or the first call gives up."
   (unless (broker-running-p broker)
     (error 'enchiridion.errors:configuration-error
            :key :broker
@@ -580,12 +664,16 @@ visible error."
            (let ((data (exchange broker operation arguments limit)))
              (when (eq data :timeout)
                ;; Only a child can be replaced. The in-process test broker
-               ;; reconnects on the next call instead.
-               (when (broker-child broker)
-                 (ignore-errors (restart-child broker)))
-               (error 'enchiridion.errors:transport-error
-                      :detail (format nil "The tool ~A did not answer within ~A seconds, so the broker was restarted."
-                                      operation limit)))
+               ;; reconnects on the next call, and the message says which of
+               ;; the two happened.
+               (let ((restarted (and (broker-child broker)
+                                     (ignore-errors (restart-child broker)))))
+                 (error 'enchiridion.errors:transport-error
+                        :detail (if restarted
+                                    (format nil "The tool ~A did not answer within ~A seconds, so the broker was restarted."
+                                            operation limit)
+                                    (format nil "The tool ~A did not answer within ~A seconds."
+                                            operation limit)))))
              (if (gethash "ok" data)
                  (gethash "result" data)
                  (error 'enchiridion.errors:tool-error

@@ -308,6 +308,31 @@ answered rather than refused."
              (ok (eq :openai (enchiridion.llm:detect-provider '())))))
       (enchiridion.llm.secrets:clear-secrets)))))
 
+(deftest a-set-but-empty-key-does-not-select-a-provider ()
+  ;; `OPENAI_API_KEY=` leaves the name set and empty. Reading that as present
+  ;; selected OpenAI and sent an empty credential.
+  (with-shipped-providers
+   (with-empty-catalog
+    (enchiridion.llm.secrets:clear-secrets)
+    (unwind-protect
+         (progn
+           (enchiridion.compat:set-environment-variable "OPENAI_API_KEY" "")
+           (enchiridion.compat:set-environment-variable "ANTHROPIC_API_KEY"
+                                                       "fake-anthropic-key-123456")
+           (testing "the empty variable is not a key"
+             (ng (enchiridion.llm::provider-key-present-p "OPENAI_API_KEY")))
+           (testing "so the provider with the real key is selected"
+             (ok (eq :anthropic (enchiridion.llm:detect-provider '()))))
+           (enchiridion.compat:unset-environment-variable "ANTHROPIC_API_KEY")
+           (testing "and with no key at all the default is still OpenAI"
+             (ok (eq :openai (enchiridion.llm:detect-provider '()))))
+           (testing "an unset variable is not present either"
+             (enchiridion.compat:unset-environment-variable "OPENAI_API_KEY")
+             (ng (enchiridion.llm::provider-key-present-p "OPENAI_API_KEY"))))
+      (enchiridion.compat:unset-environment-variable "OPENAI_API_KEY")
+      (enchiridion.compat:unset-environment-variable "ANTHROPIC_API_KEY")
+      (enchiridion.llm.secrets:clear-secrets)))))
+
 (deftest a-catalog-host-and-a-lone-catalog-key-are-detected ()
   (with-shipped-providers
    (with-fixture-catalog
@@ -506,3 +531,99 @@ answered rather than refused."
       (ok (not (null row)))
       (ok (eq :not-a-real-handler (getf row :api)))
       (ng (getf row :supported-p)))))
+
+;;; Key variables named more than once.
+
+(deftest a-key-variable-list-is-read-by-every-reader ()
+  ;; :API-KEY-ENV accepts one name or a list. The two readers that name the
+  ;; variable in a message and feed the loader read only a string, so a list
+  ;; reached them as a type error or as nothing.
+  (with-shipped-providers
+   (with-empty-catalog
+    (let ((config '(:llm (:provider :openai)
+                     (:api-key-env ("FIRST_KEY" "SECOND_KEY")))))
+      (testing "the name a message prints is the first one"
+        (ok (string= "FIRST_KEY" (enchiridion.llm:default-api-key-env config))))
+      (testing "the provider tries both first, then the row's own name"
+        ;; The row's own name stays as the last fallback, so a configured name
+        ;; this process has not loaded does not leave the provider keyless.
+        (ok (equal '("FIRST_KEY" "SECOND_KEY" "OPENAI_API_KEY")
+                   (enchiridion.llm:provider-env
+                    (enchiridion.llm:resolve-provider config :api-key nil)))))
+      (testing "the loader is told about both"
+        (let ((names (enchiridion.llm:provider-key-names config)))
+          (ok (member "FIRST_KEY" names :test #'string=))
+          (ok (member "SECOND_KEY" names :test #'string=))))
+      (testing "an empty name in the list is dropped rather than loaded"
+        (ok (equal '("FIRST_KEY")
+                   (enchiridion:config-api-key-env-list
+                    '(:llm (:api-key-env ("FIRST_KEY" "" nil)))))))))))
+
+;;; Numeric options written as text.
+
+(deftest a-numeric-option-that-is-not-a-number-uses-the-adapter-default ()
+  ;; A quoted number used to reach a structure slot and stop the command with
+  ;; a type error that named the slot, not the key.
+  (with-empty-catalog
+    (flet ((backend (config)
+             (let ((*error-output* (make-string-output-stream)))
+               (enchiridion.llm:resolve-backend :config config :api-key "k"))))
+      (testing "a quoted timeout is the sixty second default"
+        (ok (= 60 (enchiridion.llm::openai-connection-timeout
+                   (backend '(:llm (:provider :openai) (:timeout "30")))))))
+      (testing "a quoted retry count is the two attempt default"
+        (ok (= 2 (enchiridion.llm::openai-connection-retries
+                  (backend '(:llm (:provider :openai) (:retries "1")))))))
+      (testing "a quoted reply cap is the Messages default"
+        (ok (eql 4096 (enchiridion.llm::anthropic-connection-max-tokens
+                       (backend '(:llm (:provider :anthropic) (:max-tokens "4096")))))))
+      (testing "an explicit NIL is unset, which is the same default"
+        (ok (= 60 (enchiridion.llm::openai-connection-timeout
+                   (backend '(:llm (:provider :openai) (:timeout nil)))))))
+      (testing "a whole number still wins"
+        (ok (= 7 (enchiridion.llm::openai-connection-timeout
+                  (backend '(:llm (:provider :openai) (:timeout 7)))))))
+      (testing "the ignored option is named once, on the error stream"
+        (let ((*error-output* (make-string-output-stream)))
+          (enchiridion.llm:resolve-backend
+           :config '(:llm (:provider :openai) (:timeout "30")) :api-key "k")
+          (let ((line (get-output-stream-string *error-output*)))
+            (ok (search "TIMEOUT" line))
+            (ok (search "OPENAI" line))))))))
+
+;;; The wire and the row it is sent to.
+
+(deftest a-wire-the-selected-row-does-not-speak-is-refused ()
+  ;; Without an endpoint of its own, :BACKEND :OPENAI posted chat completions
+  ;; to api.anthropic.com and :BACKEND :BEDROCK-INVOKE signed nothing.
+  (with-shipped-providers
+   (with-empty-catalog
+    (enchiridion.llm.secrets:clear-secrets)
+    (unwind-protect
+         (progn
+           (enchiridion.llm.secrets:register-secret "ANTHROPIC_API_KEY"
+                                                    "fake-anthropic-key-123456")
+           (testing "the refusal names the key and both wires"
+             (let ((condition (race-condition
+                               (lambda ()
+                                 (enchiridion.llm:resolve-backend
+                                  :config '(:llm (:backend :openai) (:provider nil))
+                                  :api-key "k")))))
+               (ok condition)
+               (ok (eq :backend (enchiridion.errors::configuration-key condition)))
+               (ok (search ":provider" (enchiridion.errors:error-detail condition)
+                           :test #'char-equal))
+               (ok (search ":base-url" (enchiridion.errors:error-detail condition)
+                           :test #'char-equal))))
+           (testing "a named row makes the wire the operator's to choose"
+             (ok (enchiridion.llm:backendp
+                  (enchiridion.llm:resolve-backend
+                   :config '(:llm (:backend :openai) (:provider :anthropic))
+                   :api-key "k"))))
+           (testing "and a named endpoint does too"
+             (ok (enchiridion.llm:backendp
+                  (enchiridion.llm:resolve-backend
+                   :config '(:llm (:backend :openai)
+                             (:base-url "https://api.anthropic.com/"))
+                   :api-key "k")))))
+      (enchiridion.llm.secrets:clear-secrets)))))

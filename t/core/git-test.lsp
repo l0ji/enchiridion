@@ -575,6 +575,138 @@
           (ok (null detail))
           (ok (null reported)))))))
 
+(deftest a-live-index-lock-is-left-in-place ()
+  (with-scratch-directory (directory)
+    (enchiridion.git:git-init directory)
+    (write-text (merge-pathnames "SOUL.md" directory) "identity\n")
+    (enchiridion.git:git-commit-all directory "first" :environment (environment))
+    (write-text (merge-pathnames "WORLD.md" directory) "world\n")
+    (let ((lock (merge-pathnames ".git/index.lock" directory))
+          (reported '()))
+      (write-text lock "")
+      (let ((enchiridion.git::*stale-lock-recovery-p* t)
+            (enchiridion.git:*stale-lock-reporter*
+              (lambda (lock quarantine age)
+                (declare (ignore age))
+                (push (list lock quarantine) reported))))
+        (multiple-value-bind (result detail)
+            (enchiridion.git:git-commit-all directory "second" :environment (environment))
+          (testing "the refusal is reported"
+            (ok (null result))
+            (ok (search "index.lock" detail)))
+          (testing "but a lock younger than the stale threshold is not removed"
+            (ok (probe-file lock))
+            (ok (null reported))))))))
+
+(deftest a-stale-index-lock-is-moved-aside-and-the-commit-retried ()
+  ;; Age is not proof that the writer is gone, so the recovery renames the file
+  ;; instead of deleting it: a live lock can be restored and a crash leaves it.
+  (with-scratch-directory (directory)
+    (enchiridion.git:git-init directory)
+    (write-text (merge-pathnames "SOUL.md" directory) "identity\n")
+    (enchiridion.git:git-commit-all directory "first" :environment (environment))
+    (write-text (merge-pathnames "WORLD.md" directory) "world\n")
+    (let ((lock (merge-pathnames ".git/index.lock" directory))
+          (reported '()))
+      (write-text lock "a half written index")
+      (let ((enchiridion.git::+stale-index-lock-seconds+ -1)
+            (enchiridion.git::*stale-lock-recovery-p* t)
+            (enchiridion.git:*stale-lock-reporter*
+              (lambda (path quarantine age)
+                (push (list path quarantine age) reported))))
+        (multiple-value-bind (result detail)
+            (enchiridion.git:git-commit-all directory "second" :environment (environment))
+          (testing "the retry records the change"
+            (ok (stringp result))
+            (ok (= 40 (length result)))
+            (ok (null detail)))
+          (testing "the stale lock is moved out of Git's way and reported"
+            (ok (null (probe-file lock)))
+            (ok (= 1 (length reported)))
+            (let* ((entry (first reported))
+                   (quarantine (second entry)))
+              (ok (equal (first entry) lock))
+              (ok (probe-file quarantine))
+              (testing "and the moved file keeps what it held"
+                (ok (string= "a half written index"
+                             (with-open-file (stream quarantine)
+                               (let ((text (make-string (file-length stream))))
+                                 (read-sequence text stream)
+                                 text)))))
+              (testing "the report says how old the lock was"
+                (ok (integerp (third entry)))
+                (ok (not (minusp (third entry))))))))))))
+
+(deftest a-stale-lock-is-not-removed-for-an-unrelated-failure ()
+  (with-scratch-directory (directory)
+    (enchiridion.git:git-init directory)
+    (write-text (merge-pathnames "SOUL.md" directory) "identity\n")
+    (write-text (merge-pathnames ".git/index.lock" directory) "")
+    (let ((lock (merge-pathnames ".git/index.lock" directory))
+          (reported '()))
+      (let ((enchiridion.git::+stale-index-lock-seconds+ -1)
+            (enchiridion.git::*stale-lock-recovery-p* t)
+            (enchiridion.git:*stale-lock-reporter*
+              (lambda (lock quarantine age)
+                (declare (ignore age))
+                (push (list lock quarantine) reported))))
+        (with-functions
+            ((enchiridion.compat:run-program-capture
+              (lambda (program arguments &key timeout environment)
+                (declare (ignore program arguments timeout environment))
+                (values "fatal: hook refused" 128))))
+          (multiple-value-bind (result detail)
+              (enchiridion.git:git-commit-all directory "second")
+            (ok (null result))
+            (ok (search "hook refused" detail))
+            (testing "only a lock refusal authorizes a recovery"
+              (ok (probe-file lock))
+              (ok (null reported)))))))))
+
+(deftest stale-lock-recovery-is-off-unless-an-operator-opts-in ()
+  ;; Age and a rename are not fencing: a second process, container, or hand-run
+  ;; Git command can hold the lock longer than any threshold. Recovery is off
+  ;; by default, and an operator opts in only when this process is the only
+  ;; writer.
+  (with-scratch-directory (directory)
+    (enchiridion.git:git-init directory)
+    (write-text (merge-pathnames "SOUL.md" directory) "identity\n")
+    (enchiridion.git:git-commit-all directory "first" :environment (environment))
+    (write-text (merge-pathnames "WORLD.md" directory) "world\n")
+    (let ((lock (merge-pathnames ".git/index.lock" directory))
+          (reported '()))
+      (testing "the default is off"
+        (ng enchiridion.git::*stale-lock-recovery-p*))
+      (write-text lock "kept")
+      (let ((enchiridion.git::+stale-index-lock-seconds+ -1)
+            (enchiridion.git:*stale-lock-reporter*
+              (lambda (lock quarantine age)
+                (declare (ignore age))
+                (push (list lock quarantine) reported))))
+        (multiple-value-bind (result detail)
+            (enchiridion.git:git-commit-all directory "second" :environment (environment))
+          (testing "a stale lock is left alone and the refusal names the opt-in"
+            (ok (null result))
+            (ok (search "index.lock" detail))
+            (ok (search "stale-lock recovery is off" detail))
+            (ok (probe-file lock))
+            (ok (string= "kept" (with-open-file (stream lock)
+                                  (let ((text (make-string (file-length stream))))
+                                    (read-sequence text stream)
+                                    text))))
+            (ok (null reported))))
+        (testing "and an operator who opts in gets the recovery and the retry"
+          (let ((enchiridion.git::*stale-lock-recovery-p* t))
+            (multiple-value-bind (result detail)
+                (enchiridion.git:git-commit-all directory "second"
+                                                :environment (environment))
+              (ok (stringp result))
+              (ok (= 40 (length result)))
+              (ok (null detail))
+              (ok (null (probe-file lock)))
+              (ok (= 1 (length reported)))
+              (ok (probe-file (second (first reported)))))))))))
+
 (deftest an-add-refusal-is-reported-and-skips-the-commit ()
   (with-scratch-directory (directory)
     (ensure-directories-exist (merge-pathnames ".git/" directory))

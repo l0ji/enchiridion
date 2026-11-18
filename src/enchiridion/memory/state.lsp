@@ -40,6 +40,10 @@
 ;;;; call to a function that is neither defined nor declared yet is exactly the
 ;;;; warning this build refuses.
 
+(defparameter +state-schema+ 1
+  "The state schema this code writes. A file names its schema so a newer
+version's fields can be kept rather than silently dropped by an older one.")
+
 (declaim (ftype (function () hash-table) default-bootstrap-record))
 
 (defun default-bootstrap-record ()
@@ -58,7 +62,7 @@
 The template init writes and this function must agree, because the file is
 read back into this shape on the first call."
   (let ((state (make-hash-table :test #'equal)))
-    (setf (gethash "schema" state) 1
+    (setf (gethash "schema" state) +state-schema+
           (gethash "generation" state) 0
           (gethash "bootstrap" state) (default-bootstrap-record))
     state))
@@ -73,13 +77,21 @@ too: a state.json a human edited by hand should cost the agent a fresh start,
 not a type error three functions later. Step numbers are kept as a sorted,
 duplicate-free vector because that is what STRINGIFY writes as a JSON array."
   (let ((record (default-bootstrap-record)))
+    ;; Preserve keys written by newer versions
+    (maphash (lambda (key value)
+               (unless (member key '("step" "done" "complete") :test #'string=)
+                 (setf (gethash key record) value)))
+             candidate)
     (let ((step (gethash "step" candidate)))
       (when (and (integerp step) (not (minusp step)))
         (setf (gethash "step" record) step)))
     (let ((done (gethash "done" candidate)))
       (when (vectorp done)
         (setf (gethash "done" record)
-              (coerce (sort (remove-duplicates (remove-if-not #'integerp (coerce done 'list)))
+              (coerce (sort (remove-duplicates
+                             (remove-if-not (lambda (number)
+                                              (and (integerp number) (plusp number)))
+                                            (coerce done 'list)))
                             #'<)
                       'vector))))
     (when (gethash "complete" candidate)
@@ -94,11 +106,19 @@ from DEFAULT-STATE. A JSON document that is not an object is not a state."
   (if (not (hash-table-p candidate))
       (default-state)
       (let ((state (default-state)))
+        (maphash (lambda (key value)
+                   (unless (member key '("schema" "generation" "bootstrap")
+                                   :test #'string=)
+                     (setf (gethash key state) value)))
+                 candidate)
+        ;; A schema or generation that is not a non-negative integer is a hand
+        ;; edit, and the fresh value is the safe reading. A later schema number
+        ;; is kept: an older process must not downgrade a newer file.
         (let ((schema (gethash "schema" candidate)))
-          (when (integerp schema)
+          (when (and (integerp schema) (not (minusp schema)))
             (setf (gethash "schema" state) schema)))
         (let ((generation (gethash "generation" candidate)))
-          (when (integerp generation)
+          (when (and (integerp generation) (not (minusp generation)))
             (setf (gethash "generation" state) generation)))
         (let ((bootstrap (gethash "bootstrap" candidate)))
           (when (hash-table-p bootstrap)
@@ -143,28 +163,51 @@ the parse."
             (default-state)))
     (error () (default-state))))
 
+(defvar *state-write-lock* (bordeaux-threads:make-lock "enchiridion state writes"))
+
+(defvar *state-write-sequence* 0
+  "How many state writes this process has started, for a unique name.")
+
+(defun state-temporary-name ()
+  "Return a temporary state file name unique to this process and write."
+  (bordeaux-threads:with-lock-held (*state-write-lock*)
+    (format nil "state.json.new.~D.~D.~D"
+            (enchiridion.compat:process-id)
+            (get-internal-real-time)
+            (incf *state-write-sequence*))))
+
 (declaim (ftype (function (t hash-table) hash-table) write-state))
 
 (defun write-state (directory state)
   "Write STATE to DIRECTORY/state.json and return STATE.
 
-The bytes go to state.json.new first and the rename happens last, so a crash
-can leave the old state or the new one, never half of either. The overwriting
-rename is UIOP's: it is atomic where the implementation allows it, and this
-runs on a five second status timer."
+The bytes go to a uniquely named state.json.new.* first and the rename happens
+last, so a crash leaves the old state or the new one, and two writers cannot
+share one temporary. A failed write removes its temporary. The overwriting
+rename is UIOP's."
   (let* ((path (state-file directory))
-         (temporary (merge-pathnames "state.json.new"
-                                     (uiop:ensure-directory-pathname directory))))
+         ;; Two writers with one fixed temporary name would write the same
+         ;; file at once and publish a mix of both. The suffix is unique per
+         ;; write, so each rename publishes one whole state.
+         (temporary (merge-pathnames
+                     (state-temporary-name)
+                     (uiop:ensure-directory-pathname directory)))
+         (renamed-p nil))
     (ensure-directories-exist temporary)
-    (with-open-file (stream temporary
-                            :direction :output
-                            :if-exists :supersede
-                            :if-does-not-exist :create
-                            :external-format :utf-8)
-      (write-string (com.inuoe.jzon:stringify state) stream)
-      (terpri stream))
-    (uiop:rename-file-overwriting-target temporary path)
-    state))
+    (unwind-protect
+         (progn
+           (with-open-file (stream temporary
+                                   :direction :output
+                                   :if-exists :error
+                                   :if-does-not-exist :create
+                                   :external-format :utf-8)
+             (write-string (com.inuoe.jzon:stringify state) stream)
+             (terpri stream))
+           (uiop:rename-file-overwriting-target temporary path)
+           (setf renamed-p t)
+           state)
+      (unless renamed-p
+        (ignore-errors (delete-file temporary))))))
 
 (declaim (ftype (function (t) hash-table) ensure-state))
 
@@ -242,7 +285,11 @@ removal are repeated here so that a hand-edited file cannot make completeness
 depend on the order the file happened to list."
   (let ((done (gethash "done" record)))
     (if (vectorp done)
-        (the list (sort (remove-duplicates (remove-if-not #'integerp (coerce done 'list))) #'<))
+        (the list (sort (remove-duplicates
+                         (remove-if-not (lambda (number)
+                                          (and (integerp number) (plusp number)))
+                                        (coerce done 'list)))
+                        #'<))
         '())))
 
 ;;;; The bootstrap state machine.

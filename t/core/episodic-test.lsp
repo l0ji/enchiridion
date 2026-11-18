@@ -490,6 +490,24 @@ CALLS, when given, is a cons whose car counts the requests."
         (ok (equal batched
                    (loop for id from 1 to 6 collect (episode-rarity store id))))))))
 
+(deftest a-lexical-hint-reads-a-bounded-prefix-of-its-body ()
+  ;; RARITY-OF runs one index count per distinct token. An episode can be one
+  ;; whole tool result, so an unbounded list cost thousands of queries.
+  (with-store (store)
+    (let* ((head (with-output-to-string (s)
+                   (dotimes (index 64) (format s "tok~D " index))))
+           (one (format nil "~A~A" head (make-string 4000 :initial-element #\a)))
+           (two (format nil "~A~A" head (make-string 4000 :initial-element #\b))))
+      (testing "the weight reads at most *HINT-TOKEN-LIMIT* distinct tokens"
+        (ok (= enchiridion.memory::*hint-token-limit*
+               (length (enchiridion.memory::hint-tokens one)))))
+      (testing "so two long bodies that share their first tokens weigh the same"
+        (ok (= (enchiridion.memory::rarity-of store one)
+               (enchiridion.memory::rarity-of store two))))
+      (testing "and a short body keeps every token it has"
+        (ok (= 4 (length (enchiridion.memory::hint-tokens
+                          "deploy key in vault ops"))))))))
+
 (deftest a-changed-model-is-pending-and-keeps-the-old-vectors ()
   (with-store (store)
     (let ((write (turn-writer store)))

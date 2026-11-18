@@ -643,6 +643,61 @@ overrides the default here rather than losing to it."
       (ok (signals (enchiridion.llm:anthropic-parse-completion payload)
                    'enchiridion.errors:backend-error)))))
 
+(deftest thinking-is-refused-in-whichever-field-the-profile-reads ()
+  ;; The refusal has to read the field the parser stores. A profile reporting
+  ;; under `reasoning' used to pass and then lose its thinking on replay.
+  (flet ((reply (field)
+           (let ((data (enchiridion.llm:parse-json *string-arguments-reply*)))
+             (setf (getf (getf (first (getf data :choices)) :message) field)
+                   "private reasoning")
+             data)))
+    (testing "a profile that names DeepSeek's field"
+      (ok (signals (enchiridion.llm:parse-completion (reply :reasoning_content)
+                                                     :dialect (dialect :deepseek))
+                   'enchiridion.errors:backend-error)))
+    (testing "a profile that names OpenRouter's field"
+      (ok (signals (enchiridion.llm:parse-completion (reply :reasoning)
+                                                     :dialect (dialect :openrouter))
+                   'enchiridion.errors:backend-error)))
+    (testing "and a wire whose profile names no field still reads the name"
+      (ok (signals (enchiridion.llm:parse-completion (reply :reasoning_content))
+                   'enchiridion.errors:backend-error)))
+    (testing "an answer that carries thinking and no call is still a reply"
+      (let* ((data (enchiridion.llm:parse-json *openrouter-reply*))
+             (completion (enchiridion.llm:parse-completion
+                          data :dialect (dialect :openrouter))))
+        (ok (string= "hello" (enchiridion.llm:completion-text completion)))
+        (ok (string= "the notes" (enchiridion.llm:completion-reasoning-text completion)))))))
+
+(deftest a-dialect-field-stated-as-nil-is-not-the-generic-default ()
+  ;; Config.lsp spells `this endpoint has no model list' as :models-path NIL;
+  ;; the reader answered the generic path, so the request was sent anyway.
+  (testing "the reader tells a stated NIL from an absent field"
+    (ok (null (enchiridion.llm:dialect-field
+               (dialect :openai :overrides (list :models-path nil))
+               :models-path "models")))
+    (ok (string= "models"
+                 (enchiridion.llm:dialect-field (dialect :openai)
+                                                :models-path "models")))
+    (testing "and a profile's own NIL is a value too"
+      (ok (null (enchiridion.llm:dialect-field
+                 (enchiridion.llm:make-dialect-for :vertex :protocol :anthropic)
+                 :models-path "v1/models")))))
+  (testing "a row that says it has no list is not asked for one"
+    (let* ((seen (list nil))
+           (enchiridion.llm::*http-get-function* (capture-get "{\"data\":[]}" seen))
+           (row (provider :options '(:dialect-overrides (:models-path nil)))))
+      (ok (null (funcall (enchiridion.llm::api-handler-list-models
+                          (handler :openai-chat))
+                         row)))
+      (ok (null (car seen)))))
+  (testing "and a row that states nothing is asked at the generic path"
+    (let* ((seen (list nil))
+           (enchiridion.llm::*http-get-function* (capture-get "{\"data\":[]}" seen))
+           (row (provider)))
+      (funcall (enchiridion.llm::api-handler-list-models (handler :openai-chat)) row)
+      (ok (search "/v1/models" (first (car seen)))))))
+
 
 (deftest configured-betas-reach-the-messages-header ()
   (dolist (betas '(("beta-one" "beta-two") "beta-one, beta-two"))

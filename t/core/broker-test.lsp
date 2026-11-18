@@ -276,3 +276,148 @@
              (enchiridion.tools.broker:broker-verify-plugin #p"/tmp/")
              (ok (null (member "--digests" argv :test #'string=)))))
       (setf (symbol-function 'enchiridion.compat:run-program-capture) original))))
+
+;;;; Frames, load requests, and what a timeout says happened.
+
+(deftest the-frame-limit-is-one-number-for-both-directions ()
+  (ok (= (* 16 1024 1024) enchiridion.tools.broker::+frame-limit+))
+  (testing "a frame past the limit is refused before anything is written"
+    ;; A header written before the limit check left half a frame in the
+    ;; socket, and the next call read it as its own answer.
+    (let ((path (merge-pathnames (format nil "enchiridion-frame-~D.bin"
+                                         (random most-positive-fixnum))
+                                 #p"/tmp/"))
+          (enchiridion.tools.broker::+frame-limit+ 64))
+      (unwind-protect
+           (progn
+             (with-open-file (stream path :direction :output
+                                          :element-type '(unsigned-byte 8)
+                                          :if-exists :supersede
+                                          :if-does-not-exist :create)
+               (ok (signals (enchiridion.tools.broker::write-frame
+                             stream (make-string 65))
+                            'enchiridion.errors:transport-error)))
+             (with-open-file (stream path :element-type '(unsigned-byte 8))
+               (ok (zerop (file-length stream))
+                   "not one byte of the refused frame reached the stream")))
+        (ignore-errors (delete-file path))))))
+
+(deftest a-load-request-without-its-fields-is-refused ()
+  ;; A request with no directory reached PATHNAME as NIL, a type error three
+  ;; frames down. A request with no generation reached the loader as NIL.
+  (let ((broker (enchiridion.tools.broker:make-broker :socket (scratch-socket)
+                                                      :timeout 5))
+        (called nil))
+    (unwind-protect
+         (progn
+           (setf enchiridion.tools.broker:*load-generation-function*
+                 (lambda (directory generation)
+                   (declare (ignore directory generation))
+                   (setf called t)
+                   (values t "loaded" nil nil)))
+           (enchiridion.tools.broker:broker-start broker :in-process t)
+           (ok (signals (enchiridion.tools.broker:broker-call
+                         broker "load-generation"
+                         (enchiridion.tools.broker::json-object "generation" 4))
+                        'enchiridion.errors:tool-error))
+           (ng called "the loader is never reached without a directory")
+           (ok (signals (enchiridion.tools.broker:broker-call
+                         broker "load-generation"
+                         (enchiridion.tools.broker::json-object "directory" "/tmp/"))
+                        'enchiridion.errors:tool-error))
+           (ng called "and never without a generation"))
+      (enchiridion.tools.broker:broker-stop broker)
+      (setf enchiridion.tools.broker:*load-generation-function* nil))))
+
+(deftest a-timeout-reports-only-the-restart-that-happened ()
+  ;; The message claimed a restart whatever happened. An in-process broker has
+  ;; no child to replace.
+  (enchiridion.tools:clear-registry)
+  (enchiridion.tools:register-tool
+   (enchiridion.tools:make-tool
+    :name "slow"
+    :description "Answer after a pause."
+    :schema '(:object :properties ())
+    :handler (lambda (arguments)
+               (declare (ignore arguments))
+               (sleep 1)
+               "slow answer")))
+  (let ((broker (enchiridion.tools.broker:make-broker :socket (scratch-socket)
+                                                      :timeout 5)))
+    (unwind-protect
+         (progn
+           (enchiridion.tools.broker:broker-start broker :in-process t)
+           (let ((message
+                   (handler-case
+                       (progn (enchiridion.tools.broker:broker-call
+                               broker "slow" nil :timeout 0.1)
+                              nil)
+                     (enchiridion.errors:transport-error (condition)
+                       (enchiridion.errors:error-detail condition)))))
+             (ok (search "did not answer" message))
+             (ng (search "restarted" message)
+                 "an in-process broker has no child to restart")))
+      (enchiridion.tools.broker:broker-stop broker)
+      (enchiridion.tools:clear-registry))))
+
+;;;; Stopping the child.
+
+(deftest a-stopped-child-takes-what-it-started-with-it ()
+  ;; The child's process group was not enough: RUN-PROGRAM gives it a session
+  ;; of its own, and a tool below it another, so the tool outlived every stop.
+  (let* ((directory (uiop:ensure-directory-pathname
+                     (merge-pathnames
+                      (format nil "enchiridion-broker-test-~D/" (random most-positive-fixnum))
+                      (uiop:ensure-directory-pathname *default-pathname-defaults*))))
+         (script (merge-pathnames "child.lsp" directory))
+         (report (merge-pathnames "child.pid" directory)))
+    (ensure-directories-exist script)
+    (unwind-protect
+         (progn
+           (with-open-file (stream script :direction :output :if-exists :supersede
+                                          :if-does-not-exist :create)
+             (format stream "(let ((p (sb-ext:run-program \"/bin/sh\" (list \"-c\" \"sleep 30\")~%                                         :search t :output #p\"/dev/null\"~%                                         :if-output-exists :supersede :wait nil)))~%  (with-open-file (s #p\"~A\" :direction :output~%                                 :if-exists :supersede~%                                 :if-does-not-exist :create)~%    (format s \"~~D~~%\" (sb-ext:process-pid p)))~%  (sleep 60))~%"
+                     (namestring report)))
+           (let ((child (enchiridion.compat:run-program
+                         (enchiridion.compat:lisp-runtime-path)
+                         (list "--non-interactive" "--no-userinit" "--no-sysinit"
+                               "--load" (namestring script))
+                         :output #p"/dev/null" :if-output-exists :supersede
+                         :wait nil)))
+             (unwind-protect
+                  (let ((grandchild nil))
+                    (loop repeat 600
+                          do (setf grandchild
+                                   (and (probe-file report)
+                                        (parse-integer (uiop:read-file-string report)
+                                                       :junk-allowed t)))
+                             (when grandchild (return))
+                             (sleep 0.01))
+                    (ok grandchild "the child started a tool that is still running")
+                    (ok (member grandchild
+                                (enchiridion.compat:process-descendants child))
+                        "the walk finds it two levels down")
+                    (enchiridion.tools.broker::stop-child child)
+                    (loop repeat 300
+                          while (enchiridion.compat:process-alive-p grandchild)
+                          do (sleep 0.01))
+                    (ng (enchiridion.compat:process-alive-p grandchild)
+                        "and stopping the child stops it too")
+                    (ng (enchiridion.compat:process-alive-p
+                         (enchiridion.compat:process-pid child))))
+               (ignore-errors (enchiridion.compat:process-kill child :sigkill :process-group))
+               (ignore-errors (enchiridion.compat:process-reap child)))))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(deftest a-stopping-broker-does-not-spawn-a-child ()
+  ;; A broken call asks for a replacement child. A stopping broker would spawn
+  ;; one after the socket was removed, and nothing would stop it.
+  (let ((broker (enchiridion.tools.broker:make-broker :socket (scratch-socket)
+                                                      :timeout 1)))
+    (ok (signals (enchiridion.tools.broker::restart-child broker)
+                 'enchiridion.errors:transport-error))
+    (ng (enchiridion.tools.broker::broker-child broker) "no child was started")
+    (ok (signals (enchiridion.tools.broker::recover-broker broker)
+                 'enchiridion.errors:transport-error))
+    (ok (signals (enchiridion.tools.broker:broker-call broker "ping" nil)
+                 'enchiridion.errors:configuration-error))))

@@ -115,6 +115,17 @@ span is not an assertion."
 (defparameter +deriver-context-limit+ 600
   "How much of the turn before a record reaches the deriver's prompt.")
 
+(defparameter +deriver-body-limit+ 20000
+  "How much of the record itself reaches the deriver's prompt.
+The cut is a prefix of the body, and a span is validated against the whole
+record.")
+
+(defun deriver-record-text (body)
+  "Return BODY cut to the characters the deriver's prompt carries."
+  (if (> (length body) +deriver-body-limit+)
+      (subseq body 0 +deriver-body-limit+)
+      body))
+
 (defun previous-episode-body (store episode)
   "Return the body of the turn before EPISODE in its session, or NIL.
 An answer is about the question before it, and a claim like \"the deploy key
@@ -154,7 +165,7 @@ T2 pass has a cost the gates and the usage report can both see."
                                     (episode-session episode)
                                     (episode-role episode)
                                     (episode-channel episode)
-                                    body))))
+                                    (deriver-record-text body)))))
            (completion (enchiridion.llm:complete backend messages :model model)))
       (when *derivation-tokens*
         (incf *derivation-tokens*

@@ -19,6 +19,21 @@
   "How long a status file counts as live. The supervisor rewrites it every
 tick, so a file this old was written by a process that has stopped.")
 
+(defparameter +status-refresh-seconds+ 1
+  "How often a slow control request rewrites the status file while it runs.
+A reload can take minutes, and the poll loop is the thread inside the handler,
+so without a second writer every shell command would read a live process as a
+dead one.")
+
+(defparameter +status-report-seconds+ 30
+  "How often the same failing write is reported again.
+The poll loop reports and carries on, so once a second would bury the log.")
+
+(defun delete-file-if-present (path)
+  "Delete PATH when it still exists. A vanished entry is already clean."
+  (when (probe-file path)
+    (ignore-errors (delete-file path))))
+
 ;;;; The two files.
 
 (declaim (ftype (function (&optional t) pathname) control-file))
@@ -35,27 +50,42 @@ tick, so a file this old was written by a process that has stopped.")
   (merge-pathnames "enchiridion.status"
                    (uiop:ensure-directory-pathname run)))
 
+(defparameter *json-write-lock* (bordeaux-threads:make-lock "json write names"))
+(defvar *json-write-counter* 0)
+
 (declaim (ftype (function (pathname t) t) write-json-file))
 
 (defun write-json-file (path table)
-  "Write TABLE to PATH as JSON, then rename it into place.
+  "Write TABLE to PATH as JSON, then rename it into place. Return PATH.
 
-The rename is what makes a reader safe: a reader either sees the old file or
-the new one, never half of either. The status file is read by another process
-while this one rewrites it, so half a file is a real state and not a theory."
+The rename makes a reader safe: it sees the old file or the new one, never half
+of either, which matters because another process reads this file.
+
+The staging name carries the process id and a counter: a single shared name
+lets two writers interleave, and a slow control request writes alongside the
+poll loop."
   (let* ((directory (uiop:pathname-directory-pathname path))
          (temporary (merge-pathnames
-                     (format nil "~A.new" (file-namestring path))
+                     (format nil "~A.~D-~D.new"
+                             (file-namestring path)
+                             (enchiridion.compat:process-id)
+                             (bordeaux-threads:with-lock-held (*json-write-lock*)
+                               (incf *json-write-counter*)))
                      directory)))
     (ensure-directories-exist temporary)
-    (with-open-file (stream temporary
-                            :direction :output
-                            :if-exists :supersede
-                            :if-does-not-exist :create
-                            :external-format :utf-8)
-      (write-string (com.inuoe.jzon:stringify table) stream))
-    (rename-file temporary path)
-    path))
+    (unwind-protect
+         (progn
+           (with-open-file (stream temporary
+                                   :direction :output
+                                   :if-exists :supersede
+                                   :if-does-not-exist :create
+                                   :external-format :utf-8)
+             (write-string (com.inuoe.jzon:stringify table) stream))
+           (rename-file temporary path)
+           path)
+      ;; A failed stringify or rename leaves a staging file behind, and a
+      ;; reader listing the directory would have to guess what it is.
+      (delete-file-if-present temporary))))
 
 (declaim (ftype (function (&optional t) t) read-status))
 
@@ -139,6 +169,14 @@ A reload that refused a generation is the refusal this exists for: the operator
 script that asked has to be able to tell it from a reload that landed."
   (and (hash-table-p status) (gethash "report-ok" status)))
 
+(declaim (ftype (function (t) t) status-writes))
+
+(defun status-writes (status)
+  "Return the write report the status file carries, or NIL.
+A reader that wants the newest answer asks the running process through
+SUPERVISOR-WRITE-REPORT: a file cannot describe the failure of its own write."
+  (and (hash-table-p status) (gethash "writes" status)))
+
 (declaim (ftype (function (t) t) status-heartbeat))
 
 (defun status-heartbeat (status)
@@ -165,18 +203,22 @@ it stopped."
 
 (defparameter *control-id-lock* (bordeaux-threads:make-lock "control ids"))
 (defvar *control-id* 0)
-(defparameter +control-retention-seconds+ 60)
+(defparameter +control-retention-seconds+ 60
+  "How long an answer or a staging file stays in the spool.")
+
+(defparameter +control-pending-seconds+ 900
+  "How long a queued request may wait its turn before it is answered expired.
+
+The poll loop runs one request at a time, and the broker call limit bounds one
+at 660 seconds. Fifteen minutes is longer than that, so a queue drains; the
+number keeps an abandoned request from holding its slot forever.")
+
 (defparameter +control-file-limit+ 256)
 
 (defun control-spool (run)
   "Return the directory that holds request, response, and claim files."
   (merge-pathnames "control/" (uiop:ensure-directory-pathname run)))
 
-
-(defun delete-file-if-present (path)
-  "Delete PATH when it still exists. A vanished entry is already clean."
-  (when (probe-file path)
-    (ignore-errors (delete-file path))))
 
 (defun control-file-older-p (path cutoff)
   "Return T when PATH still exists and was last written before CUTOFF."
@@ -203,29 +245,33 @@ it stopped."
 
 (defun clean-control-spool (run)
   "Remove expired responses and staging files, and abandoned claims.
+
 Pending requests are never removed here: they are the operator's work and
 survive a restart. A claim is abandoned only when it is old and no request or
 response still names it, which is what a process that died before publishing
-leaves behind."
+leaves behind.
+
+The listing is taken again after the expired files are gone, and the claim
+pass reads that listing. Removing a claim because an expired response named it
+would release the slot of a request still pending in it."
   (ensure-directories-exist (control-spool run))
-  (let* ((paths (uiop:directory-files (control-spool run)))
-         (cutoff (- (get-universal-time) +control-retention-seconds+)))
-    (dolist (path paths)
+  (let ((cutoff (- (get-universal-time) +control-retention-seconds+)))
+    (dolist (path (uiop:directory-files (control-spool run)))
       (when (and (member (pathname-type path) '("new" "response") :test #'equal)
                  (control-file-older-p path cutoff))
-        (when (probe-file path)
-          (delete-file-if-present path)
-          (delete-file-if-present (control-entry-claim path)))))
-    (dolist (path paths)
-      (when (and (equal "claim" (pathname-type path))
-                 (control-file-older-p path cutoff)
-                 (not (control-entry-live-p path paths)))
         (delete-file-if-present path)))
-    (dolist (path paths)
-      (unless (member (pathname-type path) '("request" "response" "claim" "new")
-                      :test #'equal)
-        (when (control-file-older-p path cutoff)
-          (delete-file-if-present path))))))
+    (let ((paths (uiop:directory-files (control-spool run))))
+      (dolist (path paths)
+        (unless (member (pathname-type path) '("request" "response" "claim" "new")
+                        :test #'equal)
+          (when (control-file-older-p path cutoff)
+            (delete-file-if-present path))))
+      (let ((current (uiop:directory-files (control-spool run))))
+        (dolist (path current)
+          (when (and (equal "claim" (pathname-type path))
+                     (control-file-older-p path cutoff)
+                     (not (control-entry-live-p path current)))
+            (delete-file-if-present path)))))))
 
 (defun reserve-control-slot (run)
   "Reserve one exclusive admission slot under RUN and return its claim path."
@@ -261,25 +307,78 @@ leaves behind."
       (when (probe-file temporary) (delete-file temporary))
       (unless (probe-file path) (delete-file claim)))))
 
+(defparameter +control-wait-seconds+ 5
+  "How long a shell command waits for its answer by default.
+
+A picked up request answers within a second or so, but one queued behind a
+reload waits as long as the reload. A caller that gave up is not a caller that
+found no supervisor.")
+
+(declaim (ftype (function (t t) string) control-wait-detail))
+
+(defun control-wait-detail (run path)
+  "Return one line about the request at PATH, which has not been answered yet.
+
+A request file that still exists has not been picked up: the poll loop runs one
+at a time, so the caller is told how many are ahead. A file that is gone has
+been taken and its handler is running."
+  (if (probe-file path)
+      (let* ((slot (or (parse-integer (pathname-name path) :junk-allowed t)
+                       most-positive-fixnum))
+             (requests (remove-if-not
+                        (lambda (other) (equal "request" (pathname-type other)))
+                        (ignore-errors (uiop:directory-files (control-spool run)))))
+             (ahead (count-if (lambda (other)
+                                (let ((other-slot
+                                        (ignore-errors
+                                          (parse-integer (pathname-name other)
+                                                         :junk-allowed t))))
+                                  (and other-slot (< other-slot slot))))
+                              requests)))
+        (if (plusp ahead)
+            (format nil "the request is still queued behind ~D other request~:P."
+                    ahead)
+            (format nil "the request is still queued.")))
+      "the supervisor has taken the request and has not answered it yet."))
+
 (declaim (ftype (function (string &key (:run t) (:wait real)) t) request-control))
 
-(defun request-control (line &key (run (enchiridion:run-directory)) (wait 5))
-  "Return this request's response, or NIL after WAIT seconds."
+(defun request-control (line &key (run (enchiridion:run-directory))
+                                 (wait +control-wait-seconds+))
+  "Ask the supervisor at RUN for LINE and return three values.
+
+The answer and :ANSWERED; NIL and :NO-SUPERVISOR when no status file is fresh;
+NIL, :TIMEOUT and a line about what the request is doing now; or NIL and
+:QUEUE-FULL and a line when it could not be queued at all.
+
+A timed out request is not cancelled: the supervisor has already been told, and
+the shell that gave up cannot tell a request still queued from one being
+handled."
   (check-type wait (real 0 30))
   (unless (status-fresh-p (read-status run))
-    (return-from request-control nil))
-  (let* ((path (queue-control line :run run))
-         (response (make-pathname :type "response" :defaults path))
-         (deadline (+ (get-internal-real-time) (* wait internal-time-units-per-second))))
-    (loop
-      (when (probe-file response)
-        (unwind-protect
-             (return (com.inuoe.jzon:parse
-                      (uiop:read-file-string response :external-format :utf-8)))
-          (delete-file response)
-          (delete-file-if-present (control-entry-claim path))))
-      (when (>= (get-internal-real-time) deadline) (return nil))
-      (sleep 0.05))))
+    (return-from request-control (values nil :no-supervisor nil)))
+  (let ((path (handler-case (queue-control line :run run)
+                (error (condition)
+                  (return-from request-control
+                    (values nil :queue-full
+                            (format nil "the request was not queued: ~A"
+                                    condition)))))))
+    (let ((response (make-pathname :type "response" :defaults path))
+          (deadline (+ (get-internal-real-time)
+                       (* wait internal-time-units-per-second))))
+      (loop
+        (when (probe-file response)
+          (unwind-protect
+               (return (values (com.inuoe.jzon:parse
+                                (uiop:read-file-string response :external-format :utf-8))
+                               :answered nil))
+            ;; A response another reader took first is already clean, and the
+            ;; cleanup must not turn that into an error a caller has to catch.
+            (delete-file-if-present response)
+            (delete-file-if-present (control-entry-claim path))))
+        (when (>= (get-internal-real-time) deadline)
+          (return (values nil :timeout (control-wait-detail run path))))
+        (sleep 0.05)))))
 
 ;;;; The supervisor.
 
@@ -303,6 +402,8 @@ leaves behind."
   (broker nil :type t)
   (generation 0 :type integer)
   (channels '() :type list)
+  ;; Keep disabled names visible after removing their channel objects
+  (disabled-channels '() :type list)
   (channel-factory nil :type (or null function))
   (running-p nil :type boolean)
   (heartbeat-p nil :type boolean)
@@ -369,28 +470,142 @@ is a tick loop and a string is a mis-typed configuration key."
 (defun channel-row (channel)
   "Return CHANNEL as the JSON row the status file carries.
 
-ENABLED is true when the configuration enables the channel or when this process
-is running it. A channel started by a --channel flag is enabled in the process
-that is serving, and a row that called it disabled while its state said live
-would be the status file contradicting itself."
-  (let ((row (make-hash-table :test #'equal))
-        (name (enchiridion.channel:channel-name channel)))
-    (setf (gethash "name" row) name)
+ENABLED is true for every channel object a supervisor holds, because presence in
+that list is the statement: a channel that is off is stopped and taken out, and
+one that is configured and off has no object and reaches a reader as a
+DISABLED-CHANNEL-ROW.
+
+Reading the configuration here answered for the wrong thing: a channel started
+by a --channel flag is wanted here and disabled in the configuration, so its row
+called it unwanted."
+  (let ((row (make-hash-table :test #'equal)))
+    (setf (gethash "name" row) (enchiridion.channel:channel-name channel))
     (setf (gethash "state" row)
           (string-downcase (string (enchiridion.channel:channel-state channel))))
-    (setf (gethash "enabled" row)
-          (or (not (null (enchiridion:channel-enabled-p name)))
-              (not (null (enchiridion.channel:channel-live-p channel)))))
+    (setf (gethash "enabled" row) t)
     row))
 
-(declaim (ftype (function (supervisor) pathname) supervisor-write-status))
+(declaim (ftype (function (supervisor) list) configured-channel-names))
 
-(defun supervisor-write-status (supervisor)
-  "Write the status file and return its path.
+(defun configured-channel-names (supervisor)
+  "Return the channel names the configuration has an entry for, lowercase.
+
+The shipped section is read as well as the supervisor's own, because it decides
+a channel's default: a config.lsp that mentions only the webhook still ships a
+disabled Fluxer."
+  (let ((names '()))
+    (dolist (config (list (enchiridion:default-config)
+                          (supervisor-config supervisor)))
+      (dolist (entry (enchiridion:config-section config :channels))
+        (let ((name (first entry)))
+          (when (or (keywordp name) (stringp name))
+            (pushnew (string-downcase (string name)) names :test #'string=)))))
+    (nreverse names)))
+
+(declaim (ftype (function (string) hash-table) disabled-channel-row))
+
+(defun disabled-channel-row (name)
+  "Return the row for a channel this process is not running on purpose.
+
+The state is disabled and not stopped, so a reader can tell a surface the
+operator turned off from one that crashed and is being retried. ENABLED is
+false."
+  (let ((row (make-hash-table :test #'equal)))
+    (setf (gethash "name" row) name)
+    (setf (gethash "state" row) "disabled")
+    (setf (gethash "enabled" row) nil)
+    row))
+
+(declaim (ftype (function (supervisor) vector) supervisor-channel-rows))
+
+(defun supervisor-channel-rows (supervisor)
+  "Return every channel this process knows about, as the status file's rows.
+
+A running channel is one row. A configured or operator-disabled channel is a
+row too: a reader can then tell a surface that was never configured from one
+that is off on purpose.
+
+Rows have the same shape as CHANNEL-ROW's."
+  (let* ((channels (supervisor-channels supervisor))
+         (rows (mapcar #'channel-row channels))
+         (seen (mapcar (lambda (row) (gethash "name" row)) rows))
+         (names (remove-duplicates
+                 (remove-if (lambda (name) (member name seen :test #'string=))
+                            (append (configured-channel-names supervisor)
+                                    (supervisor-disabled-channels supervisor)))
+                 :test #'string=)))
+    (coerce (append rows (mapcar #'disabled-channel-row names)) 'vector)))
+
+(declaim (ftype (function (supervisor) boolean) supervisor-heartbeat-live-p))
+
+(defun supervisor-heartbeat-live-p (supervisor)
+  "Return T when a heartbeat thread is running.
+
+ENABLED says the operator wants a schedule; this says one exists. A thread that
+stopped while the flag stayed true is a schedule nobody runs."
+  (let ((thread (supervisor-heartbeat-thread supervisor)))
+    (and thread (bordeaux-threads:thread-alive-p thread))))
+
+(defvar *status-error-report* nil
+  "The last write failure as (message . universal-time), or NIL.
+It is what keeps the same line out of the log once a second.")
+
+(defvar *status-write-failure* nil
+  "The last write failure as (message . universal-time) since a write last landed.
+NIL means the writes are landing. The next working write clears it, so one
+transient failure does not colour the process.")
+
+(declaim (ftype (function (t t) null) note-write-error))
+
+(defun note-write-error (what condition)
+  "Report that WHAT failed once per +STATUS-REPORT-SECONDS+.
+
+A supervisor whose run directory became unwritable still serves turns, so the
+failure is reported and swallowed. The log and the write report are where the
+operator sees it."
+  (let* ((message (enchiridion.llm.secrets:scrub (princ-to-string condition)))
+         (now (get-universal-time))
+         (last *status-error-report*))
+    (setf *status-write-failure* (cons message now))
+    (unless (and last (string= (car last) message)
+                 (< (- now (cdr last)) +status-report-seconds+))
+      (setf *status-error-report* (cons message now))
+      (format *error-output* "~&enchiridion: ~A failed: ~A~%" what message)
+      (finish-output *error-output*))))
+
+(declaim (ftype (function () null) note-write-ok))
+
+(defun note-write-ok ()
+  "Record that a write landed, so a failure that is over stops being reported."
+  (setf *status-write-failure* nil))
+
+(declaim (ftype (function () hash-table) supervisor-write-report))
+
+(defun supervisor-write-report ()
+  "Return the last write as the JSON object a health reader takes.
+
+\"ok\" is false while writes fail, \"report\" is the last failure, and \"age\" is
+its age in seconds. It describes the write before the one carrying it, because a
+status file cannot report the failure of its own write."
+  (let ((row (make-hash-table :test #'equal))
+        (failure *status-write-failure*))
+    (setf (gethash "ok" row) (null failure))
+    (setf (gethash "report" row) (or (car failure) ""))
+    (setf (gethash "age" row)
+          (if failure (max 0 (- (get-universal-time) (cdr failure))) 0))
+    row))
+
+(declaim (ftype (function (supervisor) hash-table) supervisor-status-table))
+
+(defun supervisor-status-table (supervisor)
+  "Return the status file's contents as a table, without writing them.
 
 Every field a `health` reader needs is here: whether the process runs, the
 generation, the channels, the bootstrap line, and the time. Nothing secret is
-written, because the file is world readable."
+written, because the file is world readable.
+
+The table and the answer a control request gets come from one place. A response
+built by reading the file back would be missing whenever the write failed."
   (let ((table (make-hash-table :test #'equal)))
     (setf (gethash "pid" table) (enchiridion.compat:process-id))
     (setf (gethash "running" table) (supervisor-running-p supervisor))
@@ -407,7 +622,13 @@ written, because the file is world readable."
     (setf (gethash "handled" table) (supervisor-handled supervisor))
     (setf (gethash "heartbeat" table)
           (let ((beat (make-hash-table :test #'equal)))
-            (setf (gethash "enabled" beat) (supervisor-heartbeat-p supervisor))
+            ;; ENABLED answers whether unattended work can happen here: a
+            ;; schedule with no hook attached is off, not on.
+            (setf (gethash "enabled" beat)
+                  (and (supervisor-heartbeat-p supervisor)
+                       (not (null (supervisor-tick-function supervisor)))))
+            (setf (gethash "alive" beat) (supervisor-heartbeat-live-p supervisor))
+            (setf (gethash "requested" beat) (supervisor-tick-requested-p supervisor))
             (setf (gethash "ticks" beat) (supervisor-ticks supervisor))
             (setf (gethash "last-tick" beat) (supervisor-last-tick supervisor))
             (setf (gethash "running" beat) (supervisor-tick-running-p supervisor))
@@ -418,12 +639,39 @@ written, because the file is world readable."
             beat))
     (setf (gethash "root" table) (supervisor-directory supervisor))
     (setf (gethash "config" table) (enchiridion:config-digest (supervisor-config supervisor)))
+    ;; Reports the preceding write
+    (setf (gethash "writes" table) (supervisor-write-report))
     (setf (gethash "channels" table)
           ;; A vector and not a list: an empty list writes as JSON false, and
           ;; a reader that expects a list of channels would then have to treat
-          ;; false and [] as the same thing.
-          (coerce (mapcar #'channel-row (supervisor-channels supervisor)) 'vector))
-    (write-json-file (status-file (supervisor-run-directory supervisor)) table)))
+          ;; false and [] as the same thing. The same builder answers the
+          ;; webhook's health route, so the two views cannot drift.
+          (supervisor-channel-rows supervisor))
+    table))
+
+(declaim (ftype (function (supervisor) hash-table) supervisor-write-status))
+
+(defun supervisor-write-status (supervisor)
+  "Write the status file and return the table it wrote.
+
+No lock spans the write: each writer stages a file of its own name and renames
+it into place, so a reader sees one complete table and the last writer wins. A
+lock held while the poll thread is destroyed would stop the last write for
+good."
+  (let ((table (supervisor-status-table supervisor)))
+    (write-json-file (status-file (supervisor-run-directory supervisor)) table)
+    table))
+
+(declaim (ftype (function (supervisor &optional t) t) supervisor-try-write-status))
+
+(defun supervisor-try-write-status (supervisor &optional (what "the status file"))
+  "Write the status file and return its table, or NIL after reporting a failure.
+
+A run directory that filled up or vanished is a reason to report the failure
+and carry on: stopping the loop leaves the process serving while every shell
+command reads it as dead."
+  (handler-case (progn (note-write-ok) (supervisor-write-status supervisor))
+    (error (condition) (note-write-error what condition) nil)))
 
 ;;;; Channels on their own threads.
 
@@ -483,7 +731,7 @@ and spends tokens before anyone asked for anything; `heartbeat run` still forces
 one at once."
   (when (and (supervisor-tick-function supervisor)
              (supervisor-running-p supervisor)
-             (null (supervisor-heartbeat-thread supervisor)))
+             (not (supervisor-heartbeat-live-p supervisor)))
     (setf (supervisor-last-tick supervisor) (get-universal-time))
     (setf (supervisor-heartbeat-thread supervisor)
           (bordeaux-threads:make-thread
@@ -512,8 +760,47 @@ one at once."
   (supervisor-write-status supervisor)
   supervisor)
 
-(defparameter +tick-drain-seconds+ 30
-  "How long SUPERVISOR-STOP waits for a heartbeat tick to finish.")
+(defparameter +shutdown-budget-seconds+ 20
+  "How long SUPERVISOR-STOP may take before it leaves the rest unstopped.
+
+Compose allows thirty seconds between SIGTERM and SIGKILL, and the process still
+has to close its store, remove the broker socket and leave. Everything STOP
+waits for shares this deadline: a stuck tick plus one draining webhook could
+outlast the grace period and be killed before the last status file. A spent
+budget is reported and the shutdown goes on.")
+
+(defparameter +tick-drain-seconds+ 10
+  "The most of the shutdown budget a heartbeat tick may use before it is stopped.")
+
+(defparameter +channel-stop-seconds+ 8
+  "The most of the shutdown budget one channel stop may use.
+
+A channel's stop can wait for a turn in flight. Eight seconds covers the
+webhook's six second drain, which takes its own deadline for the acceptor and
+the running turn together, and leaves room for the tick's share and a second
+channel.")
+
+(declaim (ftype (function (real) real) remaining-seconds))
+
+(defun remaining-seconds (deadline)
+  "Return how many seconds are left before DEADLINE, an internal real time."
+  (max 0 (/ (- deadline (get-internal-real-time))
+            internal-time-units-per-second)))
+
+(declaim (ftype (function (t real) null) note-stop-timeout))
+
+(defun note-stop-timeout (channel seconds)
+  "Say that CHANNEL did not stop within SECONDS and mark it stopped.
+
+STOP-CHANNEL destroys the channel's thread on the way out of a cut off stop, so
+the last status file would otherwise report a channel no thread serves."
+  (format *error-output*
+          "~&enchiridion: channel ~A did not stop within ~,1F second~:P of the shutdown.~%"
+          (enchiridion.channel:channel-name channel) seconds)
+  (finish-output *error-output*)
+  (setf (enchiridion.channel:channel-live-p channel) nil
+        (enchiridion.channel:channel-state channel) :stopped)
+  nil)
 
 (declaim (ftype (function (supervisor) supervisor) supervisor-stop))
 
@@ -521,32 +808,59 @@ one at once."
   "Stop every channel, clear the running flag, and write the last status.
 Return SUPERVISOR.
 
-The heartbeat thread is given +TICK-DRAIN-SECONDS+ to finish the tick in
-flight and leave, because the store closes after this returns and a thread
-killed mid-write would leave it locked. A tick that outlasts the drain is
-stopped and reported; its task stays claimed as running and the next process
-marks it failed."
+The heartbeat thread gets its share of +SHUTDOWN-BUDGET-SECONDS+ to finish the
+tick in flight, because the store closes after this returns and a thread killed
+mid-write would leave it locked. Every channel then gets what is left, at most
++CHANNEL-STOP-SECONDS+ each, and the last status file is written whatever
+happened."
   (setf (supervisor-running-p supervisor) nil)
-  (let ((beat (supervisor-heartbeat-thread supervisor)))
-    (when (and beat (bordeaux-threads:thread-alive-p beat))
-      ;; The loop sees the cleared flag within a second, or when the tick in
-      ;; flight returns. Killing it mid-tick can unwind out of an SQLite call
-      ;; with a transaction open, so it is the last resort, not the first.
-      (let ((deadline (+ (get-internal-real-time)
-                         (* +tick-drain-seconds+ internal-time-units-per-second))))
-        (loop while (and (bordeaux-threads:thread-alive-p beat)
-                         (< (get-internal-real-time) deadline))
-              do (sleep 0.05)))
-      (when (bordeaux-threads:thread-alive-p beat)
-        (format *error-output*
-                "~&enchiridion: a heartbeat tick outlasted the ~D second drain and was stopped.~%"
-                +tick-drain-seconds+)
-        (finish-output *error-output*)
-        (ignore-errors (bordeaux-threads:destroy-thread beat))))
-    (setf (supervisor-heartbeat-thread supervisor) nil))
-  (dolist (channel (supervisor-channels supervisor))
-    (ignore-errors (stop-channel channel)))
-  (supervisor-write-status supervisor)
+  (let ((deadline (+ (get-internal-real-time)
+                     (* +shutdown-budget-seconds+ internal-time-units-per-second))))
+    (let ((beat (supervisor-heartbeat-thread supervisor)))
+      (when (and beat (bordeaux-threads:thread-alive-p beat))
+        ;; The loop sees the cleared flag within a second, or when the tick in
+        ;; flight returns. Killing it mid-tick can unwind out of an SQLite call
+        ;; with a transaction open, so it is the last resort, not the first.
+        (let ((until (min deadline
+                          (+ (get-internal-real-time)
+                             (* +tick-drain-seconds+
+                                internal-time-units-per-second)))))
+          (loop while (and (bordeaux-threads:thread-alive-p beat)
+                           (< (get-internal-real-time) until))
+                do (sleep 0.05)))
+        (when (bordeaux-threads:thread-alive-p beat)
+          (format *error-output*
+                  "~&enchiridion: a heartbeat tick outlasted its ~D second shutdown share.~%"
+                  +tick-drain-seconds+)
+          (finish-output *error-output*)
+          (ignore-errors (bordeaux-threads:destroy-thread beat))
+          ;; A killed tick leaves a flag describing a thread that is gone; a
+          ;; status file would report a dead tick as a slow one.
+          (setf (supervisor-tick-running-p supervisor) nil)))
+      (setf (supervisor-heartbeat-thread supervisor) nil))
+    (dolist (channel (supervisor-channels supervisor))
+      ;; A stopped channel holds nothing to release. A signal handler and an
+      ;; unwind-protect both call this, and asking again turned a quiet second
+      ;; call into a timeout report.
+      (unless (and (not (enchiridion.channel:channel-live-p channel))
+                   (eq :stopped (enchiridion.channel:channel-state channel)))
+        (let ((share (min +channel-stop-seconds+ (remaining-seconds deadline))))
+          (handler-case
+              (cond
+                ((not (plusp share)) (note-stop-timeout channel share))
+                ((eq :stop-timed-out
+                     (enchiridion.compat:with-deadline
+                         (share :on-timeout :stop-timed-out)
+                       (stop-channel channel)))
+                 (note-stop-timeout channel share)))
+            (error (condition)
+              (format *error-output*
+                      "~&enchiridion: channel ~A refused to stop: ~A~%"
+                      (enchiridion.channel:channel-name channel)
+                      (enchiridion.llm.secrets:scrub (princ-to-string condition)))
+              (finish-output *error-output*)
+              (note-stop-timeout channel share)))))))
+  (supervisor-try-write-status supervisor)
   supervisor)
 
 ;;;; The heartbeat.
@@ -642,71 +956,163 @@ a keyword, because both spellings reach here."
 (defparameter +channel-start-seconds+ 20
   "How long a replacement candidate may take to report :live.")
 
-(defun supervisor-enable-channel (supervisor name &key replace)
-  "Construct and activate NAME, retaining the old channel on failure.
+(declaim (ftype (function (t real) (values boolean t)) wait-for-channel))
 
-A live channel is left alone unless REPLACE is true. A replacement starts a
-fresh candidate, waits for it to report :live, and only then stops and removes
-the old one."
+(defun wait-for-channel (channel seconds)
+  "Wait up to SECONDS for CHANNEL to report itself live and return two values:
+whether it did, and why it did not.
+
+A channel reports live from its own thread, so the state is waited for rather
+than read once: a fresh instance is :starting until its bind returns."
+  (let ((deadline (+ (get-internal-real-time)
+                     (* seconds internal-time-units-per-second))))
+    (loop until (or (enchiridion.channel:channel-live-p channel)
+                    (member (enchiridion.channel:channel-state channel)
+                            '(:failed :unavailable))
+                    (>= (get-internal-real-time) deadline))
+          do (sleep 0.01))
+    (if (enchiridion.channel:channel-live-p channel)
+        (values t nil)
+        (values nil (or (enchiridion.channel::channel-start-error channel)
+                        (enchiridion.channel:channel-state channel))))))
+
+(declaim (ftype (function (supervisor t t) t) install-channel))
+
+(defun install-channel (supervisor candidate old)
+  "Make CANDIDATE the channel of its own name on SUPERVISOR, dropping OLD.
+
+The name stops being disabled: a channel that runs is not off."
+  (let ((name (string-downcase (enchiridion.channel:channel-name candidate))))
+    (setf (supervisor-disabled-channels supervisor)
+          (remove name (supervisor-disabled-channels supervisor) :test #'string=)))
+  (setf (supervisor-channels supervisor)
+        (cons candidate
+              (remove old (remove candidate (supervisor-channels supervisor)))))
+  candidate)
+
+(declaim (ftype (function (supervisor t t t t) (values string boolean))
+                replace-after-stopping))
+
+(defun replace-after-stopping (supervisor name candidate old reason)
+  "Replace the running OLD with CANDIDATE, which could not start beside it.
+
+OLD is stopped so CANDIDATE can take what it holds, CANDIDATE is started again,
+and OLD is started again when that fails: a failed replacement leaves the
+surface it was replacing serving."
+  (ignore-errors (stop-channel candidate))
+  (stop-channel old)
+  (multiple-value-bind (live again)
+      (progn (start-channel supervisor candidate)
+             (wait-for-channel candidate +channel-start-seconds+))
+    (if live
+        (progn
+          (install-channel supervisor candidate old)
+          (values
+           (format nil "~A is up; the previous instance was stopped so the new one could bind.~@[ The first attempt: ~A~]"
+                   name reason)
+           t))
+        (progn
+          (ignore-errors (stop-channel candidate))
+          (multiple-value-bind (recovered recovery)
+              (progn (start-channel supervisor old)
+                     (wait-for-channel old +channel-start-seconds+))
+            (if recovered
+                (values
+                 (format nil "channel ~A refused: ~A; the previous instance is serving again."
+                         name again)
+                 nil)
+                (values
+                 (format nil "channel ~A refused: ~A, and the previous instance could not be restarted either: ~A. ~A is down."
+                         name again recovery name)
+                 nil)))))))
+
+(declaim (ftype (function (supervisor t &key (:replace t)) t)
+                supervisor-enable-channel))
+
+(defun supervisor-enable-channel (supervisor name &key replace)
+  "Construct and activate NAME, and return a report and whether it is up.
+
+A running channel is left alone unless REPLACE is true. A replacement is tried
+beside the running one first, and only a candidate that reports live takes its
+place.
+
+A channel that owns an exclusive resource cannot start beside its predecessor,
+so a candidate that fails while a live old channel exists gets one more start
+after that channel is stopped, and the old one is started again when that fails
+too."
   (let* ((old (find-channel supervisor name))
          (factory (supervisor-channel-factory supervisor)))
     (when (and old (enchiridion.channel:channel-live-p old) (not replace))
       (return-from supervisor-enable-channel
         (values (format nil "~A is already up." name) t)))
     (handler-case
-        (let ((candidate (if factory (funcall factory name) old)))
-          (unless candidate
-            (return-from supervisor-enable-channel
-              (values (format nil "channel ~A is not implemented yet." name) nil)))
-          (when (and replace (eq candidate old))
-            (error "Replacement requires a fresh channel."))
-          (unwind-protect
-               (progn
-                 (start-channel supervisor candidate)
-                 (let ((deadline (+ (get-internal-real-time)
-                                    (* +channel-start-seconds+
-                                       internal-time-units-per-second))))
-                   (loop until (or (enchiridion.channel:channel-live-p candidate)
-                                   (member (enchiridion.channel:channel-state candidate)
-                                           '(:failed :unavailable))
-                                   (>= (get-internal-real-time) deadline))
-                         do (sleep 0.01)))
-                 (unless (enchiridion.channel:channel-live-p candidate)
-                   (error "Channel ~A did not become live: ~A" name
-                          (or (enchiridion.channel::channel-start-error candidate)
-                              (enchiridion.channel:channel-state candidate))))
-                 (when (and old (not (eq old candidate)))
-                   ;; The new surface is live and must be published even when
-                   ;; the old one fails to stop cleanly; otherwise one broken
-                   ;; stop leaves the process with no channel at all.
-                   (ignore-errors (stop-channel old)))
-                 (setf (supervisor-channels supervisor)
-                       (cons candidate (remove old (supervisor-channels supervisor))))
-                 (setf candidate nil)
-                 (values (format nil "~A is up." name) t))
-            (when candidate (ignore-errors (stop-channel candidate)))))
+        (let ((candidate (if factory (funcall factory name) old))
+              (kept nil))
+          (cond
+            ((null candidate)
+             (values (format nil "channel ~A is not implemented yet." name) nil))
+            ((and replace (eq candidate old))
+             ;; The factory handed back the running channel: there is nothing
+             ;; to start beside it and nothing to swap in.
+             (values (format nil "channel ~A needs a fresh instance to be replaced."
+                             name)
+                     nil))
+            (t
+             (unwind-protect
+                  (multiple-value-bind (live reason)
+                      (progn (start-channel supervisor candidate)
+                             (wait-for-channel candidate +channel-start-seconds+))
+                    (cond
+                      (live
+                       (when (and old (not (eq old candidate)))
+                         ;; The new surface is live and is published even when
+                         ;; the old one fails to stop cleanly; one broken stop
+                         ;; must not leave the process with no channel at all.
+                         (ignore-errors (stop-channel old)))
+                       (install-channel supervisor candidate old)
+                       (setf kept t)
+                       (values (format nil "~A is up." name) t))
+                      ((and replace old (enchiridion.channel:channel-live-p old))
+                       (multiple-value-bind (report up)
+                           (replace-after-stopping supervisor name candidate old reason)
+                         (setf kept up)
+                         (values report up)))
+                      (t
+                       (values (format nil "channel ~A refused: ~A" name reason)
+                               nil))))
+               (unless kept
+                 (ignore-errors (stop-channel candidate)))))))
       (error (condition)
-        (values (format nil "channel ~A refused: ~A" name condition) nil)))))
+        (values (format nil "channel ~A refused: ~A" name
+                        (enchiridion.llm.secrets:scrub (princ-to-string condition)))
+                nil)))))
 
 (declaim (ftype (function (supervisor t) t) handle-channels))
 
 (defun handle-channels (supervisor arguments)
   "Act on `channels list|enable N|replace N|disable N` and return a report
-and whether the request succeeded."
+and whether the request succeeded.
+
+A disable stops the channel and forgets its instance. The name stays so the
+status file can say the surface exists and is off, and a later enable builds a
+fresh one through the factory."
   (let ((action (string-downcase (or (first arguments) "list")))
         (name (second arguments)))
     (cond
       ((string= action "list")
-       (values
-        (if (supervisor-channels supervisor)
-           (format nil "~{~A~^, ~}"
-                   (mapcar (lambda (channel)
-                             (format nil "~A ~A"
-                                     (enchiridion.channel:channel-name channel)
-                                     (string-downcase
-                                      (string (enchiridion.channel:channel-state channel)))))
-                           (supervisor-channels supervisor)))
-           "no channels are up.") t))
+       (let ((off (supervisor-disabled-channels supervisor)))
+         (values
+          (if (or (supervisor-channels supervisor) off)
+              (format nil "~{~A~^, ~}~@[; disabled: ~{~A~^, ~}~]"
+                      (mapcar (lambda (channel)
+                                (format nil "~A ~A"
+                                        (enchiridion.channel:channel-name channel)
+                                        (string-downcase
+                                         (string (enchiridion.channel:channel-state channel)))))
+                              (supervisor-channels supervisor))
+                      off)
+              "no channels are up.")
+          t)))
       ((member action '("enable" "replace" "disable") :test #'string=)
        (cond
          ((null name) (values "which channel?" nil))
@@ -714,8 +1120,18 @@ and whether the request succeeded."
           (supervisor-enable-channel supervisor name :replace (string= action "replace")))
          (t
           (let ((channel (find-channel supervisor name)))
-            (when channel (stop-channel channel))
-            (values (format nil "~A is down." name) t)))))
+            (if channel
+                (let ((lowercase (string-downcase (string name))))
+                  (stop-channel channel)
+                  (setf (supervisor-channels supervisor)
+                        (remove channel (supervisor-channels supervisor))
+                        (supervisor-disabled-channels supervisor)
+                        (adjoin lowercase (supervisor-disabled-channels supervisor)
+                                :test #'string=))
+                  (values (format nil "~A is down." name) t))
+                ;; Success for a name nothing runs lets a typo read as a
+                ;; stopped channel, and the operator cannot tell the two apart.
+                (values (format nil "no channel called ~A is up." name) nil))))))
       (t (format nil "channels takes list, enable, replace or disable.")))))
 
 (declaim (ftype (function (supervisor t) t) handle-heartbeat))
@@ -826,6 +1242,59 @@ that reloads and continues deserves a non-zero status from a refusal."
 
 (declaim (ftype (function (supervisor) integer) supervisor-poll-control))
 
+(declaim (ftype (function (t hash-table t) (or null pathname))
+                publish-control-response))
+
+(defun publish-control-response (path table request-id)
+  "Write the answer for the request at PATH and return its path, or NIL.
+
+The answer is the table the supervisor holds, not a status file read back: a
+failed status write would otherwise leave the shell waiting for an answer that
+was known, and another request may have written the file in between."
+  (let ((response (alexandria:copy-hash-table table)))
+    (setf (gethash "request-id" response) request-id)
+    (let ((answer (make-pathname :type "response" :defaults path)))
+      (handler-case (progn (note-write-ok) (write-json-file answer response))
+        (error (condition)
+          (note-write-error "a control response" condition)
+          nil)))))
+
+(declaim (ftype (function (supervisor function) t) call-with-status-refresh))
+
+(defun call-with-status-refresh (supervisor function)
+  "Call FUNCTION, keeping the status file fresh for as long as it takes.
+
+A reload can run for minutes while the poll loop, the thread it runs on, writes
+nothing, and the file ages out. A second thread rewrites the same table, and is
+stopped before the caller publishes its answer."
+  (let* ((done nil)
+         (thread (bordeaux-threads:make-thread
+                  (lambda ()
+                    (let ((next (+ (get-internal-real-time)
+                                   (* +status-refresh-seconds+
+                                      internal-time-units-per-second))))
+                      (supervisor-try-write-status supervisor)
+                      ;; The poll thread that owns this call can be destroyed
+                      ;; at shutdown and DONE is never set. A writer that
+                      ;; outlived its supervisor would rewrite a status file for
+                      ;; a process that is leaving, so the flag ends the loop.
+                      (loop until (or done (not (supervisor-running-p supervisor)))
+                            do (sleep 0.02)
+                               (when (and (not done)
+                                          (>= (get-internal-real-time) next))
+                                 (setf next (+ (get-internal-real-time)
+                                               (* +status-refresh-seconds+
+                                                  internal-time-units-per-second)))
+                                 (supervisor-try-write-status supervisor)))))
+                  :name "enchiridion status refresh")))
+    (unwind-protect (funcall function)
+      (setf done t)
+      (loop repeat 5
+            while (bordeaux-threads:thread-alive-p thread)
+            do (sleep 0.01))
+      (when (bordeaux-threads:thread-alive-p thread)
+        (ignore-errors (bordeaux-threads:destroy-thread thread))))))
+
 (defun read-control-request (path)
   "Return a bounded single request line, or an invalid-request marker."
   (handler-case
@@ -840,7 +1309,12 @@ that reloads and continues deserves a non-zero status from a refusal."
     (error () "invalid unreadable request")))
 
 (defun supervisor-poll-control (supervisor)
-  "Handle each published request and write its own response."
+  "Handle each published request, publish its own answer, and return how many
+requests were consumed.
+
+An answer is published before the status file is rewritten and before the
+request is removed. The request and its slot are released whatever happened:
+running a reload twice is worse than an uncertain reply."
   (let* ((run (supervisor-run-directory supervisor))
          (requests (progn
                      (clean-control-spool run)
@@ -852,36 +1326,51 @@ that reloads and continues deserves a non-zero status from a refusal."
                                                          :junk-allowed t)
                                           most-positive-fixnum)))))
          (count 0))
-    (labels ((handle (line)
+    (labels ((answer (path report ok-p)
+               (incf count)
+               (incf (supervisor-handled supervisor))
+               (setf (supervisor-report-ok-p supervisor) ok-p
+                     (supervisor-report supervisor) (or report ""))
+               (when path
+                 (unwind-protect
+                      (publish-control-response path
+                                                (supervisor-status-table supervisor)
+                                                (pathname-name path))
+                   ;; The handler has run, so the request is consumed even when
+                   ;; its answer could not be written or this thread was
+                   ;; interrupted. Replaying a reload is worse than an answer
+                   ;; that never arrived.
+                   ;;
+                   ;; The claim is the slot QUEUE-CONTROL took; releasing it
+                   ;; lets the next request take the slot at once.
+                   (delete-file-if-present path)
+                   (delete-file-if-present (control-entry-claim path))))
+               (supervisor-try-write-status supervisor))
+             (run-line (line path)
                (multiple-value-bind (report ok-p)
-                   (handler-case (handle-control supervisor line)
-                     (error (condition) (values (princ-to-string condition) nil)))
-                 (incf count)
-                 (incf (supervisor-handled supervisor))
-                 (setf (supervisor-report-ok-p supervisor) ok-p
-                       (supervisor-report supervisor) (or report ""))
-                 (supervisor-write-status supervisor))))
-      (dolist (line (consume-control-lines run)) (handle line))
+                   (call-with-status-refresh
+                    supervisor
+                    (lambda ()
+                      (handler-case (handle-control supervisor line)
+                        (error (condition)
+                          (values (enchiridion.llm.secrets:scrub
+                                   (princ-to-string condition))
+                                  nil)))))
+                 (answer path report ok-p))))
+      (dolist (line (consume-control-lines run)) (run-line line nil))
       (dolist (path requests)
         ;; Another poll may have consumed the file after the directory listing.
         ;; A vanished request needs no answer, and inventing one would overwrite
         ;; the response the other poll already wrote.
         (when (probe-file path)
           (if (control-file-older-p path (- (get-universal-time)
-                                            +control-retention-seconds+))
-              (progn
-                (incf count)
-                (incf (supervisor-handled supervisor))
-                (setf (supervisor-report supervisor) "control request expired."
-                      (supervisor-report-ok-p supervisor) nil)
-                (supervisor-write-status supervisor))
-              (handle (read-control-request path)))
-          (let ((response (read-status run)))
-            (when (hash-table-p response)
-              (setf (gethash "request-id" response) (pathname-name path))
-              (write-json-file (make-pathname :type "response" :defaults path)
-                               response)))
-          (delete-file-if-present path))))
+                                            +control-pending-seconds+))
+              ;; An expired request still gets an answer: a shell may be
+              ;; waiting on it, and silence reads as a dead supervisor. The
+              ;; horizon is the queue's, so a request has to outlast a reload
+              ;; before it gets here.
+              (answer path "control request expired in the queue." nil)
+              (run-line (read-control-request path) path)))))
     count))
 
 (declaim (ftype (function (supervisor &key (:interval real)) supervisor)
@@ -890,9 +1379,14 @@ that reloads and continues deserves a non-zero status from a refusal."
 (defun supervisor-poll-loop (supervisor &key (interval 1))
   "Poll the control queue and rewrite the status file until SUPERVISOR stops.
 Writing the status on every tick is what keeps it fresh, which is how a reader
-tells a running supervisor from a file a dead one left."
+tells a running supervisor from a file a dead one left.
+
+A failed pass is reported and the loop goes on. The loop is the only thing that
+answers control requests and keeps the file fresh, so one bad spool entry must
+not leave a running process reported as dead."
   (loop while (supervisor-running-p supervisor)
-        do (supervisor-poll-control supervisor)
-           (supervisor-write-status supervisor)
+        do (handler-case (supervisor-poll-control supervisor)
+             (error (condition) (note-write-error "the control poll" condition)))
+           (supervisor-try-write-status supervisor)
            (sleep interval))
   supervisor)

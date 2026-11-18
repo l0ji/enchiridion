@@ -157,6 +157,38 @@ countable from the test."
                         :test #'eq)
             (ng (enchiridion.memory:block-writable-p block))))))))
 
+(deftest the-tick-agents-share-the-operator-lock ()
+  (with-scratch-world (store supervisor)
+    (let* ((agent (agent-of supervisor))
+           (sleep (enchiridion.kernel::sleep-pass-agent agent nil store))
+           (compactor (enchiridion.kernel::compactor-agent agent))
+           (lock (enchiridion.kernel::agent-lock agent)))
+      (testing "the constructors pass the operator's lock, not a fresh one"
+        (ok (eq lock (enchiridion.kernel::agent-lock sleep)))
+        (ok (eq lock (enchiridion.kernel::agent-lock compactor))))
+      (testing "and a turn on either is busy while the operator's turn holds it"
+        (let ((held (bordeaux-threads:make-semaphore :count 0))
+              (release (bordeaux-threads:make-semaphore :count 0))
+              (holder nil))
+          (setf holder
+                (bordeaux-threads:make-thread
+                 (lambda ()
+                   (bordeaux-threads:acquire-lock lock t)
+                   (bordeaux-threads:signal-semaphore held)
+                   (bordeaux-threads:wait-on-semaphore release)
+                   (bordeaux-threads:release-lock lock))
+                 :name "enchiridion sleep test holder"))
+          (bordeaux-threads:wait-on-semaphore held)
+          (unwind-protect
+               (dolist (other (list sleep compactor))
+                 (ok (handler-case
+                         (progn (enchiridion.kernel:run-turn other "hello"
+                                                             :block-p nil)
+                                nil)
+                       (enchiridion.errors:turn-busy () t))))
+            (bordeaux-threads:signal-semaphore release)
+            (bordeaux-threads:join-thread holder)))))))
+
 (deftest a-pass-with-a-task-runs-one-turn-and-completes-it ()
   (with-scratch-world (store supervisor)
     (let* ((queued (enchiridion.kernel:enqueue-task store "say hello"))
@@ -401,6 +433,67 @@ countable from the test."
     (let ((prompt (counting-backend-last-prompt (backend-of supervisor))))
       (ok (< (search "first turn" prompt) (search "fourth turn" prompt))))))
 
+(deftest a-recovered-t2-pass-says-where-its-candidate-came-from ()
+  (testing "a pass that gates an earlier pass's candidate says so"
+    (ok (search "a candidate an earlier pass built and never gated"
+                (enchiridion.kernel::t2-report-line
+                 (list :outcome :promoted :generation-id 4 :recovered t)))))
+  (testing "and a pass that built its own does not"
+    (ng (search "earlier pass"
+                (enchiridion.kernel::t2-report-line
+                 (list :outcome :promoted :generation-id 4))))))
+
+(deftest a-large-store-says-its-size-and-age-once-a-day ()
+  (with-scratch-world (store supervisor)
+    ;; 1000000 is the report's NOW below; the turn is two days older than it.
+    (enchiridion.memory.store:record-turn store :session "s" :role "user"
+                                          :body "one turn" :ts 827200)
+    (let ((enchiridion.kernel::+store-report-bytes+ 0)
+          (enchiridion.kernel::*store-reported-ts* 0)
+          (enchiridion.kernel::*store-failure-watermark* nil))
+      (let ((line (enchiridion.kernel::store-report-line store :now 1000000)))
+        (testing "the line carries the size, the count, the age and the policy"
+          (ok (search "the memory store holds" line))
+          (ok (search "1 episode" line))
+          (ok (search "2 days old" line))
+          (ok (search "nothing is deleted automatically" line))))
+      (testing "the same day does not repeat it"
+        (ok (null (enchiridion.kernel::store-report-line store :now 1000100))))
+      (testing "and the next day does"
+        (ok (search "the memory store holds"
+                    (enchiridion.kernel::store-report-line
+                     store :now (+ 1000000 enchiridion.kernel::+store-report-interval-seconds+))))))))
+
+(deftest a-small-store-does-not-wake-an-idle-tick ()
+  ;; The heartbeat reports work done. A store below the size threshold is not a
+  ;; disk problem, and a tick with nothing else to say stays idle.
+  (with-scratch-world (store supervisor)
+    (let ((enchiridion.kernel::*store-reported-ts* 0)
+          (enchiridion.kernel::*store-failure-watermark* nil))
+      (ok (null (enchiridion.kernel::store-report-line store))))))
+
+(deftest a-write-that-failed-since-the-last-tick-is-reported-on-this-one ()
+  (with-scratch-world (store supervisor)
+    (let ((enchiridion.kernel::*store-failure-watermark* nil)
+          (enchiridion.kernel::*store-reported-ts* (get-universal-time))
+          (enchiridion.kernel::*persistence-failure-reporter* nil))
+      (unwind-protect
+           (progn
+             (enchiridion.kernel::store-report-line store)
+             (testing "nothing new is nothing to say"
+               (ok (null (enchiridion.kernel::store-report-line store))))
+             (enchiridion.kernel::note-persistence-failure
+              :turn "could not persist turn: database or disk is full")
+             (testing "one failure is reported once, with the row's context"
+               (let ((line (enchiridion.kernel::store-report-line store)))
+                 (ok (search "1 memory write failed since the last tick" line))
+                 (ok (search "database or disk is full" line)))
+               (testing "and not again on the next tick"
+                 (ok (null (enchiridion.kernel::store-report-line store))))))
+        (setf enchiridion.kernel::*persistence-failures* 0
+              enchiridion.kernel::*last-persistence-failure* nil
+              enchiridion.kernel::*store-failure-watermark* nil)))))
+
 (deftest t2-spend-counts-toward-the-day-cap-but-not-the-tick-cap ()
   ;; A T2 pass is held to its own caps and is larger than a tick by design,
   ;; but unattended work as a whole stays under the day cap.
@@ -498,6 +591,76 @@ countable from the test."
                           (enchiridion.memory.store:field row "from_turn")))))))))))
 
 ;;;; Dense embedding inside the tick.
+
+(deftest a-window-that-keeps-refusing-stops-paying-every-tick ()
+  ;; A model that overshoots the block limit refuses the same four turns every
+  ;; time, and the heartbeat used to buy that refusal every fifteen minutes.
+  (with-scratch-world (store supervisor)
+    (flet ((add-turn (index)
+             (enchiridion.memory.store:record-turn
+              store :session "operator" :role "user"
+              :body (format nil "turn ~D" index))))
+      (dotimes (index 4) (add-turn index))
+      (setf (counting-backend-reply (backend-of supervisor)) "")
+      (let ((cursor (enchiridion.supervisor:supervisor-last-compacted-turn supervisor)))
+        (testing "the first empty answer is reported"
+          (ok (search "compaction produced no text"
+                      (getf (enchiridion.kernel:heartbeat supervisor) :report))))
+        (testing "and the same window gets its one retry"
+          (ok (search "compaction produced no text"
+                      (getf (enchiridion.kernel:heartbeat supervisor) :report))))
+        (testing "then the window is held instead of bought again"
+          (let ((calls (calls-made supervisor)))
+            (ok (null (enchiridion.kernel::compact-when-due
+                       supervisor store (agent-of supervisor))))
+            (ok (= calls (calls-made supervisor))
+                "no model call for a window that has used its attempts")
+            (ok (= cursor
+                   (enchiridion.supervisor:supervisor-last-compacted-turn supervisor))
+                "the cursor did not advance over unsaved turns")))
+        (testing "a newer turn makes the window worth offering again"
+          (add-turn 4)
+          (setf (counting-backend-reply (backend-of supervisor)) "done")
+          (ok (search "the session block was compacted"
+                      (getf (enchiridion.kernel:heartbeat supervisor) :report)))
+          (ok (= 1 (length (projection-rows store)))))))))
+
+(deftest an-over-limit-compaction-answer-changes-nothing-and-says-so ()
+  ;; The session block holds four hundred characters. A longer answer used to
+  ;; signal out of the phase and mark the tick failed; the outcome is that
+  ;; nothing changes, so it comes back as a reported no-op.
+  (with-scratch-world (store supervisor)
+    (flet ((add-turn (index)
+             (enchiridion.memory.store:record-turn
+              store :session "operator" :role "user"
+              :body (format nil "turn ~D" index))))
+      (dotimes (index 4) (add-turn index))
+      (setf (counting-backend-reply (backend-of supervisor))
+            (make-string 500 :initial-element #\x))
+      (enchiridion.memory.store:set-session-block store "the session so far")
+      (let ((cursor (enchiridion.supervisor:supervisor-last-compacted-turn supervisor))
+            (report (enchiridion.kernel:heartbeat supervisor)))
+        (testing "the tick succeeds and says why the answer was refused"
+          (ok (getf report :ok-p))
+          (ok (search "compaction produced nothing usable" (getf report :report))))
+        (testing "and the block, the cursor and the projections are untouched"
+          (ok (= cursor
+                 (enchiridion.supervisor:supervisor-last-compacted-turn supervisor)))
+          (ok (null (projection-rows store)))
+          (ok (string= "the session so far"
+                       (enchiridion.memory.store:session-block store))))))))
+
+(deftest a-t2-refusal-reads-as-a-sentence ()
+  ;; The refusal is a keyword, and the report is a line an operator reads:
+  ;; ":pass-budget-spent" is neither.
+  (with-scratch-world (store supervisor)
+    (let ((enchiridion.memory:*t2-enabled-p* t)
+          (enchiridion.memory:*t2-max-tokens-per-pass* 1000))
+      (enchiridion.memory.store:record-usage store :model "m" :input 1000 :output 0
+                                                   :channel :t2)
+      (let ((report (getf (enchiridion.kernel:heartbeat supervisor) :report)))
+        (ok (search "T2 skipped: the pass budget is spent" report))
+        (ng (search ":pass-budget-spent" report))))))
 
 (deftest a-spent-cap-skips-the-embedding-phase ()
   (with-scratch-world (store supervisor)

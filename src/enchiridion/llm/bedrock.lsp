@@ -76,19 +76,18 @@ this file writing a header itself."
 (defun bedrock-region (connection)
   "Return the region CONNECTION's endpoint lives in.
 
-The provider's own option wins, then the two environment variables every AWS
-toolchain reads. There is no default region: a request signed for the wrong
-region is a 403 with nothing in it to say which region was expected, and
-assuming us-east-1 would send an operator's request to another continent."
+The provider's own option wins, then AWS_REGION and AWS_DEFAULT_REGION, read
+from the loader first and the environment second: a value in .env is not in the
+process environment, and the supervisor unsets credential shaped names. There is
+no default region: a request signed for the wrong one is a 403 that names
+nothing, and us-east-1 may be another continent."
   (let ((region (or (aws-nonempty-string (bedrock-connection-region connection))
-                    (aws-nonempty-string
-                     (enchiridion.compat:environment-value "AWS_REGION"))
-                    (aws-nonempty-string
-                     (enchiridion.compat:environment-value "AWS_DEFAULT_REGION")))))
+                    (secret-or-environment "AWS_REGION")
+                    (secret-or-environment "AWS_DEFAULT_REGION"))))
     (or region
         (error 'enchiridion.errors:configuration-error
                :key :region
-               :detail "No AWS region is configured: set :region on the provider, or AWS_REGION or AWS_DEFAULT_REGION in the environment."))))
+               :detail "No AWS region is configured: set :region on the provider, or AWS_REGION or AWS_DEFAULT_REGION in the environment or .env."))))
 
 (declaim (ftype (function (bedrock-connection t) string) bedrock-model))
 
@@ -292,12 +291,12 @@ cannot replace the content type that makes the body readable."
 (defun bedrock-bearer-token (connection)
   "Return the bearer token to send, or NIL when the request must be signed.
 
-AWS_BEARER_TOKEN_BEDROCK is AWS's own short lived token and wins outright. A
-provider key is a bearer token only while there is no access key to sign with: a
-machine that has both is a machine whose operator configured a signature, and the
-signature is the credential that was deliberately set up."
-  (or (aws-nonempty-string
-       (enchiridion.compat:environment-value "AWS_BEARER_TOKEN_BEDROCK"))
+AWS_BEARER_TOKEN_BEDROCK is AWS's own short lived token and wins outright. It is
+read from the loader first and the environment second: the supervisor unsets a
+credential shaped variable once the loader holds it. A provider key is a bearer
+token only while there is no access key to sign with: a machine with both has a
+signature its operator configured, and that is the credential."
+  (or (aws-nonempty-string (secret-or-environment "AWS_BEARER_TOKEN_BEDROCK"))
       (let ((key (aws-nonempty-string (bedrock-connection-key connection))))
         (when (and key (not (aws-credentials-available-p)))
           key))))

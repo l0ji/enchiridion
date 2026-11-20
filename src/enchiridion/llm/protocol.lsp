@@ -27,7 +27,9 @@
   (:role "" :type string)
   (:content "" :type string)
   (:tool-call-id "" :type string)
-  (:tool-calls '() :type list))
+  (:tool-calls '() :type list)
+  ;; Provider reasoning for the current tool round
+  (:tool-reasoning nil :type (or null string)))
 
 (defun system-message (text)
   "Return a message carrying instructions, which the model never replies to."
@@ -77,6 +79,8 @@
 (defstruct (completion (:constructor %make-completion))
   (:text "" :type string)
   (:reasoning-text "" :type string)
+  ;; Moved to the tool-call message before the completion enters session history
+  (:tool-reasoning nil :type (or null string))
   (:tool-calls '() :type list)
   (:model "" :type string)
   (:stop-reason "" :type string)
@@ -84,6 +88,14 @@
   (:output-tokens 0 :type (integer 0 *))
   (:cache-read-tokens 0 :type (integer 0 *))
   (:cache-write-tokens 0 :type (integer 0 *)))
+
+(defun take-completion-tool-message (completion)
+  "Move the current tool round's replay data out of COMPLETION."
+  (when (completion-tool-calls completion)
+    (%make-message :role "assistant"
+                   :content (completion-text completion)
+                   :tool-calls (completion-tool-calls completion)
+                   :tool-reasoning (shiftf (completion-tool-reasoning completion) nil))))
 
 (defun completion-total-tokens (completion)
   "Return the tokens COMPLETION was billed for in total. A cache read is not

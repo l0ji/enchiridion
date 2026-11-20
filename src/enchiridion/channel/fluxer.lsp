@@ -228,7 +228,7 @@ or NIL when it names none."
 
 (declaim (ftype (function (t &optional t t) (or null integer)) frame-close-code))
 
-(defun frame-close-code (data &optional (start 0) end)
+(defun frame-close-code (data &optional start end)
   "Return the close code in DATA, one whole websocket frame, or NIL.
 
 DATA is a frame as it came off the socket: a flags byte with the opcode in its
@@ -242,7 +242,8 @@ peer's close frame and the transport then ends, so the :close event that fires
 afterwards has NIL where the code was. While the frame is still bytes it is the
 only place left to read it, and the code is what tells a refused token from a
 network blip."
-  (let ((end (or end (length data))))
+  (let ((start (or start 0))
+        (end (or end (length data))))
     (when (>= (- end start) 2)
       (let* ((opcode (logand #x0f (aref data start)))
              (masked (logand #x80 (aref data (1+ start))))

@@ -116,11 +116,11 @@ the empty strings the shape has always allowed."
   (directory nil :type (or null pathname))
   (broker nil :type t)
   (tools-p t :type boolean)
-  (tool-rounds 8 :type (integer 0 *))
+  (tool-rounds 32 :type (integer 0 *))
   (lock nil :type t))
 
 (defun make-agent (&key (name "default") backend blocks directory budget
-                          broker (tools-p t) (tool-rounds 8) lock store)
+                          broker (tools-p t) (tool-rounds 32) lock store)
   "Return an AGENT with a prompt compiled from BLOCKS, or from DIRECTORY.
 
 The prompt is compiled here, once. Callers that pass BLOCKS usually pass the
@@ -632,13 +632,15 @@ caller that does is a caller that runs two turns at once."
            (rounds 0)
            (wrapped-up nil)
            (last-words nil)
-           (completion nil))
+           (completion nil)
+           (tool-message nil))
       (persist-turn store session "user" text :channel channel)
       (loop
         (when (and cancel-p (funcall cancel-p))
           (error 'enchiridion.errors:turn-cancelled :turn rounds))
         (note-progress :request :round rounds)
-        (setf completion (complete-with-tools backend messages model tools))
+        (setf completion (complete-with-tools backend messages model tools)
+              tool-message (enchiridion.llm:take-completion-tool-message completion))
         (note-progress :response
                        :round rounds
                        :reasoning (enchiridion.llm:completion-reasoning-text completion)
@@ -677,11 +679,7 @@ caller that does is a caller that runs two turns at once."
                                               +tool-round-limit-note+)))))
               (progn
                 (incf rounds)
-                (setf messages
-                      (append messages
-                              (list (enchiridion.llm:assistant-message
-                                     (enchiridion.llm:completion-text completion)
-                                     calls))))
+                (setf messages (append messages (list tool-message)))
                 (dolist (call calls)
                   (note-progress :tool-start
                                  :name (enchiridion.llm:tool-call-name call)

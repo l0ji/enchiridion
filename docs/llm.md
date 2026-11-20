@@ -16,6 +16,12 @@ LLM setting belongs under `:llm` in `config.lsp`; the full key list is in the
 These three rows work without a catalog fetch. Every other provider comes from
 the models.dev catalog, or from a row you write.
 
+Replay is supported for `deepseek-v4.1-flash` on OpenCode Go at
+`https://opencode.ai/zen/go/v1`, `https://opencode.ai/inference/go/v1`, and
+`https://opencode.ai/inference/go/openai/v1`. Tool rounds replay the reasoning
+returned during the current turn. Reasoning is not saved in the transcript;
+assistant messages without it send an empty `reasoning_content` string.
+
 ## Selecting a provider
 
 With no explicit `:provider`, selection takes the first match:
@@ -212,6 +218,6 @@ reference](config-reference.md#llm) for the full row key list.
 | `No AWS credential is available to sign with` | access key or secret key missing | set both, or use `AWS_BEARER_TOKEN_BEDROCK` |
 | A reply with no choices or no content blocks | the provider returned an error envelope | read the transport error or the provider's message |
 
-A reply that combines thinking with tool calls is a backend error. The message
-model cannot replay reasoning blocks, so no request is sent with a transcript
-that has lost them. Plain text and ordinary tool calls are unaffected.
+Outside the listed replay route, the backend rejects replies that combine
+thinking with tool calls. Disable thinking or choose a nonthinking model.
+Plain text and ordinary tool calls are unaffected.

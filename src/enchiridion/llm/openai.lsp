@@ -292,33 +292,26 @@ and the tool layer can index {} without a special case."
     ((consp arguments) (stringify (plist-as-json-object arguments)))
     (t (stringify arguments))))
 
-(declaim (ftype (function (message &optional t) hash-table)
+(declaim (ftype (function (message &optional t t) hash-table)
                 message->request-message))
 
-(defun message->request-message (message &optional dialect)
-  "Return MESSAGE as the request object.
-
-A tool message carries its call id; an assistant message carries its tool calls
-when it asked for any. Every other message does not carry either key, because
-some servers reject an unexpected field rather than ignoring it.
-
-DIALECT may rename the system role: OpenAI's reasoning models took the
-developer role where the system role used to be, and the profile that serves
-them says so."
-  (let ((pairs (list :role (if (string= "system" (message-role message))
-                               (dialect-field dialect :system-role "system")
-                               (message-role message))
-                     :content (message-content message))))
-    (cond
-      ((plusp (length (message-tool-call-id message)))
-       (apply #'json-object
-              (append pairs (list :tool_call_id (message-tool-call-id message)))))
-      ((message-tool-calls message)
-       (apply #'json-object
-              (append pairs (list :tool_calls
-                                  (map 'list #'tool-call->request
-                                       (message-tool-calls message))))))
-      (t (apply #'json-object pairs)))))
+(defun message->request-message (message &optional dialect replay-p)
+  "Return MESSAGE in the destination dialect."
+  (let* ((role (message-role message))
+         (body (json-object :role (if (string= "system" role)
+                                      (dialect-field dialect :system-role "system")
+                                      role)
+                            :content (message-content message))))
+    (when (plusp (length (message-tool-call-id message)))
+      (setf (gethash "tool_call_id" body) (message-tool-call-id message)))
+    (when (message-tool-calls message)
+      (setf (gethash "tool_calls" body)
+            (mapcar #'tool-call->request (message-tool-calls message))))
+    (when (and replay-p (string= "assistant" role))
+      (setf (gethash "reasoning_content" body) (or (message-tool-reasoning message) ""))
+      (when (and (message-tool-calls message) (zerop (length (message-content message))))
+        (setf (gethash "content" body) +json-null+)))
+    body))
 
 (declaim (ftype (function (hash-table) hash-table) tool-definition->request))
 
@@ -326,7 +319,7 @@ them says so."
   "Wrap one registry function object as an OpenAI tool definition."
   (json-object :type "function" :function definition))
 
-(defun openai-request-body (model messages &key tools dialect max-tokens stream)
+(defun openai-request-body (model messages &key tools dialect max-tokens stream replay-p)
   "Return the request body for MODEL continuing MESSAGES as data.
 
 The data shape and not text, because a dialect may need to rewrite a field
@@ -348,7 +341,7 @@ does ask for a stream gets the stream_options field, which is legal only beside
                  :stream (if stream t nil)
                  :messages (map 'list
                                 (lambda (message)
-                                  (message->request-message message dialect))
+                                  (message->request-message message dialect replay-p))
                                 messages))))
       (when (and max-tokens (integerp max-tokens) (plusp max-tokens))
         (setf (gethash (openai-max-tokens-key dialect) body) max-tokens))
@@ -365,18 +358,13 @@ does ask for a stream gets the stream_options field, which is legal only beside
             do (setf (gethash name body) value))
       body)))
 
-(defun completion-request (model messages &key tools dialect max-tokens stream)
-  "Return the request body for MODEL continuing MESSAGES, as JSON text.
-
-#'MESSAGE->REQUEST-MESSAGE is reached through the LAMBDA above and not by a
-bare symbol: MAP evaluates its function argument as a value, so a bare symbol
-there is a variable reference and the failure arrives at run time as
-UNBOUND-VARIABLE from a function that is plainly defined."
+(defun completion-request (model messages &key tools dialect max-tokens stream replay-p)
+  "Return the request body for MODEL continuing MESSAGES, as JSON text."
   (stringify (openai-request-body model messages
                                   :tools tools
                                   :dialect dialect
                                   :max-tokens max-tokens
-                                  :stream stream)))
+                                  :stream stream :replay-p replay-p)))
 
 ;;;; The reply.
 
@@ -396,7 +384,7 @@ nothing above them wants to know that some servers send an object."
                  :arguments (normalize-tool-arguments
                              (getf (getf call :function) :arguments)))))
 
-(defun parse-completion (data &key dialect)
+(defun parse-completion (data &key dialect replay-p)
   "Return the COMPLETION described by DATA, which is the parsed JSON object a
 chat completions reply carries.
 
@@ -421,23 +409,19 @@ showing the model's private notes as its answer."
            (reasoning (and reasoning-field
                            (or (openai-field-value reply reasoning-field)
                                (openai-field-value data reasoning-field))))
-           ;; A profile that names no field still reads DeepSeek and Z.AI's,
-           ;; because the reply carries thinking the next request cannot replay.
-           (generic-reasoning (and (null reasoning-field)
-                                   (getf reply :reasoning_content))))
-      ;; DeepSeek and Z.AI require reasoning_content to be replayed with tool
-      ;; calls; this protocol keeps no such field, so refuse rather than corrupt.
-      ;; The field is the dialect's, so a profile reporting under `reasoning' is
-      ;; refused too.
-      (when (and (getf reply :tool_calls)
-                 (let ((text (or reasoning generic-reasoning)))
-                   (and (stringp text) (plusp (length text)))))
+           (wire-reasoning (getf reply :reasoning_content))
+           (calls (getf reply :tool_calls))
+           (tool-reasoning (and replay-p calls (stringp wire-reasoning) wire-reasoning)))
+      (when (and calls (not tool-reasoning)
+                 (or (and (stringp reasoning) (plusp (length reasoning)))
+                     (and (stringp wire-reasoning) (plusp (length wire-reasoning)))))
         (error 'enchiridion.errors:backend-error
                :backend "openai"
-               :detail "Thinking tool calls require reasoning replay, which this message protocol does not support. Disable thinking or choose a nonthinking model."))
+               :detail "Thinking tool calls require reasoning replay. This OpenAI-compatible backend only replays reasoning for deepseek-v4.1-flash on OpenCode Go. Disable thinking or choose a nonthinking model."))
       (%make-completion
        :text (or (getf reply :content) "")
-       :reasoning-text (if (stringp reasoning) reasoning "")
+       :reasoning-text (if (and (not tool-reasoning) (stringp reasoning)) reasoning "")
+       :tool-reasoning tool-reasoning
        :tool-calls (parse-tool-calls reply)
        :model (or (getf data :model) "")
        :stop-reason (or (getf choice :finish_reason) "")
@@ -481,6 +465,12 @@ carries something PARSE-JSON cannot read is not a transport failure and is not
 retried, and the retry loop stays a loop over one HTTP call."
   (let* ((dialect (normalize-dialect-query-params
                    (openai-connection-dialect connection)))
+         (replay-p (and (string= model "deepseek-v4.1-flash")
+                        (member (openai-connection-base-url connection)
+                                '("https://opencode.ai/zen/go/v1/"
+                                  "https://opencode.ai/inference/go/v1/"
+                                  "https://opencode.ai/inference/go/openai/v1/")
+                                :test #'string=)))
          (url (concatenate 'string
                            (openai-connection-base-url connection)
                            (dialect-path-with-model
@@ -490,6 +480,7 @@ retried, and the retry loop stays a loop over one HTTP call."
          (body (completion-request model messages
                                    :tools tools
                                    :dialect dialect
+                                   :replay-p replay-p
                                    :max-tokens (openai-connection-max-tokens
                                                 connection)))
          (request (make-http-request
@@ -507,7 +498,7 @@ retried, and the retry loop stays a loop over one HTTP call."
                            (openai-connection-session-id connection)
                            (openai-connection-headers connection)))
        (openai-connection-retries connection)))
-     :dialect dialect)))
+     :dialect dialect :replay-p replay-p)))
 
 ;;;; The operations.
 ;;;;

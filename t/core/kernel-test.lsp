@@ -36,6 +36,84 @@
   (enchiridion.memory:make-block :label label :text text
                                  :limit limit :writable-p writable-p))
 
+(deftest opencode-deepseek-replays-only-the-current-tool-rounds ()
+  (let* ((directory (merge-pathnames (format nil "enchiridion-replay-~D/"
+                                            (random most-positive-fixnum))
+                                    (uiop:temporary-directory)))
+         (store (enchiridion.memory.store:open-store
+                 :path (merge-pathnames "memory.db" directory)))
+         (backend (enchiridion.llm:resolve-backend
+                   :config '(:llm (:provider :opencode)) :api-key "fixture"))
+         (agent (enchiridion.kernel:make-agent
+                 :backend backend :blocks (list (make-test-block "voice")) :tools-p t))
+         (session (enchiridion.kernel:make-session :agent agent))
+         (requests '())
+         (progress '())
+         (enchiridion.tools::*registry* (make-hash-table :test #'equal))
+         (enchiridion.kernel:*turn-progress-function*
+           (lambda (event data) (when (eq event :response) (push data progress))))
+         (enchiridion.llm::*http-post-function*
+           (lambda (request)
+             (push (enchiridion.llm:parse-json (enchiridion.llm::http-request-body request))
+                   requests)
+             (case (length requests)
+               ((1 2 3)
+                (let ((i (length requests)))
+                  (format nil "{\"choices\":[{\"message\":{\"content\":null,~A\
+\"tool_calls\":[{\"id\":\"call-~D\",\"function\":{\"name\":\"replay-echo\",\"arguments\":\"{}\"}}]}}]}"
+                          (case i
+                            (1 "\"reasoning_content\":\"private-notes-1\",")
+                            (2 "")
+                            (3 "\"reasoning_content\":\"\","))
+                          i)))
+               (4 "{\"choices\":[{\"message\":{\"content\":\"first reply\",\"reasoning_content\":\"final private notes\"}}]}")
+               (5 "{\"choices\":[{\"message\":{\"content\":\"second reply\"}}]}")
+               (otherwise (error "Unexpected extra request"))))))
+    (unwind-protect
+         (progn
+           (enchiridion.tools:define-tool "replay-echo"
+             :description "Return fixture text."
+             :schema (:object)
+             :handler (lambda (arguments) (declare (ignore arguments)) "fixture output"))
+           (ok (string= "first reply"
+                        (enchiridion.llm:completion-text
+                         (enchiridion.kernel:run-turn agent "first question"
+                                                      :store store :session session))))
+           (ok (string= "second reply"
+                        (enchiridion.llm:completion-text
+                         (enchiridion.kernel:run-turn agent "follow up"
+                                                      :store store :session session))))
+           (destructuring-bind (next fourth third second first) requests
+             (ok (every (lambda (request) (getf request :tools)) requests))
+             (ok (eq :absent (getf (car (last (getf first :messages))) :reasoning_content :absent)))
+             (loop for body in (list second third fourth)
+                   for expected in '(2 4 6)
+                   do
+               (let ((rounds (member "assistant" (getf body :messages)
+                                     :test #'string= :key (lambda (m) (getf m :role)))))
+                 (ok (= expected (length rounds)))
+                 (loop for (assistant result) on rounds by #'cddr
+                       for i from 1
+                       do (ok (equal (getf assistant :reasoning_content)
+                                     (if (= i 1) "private-notes-1" "")))
+                          (ok (null (getf assistant :content :absent)))
+                          (ok (equal (getf result :content) "fixture output"))
+                          (ok (equal (getf (first (getf assistant :tool_calls)) :id)
+                                     (getf result :tool_call_id)))
+                          (ok (equal (getf result :role) "tool")))))
+             (let* ((messages (getf next :messages))
+                    (assistant (find "assistant" messages :test #'string=
+                                     :key (lambda (m) (getf m :role)))))
+               (ok (equal "first reply" (getf assistant :content)))
+               (ok (equal "" (getf assistant :reasoning_content)))
+               (ok (equal "follow up" (getf (car (last messages)) :content)))))
+           (ng (enchiridion.memory.store:search-sessions store "private-notes"))
+           (ok (every (lambda (completion) (null (enchiridion.llm::completion-tool-reasoning completion)))
+                      (enchiridion.kernel:session-turns session)))
+           (ok (every (lambda (event) (string= "" (getf event :reasoning))) progress)))
+      (enchiridion.memory.store:close-store store)
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
 (deftest a-turn-with-a-store-is-recorded ()
   (let* ((directory (uiop:ensure-directory-pathname
                      (merge-pathnames

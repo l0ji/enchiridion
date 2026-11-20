@@ -224,6 +224,16 @@ message: the frame tests do that once, at the edge.")
     (ng (enchiridion.channel.fluxer::frame-close-code
          (coerce (list 8 2 15) '(vector (unsigned-byte 8)))))))
 
+(deftest websocket-parse-accepts-a-whole-frame-without-offsets ()
+  (let ((socket (make-instance 'enchiridion.channel.fluxer::fluxer-socket
+                               :url "ws://offline.invalid/"))
+        (message nil)
+        (frame (make-array 4 :element-type '(unsigned-byte 8)
+                             :initial-contents '(129 2 104 105))))
+    (websocket-driver:on :message socket (lambda (text) (setf message text)))
+    (websocket-driver.ws.base:parse socket frame)
+    (ok (equal message "hi"))))
+
 (deftest a-refused-session-and-a-network-blip-are-told-apart ()
   (testing "a refused token is not worth another attempt"
     (ok (enchiridion.channel.fluxer::fatal-close-p 4004))

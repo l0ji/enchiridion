@@ -114,6 +114,7 @@ recover from a string."))
    #:completion-input-tokens #:completion-output-tokens
    #:completion-cache-read-tokens #:completion-cache-write-tokens
    #:completion-total-tokens #:copy-completion
+   #:take-completion-tool-message
    ;; The adapter registry and the provider record it speaks. A handler
    ;; registers itself under an id; the provider table resolves an id to the
    ;; handler and hands it a PROVIDER. Nothing here names a vendor, which is

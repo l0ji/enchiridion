@@ -643,6 +643,19 @@ overrides the default here rather than losing to it."
       (ok (signals (enchiridion.llm:anthropic-parse-completion payload)
                    'enchiridion.errors:backend-error)))))
 
+(deftest go-replay-is-limited-to-the-deepseek-flash-route ()
+  (let ((enchiridion.llm::*http-post-function*
+          (lambda (request)
+            (declare (ignore request))
+            "{\"choices\":[{\"message\":{\"reasoning_content\":\"notes\",\
+\"tool_calls\":[{\"id\":\"c\",\"function\":{\"name\":\"echo\",\"arguments\":\"{}\"}}]}}]}")))
+    (dolist (pair '(("https://api.openai.com/v1/" "deepseek-v4.1-flash")
+                    ("https://opencode.ai/zen/go/v1/" "glm-5.3-flash")))
+      (destructuring-bind (url model) pair
+        (let ((backend (enchiridion.llm:openai-backend :base-url url :model model)))
+          (ok (signals (enchiridion.llm:complete backend (list (enchiridion.llm:user-message "hi")))
+                       'enchiridion.errors:backend-error)))))))
+
 (deftest thinking-is-refused-in-whichever-field-the-profile-reads ()
   ;; The refusal has to read the field the parser stores. A profile reporting
   ;; under `reasoning' used to pass and then lose its thinking on replay.

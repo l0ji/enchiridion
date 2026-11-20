@@ -56,6 +56,14 @@
                    (ok (search "memory note" output))
                    (ok (search "on two lines" output))
                    (ok (not (search (format nil "~%on two lines") output)))))
+               (testing "scopes select the matching record type"
+                 (flet ((lookup (query scope)
+                          (enchiridion.tools.builtin:search-run
+                           (list :query query :scope scope))))
+                   (ok (search "session session-9" (lookup "xylophone" "sessions")))
+                   (ok (string= "no matches" (lookup "xylophone" "memories")))
+                   (ok (search "memory note" (lookup "glockenspiel" "memories")))
+                   (ok (string= "no matches" (lookup "glockenspiel" "sessions")))))
                (testing "a query that matches nothing says so"
                  (ok (string= "no matches"
                               (enchiridion.tools.builtin:search-run
@@ -92,7 +100,7 @@
       (ok (signals (enchiridion.tools.builtin:search-run (list :query ""))
                    'enchiridion.errors:schema-error))
       (ok (signals (enchiridion.tools.builtin:search-run
-                    (list :query "x" :scope "sessions"))
+                    (list :query "x" :scope "unknown"))
                    'enchiridion.errors:schema-error)))))
 
 (deftest blockops-adds-patches-and-scans ()
@@ -182,9 +190,20 @@
       (ok (signals (enchiridion.tools.builtin:meta-run
                     (list :action "bootstrap-step" :step 99 :directory text))
                    'enchiridion.errors:schema-error))
-      (dolist (step (enchiridion.memory:bootstrap-steps directory))
-        (enchiridion.tools.builtin:meta-run
-         (list :action "bootstrap-step" :step (car step) :directory text)))
+      (dolist (step '(1 3))
+        (ok (signals (enchiridion.tools.builtin:meta-run
+                      (list :action "bootstrap-step" :step step :directory text))
+                     'enchiridion.errors:schema-error)))
+      (ok (equal '(1) (getf (enchiridion.memory:bootstrap-status directory) :done)))
+      (ok (signals (enchiridion.tools.builtin:meta-run
+                    (list :action "bootstrap-steps" :steps #(2 4) :directory text))
+                   'enchiridion.errors:schema-error))
+      (ok (equal '(1) (getf (enchiridion.memory:bootstrap-status directory) :done)))
+      (ok (search "Completed steps: 1, 2, 3, 4, 5, 6, 7, 8"
+                  (enchiridion.tools.builtin:meta-run
+                   (enchiridion.llm:parse-json
+                    (format nil "{~S:~S,~S:[2,3,4,5,6,7,8],~S:~S}"
+                            "action" "bootstrap-steps" "steps" "directory" text)))))
       (ok (probe-file (merge-pathnames "BOOTSTRAP.done.md" directory)))
       (ng (probe-file (merge-pathnames "BOOTSTRAP.md" directory))))))
 

@@ -44,10 +44,12 @@ nix run .#enchiridion -- bootstrap run
 nix run .#enchiridion -- bootstrap step 3
 ```
 
-Until the last step, the block and file tools refuse agent writes to `SOUL.md`,
-`OPERATOR.md` and `WORLD.md` with `Block PERSONA is the operator's until
-bootstrap hands over.` The shell tool does not check that gate, so the agent can
-still change the files through a shell command.
+The operator may edit `SOUL.md`, `OPERATOR.md`, and `WORLD.md` at any time.
+Until handover, the block and file tools refuse agent writes to those files.
+The agent saves drafts under `proposed/` and can finish consecutive steps in
+one turn. The built-in shell is unavailable until handover. These tool restrictions
+are not an OS sandbox. Untouched older stock checklists update on the next turn;
+custom checklists and recorded progress are preserved.
 
 The last step renames the file to `BOOTSTRAP.done.md` and commits the directory.
 `bootstrap reset` restores it when the live file is absent and clears the record.
@@ -56,7 +58,8 @@ The bootstrap record lives in `state.json`, so deleting that file resets it.
 ## History
 
 The agent directory is its own Git repository. The kernel commits after each
-successful turn with the message `Turn N via CHANNEL`.
+successful turn that changed the tree, with the message `Agent turn N via CHANNEL`.
+The counter also includes turns that changed nothing, so Git history can skip numbers.
 
 ```sh
 git -C agents/default log --oneline

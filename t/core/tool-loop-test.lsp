@@ -166,6 +166,35 @@
     (ok (string= "{\"text\":\"hi\"}"
                  (getf (getf tool-call :function) :arguments)))))
 
+(deftest operator-file-refreshes-on-the-next-turn
+  (let* ((directory (merge-pathnames (format nil "identity-refresh-~D/" (random most-positive-fixnum))
+                                     (uiop:temporary-directory)))
+         (operator (merge-pathnames "OPERATOR.md" directory))
+         (bootstrap (merge-pathnames "BOOTSTRAP.md" directory))
+         (backend (make-scripted-backend :replies (list (completion "one") (completion "two")))))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist operator)
+           (enchiridion.memory:write-block-file operator "original operator text")
+           (enchiridion.memory:write-block-file bootstrap "1. Verify the identity files.")
+           (let ((agent (enchiridion.kernel:make-agent :directory directory :backend backend)))
+             (multiple-value-bind (text outcome failed)
+                 (enchiridion.kernel::execute-tool agent (call "blocked" "shell" "{}"))
+               (declare (ignore outcome))
+               (ok failed)
+               (ok (search "unavailable until bootstrap handover" text)))
+             (enchiridion.kernel:run-turn agent "go")
+             (enchiridion.memory:write-block-file operator "updated operator text")
+             (enchiridion.kernel:run-turn agent "continue")
+             (destructuring-bind (latest first) (scripted-backend-transcripts backend)
+               (let ((initial (enchiridion.llm:message-content (first first)))
+                     (current (enchiridion.llm:message-content (first latest))))
+                 (ok (search "original operator text" initial))
+                 (ok (search "Until handover, blockops and file refuse your writes" initial))
+                 (ok (search "updated operator text" current))
+                 (ng (search "original operator text" current))))))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
 (deftest a-turn-that-edits-soul-md-lands-in-the-agent-repository ()
   ;; The agent edits SOUL.md after bootstrap hands over, and the change lands
   ;; in git. The backend is scripted, so what this proves is the harness
@@ -217,7 +246,7 @@
              (testing "and the turn that wrote it is a commit in the repository"
                (let ((entry (first (enchiridion.git:git-log directory :limit 5))))
                  (ok entry)
-                 (ok (search "Turn 1" (cdr entry)))))))
+                 (ok (search "Agent turn 1" (cdr entry)))))))
       (enchiridion.tools:clear-registry)
       (uiop:delete-directory-tree directory
                                   :validate t

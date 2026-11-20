@@ -243,7 +243,8 @@ did not think of."))
    #:*block-limits* #:*unlisted-block-limit*
    ;; The bootstrap state machine.
    #:bootstrap-status #:bootstrap-complete-p #:bootstrap-remaining
-   #:bootstrap-refuse-writes-p #:mark-bootstrap-step
+   #:bootstrap-refuse-writes-p #:mark-bootstrap-step #:mark-bootstrap-steps
+    #:upgrade-stock-bootstrap
    ;; Tiers.
    #:tiered #:tiered-l0 #:tiered-l1 #:tiered-l2 #:build-tiers #:promote-tier
    #:tier-for #:tier-name #:tier-misses #:note-tier-miss #:reset-tier-misses

@@ -40,7 +40,7 @@ a commit that can be read and reverted.
 | `GUIDE.md` | the operator | this file |
 
 Until the bootstrap hands over, the block and file tools refuse agent writes to
-the first three files. The shell tool does not check that gate. After handover,
+the first three files. The built-in shell tool is unavailable during bootstrap. After handover,
 the sleep-time agent maintains all three.
 
 ## The first run
@@ -214,29 +214,37 @@ short and dated, and delete the ones that stopped being true.
 (defparameter +bootstrap+
   "# Bootstrap
 
-The first steps. Work through them in order, one turn each. The meta tool
-records a step, and the last step archives this file.
+Record each completed step with `meta` action `bootstrap-step`. Continue in the
+same turn whenever possible. Ask only for missing facts that block progress.
+
+The operator may edit `SOUL.md`, `OPERATOR.md`, and `WORLD.md` at any time.
+Until handover, `blockops` and `file` refuse agent writes to those files.
+The built-in shell tool is also unavailable until handover. These tool
+restrictions are not a substitute for an OS sandbox.
 
 1. Read `SOUL.md`, `OPERATOR.md`, and `WORLD.md`.
-2. List, in one message, every question those three files do not answer.
-3. Wait for the answers. Do not guess at a fact that was not given.
-4. Propose the answers for the three files. The operator writes them, because
-   the block and file tools refuse agent writes until handover.
-5. Create one skill under `skills/`, and use it once in this session.
-6. Write one memory with the memory tool, and read it back with the search tool.
-7. Record each step with the meta tool action `bootstrap-step`.
-8. When every step is done, the last record archives this file and reports the
-   handover to the operator.
-
-The block and file tools refuse writes to `SOUL.md`, `OPERATOR.md`, and
-`WORLD.md` until the live file is gone. The shell tool does not check that gate.
-The operator's guidance cannot be edited away through the block or file tools
-before handover.
-
-After handover this file is read-only history, and the sleep-time agent owns the
-three identity files.
+2. Identify missing facts. Ask any blocking questions together; inspect local files first when they may have the answers.
+3. Resolve blocking questions without guessing. If none remain, continue without waiting.
+4. Save any proposed changes as `proposed/SOUL.md`, `proposed/OPERATOR.md`, or `proposed/WORLD.md`. Skip drafts for files that need no changes.
+5. Create a useful reference skill under `skills/` and apply it to the current work.
+6. Save a useful, non-secret memory and read it back with `search` scope `memories`.
+7. Verify that the operator applied or declined the drafts. If there were no drafts, continue.
+8. Record this step to archive the checklist and unlock agent writes. Report the handover.
 "
   "The first steps.")
+
+(defun upgrade-stock-bootstrap (directory)
+  "Replace the old stock checklist without changing saved progress."
+  (let ((path (merge-pathnames "BOOTSTRAP.md" directory)))
+    (when (and (probe-file path) (not (enchiridion.compat:symlink-target path)))
+      (let ((text (uiop:read-file-string path :external-format :utf-8)))
+        (when (and (= (length text) 1151)
+                   (string-equal
+                    "fd3ac5bd57cfae5202d3636f72db4dd5aeb7d81f2fc36e77a4e76fb685d8dfcc"
+                    (ironclad:byte-array-to-hex-string
+                     (ironclad:digest-sequence :sha256
+                                               (sb-ext:string-to-octets text :external-format :utf-8)))))
+          (write-block-file path +bootstrap+))))))
 
 (defparameter +example-skill+
   ";;;; example-welcome.lsp --- A worked example of a skill.

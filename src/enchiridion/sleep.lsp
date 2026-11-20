@@ -707,7 +707,7 @@ deletes."
         (push (format nil "~D memory write~:P failed since the last tick; last: could not persist ~(~A~): ~A"
                       fresh (car latest) (cdr latest))
               lines))
-      (let ((usage (ignore-errors (enchiridion.memory.store::store-usage store))))
+      (let ((usage (ignore-errors (enchiridion.memory.store::store-usage store :now now))))
         (when (and usage
                    (let ((bytes (getf usage :bytes)))
                      (and bytes (>= bytes +store-report-bytes+)))

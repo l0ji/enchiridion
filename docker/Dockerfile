@@ -26,6 +26,7 @@ RUN set -eux; \
       git \
       libssl3 \
       libsqlite3-0 \
+      sqlite3 \
       zlib1g \
       libffi8 \
       coreutils \

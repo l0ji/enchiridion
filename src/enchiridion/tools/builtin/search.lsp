@@ -142,7 +142,7 @@ hit is one line of output and a result cannot forge a second line."
                 flat)
             (when (> (length flat) +search-hit-chars+) t))))
 
-(defun search-memory-run (args)
+(defun search-memory-run (args scope)
   "Search stored sessions and memories for QUERY and return one line per hit.
 
 The store is opened only when the file is already a database. Opening one
@@ -157,20 +157,18 @@ file as the agent's memory."
       (let ((store (enchiridion.memory.store:open-store :path path)))
         (unwind-protect
              (progn
-               (dolist (row (enchiridion.memory.store:search-sessions store query :limit limit))
+               (unless (string= scope "memories")
+                 (dolist (row (enchiridion.memory.store:search-sessions store query :limit limit))
                  (push (hit-line (format nil "session ~A ~A"
                                          (enchiridion.memory.store:turn-row-session row)
                                          (enchiridion.memory.store:turn-row-role row))
                                  (enchiridion.memory.store:turn-row-body row))
-                       results))
-               (dolist (row (enchiridion.memory.store:search-memories store query :limit limit))
+                         results)))
+               (unless (string= scope "sessions")
+                 (dolist (row (enchiridion.memory.store:search-memories store query :limit limit))
                  (push (hit-line (format nil "memory ~A" (getf row :name))
                                  (getf row :body))
-                       results))
-               ;; TURNS and MEMORIES are views over the one episodic log, so
-               ;; the two searches above cover every row. There is no third
-               ;; section to add.
-               nil)
+                         results))))
           (enchiridion.memory.store:close-store store))))
     (cap-result
      (if results
@@ -192,15 +190,16 @@ a caller that named a directory has already said what it wants walked."
     (cond
       (path (search-files-run args))
       ((string= scope "files") (search-files-run args))
-      ((string= scope "memory") (search-memory-run args))
+      ((member scope '("memory" "sessions" "memories") :test #'string=)
+       (search-memory-run args scope))
       (t (error 'enchiridion.errors:schema-error
-                :detail (format nil "Unknown search scope ~A." scope))))))
+                :detail (format nil "Unknown search scope ~A. Use memory, sessions, memories, or files." scope))))))
 
 (defparameter +search-tools+
   (list
    (enchiridion.tools:make-tool
     :name "search"
-    :description "Search stored sessions and memories, or the agent's files."
+    :description "Search by scope: memory (sessions and memories, default), sessions, memories, or files. A path selects files."
     :schema '(:object :required (:query)
               :properties ((:query :string) (:scope :string)
                            (:path :string) (:limit :integer)))

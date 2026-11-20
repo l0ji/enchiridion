@@ -727,13 +727,13 @@ file a block is backed by."
       ((string= action "show")
        (loop for (label . file) in +block-files+
              for path = (merge-pathnames file (agent-root))
-             for text = (if (probe-file path) (safe-read-file path) "")
-             do (say "~(~A~) ~D/~D ~A"
-                     label
-                     (length text)
-                     (enchiridion.memory:default-block-limit
-                      (intern (string-upcase label) :keyword))
-                     path))
+             do (if (string= label "persona")
+                    (say "persona (alias for soul)")
+                    (let ((text (if (probe-file path) (safe-read-file path) "")))
+                      (say "~(~A~) ~D/~D ~A" label (length text)
+                           (enchiridion.memory:default-block-limit
+                            (intern (string-upcase label) :keyword))
+                           path))))
        0)
       ((string= action "edit")
        (let ((index (parse-index (second arguments))))

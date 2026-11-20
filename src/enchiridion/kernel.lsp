@@ -146,6 +146,45 @@ than pretending to serialise."
                  :lock (or lock
                            (bordeaux-threads:make-lock "enchiridion agent")))))
 
+(defun refresh-file-blocks (agent)
+  "Recompile the prompt when a file-backed block changes."
+  (let ((changed nil))
+    (let ((blocks
+            (mapcar (lambda (block)
+                      (let* ((path (enchiridion.memory:block-file block))
+                             (text (and path
+                                        (block-text-from (uiop:pathname-directory-pathname path)
+                                                         (file-namestring path)))))
+                        (if (or (null text) (equal text (enchiridion.memory:block-text block)))
+                            block
+                            (prog1 (enchiridion.memory:make-block
+                                    :label (enchiridion.memory:block-label block)
+                                    :text text :file path
+                                    :limit (enchiridion.memory:block-limit block)
+                                    :writable-p (enchiridion.memory:block-writable-p block))
+                              (setf changed t)))))
+                    (agent-blocks agent))))
+      (when changed
+        (setf (agent-snapshot agent) (compile-prompt blocks)
+              (agent-blocks agent) blocks)))))
+
+(defun turn-prompt-text (agent tools channel)
+  (let* ((text (prompt-text (agent-snapshot agent)))
+         (directory (agent-directory agent))
+         (status (and directory (not (eq channel :sleep))
+                      (enchiridion.memory:bootstrap-status directory)))
+         (next (first (getf status :remaining))))
+    (with-output-to-string (stream)
+      (write-string text stream)
+      (when tools
+        (format stream "~%~%Tool budget: ~D rounds per turn. A round may contain multiple tool calls."
+                (agent-tool-rounds agent)))
+      (when next
+        (format stream "~%~%Bootstrap is active. Completed steps: ~A. Next step: ~D.~%"
+                (or (getf status :done) "none") (car next))
+        (write-string "Follow the operator's BOOTSTRAP.md checklist in order. Record each completed step with meta bootstrap-step and continue in this turn unless operator input is needed. The operator may edit SOUL.md, OPERATOR.md, and WORLD.md at any time. Until handover, blockops and file refuse your writes to them. Use proposed/ for drafts. The built-in shell is unavailable until handover."
+                      stream)))))
+
 ;;;; The ledger.
 
 ;; model is what actually answered; input, output, cache-read, and cache-write
@@ -392,16 +431,21 @@ The error text carries the condition's detail. The report alone says only
 that a tool failed, and neither the model nor the operator can fix a call
 from that."
   (handler-case
-      (let* ((arguments (enchiridion.llm:parse-json
+      (let* ((name (enchiridion.llm:tool-call-name call))
+             (directory (agent-directory agent))
+             (arguments (enchiridion.llm:parse-json
                          (enchiridion.llm:tool-call-arguments call)))
-             (result (if (agent-broker agent)
+             (result (cond
+                       ((and (string= name "shell") directory
+                             (enchiridion.memory:bootstrap-refuse-writes-p directory))
+                        (error 'enchiridion.errors:tool-error :tool name
+                               :detail "The built-in shell is unavailable until bootstrap handover."))
+                       ((agent-broker agent)
                          (enchiridion.tools.broker:broker-call
                           (agent-broker agent)
                           (enchiridion.llm:tool-call-name call)
-                          arguments)
-                         (enchiridion.tools:dispatch
-                          (enchiridion.llm:tool-call-name call)
-                          arguments)))
+                          arguments))
+                       (t (enchiridion.tools:dispatch name arguments))))
              (text (tool-result-text result)))
         (values text (tool-outcome text) nil))
     (error (condition)
@@ -568,7 +612,7 @@ all silent, and none of them may cost the operator the reply."
       (handler-case
           (enchiridion.git:git-commit-all
            directory
-           (format nil "Turn ~D via ~A" (agent-turn agent) channel))
+           (format nil "Agent turn ~D via ~A" (agent-turn agent) channel))
         (error () nil)))))
 
 (declaim (ftype (function (agent string t t t keyword t) t) run-turn-locked))
@@ -593,8 +637,10 @@ caller that does is a caller that runs two turns at once."
       (error 'enchiridion.errors:configuration-error
              :key :session
              :detail "The session belongs to a different agent."))
-    (let* ((snapshot (agent-snapshot agent))
-           (tools (when (agent-tools-p agent)
+    (when (and (agent-directory agent) (not (eq channel :sleep)))
+      (enchiridion.memory:upgrade-stock-bootstrap (agent-directory agent)))
+    (refresh-file-blocks agent)
+    (let* ((tools (when (agent-tools-p agent)
                     (enchiridion.tools:registry-tool-definitions)))
            (scrubbed (enchiridion.llm.secrets:scrub text))
            (pack (when (and store (not (eq channel :sleep)))
@@ -619,7 +665,7 @@ caller that does is a caller that runs two turns at once."
            (messages (append
                       (list (enchiridion.llm:system-message
                              (enchiridion.llm.secrets:scrub
-                              (prompt-text snapshot))))
+                              (turn-prompt-text agent tools channel))))
                       (mapcar (lambda (entry)
                                 (let ((body (enchiridion.llm.secrets:scrub
                                              (cdr entry))))
@@ -629,6 +675,9 @@ caller that does is a caller that runs two turns at once."
                               history)
                       (list (enchiridion.llm:user-message
                              (enchiridion.llm.secrets:scrub user-text)))))
+           (bootstrap-active (and (agent-directory agent) (not (eq channel :sleep))
+                                  (enchiridion.memory:bootstrap-refuse-writes-p
+                                   (agent-directory agent))))
            (rounds 0)
            (wrapped-up nil)
            (last-words nil)
@@ -680,7 +729,7 @@ caller that does is a caller that runs two turns at once."
               (progn
                 (incf rounds)
                 (setf messages (append messages (list tool-message)))
-                (dolist (call calls)
+                (loop for (call . later) on calls do
                   (note-progress :tool-start
                                  :name (enchiridion.llm:tool-call-name call)
                                  :arguments (enchiridion.llm:tool-call-arguments call))
@@ -694,7 +743,10 @@ caller that does is a caller that runs two turns at once."
                     (setf messages
                           (append messages
                                   (list (enchiridion.llm:tool-message
-                                         result
+                                         (if (and bootstrap-active (null later))
+                                             (format nil "~A~%~%Tool rounds remaining: ~D."
+                                                     result (- (agent-tool-rounds agent) rounds))
+                                             result)
                                          (enchiridion.llm:tool-call-id call)))))))))))
       (incf (agent-turn agent))
       (commit-agent-turn agent channel)

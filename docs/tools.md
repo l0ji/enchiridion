@@ -49,7 +49,8 @@ For write restrictions during setup, see [Bootstrap](memory.md#the-bootstrap).
 | --- | --- | --- |
 | `journey` | `limit` | Last commits in the agent repository |
 | `author` | `name`, `kind`, `text` | Write `tools/NAME.lsp` or `skills/NAME.md`; commit when the directory is a repository |
-| `bootstrap-step` | `step` | Record one bootstrap step |
+| `bootstrap-step` | `step` | Record the next bootstrap step |
+| `bootstrap-steps` | `steps` | Record consecutive completed steps in one update |
 | `undo` | `confirm` equal to `yes` | Revert the last commit |
 | `reload` | | Ask the running supervisor to reload |
 
@@ -68,7 +69,8 @@ can.
 
 ### search
 
-`scope` is `memory` by default. `files`, or any `path`, walks text files
+`scope` defaults to `memory` (sessions and saved memories). Use `sessions` or
+`memories` to search only one. `files`, or any `path`, walks text files
 instead. `limit` defaults to 20 for the store and 40 for the walk. A store hit
 prints as `session SESSION ROLE: TEXT` or `memory NAME: TEXT`, flattened to one
 line and cut at 400 characters. The file walk visits `md`, `txt`, `cl`, `lisp`,

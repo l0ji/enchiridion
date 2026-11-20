@@ -92,19 +92,31 @@ either way, and the commit is what turns it into a journey entry."
          (format nil "wrote ~A~@[ and committed ~A~]"
                  (namestring path)
                  (commit-author-change directory path))))
-      ((string= action "bootstrap-step")
-       (let* ((step (argument args "step"))
-              (steps (enchiridion.memory:bootstrap-steps directory)))
-         (unless (and (integerp step) (plusp step))
+      ((member action '("bootstrap-step" "bootstrap-steps") :test #'string=)
+       (let* ((single (string= action "bootstrap-step"))
+              (requested (if single (list (argument args "step")) (argument args "steps")))
+              (steps (if (and (vectorp requested) (not (stringp requested)))
+                         (coerce requested 'list)
+                         requested))
+              (status (enchiridion.memory:bootstrap-status directory))
+              (done (getf status :done))
+              (remaining (getf status :remaining)))
+         (unless (and (consp steps) (listp steps)
+                      (every (lambda (step) (and (integerp step) (plusp step))) steps))
            (error 'enchiridion.errors:schema-error
-                  :detail "step must be a positive integer."))
-         (unless (member step (mapcar #'car steps) :test #'=)
+                  :detail "Supply a positive step number or a nonempty array of positive step numbers."))
+         (unless (loop for step in steps
+                       for next in remaining
+                       always (eql step (car next))
+                       finally (return (<= (length steps) (length remaining))))
            (error 'enchiridion.errors:schema-error
-                  :detail (format nil "There is no bootstrap step ~D." step)))
-         (enchiridion.memory:mark-bootstrap-step directory step)
-         (cap-result
-          (format nil "bootstrap step ~D recorded. ~A"
-                  step (enchiridion.memory:bootstrap-status-line directory)))))
+                  :detail (format nil "Record only the next consecutive steps in order. Completed: ~A. ~A"
+                                  done (enchiridion.memory:bootstrap-status-line directory))))
+         (let ((updated (enchiridion.memory:mark-bootstrap-steps directory steps)))
+           (cap-result
+            (format nil "bootstrap ~:[steps~;step~] ~{~D~^, ~} recorded. Completed steps: ~{~D~^, ~}. ~A"
+                    single steps (getf updated :done)
+                    (enchiridion.memory:bootstrap-status-line directory))))))
       ((string= action "undo")
        (unless (string= (or (argument args "confirm") "") "yes")
          (error 'enchiridion.errors:schema-error
@@ -134,11 +146,11 @@ either way, and the commit is what turns it into a journey entry."
   (list
    (enchiridion.tools:make-tool
     :name "meta"
-    :description "Read the journey, author a tool or skill, record a bootstrap step, undo, or request a reload."
+    :description "Read the journey, author a tool or skill, record bootstrap-step (step) or bootstrap-steps (steps), undo, or request a reload."
     :schema '(:object :properties
               ((:action :string) (:directory :string) (:limit :integer)
                (:name :string) (:kind :string) (:text :string) (:confirm :string)
-               (:step :integer)))
+               (:step :integer) (:steps (:array :items :integer))))
     :handler #'meta-run)))
 
 (defun register-meta-tools ()

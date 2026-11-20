@@ -384,7 +384,8 @@ comes first and the commit last, so no git failure can lose the archive."
                 "Bootstrap complete; there was no BOOTSTRAP.md to archive.")
             (bootstrap-commit-report directory))))
 
-(declaim (ftype (function (t integer) list) mark-bootstrap-step))
+(declaim (ftype (function (t list) list) mark-bootstrap-steps)
+         (ftype (function (t integer) list) mark-bootstrap-step))
 
 (defun mark-bootstrap-step (directory step)
   "Mark STEP done in DIRECTORY and return the new bootstrap status.
@@ -392,9 +393,13 @@ comes first and the commit last, so no git failure can lose the archive."
 The list stays sorted and duplicate free, so marking the same step twice is the
 same as marking it once. When the last step lands, the handover runs from here:
 the agent should not have to know that a separate call finishes the job."
+  (mark-bootstrap-steps directory (list step)))
+
+(defun mark-bootstrap-steps (directory steps)
+  "Record STEPS in one state update and run handover if complete."
   (let* ((state (read-state directory))
          (record (bootstrap-record state))
-         (done (sort (remove-duplicates (cons step (bootstrap-done-list record))) #'<)))
+         (done (sort (remove-duplicates (append steps (bootstrap-done-list record))) #'<)))
     (setf (gethash "done" record) (coerce done 'vector)
           (gethash "step" record) (length done))
     (write-state directory state)

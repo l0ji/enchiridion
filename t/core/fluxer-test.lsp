@@ -856,6 +856,388 @@ message: the frame tests do that once, at the edge.")
       (ok (signals (enchiridion.channel.fluxer::send-reply channel "target" "reply")
                    'enchiridion.errors:transport-error)))))
 
+;;;; The reaction lifecycle.
+;;;;
+;;;; A message carries one marker at a time: an hourglass while it waits, a
+;;;; wrench while its turn runs, a warning when the turn or its reply fails, and
+;;;; nothing once the reply is delivered. The queue coalesces per message, so
+;;;; the tests read the queue directly where the thread is not the subject, and
+;;;; start the thread where it is.
+
+(deftest a-reaction-key-names-the-channel-and-the-message ()
+  (ok (string= "d-1/m-1"
+               (enchiridion.channel.fluxer::message-reaction-key
+                +direct-message+)))
+  (testing "a payload without both ids has no message to mark"
+    (ng (enchiridion.channel.fluxer::message-reaction-key '(:id "m-1")))
+    (ng (enchiridion.channel.fluxer::message-reaction-key '(:channel_id "d-1")))
+    (ng (enchiridion.channel.fluxer::message-reaction-key nil))))
+
+(deftest the-three-markers-are-the-documented-emoji ()
+  (ok (string= "⏳" enchiridion.channel.fluxer::+queued-reaction+))
+  (ok (string= "🔧" enchiridion.channel.fluxer::+processing-reaction+))
+  (ok (string= "⚠️" enchiridion.channel.fluxer::+failed-reaction+)))
+
+(deftest the-emoji-is-utf-8-percent-encoded-in-the-own-reaction-route ()
+  (testing "an emoji is its UTF-8 octets, not its code point"
+    (ok (string= "%E2%8F%B3"
+                 (enchiridion.channel.fluxer::percent-encode-segment
+                  enchiridion.channel.fluxer::+queued-reaction+)))
+    (ok (string= "%F0%9F%94%A7"
+                 (enchiridion.channel.fluxer::percent-encode-segment
+                  enchiridion.channel.fluxer::+processing-reaction+)))
+    ;; The warning is a base character and a variation selector, so this is
+    ;; also the test that both code points reach the path.
+    (ok (string= "%E2%9A%A0%EF%B8%8F"
+                 (enchiridion.channel.fluxer::percent-encode-segment
+                  enchiridion.channel.fluxer::+failed-reaction+))))
+  (testing "the route is the bot's own reaction on the message"
+    (ok (string= (concatenate 'string
+                              "https://api.fluxer.app/v1/channels/d-1"
+                              "/messages/m-1/reactions/%E2%8F%B3/@me")
+                 (enchiridion.channel.fluxer::reaction-url
+                  "d-1/m-1" enchiridion.channel.fluxer::+queued-reaction+)))))
+
+(deftest a-marker-follows-a-message-and-a-delivery-clears-it ()
+  (let* ((calls '())
+         (channel (enchiridion.channel.fluxer:make-fluxer-channel))
+         (enchiridion.llm::*http-request-function*
+           (lambda (url &rest options)
+             (push (list url (getf options :method)) calls)
+             "")))
+    (setf (enchiridion.channel.fluxer::fluxer-channel-token channel) "fake")
+    (labels ((url (emoji)
+               (enchiridion.channel.fluxer::reaction-url "d-1/m-1" emoji))
+             (applied ()
+               (enchiridion.channel.fluxer::applied-reaction channel "d-1/m-1"))
+             (apply-state (state)
+               (enchiridion.channel.fluxer::apply-reaction-state
+                channel "d-1/m-1" state)))
+      (testing "acceptance puts the hourglass with one PUT"
+        (apply-state :queued)
+        (ok (equal (list (list (url enchiridion.channel.fluxer::+queued-reaction+)
+                               :put))
+                   (reverse calls)))
+        (ok (string= enchiridion.channel.fluxer::+queued-reaction+ (applied))))
+      (testing "processing replaces it with the wrench"
+        (apply-state :processing)
+        (ok (equal (list (list (url enchiridion.channel.fluxer::+queued-reaction+)
+                               :delete)
+                         (list (url enchiridion.channel.fluxer::+processing-reaction+)
+                               :put))
+                   (reverse (subseq calls 0 2))))
+        (ok (string= enchiridion.channel.fluxer::+processing-reaction+
+                     (applied))))
+      (testing "a delivered reply removes the wrench and remembers nothing"
+        (apply-state :delivered)
+        (ok (equal (list (url enchiridion.channel.fluxer::+processing-reaction+)
+                         :delete)
+                   (first calls)))
+        (ok (null (applied))))
+      (testing "a failure puts the warning over the wrench"
+        (apply-state :processing)
+        (apply-state :failed)
+        (ok (equal (list (list (url enchiridion.channel.fluxer::+processing-reaction+)
+                               :delete)
+                         (list (url enchiridion.channel.fluxer::+failed-reaction+)
+                               :put))
+                   (reverse (subseq calls 0 2))))
+        (ok (string= enchiridion.channel.fluxer::+failed-reaction+ (applied))))
+      (testing "a state for a marker that was never put issues no delete"
+        (setf calls '())
+        (enchiridion.channel.fluxer::apply-reaction-state
+         channel "d-2/m-2" :processing)
+        (ok (equal (list (list (enchiridion.channel.fluxer::reaction-url
+                                "d-2/m-2"
+                                enchiridion.channel.fluxer::+processing-reaction+)
+                               :put))
+                   (reverse calls))))
+      (testing "and a message delivered before the worker started costs nothing"
+        (setf calls '())
+        (enchiridion.channel.fluxer::apply-reaction-state
+         channel "d-3/m-3" :delivered)
+        (ok (null calls))))))
+
+(deftest a-gone-message-is-not-a-reaction-failure ()
+  (let ((channel (enchiridion.channel.fluxer:make-fluxer-channel)))
+    (setf (enchiridion.channel.fluxer::fluxer-channel-token channel) "fake")
+    (testing "a 404 says the message or the reaction is already gone"
+      (let ((enchiridion.llm::*http-request-function*
+              (lambda (url &rest options)
+                (declare (ignore url options))
+                (error 'dexador.error:http-request-failed
+                       :status 404 :body "{\"message\":\"Unknown Message\"}"
+                       :headers nil :uri nil :method :delete))))
+        (ok (enchiridion.channel.fluxer::reaction-call
+             channel "d-9/gone"
+             enchiridion.channel.fluxer::+failed-reaction+ nil))))
+    (testing "and a 500 is"
+      (let ((enchiridion.llm::*http-request-function*
+              (lambda (url &rest options)
+                (declare (ignore url options))
+                (error 'dexador.error:http-request-failed
+                       :status 500 :body "{\"message\":\"boom\"}"
+                       :headers nil :uri nil :method :put))))
+        (ng (enchiridion.channel.fluxer::reaction-call
+             channel "d-9/m-9"
+             enchiridion.channel.fluxer::+queued-reaction+ t))))))
+
+(deftest a-429-on-a-reaction-is-retried ()
+  (let ((calls 0)
+        (channel (enchiridion.channel.fluxer:make-fluxer-channel)))
+    (setf (enchiridion.channel.fluxer::fluxer-channel-token channel) "fake")
+    (let ((enchiridion.llm::*http-request-function*
+            (lambda (url &rest options)
+              (declare (ignore url options))
+              (incf calls)
+              (if (= calls 1)
+                  (error 'dexador.error:http-request-failed
+                         :status 429 :body "{\"retry_after\":0}"
+                         :headers nil :uri nil :method :put)
+                  ""))))
+      (ok (enchiridion.channel.fluxer::reaction-call
+           channel "d-1/m-1"
+           enchiridion.channel.fluxer::+queued-reaction+ t)))
+    (ok (= 2 calls))))
+
+(deftest the-reaction-queue-coalesces-one-message-to-one-state ()
+  (let ((channel (enchiridion.channel.fluxer:make-fluxer-channel)))
+    (enchiridion.channel.fluxer::enqueue-reaction channel "d-1/m-1" :queued)
+    (enchiridion.channel.fluxer::enqueue-reaction channel "d-2/m-2" :queued)
+    (enchiridion.channel.fluxer::enqueue-reaction channel "d-1/m-1" :processing)
+    (testing "two messages are two entries and the newer state wins"
+      (ok (= 2 (length (enchiridion.channel.fluxer::fluxer-channel-reaction-order
+                        channel))))
+      (ok (eq :processing
+              (gethash "d-1/m-1"
+                       (enchiridion.channel.fluxer::fluxer-channel-reaction-pending
+                        channel)))))
+    (testing "and the queue is oldest first"
+      (let ((first (enchiridion.channel.fluxer::dequeue-reaction channel)))
+        (ok (string= "d-1/m-1" (car first)))
+        (ok (eq :processing (cdr first))))
+      (let ((second (enchiridion.channel.fluxer::dequeue-reaction channel)))
+        (ok (string= "d-2/m-2" (car second)))
+        (ok (eq :queued (cdr second))))
+      (ok (null (enchiridion.channel.fluxer::dequeue-reaction channel))))))
+
+(deftest a-message-delivered-before-the-worker-started-never-flickers ()
+  (let* ((calls 0)
+         (channel (enchiridion.channel.fluxer:make-fluxer-channel))
+         (enchiridion.llm::*http-request-function*
+           (lambda (url &rest options)
+             (declare (ignore url options))
+             (incf calls)
+             "")))
+    (setf (enchiridion.channel.fluxer::fluxer-channel-token channel) "fake")
+    (enchiridion.channel.fluxer::enqueue-reaction channel "d-1/m-1" :queued)
+    (enchiridion.channel.fluxer::enqueue-reaction channel "d-1/m-1" :processing)
+    (enchiridion.channel.fluxer::enqueue-reaction channel "d-1/m-1" :delivered)
+    (let ((entry (enchiridion.channel.fluxer::dequeue-reaction channel)))
+      (ok (eq :delivered (cdr entry))))
+    (enchiridion.channel.fluxer::apply-reaction-state
+     channel "d-1/m-1" :delivered)
+    (testing "the coalesced history costs no request at all"
+      (ok (zerop calls)))))
+
+(deftest the-reaction-worker-applies-the-states-in-order ()
+  (let* ((calls '())
+         (done (bordeaux-threads:make-semaphore))
+         (channel (enchiridion.channel.fluxer:make-fluxer-channel)))
+    (setf (enchiridion.channel.fluxer::fluxer-channel-token channel) "fake")
+    (unwind-protect
+         (progn
+           (setf (enchiridion.channel.fluxer::fluxer-channel-reaction-worker channel)
+                 (bordeaux-threads:make-thread
+                  (lambda ()
+                    (let ((enchiridion.llm::*http-request-function*
+                            (lambda (url &rest options)
+                              (push (list url (getf options :method)) calls)
+                              (bordeaux-threads:signal-semaphore done)
+                              "")))
+                      (enchiridion.channel.fluxer::run-reaction-worker channel)))))
+           (enchiridion.channel.fluxer::enqueue-reaction
+            channel "d-1/m-1" :queued)
+           (ok (bordeaux-threads:wait-on-semaphore done :timeout 2))
+           (enchiridion.channel.fluxer::enqueue-reaction
+            channel "d-1/m-1" :processing)
+           (ok (bordeaux-threads:wait-on-semaphore done :timeout 2))
+           (ok (bordeaux-threads:wait-on-semaphore done :timeout 2))
+           (enchiridion.channel.fluxer::enqueue-reaction
+            channel "d-1/m-1" :delivered)
+           (ok (bordeaux-threads:wait-on-semaphore done :timeout 2))
+           (labels ((url (emoji)
+                      (enchiridion.channel.fluxer::reaction-url "d-1/m-1" emoji)))
+             (ok (equal (list
+                         (list (url enchiridion.channel.fluxer::+queued-reaction+)
+                               :put)
+                         (list (url enchiridion.channel.fluxer::+queued-reaction+)
+                               :delete)
+                         (list (url enchiridion.channel.fluxer::+processing-reaction+)
+                               :put)
+                         (list (url enchiridion.channel.fluxer::+processing-reaction+)
+                               :delete))
+                        (reverse calls)))))
+      (enchiridion.channel.fluxer::stop-reaction-worker channel))
+    (ok (null (enchiridion.channel.fluxer::fluxer-channel-reaction-worker channel)))))
+
+(deftest an-accepted-message-is-marked-before-it-can-run ()
+  (let* ((channel (enchiridion.channel.fluxer:make-fluxer-channel
+                   :config '(:allowed-users ("u-1"))
+                   :turn (lambda (message)
+                           (declare (ignore message))
+                           (list :ok-p t :reply "answer")))))
+    (setf (enchiridion.channel.fluxer::fluxer-channel-token channel) "fake")
+    (enchiridion.channel.fluxer::offer-message channel +direct-message+)
+    (testing "the worker has it and the marker says it is waiting"
+      (ok (= 1 (length (enchiridion.channel.fluxer::fluxer-channel-pending channel))))
+      (ok (eq :queued
+              (gethash "d-1/m-1"
+                       (enchiridion.channel.fluxer::fluxer-channel-reaction-pending
+                        channel)))))
+    (let ((enchiridion.llm::*http-request-function*
+            (lambda (url &rest options)
+              (declare (ignore url options))
+              "{\"id\":\"reply-1\"}")))
+      (enchiridion.channel.fluxer::handle-inkbound
+       channel
+       (enchiridion.channel.fluxer::dequeue-inkbound channel)))
+    (testing "and a delivered reply is the terminal state"
+      (ok (eq :delivered
+              (gethash "d-1/m-1"
+                       (enchiridion.channel.fluxer::fluxer-channel-reaction-pending
+                        channel)))))))
+
+(deftest a-failed-turn-marks-the-message-failed ()
+  (dolist (turn (list (lambda (message)
+                        (declare (ignore message))
+                        (list :ok-p nil :error "boom"))
+                      (lambda (message)
+                        (declare (ignore message))
+                        (error "kaboom"))))
+    (let ((channel (enchiridion.channel.fluxer:make-fluxer-channel
+                    :config '(:allowed-users ("u-1"))
+                    :turn turn)))
+      (enchiridion.channel.fluxer::handle-inkbound channel +direct-message+)
+      (ok (eq :failed
+              (gethash "d-1/m-1"
+                       (enchiridion.channel.fluxer::fluxer-channel-reaction-pending
+                        channel))))))
+  (testing "and a channel with no turn function has nothing to deliver"
+    (let ((channel (enchiridion.channel.fluxer:make-fluxer-channel)))
+      (enchiridion.channel.fluxer::handle-inkbound channel +direct-message+)
+      (ok (eq :failed
+              (gethash "d-1/m-1"
+                       (enchiridion.channel.fluxer::fluxer-channel-reaction-pending
+                        channel)))))))
+
+(deftest a-reply-that-fails-mid-chunk-is-not-delivered ()
+  (let* ((posts 0)
+         (channel (enchiridion.channel.fluxer:make-fluxer-channel
+                   :config '(:allowed-users ("u-1"))
+                   :turn (lambda (message)
+                           (declare (ignore message))
+                           (list :ok-p t
+                                 :reply (make-string 2500 :initial-element #\a)))))
+         (enchiridion.llm::*http-request-function*
+           (lambda (url &rest options)
+             (declare (ignore url options))
+             (incf posts)
+             (if (= posts 1)
+                 "{\"id\":\"first\"}"
+                 (error 'dexador.error:http-request-failed
+                        :status 500 :body "{\"message\":\"boom\"}"
+                        :headers nil :uri nil :method :post)))))
+    (setf (enchiridion.channel.fluxer::fluxer-channel-token channel) "fake")
+    (enchiridion.channel.fluxer::handle-inkbound channel +direct-message+)
+    (testing "both pieces were attempted and the second failed"
+      (ok (= 2 posts)))
+    (testing "so the marker is the warning and not a clear"
+      (ok (eq :failed
+              (gethash "d-1/m-1"
+                       (enchiridion.channel.fluxer::fluxer-channel-reaction-pending
+                        channel)))))))
+
+(deftest a-message-evicted-from-the-turn-queue-is-marked-failed ()
+  (let ((channel (enchiridion.channel.fluxer:make-fluxer-channel)))
+    (dotimes (index enchiridion.channel.fluxer::+max-pending-messages+)
+      (enchiridion.channel.fluxer::enqueue-inkbound
+       channel (list :id (format nil "m-~D" index) :channel_id "d-1")))
+    (enchiridion.channel.fluxer::enqueue-inkbound
+     channel '(:id "m-new" :channel_id "d-1"))
+    (testing "the queue stayed bounded and counted the drop"
+      (ok (= enchiridion.channel.fluxer::+max-pending-messages+
+             (length (enchiridion.channel.fluxer::fluxer-channel-pending channel))))
+      (ok (= 1 (enchiridion.channel.fluxer::fluxer-channel-dropped channel))))
+    (testing "the oldest waiting message carries the warning"
+      (ok (eq :failed
+              (gethash "d-1/m-0"
+                       (enchiridion.channel.fluxer::fluxer-channel-reaction-pending
+                        channel)))))
+    (testing "and the message that was admitted does not"
+      (ng (gethash "d-1/m-new"
+                   (enchiridion.channel.fluxer::fluxer-channel-reaction-pending
+                    channel))))))
+
+(deftest the-reaction-queue-is-bounded ()
+  (let ((channel (enchiridion.channel.fluxer:make-fluxer-channel)))
+    (dotimes (index (1+ enchiridion.channel.fluxer::+max-pending-reactions+))
+      (enchiridion.channel.fluxer::enqueue-reaction
+       channel (format nil "d-1/m-~D" index) :queued))
+    (ok (= enchiridion.channel.fluxer::+max-pending-reactions+
+           (length (enchiridion.channel.fluxer::fluxer-channel-reaction-order
+                    channel))))))
+
+(deftest a-stop-marks-an-abandoned-turn-and-leaves-the-warning ()
+  (let* ((channel (enchiridion.channel.fluxer:make-fluxer-channel
+                   :config '(:allowed-users ("u-1"))
+                   :turn (lambda (message)
+                           (declare (ignore message))
+                           (sleep 5)
+                           (list :ok-p t :reply "late"))))
+         (enchiridion.channel.fluxer::+stop-join-seconds+ 0.05))
+    (setf (enchiridion.channel.fluxer::fluxer-channel-token channel) "fake")
+    (unwind-protect
+         (progn
+           (setf (enchiridion.channel.fluxer::fluxer-channel-reaction-worker channel)
+                 (bordeaux-threads:make-thread
+                  (lambda ()
+                    (let ((enchiridion.llm::*http-request-function*
+                            (lambda (url &rest options)
+                              (declare (ignore url options))
+                              "")))
+                      (enchiridion.channel.fluxer::run-reaction-worker channel)))
+                  :name "fluxer test reactions"))
+           (setf (enchiridion.channel.fluxer::fluxer-channel-worker channel)
+                 (bordeaux-threads:make-thread
+                  (lambda () (enchiridion.channel.fluxer::run-worker channel))
+                  :name "fluxer test worker"))
+           (enchiridion.channel.fluxer::enqueue-reaction
+            channel "d-1/m-1" :queued)
+           (enchiridion.channel.fluxer::enqueue-inkbound
+            channel '(:id "m-1" :channel_id "d-1" :channel_type 1
+                      :author (:id "u-1")))
+           ;; Wait for the worker to be inside the turn, so the stop has a turn
+           ;; to abandon rather than a message to dequeue and mark normally.
+           (loop repeat 200
+                 until (string= "d-1/m-1"
+                                (bordeaux-threads:with-lock-held
+                                    ((enchiridion.channel.fluxer::fluxer-channel-pending-lock
+                                      channel))
+                                  (or (enchiridion.channel.fluxer::fluxer-channel-active-reaction
+                                       channel)
+                                      "")))
+                 do (sleep 0.01))
+           (enchiridion.channel.fluxer::shutdown channel)
+           (testing "the abandoned turn ends on the warning marker"
+             (ok (string= enchiridion.channel.fluxer::+failed-reaction+
+                          (enchiridion.channel.fluxer::applied-reaction
+                           channel "d-1/m-1"))))
+           (testing "and the reaction thread is gone"
+             (ok (null (enchiridion.channel.fluxer::fluxer-channel-reaction-worker
+                        channel)))))
+      (ignore-errors (enchiridion.channel.fluxer::shutdown channel)))))
+
 ;;;; The session cursor, the reconnect budget, and a socket that goes quiet.
 ;;;;
 ;;;; A session and its dispatch sequence are one object: the gateway numbers

@@ -15,7 +15,9 @@
 ;;;; Everything that can spin is bounded. Reconnects are counted and backed
 ;;;; off. The heartbeat waits in slices and stops on the same flag a close
 ;;;; sets. The worker is the only thread that runs a turn, so the library's
-;;;; read thread never holds a turn while the socket backs up behind it.
+;;;; read thread never holds a turn while the socket backs up behind it. The
+;;;; reaction thread is a third thread with a bounded, coalescing queue, so a
+;;;; cosmetic marker never sits in front of a socket or a turn.
 ;;;;
 ;;;; The protocol is facts and pure functions at the top of the file. The
 ;;;; socket, the threads, and the HTTP calls below them use those facts, so
@@ -869,7 +871,49 @@ proposed, as a universal time. The cooldown is counted from it.")
                 :documentation "Guards the status state. The worker proposes,
 the read thread reapplies on READY, and the heartbeat thread expires it.")
    (dropped :accessor fluxer-channel-dropped :initform 0 :type integer
-            :documentation "How many messages a full queue has dropped."))
+            :documentation "How many messages a full queue has dropped.")
+   (reaction-pending :accessor fluxer-channel-reaction-pending
+                     :initform (make-hash-table :test #'equal) :type hash-table
+                     :documentation "The newest reaction state waiting for each
+message, keyed by \"channel/message\". A newer state for a message already here
+replaces it.")
+   (reaction-order :accessor fluxer-channel-reaction-order :initform nil :type list
+                   :documentation "The keys in REACTION-PENDING, oldest first.
+The queue is bounded by +MAX-PENDING-REACTIONS+.")
+   (reaction-lock :accessor fluxer-channel-reaction-lock
+                  :initform (bordeaux-threads:make-lock "fluxer reactions")
+                  :type t
+                  :documentation "Guards the reaction queue, which the socket's
+read thread and the turn worker write and the reaction thread drains.")
+   (reaction-ready :accessor fluxer-channel-reaction-ready
+                   :initform (bordeaux-threads:make-semaphore
+                              :name "fluxer reactions")
+                   :type t
+                   :documentation "Counts the messages waiting, so the reaction
+thread sleeps rather than polls.")
+   (reaction-worker :accessor fluxer-channel-reaction-worker :initform nil :type t
+                    :documentation "The one thread that sends reactions, or NIL.")
+   (reaction-stopping-p :accessor fluxer-channel-reaction-stopping-p
+                        :initform nil :type boolean
+                        :documentation "True once the reaction thread has been
+asked to drain and finish. Separate from STOPPING-P, because the reaction thread
+outlives the socket and the worker by one drain.")
+   (reaction-deadline :accessor fluxer-channel-reaction-deadline :initform nil
+                      :type t
+                      :documentation "When a stop's drain gives up, as a real
+time from REAL-SECONDS, or NIL outside a stop.")
+   (reaction-applied :accessor fluxer-channel-reaction-applied
+                     :initform (make-hash-table :test #'equal) :type hash-table
+                     :documentation "The marker the bot last put on each
+message, so a state that was coalesced away never causes a delete.")
+   (reaction-applied-order :accessor fluxer-channel-reaction-applied-order
+                           :initform nil :type list
+                           :documentation "The keys in REACTION-APPLIED, oldest
+first, so the table can evict at +REACTION-TRACKED-LIMIT+.")
+   (active-reaction :accessor fluxer-channel-active-reaction :initform nil
+                    :type t
+                    :documentation "The message key the turn worker is inside,
+so a stop that has to destroy the thread can mark it failed."))
   (:documentation
    "The Fluxer direct-message channel. One worker thread runs every turn, so a
 slow turn queues instead of starving the socket, and the library's read thread
@@ -1083,21 +1127,25 @@ number instead of accepting whatever the dice said."
         (/ interval 1000)
         (/ (or jitter (random interval)) 1000))))
 
-(declaim (ftype (function (t integer) null) join-thread-bounded))
+(declaim (ftype (function (t real) boolean) join-thread-bounded))
 
 (defun join-thread-bounded (thread seconds)
-  "Wait up to SECONDS for THREAD to finish, then destroy it. Return NIL.
+  "Wait up to SECONDS for THREAD to finish, then destroy it.
 
+Return T when the thread had to be destroyed and NIL when it ended on its own.
 A plain join on a worker that is inside a model call is a stop that never
-finishes, and the deadline is what makes a stop a stop."
-  (when (and thread (bordeaux-threads:thread-alive-p thread))
-    (let ((deadline (+ (real-seconds) seconds)))
-      (loop while (and (bordeaux-threads:thread-alive-p thread)
-                       (< (real-seconds) deadline))
-            do (sleep 0.05))
-      (when (bordeaux-threads:thread-alive-p thread)
-        (ignore-errors (bordeaux-threads:destroy-thread thread)))))
-  nil)
+finishes, and the deadline is what makes a stop a stop. The answer matters to
+the caller because a destroyed turn reached no terminal state."
+  (let ((destroyed nil))
+    (when (and thread (bordeaux-threads:thread-alive-p thread))
+      (let ((deadline (+ (real-seconds) seconds)))
+        (loop while (and (bordeaux-threads:thread-alive-p thread)
+                         (< (real-seconds) deadline))
+              do (sleep 0.05))
+        (when (bordeaux-threads:thread-alive-p thread)
+          (ignore-errors (bordeaux-threads:destroy-thread thread))
+          (setf destroyed t))))
+    destroyed))
 
 ;;;; The socket's own small operations.
 
@@ -1550,6 +1598,419 @@ reply was empty, so there was nothing to say."
           (when id (push id ids)))))
     (nreverse ids)))
 
+;;;; The reaction lifecycle.
+;;;;
+;;;; A direct message carries a marker while it is not answered: an hourglass
+;;;; while it waits for the worker, a wrench while its turn runs, and a warning
+;;;; when the turn fails, a reply cannot be delivered whole, or the message is
+;;;; evicted from the full queue. A delivered reply removes the marker.
+;;;;
+;;;; The calls are cosmetic and the paths that ask for them are not: the
+;;;; gateway's read thread and the turn worker only enqueue and return. One
+;;;; more thread owns the queue and every REST call. The queue is keyed by
+;;;; message and coalesces, so a state that arrives before the previous one was
+;;;; applied replaces it, and a reply delivered inside one round trip never
+;;;; flickers.
+;;;;
+;;;; The queue is bounded, because a channel that accepts messages faster than
+;;;; the reaction bucket carries them must not turn that into memory. The
+;;;; applied table is bounded too; it only remembers enough messages to skip a
+;;;; delete for a reaction that was never added.
+
+(defparameter +queued-reaction+ "⏳"
+  "The marker on a direct message that is waiting for the worker.")
+
+(defparameter +processing-reaction+ "🔧"
+  "The marker on a direct message whose turn is running.")
+
+(defparameter +failed-reaction+ "⚠️"
+  "The marker left on a direct message whose turn or reply failed, and on one
+evicted from the full queue.")
+
+(defparameter +reaction-states+ '(:queued :processing :failed :delivered)
+  "The states a message is moved through. DELIVERED adds no marker: it clears
+the one that is there.")
+
+(defparameter +max-pending-reactions+ 128
+  "How many distinct messages may wait for the reaction worker. Coalescing
+means one entry per message and not one per change, and the turn queue in front
+of the worker holds only 32, so this is headroom rather than a limit a healthy
+channel reaches.")
+
+(defparameter +reaction-tracked-limit+ 512
+  "How many messages the applied table remembers. Entries for delivered
+messages are removed as they clear, and a failed marker stays because no later
+state revisits it. The bound is what keeps a long session's failures from
+growing the table without end; evicting one costs no request.")
+
+(defparameter +reaction-drain-seconds+ 1
+  "How long a stop spends sending the markers it just set.
+
+The markers a stop creates are the ones a person is most likely to be staring
+at, so they get a drain of their own, and the abandoned turn's warning is
+enqueued first. One second is what a cosmetic marker is worth: the count line
+says how many waiting messages were left. The join that follows gives up at
++REACTION-STOP-SECONDS+ either way, so a channel stop stays inside the
+supervisor's eight second share next to the turn worker's five.")
+
+(defparameter +reaction-stop-seconds+ 1
+  "How long a stop waits for the reaction thread after its drain. A reaction
+that has not finished a call by then is destroyed, because a shutdown is worth
+more than a marker.")
+
+(defparameter +reaction-timeout-seconds+ 5
+  "Seconds to wait for one reaction call. A marker is cosmetic and never worth
+the fifteen a reply gets, so a service that has stopped answering costs five
+seconds per call and one line rather than a channel's whole budget.")
+
+(declaim (ftype (function (t) (or null string)) message-reaction-key))
+
+(defun message-reaction-key (data)
+  "Return the key that names DATA's message, or NIL.
+
+The key is the channel id and the message id, because a reaction route names
+both and a message id alone is unique only within its channel. A payload
+without either id has no message to react to."
+  (let ((channel (text-field data :channel_id))
+        (message (text-field data :id)))
+    (when (and (plusp (length channel)) (plusp (length message)))
+      (concatenate 'string channel "/" message))))
+
+(declaim (ftype (function (t) boolean) reaction-key-p))
+
+(defun reaction-key-p (key)
+  "Return T when KEY is a channel id and a message id with a slash between."
+  (and (stringp key)
+       (let ((slash (position #\/ key)))
+         (and slash
+              (plusp slash)
+              (< (1+ slash) (length key))))))
+
+(declaim (ftype (function (string) (values string string)) reaction-parts))
+
+(defun reaction-parts (key)
+  "Return the channel id and the message id in KEY as two values."
+  (let ((slash (position #\/ key)))
+    (values (subseq key 0 slash) (subseq key (1+ slash)))))
+
+(defparameter +path-unreserved+
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+  "The characters RFC 3986 leaves alone in a path segment. Everything else is
+percent encoded, which is what an emoji needs: the route takes the emoji
+itself, and the emoji itself is four UTF-8 octets and not four characters.")
+
+(declaim (ftype (function (string) string) percent-encode-segment))
+
+(defun percent-encode-segment (text)
+  "Return TEXT percent encoded as one URL path segment."
+  (let ((octets (enchiridion.compat:encode-utf8 text))
+        (out (make-string-output-stream)))
+    (loop for octet across octets
+          do (let ((character (code-char octet)))
+               (if (and character
+                        (find character +path-unreserved+ :test #'char=))
+                   (write-char character out)
+                   (format out "%~2,'0X" octet))))
+    (get-output-stream-string out)))
+
+(declaim (ftype (function (string string) string) reaction-url))
+
+(defun reaction-url (key emoji)
+  "Return the route that adds or removes EMOJI on the message KEY names.
+
+Both ends are the same route: PUT adds the bot's own reaction, DELETE removes
+it. @ME is literal and is what says which reaction, because the authorization
+header already says which bot."
+  (multiple-value-bind (channel message) (reaction-parts key)
+    (format nil "~A/channels/~A/messages/~A/reactions/~A/@me"
+            +rest-base+
+            (percent-encode-segment channel)
+            (percent-encode-segment message)
+            (percent-encode-segment emoji))))
+
+(declaim (ftype (function (keyword) (or null string)) reaction-emoji))
+
+(defun reaction-emoji (state)
+  "Return the marker STATE shows, or NIL for a state that shows none."
+  (case state
+    (:queued +queued-reaction+)
+    (:processing +processing-reaction+)
+    (:failed +failed-reaction+)
+    (t nil)))
+
+;;;; What the bot has on a message.
+
+(declaim (ftype (function (t string) (or null string)) applied-reaction))
+
+(defun applied-reaction (channel key)
+  "Return the marker CHANNEL last put on KEY, or NIL."
+  (gethash key (fluxer-channel-reaction-applied channel)))
+
+(declaim (ftype (function (t string string) null) track-reaction))
+
+(defun track-reaction (channel key emoji)
+  "Remember that EMOJI is the marker on KEY, evicting the oldest entry when the
+table is full. Return NIL."
+  (let ((table (fluxer-channel-reaction-applied channel))
+        (order (fluxer-channel-reaction-applied-order channel)))
+    (setf (gethash key table) emoji)
+    (setf order (append (remove key order :test #'string=) (list key)))
+    (loop while (> (length order) +reaction-tracked-limit+)
+          do (remhash (pop order) table))
+    (setf (fluxer-channel-reaction-applied-order channel) order))
+  nil)
+
+(declaim (ftype (function (t string) null) forget-reaction))
+
+(defun forget-reaction (channel key)
+  "Forget the marker on KEY. Return NIL."
+  (remhash key (fluxer-channel-reaction-applied channel))
+  (setf (fluxer-channel-reaction-applied-order channel)
+        (remove key (fluxer-channel-reaction-applied-order channel)
+                :test #'string=))
+  nil)
+
+;;;; Sending one change.
+
+(declaim (ftype (function (t real) boolean) reaction-wait))
+
+(defun reaction-wait (channel seconds)
+  "Wait up to SECONDS, stopping early when the channel is shutting down.
+Return T when the wait ran out and NIL when a stop cut it short."
+  (let ((end (+ (real-seconds) (max 0 seconds))))
+    (loop
+      (when (fluxer-channel-reaction-stopping-p channel)
+        (return nil))
+      (when (>= (real-seconds) end)
+        (return t))
+      (sleep (max 0.01 (min 0.05 (- end (real-seconds))))))))
+
+(declaim (ftype (function (t string string boolean &optional integer) boolean)
+                reaction-call))
+
+(defun reaction-call (channel key emoji add-p &optional (attempt 0))
+  "Add EMOJI to KEY when ADD-P, or remove it, and return T on success.
+
+A 404 is a success: the message or the reaction is already gone, which is the
+state the caller wanted. A 429 is retried the way a reply is retried, up to
++RATE-LIMIT-ATTEMPTS+ times, because every marker on every message shares one
+bucket of 30 requests per 10 seconds per channel. Anything else is one line and
+NIL: a marker that cannot be put is not a reason to stop a channel that is
+answering messages."
+  (let ((token (non-blank-string (fluxer-channel-token channel))))
+    (if (null token)
+        (progn
+          (note "there is no token, so a ~A marker was not sent." emoji)
+          nil)
+        (handler-case
+            (progn
+              (enchiridion.llm::bounded-http-request
+               (enchiridion.llm:make-http-request
+                :url (reaction-url key emoji)
+                :headers (bot-headers token)
+                :body ""
+                :timeout +reaction-timeout-seconds+)
+               :method (if add-p :put :delete)
+               :body-limit 4096)
+              t)
+          (dexador.error:http-request-failed (failure)
+            (let ((status (dexador.error:response-status failure)))
+              (cond
+                ((eql status 404) t)
+                ((and (eql status 429)
+                      (< attempt +rate-limit-attempts+)
+                      (reaction-wait channel
+                                     (or (retry-after-seconds
+                                          (dexador.error:response-body failure))
+                                         (next-backoff (1+ attempt)))))
+                 (reaction-call channel key emoji add-p (1+ attempt)))
+                (t
+                 (note "the ~A reaction on ~A failed with ~D: ~A"
+                       (if add-p "add" "remove") key status
+                       (error-note (dexador.error:response-body failure)))
+                 nil))))
+          (error (condition)
+            (note "the ~A reaction on ~A failed: ~A"
+                  (if add-p "add" "remove") key condition)
+            nil)))))
+
+(declaim (ftype (function (t string keyword) (or null string))
+                apply-reaction-state))
+
+(defun apply-reaction-state (channel key state)
+  "Bring the bot's marker on KEY to STATE and return what is now applied.
+
+The applied table is what makes the cost proportional to the changes: a
+message coalesced from waiting straight to delivered never had the hourglass
+put, so there is nothing to delete. A call that fails leaves the table saying
+what is actually there, not what was wanted."
+  (let* ((applied (applied-reaction channel key))
+         (want (reaction-emoji state)))
+    (cond
+      ((null want)
+       (when (and applied (reaction-call channel key applied nil))
+         (forget-reaction channel key))
+       nil)
+      ((and applied (string= applied want))
+       applied)
+      (t
+       (let ((removed (or (null applied)
+                          (reaction-call channel key applied nil))))
+         (when (and applied removed)
+           (forget-reaction channel key))
+         (when (reaction-call channel key want t)
+           (track-reaction channel key want)))
+       (applied-reaction channel key)))))
+
+;;;; The queue between the two callers and the reaction thread.
+
+(declaim (ftype (function (t t keyword) null) enqueue-reaction))
+
+(defun enqueue-reaction (channel key state)
+  "Ask the reaction worker to bring KEY to STATE and return NIL.
+
+Only a lock and a bounded append happen here. The gateway's read thread and
+the turn worker both call this, and neither may wait on a service that is
+decorative. A state for a message still waiting replaces the waiting one, so
+the worker only ever applies the newest one; a delivered state that replaces a
+waiting processing state costs no request at all."
+  (when (and (reaction-key-p key)
+             (member state +reaction-states+))
+    (let ((queued nil)
+          (full nil))
+      (bordeaux-threads:with-lock-held ((fluxer-channel-reaction-lock channel))
+        (let ((states (fluxer-channel-reaction-pending channel)))
+          (cond
+            ((gethash key states)
+             (setf (gethash key states) state))
+            ((>= (length (fluxer-channel-reaction-order channel))
+                 +max-pending-reactions+)
+             (setf full t))
+            (t
+             (setf (gethash key states) state)
+             (setf (fluxer-channel-reaction-order channel)
+                   (nconc (fluxer-channel-reaction-order channel)
+                          (list key)))
+             (setf queued t)))))
+      (when full
+        (note "the reaction queue is full, so a ~(~A~) marker on ~A was dropped."
+              state key))
+      (when queued
+        (bordeaux-threads:signal-semaphore
+         (fluxer-channel-reaction-ready channel)))))
+  nil)
+
+(declaim (ftype (function (t) t) dequeue-reaction))
+
+(defun dequeue-reaction (channel)
+  "Return the next (KEY . STATE) for the reaction worker, or NIL."
+  (bordeaux-threads:with-lock-held ((fluxer-channel-reaction-lock channel))
+    (let ((key (pop (fluxer-channel-reaction-order channel))))
+      (when key
+        (let ((state (gethash key (fluxer-channel-reaction-pending channel))))
+          (remhash key (fluxer-channel-reaction-pending channel))
+          (cons key state))))))
+
+(declaim (ftype (function (t) null) fail-pending-reactions))
+
+(defun fail-pending-reactions (channel)
+  "Turn every waiting or running marker into the warning one and return NIL.
+
+A message that has not reached a terminal state when the channel stops will
+never be answered, and an hourglass or a wrench left on it is a promise the
+process can no longer keep. A delivered state is left alone: its reply did
+reach the gateway, so the stop still clears its marker."
+  (bordeaux-threads:with-lock-held ((fluxer-channel-reaction-lock channel))
+    (let ((states (fluxer-channel-reaction-pending channel))
+          (keys '()))
+      (maphash (lambda (key state)
+                 (when (member state '(:queued :processing))
+                   (push key keys)))
+               states)
+      (dolist (key keys)
+        (setf (gethash key states) :failed))))
+  nil)
+
+;;;; The one thread that applies them.
+
+(declaim (ftype (function (t) boolean) reaction-drain-expired-p))
+
+(defun reaction-drain-expired-p (channel)
+  "Return T when a stop's drain window has passed."
+  (let ((deadline (fluxer-channel-reaction-deadline channel)))
+    (and deadline
+         (fluxer-channel-reaction-stopping-p channel)
+         (>= (real-seconds) deadline))))
+
+(declaim (ftype (function (t) null) run-reaction-worker))
+
+(defun run-reaction-worker (channel)
+  "Apply queued reaction states until CHANNEL stops. Return NIL.
+
+The thread waits on a semaphore rather than polling, and the same semaphore
+wakes it at a stop. A stop keeps draining until the queue is empty or its
+deadline passes, so the warning markers a stop creates are sent when the
+service still answers."
+  (loop
+    (let ((entry (dequeue-reaction channel)))
+      (cond
+        (entry
+         (apply-reaction-state channel (car entry) (cdr entry)))
+        ((fluxer-channel-reaction-stopping-p channel)
+         (return))
+        (t
+         (bordeaux-threads:wait-on-semaphore
+          (fluxer-channel-reaction-ready channel)
+          :timeout +worker-wait-seconds+))))
+    (when (reaction-drain-expired-p channel)
+      (return)))
+  nil)
+
+(declaim (ftype (function (t) t) start-reaction-worker))
+
+(defun start-reaction-worker (channel)
+  "Reset the reaction state and start the one thread that applies it."
+  (setf (fluxer-channel-reaction-stopping-p channel) nil
+        (fluxer-channel-reaction-deadline channel) nil
+        (fluxer-channel-reaction-pending channel) (make-hash-table :test #'equal)
+        (fluxer-channel-reaction-order channel) nil
+        (fluxer-channel-reaction-applied channel) (make-hash-table :test #'equal)
+        (fluxer-channel-reaction-applied-order channel) nil
+        (fluxer-channel-reaction-worker channel)
+        (bordeaux-threads:make-thread
+         (lambda () (run-reaction-worker channel))
+         :name "enchiridion fluxer reactions"))
+  channel)
+
+(declaim (ftype (function (t) null) stop-reaction-worker))
+
+(defun stop-reaction-worker (channel)
+  "Mark what is waiting as failed, drain for a bounded time, and join the
+reaction thread. Return NIL.
+
+The thread is joined after the drain with +REACTION-STOP-SECONDS+, not the
+turn worker's five: a reaction is never worth making a shutdown wait on a
+service that may be gone. The applied table is left as it is: a restart resets
+it, and until then it is the only record of which markers the bot put down."
+  (let ((worker (fluxer-channel-reaction-worker channel)))
+    (when worker
+      (fail-pending-reactions channel)
+      (setf (fluxer-channel-reaction-stopping-p channel) t
+            (fluxer-channel-reaction-deadline channel)
+            (+ (real-seconds) +reaction-drain-seconds+))
+      (bordeaux-threads:signal-semaphore (fluxer-channel-reaction-ready channel))
+      (join-thread-bounded worker +reaction-stop-seconds+)
+      ;; The thread is joined or destroyed, so these reads are not racing a
+      ;; writer. Taking the lock here would deadlock if the thread died while
+      ;; it held it, which is the one thing a bounded join cannot rule out.
+      (let ((left (length (fluxer-channel-reaction-order channel))))
+        (setf (fluxer-channel-reaction-pending channel) (make-hash-table :test #'equal)
+              (fluxer-channel-reaction-order channel) nil)
+        (when (plusp left)
+          (note "~D reaction~:P were not sent before the stop." left)))
+      (setf (fluxer-channel-reaction-worker channel) nil)))
+  nil)
+
 ;;;; The queue between the read thread and the worker.
 
 (declaim (ftype (function (fluxer-channel t) null) enqueue-inkbound))
@@ -1560,16 +2021,20 @@ reply was empty, so there was nothing to say."
 The queue is bounded. A turn can take minutes, and the gateway does not stop
 sending while it runs, so a full queue drops the oldest waiting message and
 counts it rather than growing without a limit. The drop is one log line, which
-is loud enough to act on and quiet enough not to stop the channel."
-  (bordeaux-threads:with-lock-held ((fluxer-channel-pending-lock channel))
-    (when (>= (length (fluxer-channel-pending channel)) +max-pending-messages+)
-      (pop (fluxer-channel-pending channel))
-      (incf (fluxer-channel-dropped channel))
+is loud enough to act on and quiet enough not to stop the channel, and the
+message it dropped is marked failed because no turn will ever answer it."
+  (let ((dropped nil))
+    (bordeaux-threads:with-lock-held ((fluxer-channel-pending-lock channel))
+      (when (>= (length (fluxer-channel-pending channel)) +max-pending-messages+)
+        (setf dropped (pop (fluxer-channel-pending channel)))
+        (incf (fluxer-channel-dropped channel)))
+      (setf (fluxer-channel-pending channel)
+            (nconc (fluxer-channel-pending channel) (list data))))
+    (when dropped
       (note "the queue is full, so the oldest waiting message was dropped (~D so far)."
-            (fluxer-channel-dropped channel)))
-    (setf (fluxer-channel-pending channel)
-          (nconc (fluxer-channel-pending channel) (list data))))
-  (bordeaux-threads:signal-semaphore (fluxer-channel-pending-ready channel))
+            (fluxer-channel-dropped channel))
+      (enqueue-reaction channel (message-reaction-key dropped) :failed))
+    (bordeaux-threads:signal-semaphore (fluxer-channel-pending-ready channel)))
   nil)
 
 (declaim (ftype (function (fluxer-channel) t) dequeue-inkbound))
@@ -1581,6 +2046,18 @@ is loud enough to act on and quiet enough not to stop the channel."
 
 ;;;; The worker: the one thread that runs a turn.
 
+(declaim (ftype (function (t (or null string)) null) note-active-reaction))
+
+(defun note-active-reaction (channel key)
+  "Record the message the worker is inside, or clear it with NIL.
+
+A stop that has to destroy the worker reads this to mark the abandoned message
+failed. The pending lock is the one both sides already take, and neither side
+holds it across a call that waits."
+  (bordeaux-threads:with-lock-held ((fluxer-channel-pending-lock channel))
+    (setf (fluxer-channel-active-reaction channel) key))
+  nil)
+
 (declaim (ftype (function (fluxer-channel t) null) handle-inkbound))
 
 (defun handle-inkbound (channel data)
@@ -1589,33 +2066,64 @@ is loud enough to act on and quiet enough not to stop the channel."
 The turn is an injected function, and a turn that signals, or one that answers
 without :OK-P, is one log line and no reply. A worker that dies on the first
 bad turn is a channel that stops answering, and the gateway does not care whose
-fault it was."
-  (let ((message (message-create->msg data))
-        (turn (fluxer-channel-turn channel)))
-    (if (not (functionp turn))
-        (note "there is no turn function, so ~A was not answered."
-              (enchiridion.channel:message-digest message))
-        (handler-case
-            (let ((result (funcall turn message)))
-              (cond
-                ((not (listp result))
-                 (note "the turn answered ~S, which is not a result plist."
-                       result))
-                ((getf result :ok-p)
-                 ;; A proposal travels beside the reply and never inside it, so
-                 ;; the reply is not delayed and a refused status costs nothing.
-                 (propose-custom-status channel (getf result :status))
-                 (send-reply channel
-                             (enchiridion.channel:msg-target message)
-                             (getf result :reply)))
-                (t
-                 (note "the turn failed for ~A: ~A"
-                       (enchiridion.channel:message-digest message)
-                       (or (getf result :error) "no reason given")))))
-          (error (condition)
-            (note "the turn for ~A signalled: ~A"
-                  (enchiridion.channel:message-digest message)
-                  condition)))))
+fault it was.
+
+The reaction is part of the same lifecycle. DELIVERED is enqueued only when
+SEND-REPLY returns, which is the one answer that says every piece reached the
+gateway; a reply whose second piece fails leaves FAILED, because a person who
+got half an answer has not got the answer."
+  (let* ((message (message-create->msg data))
+         (key (message-reaction-key data))
+         (turn (fluxer-channel-turn channel))
+         (completed nil))
+    (unwind-protect
+         (progn
+           (note-active-reaction channel key)
+           (enqueue-reaction channel key :processing)
+           (cond
+             ((not (functionp turn))
+              (note "there is no turn function, so ~A was not answered."
+                    (enchiridion.channel:message-digest message))
+              (enqueue-reaction channel key :failed))
+             ((handler-case
+                  (let ((result (funcall turn message)))
+                    (cond
+                      ((not (listp result))
+                       (note "the turn answered ~S, which is not a result plist."
+                             result)
+                       nil)
+                      ((not (getf result :ok-p))
+                       (note "the turn failed for ~A: ~A"
+                             (enchiridion.channel:message-digest message)
+                             (or (getf result :error) "no reason given"))
+                       nil)
+                      (t
+                       (handler-case
+                           (progn
+                             (send-reply channel
+                                         (enchiridion.channel:msg-target message)
+                                         (getf result :reply))
+                             (ignore-errors
+                               (propose-custom-status channel (getf result :status)))
+                             t)
+                         (error (condition)
+                           (note "the reply for ~A did not finish: ~A"
+                                 (enchiridion.channel:message-digest message)
+                                 condition)
+                           nil)))))
+                (error (condition)
+                  (note "the turn for ~A signalled: ~A"
+                        (enchiridion.channel:message-digest message)
+                        condition)
+                  nil))
+              (enqueue-reaction channel key :delivered))
+             (t
+              (enqueue-reaction channel key :failed)))
+           (setf completed t))
+      ;; A destroyed thread that runs this cleanup did not reach a terminal
+      ;; state, so the marker stays set for STOP-WORKER to find and mark failed.
+      (when completed
+        (note-active-reaction channel nil))))
   nil)
 
 (declaim (ftype (function (fluxer-channel) null) run-worker))
@@ -1639,13 +2147,32 @@ wake-up costs +WORKER-WAIT-SECONDS+ and never a message."
 
 (defun stop-worker (channel)
   "Ask the worker to finish, wake it, and join it for a bounded time. Return
-NIL."
+NIL.
+
+A turn that had to be destroyed, and every message still waiting behind it,
+will never be answered, so each is marked failed on the message itself. The
+markers are only enqueued here: the reaction thread is stopped after this, and
+that order is what lets it send them."
   (setf (fluxer-channel-stopping-p channel) t)
   (bordeaux-threads:signal-semaphore (fluxer-channel-pending-ready channel))
-  (let ((worker (fluxer-channel-worker channel)))
+  (let ((worker (fluxer-channel-worker channel))
+        (abandoned nil)
+        (active nil)
+        (waiting nil))
     (when worker
-      (join-thread-bounded worker +stop-join-seconds+)
-      (setf (fluxer-channel-worker channel) nil)))
+      (setf abandoned (join-thread-bounded worker +stop-join-seconds+)
+            (fluxer-channel-worker channel) nil))
+    (bordeaux-threads:with-lock-held ((fluxer-channel-pending-lock channel))
+      (setf active (fluxer-channel-active-reaction channel)
+            (fluxer-channel-active-reaction channel) nil
+            waiting (fluxer-channel-pending channel)
+            (fluxer-channel-pending channel) nil))
+    (when (and abandoned active)
+      (enqueue-reaction channel active :failed))
+    (dolist (data waiting)
+      (enqueue-reaction channel (message-reaction-key data) :failed))
+    (when waiting
+      (note "~D waiting message~:P dropped at the stop." (length waiting))))
   nil)
 
 ;;;; The read thread's handlers.
@@ -1763,7 +2290,12 @@ the condition carries."
 Three refusals, each with its own line and none of them an error out of this
 thread: a message that is not a direct message from a person, and a direct
 message from someone the allowlist does not name. A refusal is never answered,
-because an answer is a reply to whoever asked."
+because an answer is a reply to whoever asked.
+
+The waiting marker is queued before the message reaches the worker, so the
+worker's processing marker cannot overtake it: the two states are read in the
+order they were enqueued, and a marker that arrived late would move a message
+back to waiting while its turn ran."
   (cond
     ((not (inkbound-p data (fluxer-channel-self-id channel)))
      (note "dropped a message that is not a direct message from a person."))
@@ -1771,6 +2303,7 @@ because an answer is a reply to whoever asked."
      (handler-case
          (progn
             (check-sender (channel-allowlist channel) (author-id data))
+            (enqueue-reaction channel (message-reaction-key data) :queued)
             (enqueue-inkbound channel data))
        (enchiridion.errors:unauthorized (condition)
          (note "~A" condition))
@@ -2026,12 +2559,16 @@ half a second rather than in a minute."
 (declaim (ftype (function (fluxer-channel) null) shutdown))
 
 (defun shutdown (channel)
-  "Close the socket and join the worker. Return NIL.
+  "Close the socket, stop the turn worker, and drain the reaction thread. Return
+NIL.
 
 Safe to run twice and safe on a channel that never started: a stop and an
-unwinding start both run it."
+unwinding start both run it. The turn worker stops first because it is what
+turns a waiting message into a failed one, and the reaction thread has to still
+be there to send those markers."
   (close-socket (fluxer-channel-socket channel))
   (stop-worker channel)
+  (stop-reaction-worker channel)
   nil)
 
 (defmethod enchiridion.channel:channel-start ((channel fluxer-channel) &key config)
@@ -2065,11 +2602,15 @@ down over a mis-set variable."
         (fluxer-channel-attempt channel) 0
         (fluxer-channel-dropped channel) 0
         (fluxer-channel-pending channel) nil
+        (fluxer-channel-active-reaction channel) nil
         ;; A socket left over from a stop is not the one the next connection
         ;; will read, and CURRENT-SOCKET-P would take its frames for another's
         (fluxer-channel-socket channel) nil
         (enchiridion.channel:channel-live-p channel) t
         (enchiridion.channel:channel-state channel) :live)
+  ;; The reaction thread starts first, so no accepted message can outrun the
+  ;; thread that will carry its markers.
+  (start-reaction-worker channel)
   (setf (fluxer-channel-worker channel)
         (bordeaux-threads:make-thread
          (lambda () (run-worker channel))

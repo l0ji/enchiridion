@@ -514,8 +514,9 @@ refused at startup rather than at first request."))
   (:export #:start-fluxer #:stop-fluxer #:fluxer-running-p #:allowed-p
            #:make-fluxer-channel #:propose-custom-status #:custom-status)
   (:documentation
-   "Direct messages only. Group channels, guild events, mentions, and
-reactions are all out, so the allowlist is the whole authorisation story."))
+   "Direct messages only. Group channels, guild events, and mentions are out,
+and the bot's reactions only report the state of a message it was sent, so the
+allowlist is the whole authorisation story."))
 
 (defpackage #:enchiridion.supervisor
   (:use #:cl)

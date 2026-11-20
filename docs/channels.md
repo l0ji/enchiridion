@@ -160,7 +160,16 @@ A 429 retries up to three times. It resumes a session that ended less than 60
 seconds ago, and otherwise identifies again. Reconnects stop after five
 attempts. Close codes 4002, 4004 and 4012 end the session without a retry, and
 the supervisor starts it again one second later.
-The queue holds 32 messages. A missing token logs one line per second:
+
+An accepted direct message carries a marker until its turn finishes: ⏳ while it
+waits for the worker, 🔧 while the turn runs, and ⚠️ when the turn fails, when
+any piece of the reply cannot be delivered, or when the message is evicted from
+the full queue. A delivered reply removes the marker. The markers are the bot's
+own reactions, sent by one thread from a queue that coalesces a message's
+states, so neither the gateway nor the turn waits on a reaction call.
+
+The queue holds 32 messages, and a message dropped from it is marked ⚠️. A
+missing token logs one line per second:
 `enchiridion fluxer: no bot token: set FLUXER_BOT_TOKEN, or :token-env in the
 :fluxer section.`
 

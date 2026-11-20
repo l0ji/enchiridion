@@ -176,8 +176,8 @@ waits for another eligible turn.
 
 | Setting under `:budget` | Default | Applies to |
 | --- | --- | --- |
-| `:max-tokens-per-tick` | 4000 | Sleep and embedding calls in one tick |
-| `:max-tokens-per-day` | 400000 | Sleep and embedding calls over 24 hours |
+| `:max-tokens-per-tick` | 40000 | Sleep and embedding calls in one tick |
+| `:max-tokens-per-day` | 4000000 | Sleep and embedding calls over 24 hours |
 
 Set either cap to `nil` to disable it. A call in progress can exceed a cap.
 These limits do not cover chat or provider charges.

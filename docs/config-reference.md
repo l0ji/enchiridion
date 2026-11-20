@@ -102,8 +102,8 @@ channel regardless. `--channel` selects a channel for one run; HTTP flags
 | --- | --- | --- | --- |
 | `:sleep` | `:enabled` | `t` | Schedule background work during `serve` |
 | `:sleep` | `:interval-seconds` | `900` | Time between ticks |
-| `:budget` | `:max-tokens-per-tick` | `4000` | Background token cap per tick |
-| `:budget` | `:max-tokens-per-day` | `400000` | Rolling 24-hour token cap checked by background work |
+| `:budget` | `:max-tokens-per-tick` | `40000` | Background token cap per tick |
+| `:budget` | `:max-tokens-per-day` | `4000000` | Rolling 24-hour token cap checked by background work |
 | `:sandbox` | `:agent-uid` | `1000` | Agent process user id when started as root |
 | `:sandbox` | `:agent-gid` | `1000` | Agent process group id when started as root |
 

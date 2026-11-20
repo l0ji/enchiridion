@@ -194,8 +194,8 @@ store path. The model defaults match the shipped adapter defaults."
     (:fluxer (:enabled nil) (:allowed-users nil) (:token-env "FLUXER_BOT_TOKEN"))
 
     :budget
-    (:max-tokens-per-tick 4000)
-    (:max-tokens-per-day 400000)
+    (:max-tokens-per-tick 40000)
+    (:max-tokens-per-day 4000000)
 
     :sandbox
     (:agent-uid 1000)

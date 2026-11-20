@@ -88,8 +88,8 @@ The `:sleep` section controls the schedule during `serve`:
 (:interval-seconds 900)
 
 :budget
-(:max-tokens-per-tick 4000)
-(:max-tokens-per-day 400000)
+(:max-tokens-per-tick 40000)
+(:max-tokens-per-day 4000000)
 ```
 
 Set `:enabled` to `nil` to disable scheduled background work. The interval is in

@@ -77,8 +77,10 @@ Put the bot token in `.env` and replace `your-user-id` with your Fluxer user id.
 Only listed users can send it direct messages. An empty list admits nobody.
 The surrounding config list is already quoted, so the user list needs no extra
 quote. Add `(:custom-status t)` to let the agent show a temporary public status
-on its profile; the TTL and cooldown default to 300 and 60 seconds. See
-[Channels](channels.md) for bot setup and the status rules.
+on its profile; the TTL and cooldown default to 300 and 60 seconds. With several
+allowed users, name the one whose turns may set it with
+`(:custom-status-user "your-user-id")`. See [Channels](channels.md) for bot
+setup and the status rules.
 
 ## Background work
 

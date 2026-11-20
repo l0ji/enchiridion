@@ -989,6 +989,35 @@ The default is off. A public status is a new way for the agent to be seen, and
 an operator who did not ask for one should never discover it is on."
   (not (null (getf (channel-options channel) :custom-status))))
 
+(declaim (ftype (function (fluxer-channel) (or null string))
+                custom-status-operator))
+
+(defun custom-status-operator (channel)
+  "Return the user id whose turns may set CHANNEL's public status, or NIL.
+
+An explicit :CUSTOM-STATUS-USER wins, but only when that id is one the
+allowlist admits. Without one, a single allowed user is the operator, because
+that is the one person the channel was set up to talk to. Several allowed users
+and no explicit id is ambiguous, so nobody may steer the public status: being
+allowed to send the agent a direct message is not permission to speak for it."
+  (let ((configured (non-blank-string
+                     (getf (channel-options channel) :custom-status-user)))
+        (allowed (channel-allowlist channel)))
+    (if configured
+        (and (allowed-p allowed configured) configured)
+        (let ((ids (remove-duplicates (remove-if-not #'stringp allowed)
+                                      :test #'string=)))
+          (and (= 1 (length ids)) (first ids))))))
+
+(declaim (ftype (function (fluxer-channel t) boolean) custom-status-author-p))
+
+(defun custom-status-author-p (channel author)
+  "Return T when AUTHOR's turn may set CHANNEL's public status."
+  (let ((operator (custom-status-operator channel)))
+    (and operator
+         (non-blank-string author)
+         (string= operator author))))
+
 (declaim (ftype (function (keyword) (or null integer)) shipped-status-seconds))
 
 (defun shipped-status-seconds (key)
@@ -1323,13 +1352,20 @@ socket the heartbeat is already writing to."
           :reason reason
           :sent (and frame-p (null reason)))))
 
-(declaim (ftype (function (fluxer-channel t &key (:now integer)) list)
+(declaim (ftype (function (fluxer-channel t &key (:now integer)
+                                             (:author (or null string)))
+                            list)
                 propose-custom-status))
 
-(defun propose-custom-status (channel proposal &key (now (get-universal-time)))
+(defun propose-custom-status (channel proposal &key (now (get-universal-time))
+                                                author)
   "Propose PROPOSAL as the agent's temporary public custom status.
 
 PROPOSAL is a string to set, :CLEAR to remove it, or NIL for no proposal.
+AUTHOR names the sender whose turn made the proposal. When it is supplied, only
+the operator may set or clear the status, so one allowlisted friend cannot
+speak for the agent. An in-process caller omits AUTHOR and is the operator.
+
 Return a decision plist (:outcome OUTCOME :reason TEXT-OR-NIL :sent BOOL).
 OUTCOME is :disabled, :unchanged, :refused, :applied, or :cleared. A frame
 error leaves the outcome and reports the error in :reason: the status is
@@ -1347,6 +1383,10 @@ leaves the process."
      (list :outcome :disabled
            :reason "the Fluxer channel is not opted in to a custom status."
            :sent nil))
+    ((and author (not (custom-status-author-p channel author)))
+     (let ((reason (format nil "~A may not set the custom status." author)))
+       (note "refused a custom status from ~A: not the operator." author)
+       (list :outcome :refused :reason reason :sent nil)))
     ((eq proposal :clear)
      (apply-status-proposal channel :clear now))
     (t
@@ -1404,10 +1444,16 @@ A READY follows an Identify, so the session that just began does not carry the
 old presence. A status whose lifetime is over is forgotten here instead of
 being published again, and an unchanged status is not resent: a reconnect is
 not a new proposal and must not restart the cooldown."
-  (let ((outcome nil) (sent nil) (reason nil) (expired nil))
+  (let ((outcome nil) (sent nil) (reason nil) (expired nil) (disabled nil))
     (bordeaux-threads:with-lock-held ((fluxer-channel-status-lock channel))
       (let ((text (fluxer-channel-status-text channel)))
         (cond
+          ((not (channel-custom-status-p channel))
+           (when text
+             (setf (fluxer-channel-status-text channel) nil
+                   (fluxer-channel-status-expires channel) nil
+                   disabled t))
+           (setf outcome :disabled))
           ((null text) (setf outcome :unchanged))
           ((custom-status-live-p channel now)
            ;; The lock covers the write so an expiry cannot clear the status
@@ -1427,6 +1473,8 @@ not a new proposal and must not restart the cooldown."
                  expired t
                  outcome :expired)))))
     (cond
+      (disabled
+       (note "dropped a custom status because the channel is opted out."))
       (expired (note "a custom status expired while disconnected."))
       ((eq outcome :failed)
        (note "the custom status was not reapplied: ~A" reason)))
@@ -2128,8 +2176,11 @@ got half an answer has not got the answer."
                              (send-reply channel
                                          (enchiridion.channel:msg-target message)
                                          (getf result :reply))
-                             (ignore-errors
-                               (propose-custom-status channel (getf result :status)))
+                             (when (getf result :status)
+                               (ignore-errors
+                                 (propose-custom-status
+                                  channel (getf result :status)
+                                  :author (enchiridion.channel:msg-author message))))
                              t)
                          (error (condition)
                            (note "the reply for ~A did not finish: ~A"

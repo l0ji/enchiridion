@@ -191,11 +191,20 @@ The agent proposes the text with its `presence` tool, in a field separate from
 its reply and from its reasoning. The channel owns the last word: the text is
 trimmed, must be one line of at most 128 characters, and is refused if it
 contains a control character or anything the secret scrubber would redact.
+
+Only the operator's own turns may set or clear the status. Name that user id
+with `(:custom-status-user "123456789012345678")`, or leave the key out and let
+a single entry in `:allowed-users` be the operator. Two or more allowed users
+and no explicit id is ambiguous, so no sender can set a status: being allowed
+to send the agent a direct message is not permission to speak for it. The
+status is published after the reply is delivered, not while the turn runs.
+
 Proposing the text already showing sends nothing. A different text waits for
 the cooldown, 60 seconds by default; `0` disables it. A status is temporary:
 the channel clears it after the TTL, 300 seconds by default, and forgets it if
 it ends while the channel is disconnected. A status still current is reapplied
-after a reconnect. An out-of-range TTL or cooldown falls back to its default.
+after a reconnect; a channel that is no longer opted in drops a stored status
+instead. An out-of-range TTL or cooldown falls back to its default.
 
 Only the bot token and the gateway are used. The channel never edits the bot's
 bio and never needs an owner credential. The gateway does not acknowledge a

@@ -175,10 +175,13 @@ message: the frame tests do that once, at the edge.")
   (make-instance 'enchiridion.channel.fluxer::fluxer-socket
                  :url "ws://offline.invalid/status"))
 
-(defun status-channel (&key (custom-status t) (ttl 300) (cooldown 60) socket)
+(defun status-channel (&key (custom-status t) (ttl 300) (cooldown 60)
+                            (allowed-users '("u-1")) status-user socket)
   "Return a channel with a status configuration and a socket when one is given."
   (let ((channel (enchiridion.channel.fluxer:make-fluxer-channel
-                  :config (list :custom-status custom-status
+                  :config (list :allowed-users allowed-users
+                                :custom-status custom-status
+                                :custom-status-user status-user
                                 :custom-status-ttl-seconds ttl
                                 :custom-status-cooldown-seconds cooldown))))
     (when socket
@@ -266,6 +269,62 @@ message: the frame tests do that once, at the edge.")
     (let ((channel (enchiridion.channel.fluxer:make-fluxer-channel
                     :config '(:allowed-users ("u-1")))))
       (ng (enchiridion.channel.fluxer::channel-custom-status-p channel)))))
+
+(deftest only-the-operator-may-steer-the-status ()
+  (testing "one allowed user is the operator when no id is named"
+    (let* ((socket (status-socket))
+           (channel (status-channel :socket socket)))
+      (ok (string= "u-1" (enchiridion.channel.fluxer::custom-status-operator channel)))
+      (ok (eq :applied
+              (getf (enchiridion.channel.fluxer:propose-custom-status
+                     channel "Working" :author "u-1" :now 1000)
+                    :outcome)))
+      (ok (eql 1 (length (queued-frames socket))))))
+  (testing "several allowed users and no explicit id is ambiguous"
+    (let* ((socket (status-socket))
+           (channel (status-channel :allowed-users '("u-1" "u-2")
+                                    :socket socket)))
+      (ok (null (enchiridion.channel.fluxer::custom-status-operator channel)))
+      (dolist (author '("u-1" "u-2"))
+        (let ((decision (enchiridion.channel.fluxer:propose-custom-status
+                         channel "Working" :author author :now 1000)))
+          (ok (eq :refused (getf decision :outcome)))
+          (ok (search "may not set" (getf decision :reason)))))
+      (ok (null (queued-frames socket)))))
+  (testing "an explicit id resolves the ambiguity"
+    (let* ((socket (status-socket))
+           (channel (status-channel :allowed-users '("u-1" "u-2")
+                                    :status-user "u-2" :socket socket)))
+      (ok (string= "u-2" (enchiridion.channel.fluxer::custom-status-operator channel)))
+      (ok (eq :refused
+              (getf (enchiridion.channel.fluxer:propose-custom-status
+                     channel "Working" :author "u-1" :now 1000)
+                    :outcome)))
+      (ok (eq :applied
+              (getf (enchiridion.channel.fluxer:propose-custom-status
+                     channel "Working" :author "u-2" :now 1000)
+                    :outcome)))
+      (ok (eql 1 (length (queued-frames socket))))))
+  (testing "an explicit id must itself be on the allowlist"
+    (let* ((socket (status-socket))
+           (channel (status-channel :allowed-users '("u-1")
+                                    :status-user "u-9" :socket socket)))
+      (ok (null (enchiridion.channel.fluxer::custom-status-operator channel)))
+      (ok (eq :refused
+              (getf (enchiridion.channel.fluxer:propose-custom-status
+                     channel "Working" :author "u-9" :now 1000)
+                    :outcome)))
+      (ok (null (queued-frames socket)))))
+  (testing "the same id listed twice is still one user"
+    (let ((channel (status-channel :allowed-users '("u-1" "u-1"))))
+      (ok (string= "u-1"
+                   (enchiridion.channel.fluxer::custom-status-operator channel)))))
+  (testing "an in-process caller omits the author and is the operator"
+    (let ((channel (status-channel)))
+      (ok (eq :applied
+              (getf (enchiridion.channel.fluxer:propose-custom-status
+                     channel "Working" :now 1000)
+                    :outcome))))))
 
 (deftest a-live-status-is-not-resent-and-a-change-waits-for-the-cooldown ()
   (let* ((socket (status-socket))
@@ -369,6 +428,59 @@ message: the frame tests do that once, at the edge.")
         (ok (eql 1 (length (queued-frames
                             (enchiridion.channel.fluxer::fluxer-channel-socket
                              stale)))))))))
+
+(deftest a-disabled-channel-drops-a-stored-status-on-reconnect ()
+  (let* ((socket (status-socket))
+         (channel (status-channel :socket socket)))
+    (enchiridion.channel.fluxer:propose-custom-status channel "Working" :now 1000)
+    (ok (eql 1 (length (queued-frames socket))))
+    (setf (enchiridion.channel.fluxer::fluxer-channel-config channel)
+          (list :allowed-users '("u-1") :custom-status nil))
+    (testing "a direct reapply sends nothing and forgets the text"
+      (ok (eq :disabled
+              (getf (enchiridion.channel.fluxer::reapply-custom-status
+                     channel :now 1001)
+                    :outcome)))
+      (ok (eql 1 (length (queued-frames socket))))
+      (ok (null (getf (enchiridion.channel.fluxer:custom-status channel :now 1001)
+                      :text)))))
+  (testing "READY on the real path sends nothing either"
+    (let* ((socket (status-socket))
+           (channel (status-channel)))
+      (enchiridion.channel.fluxer:propose-custom-status
+       channel "Working" :now (get-universal-time))
+      (setf (enchiridion.channel.fluxer::fluxer-channel-config channel)
+            (list :allowed-users '("u-1") :custom-status nil)
+            (enchiridion.channel.fluxer::fluxer-channel-socket channel) socket)
+      (enchiridion.channel.fluxer::handle-text
+       channel socket
+       (enchiridion.channel.fluxer::json-text
+        (list :op 0 :s 1 :t "READY"
+              :d (list :user (list :id "bot-1") :session_id "s-1"))))
+      (ok (null (queued-frames socket)))
+      (ok (null (getf (enchiridion.channel.fluxer:custom-status channel) :text))))))
+
+(deftest a-non-operator-turn-cannot-publish-a-status ()
+  (let* ((status (status-socket))
+         (channel (status-channel :allowed-users '("u-1" "u-2")
+                                  :status-user "u-1" :socket status))
+         (sent '())
+         (enchiridion.llm::*http-request-function*
+           (lambda (url &rest options)
+             (declare (ignore options))
+             (push url sent)
+             "{\"id\":\"r-1\"}")))
+    (setf (enchiridion.channel.fluxer::fluxer-channel-token channel) "fake"
+          (enchiridion.channel.fluxer::fluxer-channel-turn channel)
+          (lambda (message)
+            (declare (ignore message))
+            (list :ok-p t :reply "answer" :status "Working")))
+    (enchiridion.channel.fluxer::handle-inkbound
+     channel
+     (list :id "m-2" :channel_id "d-1" :content "hi" :channel_type 1
+           :author (list :id "u-2" :bot nil)))
+    (ok (null (queued-frames status)))
+    (ok (equal (list "https://api.fluxer.app/v1/channels/d-1/messages") sent))))
 
 (deftest a-ready-reapplies-the-status-and-the-worker-publishes-a-proposal ()
   (testing "READY on a new session reapplies the live status"

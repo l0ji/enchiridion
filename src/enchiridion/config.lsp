@@ -192,7 +192,8 @@ store path. The model defaults match the shipped adapter defaults."
     (:http (:enabled nil) (:bind "127.0.0.1") (:port 8787) (:token nil)
            (:token-env "ENCHIRIDION_HTTP_TOKEN") (:max-body-bytes 65536))
     (:fluxer (:enabled nil) (:allowed-users nil) (:token-env "FLUXER_BOT_TOKEN")
-             (:custom-status nil) (:custom-status-ttl-seconds 300)
+             (:custom-status nil) (:custom-status-user nil)
+             (:custom-status-ttl-seconds 300)
              (:custom-status-cooldown-seconds 60))
 
     :budget

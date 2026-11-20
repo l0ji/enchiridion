@@ -91,6 +91,7 @@ defaults. See [Channels](channels.md) for usage.
 | `:fluxer` | `:allowed-users` | `nil` |
 | `:fluxer` | `:token-env` | `"FLUXER_BOT_TOKEN"` |
 | `:fluxer` | `:custom-status` | `nil` |
+| `:fluxer` | `:custom-status-user` | sole allowed user |
 | `:fluxer` | `:custom-status-ttl-seconds` | `300` |
 | `:fluxer` | `:custom-status-cooldown-seconds` | `60` |
 

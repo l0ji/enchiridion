@@ -1101,7 +1101,7 @@ message: the frame tests do that once, at the edge.")
               "{\"id\":\"reply-1\"}")))
       (enchiridion.channel.fluxer::handle-inkbound
        channel
-       (enchiridion.channel.fluxer::dequeue-inkbound channel)))
+       (enchiridion.channel.fluxer::claim-inkbound channel)))
     (testing "and a delivered reply is the terminal state"
       (ok (eq :delivered
               (gethash "d-1/m-1"
@@ -1128,6 +1128,82 @@ message: the frame tests do that once, at the edge.")
       (enchiridion.channel.fluxer::handle-inkbound channel +direct-message+)
       (ok (eq :failed
               (gethash "d-1/m-1"
+                       (enchiridion.channel.fluxer::fluxer-channel-reaction-pending
+                        channel)))))))
+
+(deftest a-failed-marker-removal-keeps-the-old-marker ()
+  (let* ((delete-fails nil)
+         (calls '())
+         (channel (enchiridion.channel.fluxer:make-fluxer-channel))
+         (enchiridion.llm::*http-request-function*
+           (lambda (url &rest options)
+             (let ((method (getf options :method)))
+               (push (list url method) calls)
+               (if (and delete-fails (eq method :delete))
+                   (error 'dexador.error:http-request-failed
+                          :status 500 :body "{\"message\":\"boom\"}"
+                          :headers nil :uri nil :method :delete)
+                   "")))))
+    (setf (enchiridion.channel.fluxer::fluxer-channel-token channel) "fake")
+    (labels ((url (emoji)
+               (enchiridion.channel.fluxer::reaction-url "d-1/m-1" emoji))
+             (applied ()
+               (enchiridion.channel.fluxer::applied-reaction channel "d-1/m-1"))
+             (apply-state (state)
+               (enchiridion.channel.fluxer::apply-reaction-state
+                channel "d-1/m-1" state)))
+      (apply-state :queued)
+      (setf calls '()
+            delete-fails t)
+      (testing "a delete that fails stops the transition"
+        (apply-state :processing)
+        (ok (equal (list (list (url enchiridion.channel.fluxer::+queued-reaction+)
+                               :delete))
+                   (reverse calls)))
+        (ok (string= enchiridion.channel.fluxer::+queued-reaction+ (applied))))
+      (testing "and a later attempt that can delete still moves it"
+        (setf calls '()
+              delete-fails nil)
+        (apply-state :processing)
+        (ok (equal (list (list (url enchiridion.channel.fluxer::+queued-reaction+)
+                               :delete)
+                         (list (url enchiridion.channel.fluxer::+processing-reaction+)
+                               :put))
+                   (reverse calls)))
+        (ok (string= enchiridion.channel.fluxer::+processing-reaction+
+                     (applied)))))))
+
+(deftest a-stop-rechecks-before-claiming-waiting-work ()
+  (let ((channel (enchiridion.channel.fluxer:make-fluxer-channel)))
+    (enchiridion.channel.fluxer::enqueue-inkbound
+     channel '(:id "m-1" :channel_id "d-1"))
+    (bordeaux-threads:with-lock-held
+        ((enchiridion.channel.fluxer::fluxer-channel-pending-lock channel))
+      (setf (enchiridion.channel.fluxer::fluxer-channel-stopping-p channel) t))
+    (testing "the worker cannot claim after the stop flag is set"
+      (ok (null (enchiridion.channel.fluxer::claim-inkbound channel)))
+      (ok (= 1 (length (enchiridion.channel.fluxer::fluxer-channel-pending
+                        channel)))))
+    (testing "and the stop drains it as failed rather than losing it"
+      (enchiridion.channel.fluxer::stop-worker channel)
+      (ok (null (enchiridion.channel.fluxer::fluxer-channel-pending channel)))
+      (ok (eq :failed
+              (gethash "d-1/m-1"
+                       (enchiridion.channel.fluxer::fluxer-channel-reaction-pending
+                        channel)))))))
+
+(deftest a-message-that-arrives-after-the-stop-is-not-queued ()
+  (let ((channel (enchiridion.channel.fluxer:make-fluxer-channel)))
+    (bordeaux-threads:with-lock-held
+        ((enchiridion.channel.fluxer::fluxer-channel-pending-lock channel))
+      (setf (enchiridion.channel.fluxer::fluxer-channel-stopping-p channel) t))
+    (enchiridion.channel.fluxer::enqueue-inkbound
+     channel '(:id "m-late" :channel_id "d-1"))
+    (testing "nothing is left for a worker that has gone"
+      (ok (null (enchiridion.channel.fluxer::fluxer-channel-pending channel))))
+    (testing "and the message that was not queued is marked failed"
+      (ok (eq :failed
+              (gethash "d-1/m-late"
                        (enchiridion.channel.fluxer::fluxer-channel-reaction-pending
                         channel)))))))
 
@@ -1228,11 +1304,20 @@ message: the frame tests do that once, at the edge.")
                                        channel)
                                       "")))
                  do (sleep 0.01))
+           ;; A second message waits behind the abandoned turn and must be
+           ;; marked failed by the drain, not left for a worker that is gone.
+           (enchiridion.channel.fluxer::enqueue-inkbound
+            channel '(:id "m-2" :channel_id "d-1" :channel_type 1
+                      :author (:id "u-1")))
            (enchiridion.channel.fluxer::shutdown channel)
            (testing "the abandoned turn ends on the warning marker"
              (ok (string= enchiridion.channel.fluxer::+failed-reaction+
                           (enchiridion.channel.fluxer::applied-reaction
                            channel "d-1/m-1"))))
+           (testing "and the waiting message behind it is marked failed too"
+             (ok (string= enchiridion.channel.fluxer::+failed-reaction+
+                          (enchiridion.channel.fluxer::applied-reaction
+                           channel "d-1/m-2"))))
            (testing "and the reaction thread is gone"
              (ok (null (enchiridion.channel.fluxer::fluxer-channel-reaction-worker
                         channel)))))

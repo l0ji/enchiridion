@@ -1843,7 +1843,8 @@ answering messages."
 The applied table is what makes the cost proportional to the changes: a
 message coalesced from waiting straight to delivered never had the hourglass
 put, so there is nothing to delete. A call that fails leaves the table saying
-what is actually there, not what was wanted."
+what is actually there, not what was wanted. A DELETE that fails stops the
+transition, because putting the new marker would leave the old one beside it."
   (let* ((applied (applied-reaction channel key))
          (want (reaction-emoji state)))
     (cond
@@ -1856,11 +1857,15 @@ what is actually there, not what was wanted."
       (t
        (let ((removed (or (null applied)
                           (reaction-call channel key applied nil))))
-         (when (and applied removed)
-           (forget-reaction channel key))
-         (when (reaction-call channel key want t)
-           (track-reaction channel key want)))
-       (applied-reaction channel key)))))
+         (if (not removed)
+             ;; The old marker is still on the message, which is what the
+             ;; table says. A new one now would leave both.
+             applied
+             (progn
+               (when applied (forget-reaction channel key))
+               (when (reaction-call channel key want t)
+                 (track-reaction channel key want))
+               (applied-reaction channel key))))))))
 
 ;;;; The queue between the two callers and the reaction thread.
 
@@ -2022,27 +2027,47 @@ The queue is bounded. A turn can take minutes, and the gateway does not stop
 sending while it runs, so a full queue drops the oldest waiting message and
 counts it rather than growing without a limit. The drop is one log line, which
 is loud enough to act on and quiet enough not to stop the channel, and the
-message it dropped is marked failed because no turn will ever answer it."
-  (let ((dropped nil))
+message it dropped is marked failed because no turn will ever answer it.
+
+The stop flag is read under the same lock that writes the queue. A message
+that arrives after a stop began is therefore never left waiting for a worker
+that has gone: it is refused, and marked failed for the same reason."
+  (let ((dropped nil)
+        (refused nil))
     (bordeaux-threads:with-lock-held ((fluxer-channel-pending-lock channel))
-      (when (>= (length (fluxer-channel-pending channel)) +max-pending-messages+)
-        (setf dropped (pop (fluxer-channel-pending channel)))
-        (incf (fluxer-channel-dropped channel)))
-      (setf (fluxer-channel-pending channel)
-            (nconc (fluxer-channel-pending channel) (list data))))
-    (when dropped
-      (note "the queue is full, so the oldest waiting message was dropped (~D so far)."
-            (fluxer-channel-dropped channel))
-      (enqueue-reaction channel (message-reaction-key dropped) :failed))
-    (bordeaux-threads:signal-semaphore (fluxer-channel-pending-ready channel)))
+      (if (fluxer-channel-stopping-p channel)
+          (setf refused t)
+          (progn
+            (when (>= (length (fluxer-channel-pending channel))
+                      +max-pending-messages+)
+              (setf dropped (pop (fluxer-channel-pending channel)))
+              (incf (fluxer-channel-dropped channel)))
+            (setf (fluxer-channel-pending channel)
+                  (nconc (fluxer-channel-pending channel) (list data))))))
+    (cond
+      (refused
+       (note "the channel is stopping, so a message was not queued.")
+       (enqueue-reaction channel (message-reaction-key data) :failed))
+      (dropped
+       (note "the queue is full, so the oldest waiting message was dropped (~D so far)."
+             (fluxer-channel-dropped channel))
+       (enqueue-reaction channel (message-reaction-key dropped) :failed)))
+    (unless refused
+      (bordeaux-threads:signal-semaphore (fluxer-channel-pending-ready channel))))
   nil)
 
-(declaim (ftype (function (fluxer-channel) t) dequeue-inkbound))
+(declaim (ftype (function (fluxer-channel) t) claim-inkbound))
 
-(defun dequeue-inkbound (channel)
-  "Return the oldest payload waiting for the worker, or NIL when none is."
+(defun claim-inkbound (channel)
+  "Return the oldest waiting payload for the worker, or NIL.
+
+NIL means the queue was empty, or the channel is stopping. The stop flag and
+the queue are read under one lock, so a stop cannot begin between the check and
+the pop: a message is either claimed by a running worker or left for
+STOP-WORKER to mark failed, never both."
   (bordeaux-threads:with-lock-held ((fluxer-channel-pending-lock channel))
-    (pop (fluxer-channel-pending channel))))
+    (unless (fluxer-channel-stopping-p channel)
+      (pop (fluxer-channel-pending channel)))))
 
 ;;;; The worker: the one thread that runs a turn.
 
@@ -2133,14 +2158,20 @@ got half an answer has not got the answer."
 
 One worker thread, so two turns never run at once and messages are answered in
 the order they arrived. The wait is signalled as well as timed, so a lost
-wake-up costs +WORKER-WAIT-SECONDS+ and never a message."
-  (loop until (fluxer-channel-stopping-p channel)
-        do (when (bordeaux-threads:wait-on-semaphore
-                  (fluxer-channel-pending-ready channel)
-                  :timeout +worker-wait-seconds+)
-             (let ((data (dequeue-inkbound channel)))
-               (when data
-                 (handle-inkbound channel data)))))
+wake-up costs +WORKER-WAIT-SECONDS+ and never a message.
+
+The stop flag is checked again by CLAIM-INKBOUND, under the queue lock, when a
+wake-up is turned into work. A stop that lands after the wait but before the
+pop therefore ends the loop instead of starting one more turn."
+  (loop
+    (when (fluxer-channel-stopping-p channel)
+      (return))
+    (when (bordeaux-threads:wait-on-semaphore
+           (fluxer-channel-pending-ready channel)
+           :timeout +worker-wait-seconds+)
+      (let ((data (claim-inkbound channel)))
+        (when data
+          (handle-inkbound channel data)))))
   nil)
 
 (declaim (ftype (function (fluxer-channel) null) stop-worker))
@@ -2153,7 +2184,8 @@ A turn that had to be destroyed, and every message still waiting behind it,
 will never be answered, so each is marked failed on the message itself. The
 markers are only enqueued here: the reaction thread is stopped after this, and
 that order is what lets it send them."
-  (setf (fluxer-channel-stopping-p channel) t)
+  (bordeaux-threads:with-lock-held ((fluxer-channel-pending-lock channel))
+    (setf (fluxer-channel-stopping-p channel) t))
   (bordeaux-threads:signal-semaphore (fluxer-channel-pending-ready channel))
   (let ((worker (fluxer-channel-worker channel))
         (abandoned nil)

@@ -62,6 +62,21 @@ socket and then says nothing is not a gateway to sit and wait on.")
 (defparameter +message-limit+ 2000
   "How many characters one message may carry. The resolved default for a bot.")
 
+(defparameter +custom-status-max-characters+ 128
+  "The longest custom status text the gateway accepts, in characters.")
+
+(defparameter +custom-status-max-ttl-seconds+ 86400
+  "The longest configurable custom status lifetime, in seconds.")
+
+(defparameter +custom-status-max-cooldown-seconds+ 3600
+  "The longest configurable custom status cooldown, in seconds.")
+
+(defparameter +presence-online+ "online"
+  "The base presence every custom status update carries.
+
+The gateway requires d.status even when only custom_status changes, so the
+channel names the one state it wants rather than leaving the field to default.")
+
 (defparameter +http-timeout-seconds+ 15
   "Seconds to wait for one REST call. A send that has not answered by then is a
 send the operator has already given up on.")
@@ -117,6 +132,11 @@ or null before the first one, and the gateway answers with op 11.")
 
 (defparameter +op-identify+ 2
   "The identify opcode. It authenticates a fresh session on an open socket.")
+
+(defparameter +op-presence+ 3
+  "The presence opcode. It sets the displayed status and custom status. The
+gateway sends no acknowledgement for it, so a frame that left the socket is all
+this channel can know.")
 
 (defparameter +op-resume+ 6
   "The resume opcode. It reattaches to a session the gateway still holds.")
@@ -374,6 +394,67 @@ One field, because that is what the endpoint takes, and the test pins that
 there is no second one: an unknown field is ignored by one gateway version and
 refused by the next."
   (list :content text))
+
+;;;; The agent's custom status.
+;;;;
+;;;; A status is public the moment it leaves this process, so the adapter and
+;;;; not the agent owns the last word: the text is one line of bounded length,
+;;;; it carries no secret the scrubber would redact, and it is the agent's
+;;;; deliberate proposal rather than anything read out of its reasoning. The
+;;;; channel also owns the lifetime and the spacing between changes, because a
+;;;; model that can publish on every turn is a model that can flood a profile.
+
+(declaim (ftype (function (character) boolean) control-character-p))
+
+(defun control-character-p (character)
+  "Return T when CHARACTER cannot appear in a one line status."
+  (let ((code (char-code character)))
+    (or (< code 32) (= code 127))))
+
+(declaim (ftype (function (t) (values (or null string) (or null string)))
+                validate-custom-status))
+
+(defun validate-custom-status (proposal)
+  "Return PROPOSAL as custom status text and NIL, or NIL and the refusal.
+
+The text is trimmed, must be non-empty and at most
++CUSTOM-STATUS-MAX-CHARACTERS+ characters, must not contain a line break or any
+other control character, and must survive the scrubber unchanged. A value the
+scrubber would redact is refused rather than published redacted: the marker is
+noise on a profile and the text that produced it was never meant to be public."
+  (unless (stringp proposal)
+    (return-from validate-custom-status
+      (values nil "a custom status is a string.")))
+  (let ((text (string-trim '(#\Space #\Tab #\Newline #\Return) proposal)))
+    (cond
+      ((zerop (length text))
+       (values nil "the custom status is blank."))
+      ((> (length text) +custom-status-max-characters+)
+       (values nil (format nil "the custom status is longer than ~D characters."
+                           +custom-status-max-characters+)))
+      ((find-if #'control-character-p text)
+       (values nil "the custom status must be one line."))
+      (t
+       (let ((clean (enchiridion.llm.secrets:scrub text)))
+         (if (string= clean text)
+             (values text nil)
+             (values nil "the scrubber redacts this status.")))))))
+
+(declaim (ftype (function ((or null string)) list) presence-frame))
+
+(defun presence-frame (text)
+  "Return the op 3 frame that sets TEXT, or clears the custom status when TEXT
+is NIL.
+
+The documented clear is a null custom_status and not an empty text, because a
+text must be 1 to 128 characters. d.status is required even when only the
+custom status changes, and this channel does not play with idle or do not
+disturb."
+  (list :op +op-presence+
+        :d (list :status +presence-online+
+                 :custom_status (if text
+                                    (list :text text)
+                                    +json-null+))))
 
 ;;;; Who may talk, and what counts as a message.
 
@@ -773,6 +854,20 @@ universal time. The resume window is counted from it.")
    (attempt :accessor fluxer-channel-attempt :initform 0 :type integer
             :documentation "Reconnects since the last connection that stayed
 up. NEXT-ATTEMPT decides which connections earn a fresh budget.")
+   (status-text :accessor fluxer-channel-status-text :initform nil :type t
+                :documentation "The live custom status text, or NIL. It is
+never read from a reply or from reasoning: only an explicit proposal sets it.")
+   (status-expires :accessor fluxer-channel-status-expires :initform nil :type t
+                   :documentation "When the live custom status stops being
+current, as a universal time, or NIL.")
+   (status-changed :accessor fluxer-channel-status-changed :initform nil :type t
+                   :documentation "When the last accepted status change was
+proposed, as a universal time. The cooldown is counted from it.")
+   (status-lock :accessor fluxer-channel-status-lock
+                :initform (bordeaux-threads:make-lock "fluxer status")
+                :type t
+                :documentation "Guards the status state. The worker proposes,
+the read thread reapplies on READY, and the heartbeat thread expires it.")
    (dropped :accessor fluxer-channel-dropped :initform 0 :type integer
             :documentation "How many messages a full queue has dropped."))
   (:documentation
@@ -788,10 +883,14 @@ only ever parses a frame and hands it on."))
   "Return a stopped Fluxer channel that calls TURN for every inkbound message.
 
 TURN is (lambda (msg) ...) and returns a plist (:ok-p BOOL :reply STRING :error
-STRING :usage PLIST-OR-NIL). It is the only way this channel reaches an agent:
-the channel never calls the kernel, so a test hands it a closure and a
-supervisor hands it the agent's turn. CONFIG is the :FLUXER options, or a whole
-configuration that carries them; NIL means whatever is active."
+STRING :usage PLIST-OR-NIL :status PROPOSAL). STATUS is the agent's deliberate
+custom status proposal, a string or :CLEAR, and is ignored unless the :FLUXER
+options set :CUSTOM-STATUS. It travels beside the reply, not inside it: the
+channel validates, rate limits, and expires it, and a refusal never costs the
+reply. It is the only way this channel reaches an agent: the channel never
+calls the kernel, so a test hands it a closure and a supervisor hands it the
+agent's turn. CONFIG is the :FLUXER options, or a whole configuration that
+carries them; NIL means whatever is active."
   (make-instance 'fluxer-channel :name "fluxer" :turn turn :config config))
 
 ;;;; What the configuration says.
@@ -836,6 +935,50 @@ admitting somebody the operator did not name."
 token, or the default when they name none."
   (or (non-blank-string (getf (channel-options channel) :token-env))
       +token-env-default+))
+
+(declaim (ftype (function (fluxer-channel) boolean) channel-custom-status-p))
+
+(defun channel-custom-status-p (channel)
+  "Return T when the :FLUXER options opt in to an agent-authored custom status.
+
+The default is off. A public status is a new way for the agent to be seen, and
+an operator who did not ask for one should never discover it is on."
+  (not (null (getf (channel-options channel) :custom-status))))
+
+(declaim (ftype (function (keyword) (or null integer)) shipped-status-seconds))
+
+(defun shipped-status-seconds (key)
+  "Return KEY from the shipped :FLUXER entry, or NIL when it names none."
+  (getf (enchiridion:channel-config :fluxer (enchiridion:default-config)) key))
+
+(declaim (ftype (function (fluxer-channel keyword integer integer) integer)
+                status-seconds))
+
+(defun status-seconds (channel key minimum maximum)
+  "Return KEY from CHANNEL's options as seconds, or the shipped value.
+
+A value that is not an integer, or that falls outside MINIMUM..MAXIMUM, is the
+shipped default. The bounds are what keep one typo from pinning a status for a
+day or letting the cooldown disappear without the operator saying so."
+  (let ((value (getf (channel-options channel) key)))
+    (if (and (integerp value) (<= minimum value maximum))
+        value
+        (shipped-status-seconds key))))
+
+(declaim (ftype (function (fluxer-channel) integer) channel-custom-status-ttl))
+
+(defun channel-custom-status-ttl (channel)
+  "Return how many seconds a custom status stays live on CHANNEL."
+  (status-seconds channel :custom-status-ttl-seconds
+                  1 +custom-status-max-ttl-seconds+))
+
+(declaim (ftype (function (fluxer-channel) integer)
+                channel-custom-status-cooldown))
+
+(defun channel-custom-status-cooldown (channel)
+  "Return the cooldown between accepted custom status changes on CHANNEL."
+  (status-seconds channel :custom-status-cooldown-seconds
+                  0 +custom-status-max-cooldown-seconds+))
 
 ;;;; Saying what happened.
 
@@ -1017,6 +1160,239 @@ and the gateway reads that as one corrupt frame and closes 4002."
     (bordeaux-threads:with-lock-held ((fluxer-channel-send-lock channel))
       (websocket-driver:send socket text))
     text))
+
+;;;; The custom status, from proposal to frame.
+;;;;
+;;;; The state is three facts and a lock. A proposal is either applied or
+;;;; refused, and the reason is part of the answer so a caller can log one line
+;;;; and a test can name the rule. Nothing here signals: a refused status must
+;;;; never cost the reply that was proposed beside it.
+
+(declaim (ftype (function (fluxer-channel &optional integer) boolean)
+                custom-status-live-p))
+
+(defun custom-status-live-p (channel &optional (now (get-universal-time)))
+  "Return T when CHANNEL holds a custom status that has not expired at NOW.
+
+The caller holds the status lock, or accepts a snapshot. Expiry is strict: a
+status that ends at NOW is over, not one second more."
+  (let ((text (fluxer-channel-status-text channel))
+        (expires (fluxer-channel-status-expires channel)))
+    (and (stringp text)
+         (plusp (length text))
+         (integerp expires)
+         (< now expires))))
+
+(declaim (ftype (function (fluxer-channel (or null string)) (or null string))
+                send-presence))
+
+(defun send-presence (channel text)
+  "Send one op 3 frame setting TEXT, or clearing when TEXT is NIL.
+
+Return the frame text, or NIL when the channel has no socket to write to. A
+status proposed between connections is kept and reapplied on the next READY,
+so a missing socket is not a lost status."
+  (let ((socket (fluxer-channel-socket channel)))
+    (when socket
+      (send-frame channel socket (presence-frame text)))))
+
+(declaim (ftype (function (fluxer-channel t integer) list)
+                apply-status-proposal))
+
+(defun apply-status-proposal (channel proposal now)
+  "Apply PROPOSAL, a validated text or :CLEAR, at NOW under the status lock.
+Return the decision plist.
+
+The lock is held across the write so two proposals cannot invert their frames
+on the wire. The frame write itself is short; a socket that blocks is the same
+socket the heartbeat is already writing to."
+  (let ((outcome nil) (reason nil) (frame-p nil) (frame-text nil))
+    (bordeaux-threads:with-lock-held ((fluxer-channel-status-lock channel))
+      (let ((cooldown (channel-custom-status-cooldown channel))
+            (live (custom-status-live-p channel now))
+            (changed (fluxer-channel-status-changed channel)))
+        ;; An expired status is already over. Forget it before the decision so
+        ;; a clear after the deadline is a no-op and a new text does not
+        ;; deduplicate against one nobody is showing.
+        (when (and (fluxer-channel-status-text channel) (not live))
+          (setf (fluxer-channel-status-text channel) nil
+                (fluxer-channel-status-expires channel) nil))
+        (cond
+          ((eq proposal :clear)
+           (cond
+             ((not live)
+              (setf outcome :unchanged))
+             ((and (integerp changed)
+                   (< (- now changed) cooldown))
+              (setf outcome :refused
+                    reason (format nil "the cooldown has ~D seconds left."
+                                   (- cooldown (- now changed)))))
+             (t
+              (setf (fluxer-channel-status-text channel) nil
+                    (fluxer-channel-status-expires channel) nil
+                    (fluxer-channel-status-changed channel) now
+                    outcome :cleared
+                    frame-p t
+                    frame-text nil))))
+          ((and live
+                (string= proposal (fluxer-channel-status-text channel)))
+           (setf outcome :unchanged))
+          ((and (integerp changed)
+                (< (- now changed) cooldown))
+           (setf outcome :refused
+                 reason (format nil "the cooldown has ~D seconds left."
+                                (- cooldown (- now changed)))))
+          (t
+           (setf (fluxer-channel-status-text channel) proposal
+                 (fluxer-channel-status-expires channel)
+                 (+ now (channel-custom-status-ttl channel))
+                 (fluxer-channel-status-changed channel) now
+                 outcome :applied
+                 frame-p t
+                 frame-text proposal))))
+      ;; The lock covers the write as well as the decision, so two proposals
+      ;; cannot invert their frames and an expiry cannot clear one that this
+      ;; frame is about to republish.
+      (when frame-p
+        (handler-case
+            (let ((sent (send-presence channel frame-text)))
+              (unless sent
+                (setf reason
+                      (if frame-text
+                          "no live socket; the status waits for READY."
+                          "no live socket; a new session has no status."))))
+          (error (condition)
+            (setf reason
+                  (format nil "the status frame was not sent: ~A" condition))))))
+    (cond
+      ((eq outcome :applied)
+       (note "custom status set: ~A" (short-text frame-text 64)))
+      ((eq outcome :cleared)
+       (note "custom status cleared."))
+      ((eq outcome :refused)
+       (note "refused a custom status change: ~A" reason)))
+    (list :outcome outcome
+          :reason reason
+          :sent (and frame-p (null reason)))))
+
+(declaim (ftype (function (fluxer-channel t &key (:now integer)) list)
+                propose-custom-status))
+
+(defun propose-custom-status (channel proposal &key (now (get-universal-time)))
+  "Propose PROPOSAL as the agent's temporary public custom status.
+
+PROPOSAL is a string to set, :CLEAR to remove it, or NIL for no proposal.
+Return a decision plist (:outcome OUTCOME :reason TEXT-OR-NIL :sent BOOL).
+OUTCOME is :disabled, :unchanged, :refused, :applied, or :cleared. A frame
+error leaves the outcome and reports the error in :reason: the status is
+recorded and a later READY can apply it.
+
+The proposal is the agent's own deliberate text. This function never reads a
+reply, a transcript, or reasoning, so nothing private becomes public by
+accident. Validation, the cooldown, deduplication, and expiry all live here
+rather than in the agent, because the channel is the last place before a frame
+leaves the process."
+  (cond
+    ((null proposal)
+     (list :outcome :unchanged :reason nil :sent nil))
+    ((not (channel-custom-status-p channel))
+     (list :outcome :disabled
+           :reason "the Fluxer channel is not opted in to a custom status."
+           :sent nil))
+    ((eq proposal :clear)
+     (apply-status-proposal channel :clear now))
+    (t
+     (multiple-value-bind (text reason)
+         (validate-custom-status proposal)
+       (if text
+           (apply-status-proposal channel text now)
+           (progn
+             (note "refused a custom status proposal: ~A" reason)
+             (list :outcome :refused :reason reason :sent nil)))))))
+
+(declaim (ftype (function (fluxer-channel &key (:now integer)) list)
+                expire-custom-status))
+
+(defun expire-custom-status (channel &key (now (get-universal-time)))
+  "Clear CHANNEL's custom status when it has expired at NOW, and return the
+decision.
+
+The clear goes out on the socket this connection recorded. A status that
+expires while the channel is disconnected is simply forgotten: a new session
+starts with no custom status, and REAPPLY-CUSTOM-STATUS does not send one that
+is already over."
+  (let ((expired nil) (sent nil) (reason nil))
+    (bordeaux-threads:with-lock-held ((fluxer-channel-status-lock channel))
+      (when (and (stringp (fluxer-channel-status-text channel))
+                 (integerp (fluxer-channel-status-expires channel))
+                 (>= now (fluxer-channel-status-expires channel)))
+        (setf (fluxer-channel-status-text channel) nil
+              (fluxer-channel-status-expires channel) nil
+              expired t)
+        (handler-case
+            (let ((socket (fluxer-channel-socket channel)))
+              (when socket
+                (send-frame channel socket (presence-frame nil))
+                (setf sent t)))
+          (error (condition)
+            (setf reason (format nil "the expiry clear could not be sent: ~A"
+                                 condition))))))
+    (when expired
+      (if reason
+          (note "the custom status expired, but the clear could not be sent: ~A"
+                reason)
+          (note "the custom status expired.")))
+    (if expired
+        (list :outcome :expired :reason reason :sent sent)
+        (list :outcome :unchanged :reason nil :sent nil))))
+
+(declaim (ftype (function (fluxer-channel &key (:now integer)) list)
+                reapply-custom-status))
+
+(defun reapply-custom-status (channel &key (now (get-universal-time)))
+  "Reapply a still-current custom status on a new session.
+
+A READY follows an Identify, so the session that just began does not carry the
+old presence. A status whose lifetime is over is forgotten here instead of
+being published again, and an unchanged status is not resent: a reconnect is
+not a new proposal and must not restart the cooldown."
+  (let ((outcome nil) (sent nil) (reason nil) (expired nil))
+    (bordeaux-threads:with-lock-held ((fluxer-channel-status-lock channel))
+      (let ((text (fluxer-channel-status-text channel)))
+        (cond
+          ((null text) (setf outcome :unchanged))
+          ((custom-status-live-p channel now)
+           ;; The lock covers the write so an expiry cannot clear the status
+           ;; between this decision and the frame that republishes it.
+           (handler-case
+               (if (send-presence channel text)
+                   (setf outcome :reapplied sent t)
+                   (setf outcome :reapplied
+                         reason "the channel has no live socket."))
+             (error (condition)
+               (setf outcome :failed
+                     reason (format nil "the status was not reapplied: ~A"
+                                    condition)))))
+          (t
+           (setf (fluxer-channel-status-text channel) nil
+                 (fluxer-channel-status-expires channel) nil
+                 expired t
+                 outcome :expired)))))
+    (cond
+      (expired (note "a custom status expired while disconnected."))
+      ((eq outcome :failed)
+       (note "the custom status was not reapplied: ~A" reason)))
+    (list :outcome outcome :reason reason :sent sent)))
+
+(declaim (ftype (function (fluxer-channel &key (:now integer)) list)
+                custom-status))
+
+(defun custom-status (channel &key (now (get-universal-time)))
+  "Return what CHANNEL currently has as (:text TEXT :expires TIME :live BOOL)."
+  (bordeaux-threads:with-lock-held ((fluxer-channel-status-lock channel))
+    (list :text (fluxer-channel-status-text channel)
+          :expires (fluxer-channel-status-expires channel)
+          :live (custom-status-live-p channel now))))
 
 (declaim (ftype (function (fluxer-channel fluxer-socket) string)
                 send-heartbeat))
@@ -1226,6 +1602,9 @@ fault it was."
                  (note "the turn answered ~S, which is not a result plist."
                        result))
                 ((getf result :ok-p)
+                 ;; A proposal travels beside the reply and never inside it, so
+                 ;; the reply is not delayed and a refused status costs nothing.
+                 (propose-custom-status channel (getf result :status))
                  (send-reply channel
                              (enchiridion.channel:msg-target message)
                              (getf result :reply)))
@@ -1356,7 +1735,11 @@ connection that stayed up. See NEXT-ATTEMPT."
       (setf (fluxer-channel-session-id channel)
             (non-blank-string (getf data :session_id))))
     (note "connected as ~A." (or (fluxer-channel-self-id channel)
-                                 "an unknown user")))
+                                 "an unknown user"))
+    ;; READY follows an Identify, so this session began without the presence
+    ;; the last one had. A status that is still current goes out again; one
+    ;; that has expired is forgotten rather than republished.
+    (reapply-custom-status channel))
   nil)
 
 (declaim (ftype (function (list t) t) check-sender))
@@ -1544,6 +1927,10 @@ the reconnect loop do the rest."
       (when (or (fluxer-channel-stopping-p channel)
                 (fluxer-socket-closed-p socket))
         (return))
+      ;; The heartbeat is already awake at least once a second, so the status
+      ;; deadline rides on it instead of starting a timer of its own.
+      (when (fluxer-channel-status-text channel)
+        (expire-custom-status channel))
       (when (heartbeat-ack-overdue-p sent (fluxer-socket-last-ack socket)
                                     (get-universal-time))
         (note "no heartbeat acknowledged for ~D seconds, so this socket is gone."

@@ -136,6 +136,22 @@
                           :text "again" :directory directory))
                    'enchiridion.errors:tool-error)))))
 
+(deftest presence-proposes-one-line-and-refuses-an-ambiguous-call ()
+  (ok (search "Proposed a Fluxer custom status"
+              (enchiridion.tools.builtin:presence-run
+               (list :text "Working on retries"))))
+  (ok (search "clearing"
+              (enchiridion.tools.builtin:presence-run
+               (list :clear t))))
+  (testing "an empty proposal asks for one shape"
+    (ok (signals (enchiridion.tools.builtin:presence-run '())
+                 'enchiridion.errors:schema-error))
+    (ok (signals (enchiridion.tools.builtin:presence-run (list :text "  "))
+                 'enchiridion.errors:schema-error))
+    (ok (signals (enchiridion.tools.builtin:presence-run
+                  (list :text "Working" :clear t))
+                 'enchiridion.errors:schema-error))))
+
 (deftest web-fetch-and-search-use-the-injected-getter ()
   (let ((enchiridion.tools.builtin::*web-get-function*
           (lambda (url &rest arguments)
@@ -159,7 +175,8 @@
        (progn
          (enchiridion.tools.builtin:register-builtin-tools)
          (dolist (name '("index" "read-file" "write-file" "edit-file" "glob"
-                         "shell" "search" "blockops" "memory" "meta" "web"))
+                         "shell" "search" "blockops" "memory" "meta" "presence"
+                         "web"))
            (ok (enchiridion.tools:find-tool name))))
     (enchiridion.tools:clear-registry)))
 

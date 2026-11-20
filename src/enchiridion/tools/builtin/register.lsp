@@ -14,4 +14,5 @@
      (register-block-tools)
      (register-memory-tools)
      (register-meta-tools)
+     (register-presence-tools)
      (register-web-tools)))

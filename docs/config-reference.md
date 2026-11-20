@@ -90,6 +90,9 @@ defaults. See [Channels](channels.md) for usage.
 | `:fluxer` | `:enabled` | `nil` |
 | `:fluxer` | `:allowed-users` | `nil` |
 | `:fluxer` | `:token-env` | `"FLUXER_BOT_TOKEN"` |
+| `:fluxer` | `:custom-status` | `nil` |
+| `:fluxer` | `:custom-status-ttl-seconds` | `300` |
+| `:fluxer` | `:custom-status-cooldown-seconds` | `60` |
 
 The HTTP body limit is in bytes. Prefer `:token-env` over a literal `:token`.
 The CLI `:enabled` field is reported in status; `serve` builds the terminal

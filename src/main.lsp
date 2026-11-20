@@ -1111,7 +1111,9 @@ over the webhook is not filed as a turn typed at the terminal."
 The result is a plist, because every channel formats its own answer and none
 of them should have to know what a completion is: :ok-p says whether the turn
 ran, :reply is the text to send, :error is one line when it did not, :reason
-separates a busy agent from a failure, and :usage sums what the turn cost.
+separates a busy agent from a failure, :status is the presence proposal a tool
+made (a string or :CLEAR, or NIL), and :usage sums what the turn cost. A
+channel that shows presence reads :status; every other channel ignores it.
 
 By default the turn takes the agent lock without waiting. A webhook client is
 better served by a 503 and a retry than by a connection held open behind
@@ -1132,20 +1134,26 @@ path is the last gate."
                                     (context-config context)))))
           (ensure-started context)
           (let* ((agent (context-agent context))
-                 (before (enchiridion.kernel:spend-count agent))
-                 (completion (enchiridion.kernel:run-turn
-                              agent text
-                              :session (context-session context)
-                              :store (context-store context)
-                              :channel channel
-                              :block-p block-p)))
-            (list :ok-p t
-                  :reply (enchiridion.llm.secrets:scrub
-                          (enchiridion.llm:completion-text completion))
-                  :error ""
-                  :reason nil
-                  :usage (enchiridion.kernel:spend-summary
-                          (enchiridion.kernel:spend-since agent before)))))
+                 (before (enchiridion.kernel:spend-count agent)))
+            ;; RUN-TURN's second value is the presence proposal a tool made
+            ;; this turn. It travels beside the reply so a channel that does
+            ;; not show presence ignores it, and a refused proposal costs the
+            ;; reply nothing.
+            (multiple-value-bind (completion proposal)
+                (enchiridion.kernel:run-turn
+                 agent text
+                 :session (context-session context)
+                 :store (context-store context)
+                 :channel channel
+                 :block-p block-p)
+              (list :ok-p t
+                    :reply (enchiridion.llm.secrets:scrub
+                            (enchiridion.llm:completion-text completion))
+                    :error ""
+                    :reason nil
+                    :status proposal
+                    :usage (enchiridion.kernel:spend-summary
+                            (enchiridion.kernel:spend-since agent before))))))
       (enchiridion.errors:turn-busy (condition)
         (channel-failure :busy (condition-line condition)))
       (enchiridion.errors:turn-cancelled (condition)

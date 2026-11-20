@@ -164,6 +164,35 @@ The queue holds 32 messages. A missing token logs one line per second:
 `enchiridion fluxer: no bot token: set FLUXER_BOT_TOKEN, or :token-env in the
 :fluxer section.`
 
+### Custom status
+
+The agent can show one short, public line on its Fluxer profile. It is off by
+default; turn it on in the `:fluxer` section:
+
+```lisp
+(:fluxer
+ (:enabled t)
+ (:allowed-users ("123456789012345678"))
+ (:custom-status t)
+ (:custom-status-ttl-seconds 300)
+ (:custom-status-cooldown-seconds 60))
+```
+
+The agent proposes the text with its `presence` tool, in a field separate from
+its reply and from its reasoning. The channel owns the last word: the text is
+trimmed, must be one line of at most 128 characters, and is refused if it
+contains a control character or anything the secret scrubber would redact.
+Proposing the text already showing sends nothing. A different text waits for
+the cooldown, 60 seconds by default; `0` disables it. A status is temporary:
+the channel clears it after the TTL, 300 seconds by default, and forgets it if
+it ends while the channel is disconnected. A status still current is reapplied
+after a reconnect. An out-of-range TTL or cooldown falls back to its default.
+
+Only the bot token and the gateway are used. The channel never edits the bot's
+bio and never needs an owner credential. The gateway does not acknowledge a
+presence update, so the Fluxer client is the only confirmation that a status
+rendered.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |

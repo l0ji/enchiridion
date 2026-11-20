@@ -74,6 +74,49 @@
            (ok (= 1 (enchiridion.kernel:agent-turn agent)))))
     (enchiridion.tools:clear-registry)))
 
+(deftest a-presence-call-proposes-beside-the-reply ()
+  (enchiridion.tools:clear-registry)
+  (unwind-protect
+       (progn
+         (enchiridion.tools.builtin:register-presence-tools)
+         (let* ((backend (make-scripted-backend
+                          :replies (list (completion "" :tool-calls
+                                                     (list (call "c1" "presence"
+                                                                 "{\"text\":\"Working on retries\"}")))
+                                         (completion "done"))))
+                (agent (test-agent backend)))
+           (multiple-value-bind (result proposal)
+               (enchiridion.kernel:run-turn agent "go")
+             (testing "the reply and the proposal are separate values"
+               (ok (string= "done" (enchiridion.llm:completion-text result)))
+               (ok (string= "Working on retries" proposal)))
+             (testing "the tool result tells the model the channel decides"
+               (let ((tool (fourth (first (scripted-backend-transcripts backend)))))
+                 (ok (search "Proposed a Fluxer custom status"
+                             (enchiridion.llm:message-content tool)))))))
+         (let* ((backend (make-scripted-backend
+                          :replies (list (completion "" :tool-calls
+                                                     (list (call "c1" "presence"
+                                                                 "{\"clear\":true}")))
+                                         (completion "done"))))
+                (agent (test-agent backend)))
+           (multiple-value-bind (result proposal)
+               (enchiridion.kernel:run-turn agent "go")
+             (declare (ignore result))
+             (ok (eq :clear proposal))))
+         (testing "a call the tool refused proposes nothing"
+           (let* ((backend (make-scripted-backend
+                            :replies (list (completion "" :tool-calls
+                                                       (list (call "c1" "presence"
+                                                                   "{\"text\":\"x\",\"clear\":true}")))
+                                           (completion "done"))))
+                  (agent (test-agent backend)))
+             (multiple-value-bind (result proposal)
+                 (enchiridion.kernel:run-turn agent "go")
+               (ok (string= "done" (enchiridion.llm:completion-text result)))
+               (ok (null proposal))))))
+    (enchiridion.tools:clear-registry)))
+
 (deftest a-tool-turn-is-recorded-beside-the-question ()
   (enchiridion.tools:clear-registry)
   (let* ((directory (uiop:ensure-directory-pathname

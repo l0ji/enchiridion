@@ -168,6 +168,299 @@ message: the frame tests do that once, at the edge.")
   (let ((text (enchiridion.channel.fluxer::json-text (list (list :a 1)))))
     (ok (char= #\[ (char text 0)))))
 
+;;;; The agent's custom status.
+
+(defun status-socket ()
+  "Return an offline socket, whose send queue is where frames are inspected."
+  (make-instance 'enchiridion.channel.fluxer::fluxer-socket
+                 :url "ws://offline.invalid/status"))
+
+(defun status-channel (&key (custom-status t) (ttl 300) (cooldown 60) socket)
+  "Return a channel with a status configuration and a socket when one is given."
+  (let ((channel (enchiridion.channel.fluxer:make-fluxer-channel
+                  :config (list :custom-status custom-status
+                                :custom-status-ttl-seconds ttl
+                                :custom-status-cooldown-seconds cooldown))))
+    (when socket
+      (setf (enchiridion.channel.fluxer::fluxer-channel-socket channel) socket))
+    channel))
+
+(defun queued-frames (socket)
+  "Return the text of every frame handed to SOCKET."
+  (loop for entry across (websocket-driver.ws.base::queue socket)
+        collect (car entry)))
+
+(deftest the-presence-frame-sets-and-clears-the-documented-fields ()
+  (let* ((frame (enchiridion.channel.fluxer::presence-frame "Working on retries"))
+         (data (getf frame :d)))
+    (ok (eql 3 (getf frame :op)))
+    (ok (eql 4 (length frame)))
+    (testing "the base presence is named because the gateway requires it"
+      (ok (string= "online" (getf data :status))))
+    (testing "the status is the one field the custom status carries"
+      (ok (equal '(:text "Working on retries") (getf data :custom_status)))
+      (ok (string= "{\"op\":3,\"d\":{\"status\":\"online\",\"custom_status\":{\"text\":\"Working on retries\"}}}"
+                   (enchiridion.channel.fluxer::json-text frame)))))
+  (testing "clearing sends a null custom status, never an empty text"
+    (let* ((frame (enchiridion.channel.fluxer::presence-frame nil))
+           (data (getf frame :d))
+           (text (enchiridion.channel.fluxer::json-text frame)))
+      (ok (eql enchiridion.channel.fluxer::+json-null+
+               (getf data :custom_status)))
+      (ok (search "\"custom_status\":null" text))
+      (ng (search "false" text)))))
+
+(deftest a-custom-status-is-one-clean-line-of-bounded-length ()
+  (testing "a string is trimmed and returned"
+    (multiple-value-bind (text reason)
+        (enchiridion.channel.fluxer::validate-custom-status "  Working  ")
+      (ok (string= "Working" text))
+      (ng reason)))
+  (testing "a non string, a blank, and a whitespace only value are refused"
+    (dolist (proposal '(7 nil "   " ""))
+      (multiple-value-bind (text reason)
+          (enchiridion.channel.fluxer::validate-custom-status proposal)
+        (ng text)
+        (ok (stringp reason)))))
+  (testing "the length limit is 128 characters and is counted after trimming"
+    (let ((text (make-string 128 :initial-element #\a)))
+      (multiple-value-bind (clean reason)
+          (enchiridion.channel.fluxer::validate-custom-status text)
+        (ok (string= text clean))
+        (ng reason)))
+    (multiple-value-bind (clean reason)
+        (enchiridion.channel.fluxer::validate-custom-status
+         (make-string 129 :initial-element #\a))
+      (ng clean)
+      (ok (search "128" reason))))
+  (testing "a line break, a tab, and a control character are refused"
+    (dolist (proposal (list (format nil "one~%two")
+                            (format nil "one~Ctwo" #\Tab)
+                            (format nil "one~Ctwo" (code-char 7))))
+      (multiple-value-bind (text reason)
+          (enchiridion.channel.fluxer::validate-custom-status proposal)
+        (ng text)
+        (ok (search "one line" reason)))))
+  (testing "text the scrubber would redact is refused rather than published"
+    (unwind-protect
+         (progn
+           (enchiridion.llm.secrets:register-secret
+            "ENCHIRIDION_STATUS_TEST_SECRET" "abcdefghijklmnop")
+           (multiple-value-bind (text reason)
+               (enchiridion.channel.fluxer::validate-custom-status
+                "the key is abcdefghijklmnop")
+             (ng text)
+             (ok (search "redacts" reason))))
+      (enchiridion.llm.secrets:clear-secrets))))
+
+(deftest the-custom-status-is-off-until-the-operator-opts-in ()
+  (let* ((socket (status-socket))
+         (channel (status-channel :custom-status nil :socket socket)))
+    (ok (equal '(:outcome :disabled :reason "the Fluxer channel is not opted in to a custom status." :sent nil)
+               (enchiridion.channel.fluxer:propose-custom-status
+                channel "Working" :now 1000)))
+    (ok (null (getf (enchiridion.channel.fluxer:custom-status channel :now 1000)
+                    :text)))
+    (ok (null (queued-frames socket))))
+  (testing "the default is off, not on"
+    (let ((channel (enchiridion.channel.fluxer:make-fluxer-channel
+                    :config '(:allowed-users ("u-1")))))
+      (ng (enchiridion.channel.fluxer::channel-custom-status-p channel)))))
+
+(deftest a-live-status-is-not-resent-and-a-change-waits-for-the-cooldown ()
+  (let* ((socket (status-socket))
+         (channel (status-channel :socket socket)))
+    (testing "the first proposal is applied and sent"
+      (ok (eq :applied
+              (getf (enchiridion.channel.fluxer:propose-custom-status
+                     channel "Working on retries" :now 1000)
+                    :outcome)))
+      (ok (eql 1 (length (queued-frames socket)))))
+    (testing "the same live text is deduplicated, not sent again"
+      (ok (eq :unchanged
+              (getf (enchiridion.channel.fluxer:propose-custom-status
+                     channel "Working on retries" :now 1010)
+                    :outcome)))
+      (ok (eql 1 (length (queued-frames socket)))))
+    (testing "a different text inside the cooldown is refused"
+      (let ((decision (enchiridion.channel.fluxer:propose-custom-status
+                       channel "Reviewing code" :now 1010)))
+        (ok (eq :refused (getf decision :outcome)))
+        (ok (search "50 seconds left" (getf decision :reason)))
+        (ok (eql 1 (length (queued-frames socket))))))
+    (testing "the cooldown ends exactly at its configured number of seconds"
+      (ok (eq :refused
+              (getf (enchiridion.channel.fluxer:propose-custom-status
+                     channel "Reviewing code" :now 1059)
+                    :outcome)))
+      (ok (eq :applied
+              (getf (enchiridion.channel.fluxer:propose-custom-status
+                     channel "Reviewing code" :now 1060)
+                    :outcome)))
+      (ok (eql 2 (length (queued-frames socket)))))
+    (testing "clearing is a change too, and an empty clear is a no-op"
+      (ok (eq :cleared
+              (getf (enchiridion.channel.fluxer:propose-custom-status
+                     channel :clear :now 1120)
+                    :outcome)))
+      (ok (eql 3 (length (queued-frames socket))))
+      (ok (eq :unchanged
+              (getf (enchiridion.channel.fluxer:propose-custom-status
+                     channel :clear :now 1130)
+                    :outcome)))
+      (ok (eql 3 (length (queued-frames socket)))))))
+
+(deftest a-custom-status-expires-and-is-cleared-once ()
+  (let* ((socket (status-socket))
+         (channel (status-channel :socket socket)))
+    (enchiridion.channel.fluxer:propose-custom-status
+     channel "Working on retries" :now 1000)
+    (ok (eql 1300 (getf (enchiridion.channel.fluxer:custom-status channel :now 1000)
+                        :expires)))
+    (testing "one second before the deadline nothing happens"
+      (ok (eq :unchanged
+              (getf (enchiridion.channel.fluxer::expire-custom-status
+                     channel :now 1299)
+                    :outcome)))
+      (ok (eql 1 (length (queued-frames socket)))))
+    (testing "at the deadline the clear goes out once and the text is forgotten"
+      (ok (eq :expired
+              (getf (enchiridion.channel.fluxer::expire-custom-status
+                     channel :now 1300)
+                    :outcome)))
+      (ok (eql 2 (length (queued-frames socket))))
+      (ok (string= "{\"op\":3,\"d\":{\"status\":\"online\",\"custom_status\":null}}"
+                   (second (queued-frames socket))))
+      (ok (null (getf (enchiridion.channel.fluxer:custom-status channel :now 1301)
+                      :text))))
+    (testing "a second expiry pass sends nothing"
+      (ok (eq :unchanged
+              (getf (enchiridion.channel.fluxer::expire-custom-status
+                     channel :now 1301)
+                    :outcome)))
+      (ok (eql 2 (length (queued-frames socket)))))))
+
+(deftest a-reconnect-reapplies-a-live-status-without-restarting-the-cooldown ()
+  (let* ((socket (status-socket))
+         (channel (status-channel :socket socket)))
+    (enchiridion.channel.fluxer:propose-custom-status
+     channel "Working on retries" :now 1000)
+    (testing "a live status goes out again on the new session"
+      (ok (eq :reapplied
+              (getf (enchiridion.channel.fluxer::reapply-custom-status
+                     channel :now 1001)
+                    :outcome)))
+      (ok (eql 2 (length (queued-frames socket)))))
+    (testing "a reconnect is not a proposal, so the cooldown still counts from 1000"
+      (let ((decision (enchiridion.channel.fluxer:propose-custom-status
+                       channel "Reviewing code" :now 1030)))
+        (ok (eq :refused (getf decision :outcome)))
+        (ok (search "30 seconds left" (getf decision :reason)))))
+    (testing "a status that ended while disconnected is forgotten, not republished"
+      (let* ((stale (status-channel :socket (status-socket))))
+        (enchiridion.channel.fluxer:propose-custom-status
+         stale "Old news" :now 1000)
+        (ok (eq :expired
+                (getf (enchiridion.channel.fluxer::reapply-custom-status
+                       stale :now 1300)
+                      :outcome)))
+        (ok (null (getf (enchiridion.channel.fluxer:custom-status stale :now 1300)
+                        :text)))
+        (ok (eql 1 (length (queued-frames
+                            (enchiridion.channel.fluxer::fluxer-channel-socket
+                             stale)))))))))
+
+(deftest a-ready-reapplies-the-status-and-the-worker-publishes-a-proposal ()
+  (testing "READY on a new session reapplies the live status"
+    (let* ((socket (status-socket))
+           (channel (status-channel)))
+      (enchiridion.channel.fluxer:propose-custom-status
+       channel "Reading the diff" :now (get-universal-time))
+      (setf (enchiridion.channel.fluxer::fluxer-channel-socket channel) socket)
+      (enchiridion.channel.fluxer::handle-text
+       channel socket
+       (enchiridion.channel.fluxer::json-text
+        (list :op 0 :s 1 :t "READY"
+              :d (list :user (list :id "bot-1") :session_id "s-1"))))
+      (ok (equal (list "{\"op\":3,\"d\":{\"status\":\"online\",\"custom_status\":{\"text\":\"Reading the diff\"}}}")
+                 (queued-frames socket)))))
+  (testing "a successful turn publishes the proposal beside its reply"
+    (let* ((status (status-socket))
+           (channel (status-channel :socket status))
+           (sent '())
+           (enchiridion.llm::*http-request-function*
+             (lambda (url &rest options)
+               (declare (ignore options))
+               (push url sent)
+               "{\"id\":\"r-1\"}")))
+      (setf (enchiridion.channel.fluxer::fluxer-channel-token channel) "fake")
+      (setf (enchiridion.channel.fluxer::fluxer-channel-turn channel)
+            (lambda (message)
+              (declare (ignore message))
+              (list :ok-p t :reply "answer" :status "Working on retries")))
+      (enchiridion.channel.fluxer::handle-inkbound channel +direct-message+)
+      (ok (eql 1 (length (queued-frames status))))
+      (ok (search "Working on retries" (first (queued-frames status))))
+      (ok (equal (list "https://api.fluxer.app/v1/channels/d-1/messages") sent))))
+  (testing "a failed turn's proposal is not published"
+    (let* ((status (status-socket))
+           (channel (status-channel :socket status)))
+      (setf (enchiridion.channel.fluxer::fluxer-channel-turn channel)
+            (lambda (message)
+              (declare (ignore message))
+              (list :ok-p nil :error "no" :status "Working on retries")))
+      (enchiridion.channel.fluxer::handle-inkbound channel +direct-message+)
+      (ok (null (queued-frames status)))))
+  (testing "a refused proposal costs the reply nothing"
+    (let* ((status (status-socket))
+           (channel (status-channel :socket status))
+           (sent '())
+           (enchiridion.llm::*http-request-function*
+             (lambda (url &rest options)
+               (declare (ignore options))
+               (push url sent)
+               "{\"id\":\"r-1\"}")))
+      (setf (enchiridion.channel.fluxer::fluxer-channel-token channel) "fake")
+      (enchiridion.channel.fluxer:propose-custom-status
+       channel "First" :now (get-universal-time))
+      (setf (enchiridion.channel.fluxer::fluxer-channel-turn channel)
+            (lambda (message)
+              (declare (ignore message))
+              (list :ok-p t :reply "answer" :status "Second")))
+      (enchiridion.channel.fluxer::handle-inkbound channel +direct-message+)
+      (ok (eql 1 (length (queued-frames status))))
+      (ok (equal (list "https://api.fluxer.app/v1/channels/d-1/messages") sent)))))
+
+(deftest the-status-ttl-and-cooldown-options-are-bounded ()
+  (let ((channel (enchiridion.channel.fluxer:make-fluxer-channel
+                  :config '(:custom-status t))))
+    (ok (= 300 (enchiridion.channel.fluxer::channel-custom-status-ttl channel)))
+    (ok (= 60 (enchiridion.channel.fluxer::channel-custom-status-cooldown channel))))
+  (testing "an out of range or non integer value falls back to the shipped default"
+    (let ((channel (enchiridion.channel.fluxer:make-fluxer-channel
+                    :config '(:custom-status t
+                              :custom-status-ttl-seconds 0
+                              :custom-status-cooldown-seconds "60"))))
+      (ok (= 300 (enchiridion.channel.fluxer::channel-custom-status-ttl channel)))
+      (ok (= 60 (enchiridion.channel.fluxer::channel-custom-status-cooldown channel)))))
+  (testing "the bounds are inclusive"
+    (let ((channel (enchiridion.channel.fluxer:make-fluxer-channel
+                    :config '(:custom-status t
+                              :custom-status-ttl-seconds 1
+                              :custom-status-cooldown-seconds 0))))
+      (ok (= 1 (enchiridion.channel.fluxer::channel-custom-status-ttl channel)))
+      (ok (= 0 (enchiridion.channel.fluxer::channel-custom-status-cooldown channel))))
+    (let ((channel (enchiridion.channel.fluxer:make-fluxer-channel
+                    :config (list :custom-status t
+                                  :custom-status-ttl-seconds
+                                  enchiridion.channel.fluxer::+custom-status-max-ttl-seconds+
+                                  :custom-status-cooldown-seconds
+                                  enchiridion.channel.fluxer::+custom-status-max-cooldown-seconds+))))
+      (ok (= enchiridion.channel.fluxer::+custom-status-max-ttl-seconds+
+             (enchiridion.channel.fluxer::channel-custom-status-ttl channel)))
+      (ok (= enchiridion.channel.fluxer::+custom-status-max-cooldown-seconds+
+             (enchiridion.channel.fluxer::channel-custom-status-cooldown channel))))))
+
 (deftest the-gateway-url-keeps-its-scheme ()
   (ok (string= "wss://gateway.fluxer.app?v=1&encoding=json"
                (enchiridion.channel.fluxer::gateway-url "wss://gateway.fluxer.app")))

@@ -418,6 +418,29 @@ rather than a guess about whether the call was useful."
     ((search "[timed out" text) 0)
     (t nil)))
 
+(defvar *turn-proposal* nil
+  "The presence proposal a tool made during the turn RUN-TURN is running.
+
+Bound by RUN-TURN-LOCKED, set by EXECUTE-TOOL only when the presence tool
+returned successfully, and returned beside the completion. It is deliberately
+not derived from the reply or from reasoning: a public status is something the
+agent chose to say, not something the runtime inferred.")
+
+(defun presence-proposal (arguments)
+  "Return the custom status proposal ARGUMENTS carries, or NIL.
+
+CLEAR is the agent asking for no status; otherwise TEXT is the proposed line.
+The channel still validates it, so this only decides which shape the proposal
+has. NIL means the call proposed nothing, including the ambiguous call that
+gave both fields."
+  (let ((clear (getf arguments :clear))
+        (text (getf arguments :text)))
+    (cond
+      ((and (not (null clear)) (stringp text)) nil)
+      ((not (null clear)) :clear)
+      ((stringp text) text)
+      (t nil))))
+
 (defun execute-tool (agent call)
   "Run CALL for AGENT and return three values: result text, outcome, and
 whether the call failed.
@@ -447,6 +470,8 @@ from that."
                           arguments))
                        (t (enchiridion.tools:dispatch name arguments))))
              (text (tool-result-text result)))
+        (when (string= name "presence")
+          (setf *turn-proposal* (presence-proposal arguments)))
         (values text (tool-outcome text) nil))
     (error (condition)
       (let* ((detail (and (typep condition 'enchiridion.errors:enchiridion-error)
@@ -615,7 +640,8 @@ all silent, and none of them may cost the operator the reply."
            (format nil "Agent turn ~D via ~A" (agent-turn agent) channel))
         (error () nil)))))
 
-(declaim (ftype (function (agent string t t t keyword t) t) run-turn-locked))
+(declaim (ftype (function (agent string t t t keyword t) (values t t))
+                run-turn-locked))
 
 (defun run-turn-locked (agent text model session store channel cancel-p)
   "Run one turn on AGENT with the agent's lock already held.
@@ -624,7 +650,8 @@ The body of RUN-TURN, separated so that the lock is taken in exactly one place
 and every path out of the body releases it. Nothing else may call this: a
 caller that does is a caller that runs two turns at once."
   (check-type text string)
-  (let ((backend (agent-backend agent)))
+  (let ((backend (agent-backend agent))
+        (*turn-proposal* nil))
     (unless backend
       (error 'enchiridion.errors:configuration-error
              :key :backend
@@ -712,9 +739,11 @@ caller that does is a caller that runs two turns at once."
           (setf last-words (enchiridion.llm:completion-text completion)))
         (let ((calls (enchiridion.llm:completion-tool-calls completion)))
           (when (null calls)
-            (return completion))
+            (return (values completion *turn-proposal*)))
           (when wrapped-up
-            (return (setf completion (wrap-up-completion completion last-words))))
+            (return (values (setf completion
+                                  (wrap-up-completion completion last-words))
+                            *turn-proposal*)))
           ;; At the cap the pending calls are dropped and the model gets one
           ;; more round to answer. Returning the capped completion would hand
           ;; the operator a reply with no text, because a round that asks for
@@ -750,7 +779,7 @@ caller that does is a caller that runs two turns at once."
                                          (enchiridion.llm:tool-call-id call)))))))))))
       (incf (agent-turn agent))
       (commit-agent-turn agent channel)
-      completion)))
+      (values completion *turn-proposal*))))
 
 ;; No F-TYPE on RUN-TURN, for the reason PERSIST-TURN has none: the keyword
 ;; list is long, and a declaration that has to name every keyword catches less

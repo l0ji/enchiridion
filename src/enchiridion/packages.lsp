@@ -423,8 +423,8 @@ child; the supervisor never loads it."))
   (:use #:cl)
   (:export
    #:register-builtin-tools #:file-index #:file-index-forms #:shell-run
-   #:search-run #:block-ops #:memory-run #:meta-run #:web-fetch
-   #:cap-result #:spill-path)
+   #:search-run #:block-ops #:memory-run #:meta-run #:presence-run
+   #:register-presence-tools #:web-fetch #:cap-result #:spill-path)
   (:documentation
    "The built-in tools. Index before read, cap every result, and spill the
 middle of anything oversized to a file the agent can go and read."))
@@ -512,7 +512,7 @@ refused at startup rather than at first request."))
 (defpackage #:enchiridion.channel.fluxer
   (:use #:cl)
   (:export #:start-fluxer #:stop-fluxer #:fluxer-running-p #:allowed-p
-           #:make-fluxer-channel)
+           #:make-fluxer-channel #:propose-custom-status #:custom-status)
   (:documentation
    "Direct messages only. Group channels, guild events, mentions, and
 reactions are all out, so the allowlist is the whole authorisation story."))

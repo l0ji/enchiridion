@@ -26,7 +26,8 @@
     (:fluxer
      (:enabled nil)
      (:allowed-users nil)            ; e.g. ("your-user-id")
-     (:token-env "FLUXER_BOT_TOKEN"))
+     (:token-env "FLUXER_BOT_TOKEN")
+     (:custom-status nil))           ; temporary public status
 
     :sleep
     ;; Background work during serve. NIL disables the schedule

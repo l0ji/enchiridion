@@ -114,6 +114,7 @@
            (:file "blockops")
            (:file "memory")
            (:file "meta")
+           (:file "presence")
            (:file "web")
            (:file "register")))))
        (:module "plugin"

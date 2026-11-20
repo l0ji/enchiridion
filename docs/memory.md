@@ -71,19 +71,26 @@ The two terms are counts the store already has:
 
 | Term | Counts | Full at |
 | --- | --- | --- |
-| Substantive memory | Non-sleep user and assistant turns and saved memories | 120 |
+| Substantive memory | Non-sleep user and assistant turns | 120 |
 | Corroborated experience | Sessions with at least two tool results and an assistant reply | 6 |
 
 Sleep output and tool rows do not enter the memory term, so consolidation
-cannot age an agent by talking to itself. `ADAPT.md` has five bearing bands and
-changes only when a maintenance pass runs and a band is crossed.
+cannot age an agent by talking to itself. Saved memories do not enter it
+either: the store writes owner provenance for every saved memory, so that field
+does not identify the source. `ADAPT.md` has five bearing bands and changes
+only when a maintenance pass runs and a band is crossed.
 
 The maintenance pass may add at most one learned entry, and a bearing change
-counts as that pass's one change. The default is no change. An explicit
-operator correction may be applied immediately with the operator turn id and a
-short quote. An inferred preference needs at least three separate operator
-turns. The harness checks the cited turn ids, their role, the quote and the
-category before it writes the entry.
+counts as that pass's one change. The default is no change. An explicit CLI
+operator correction may be applied immediately with the turn id and a short
+quote. An inferred preference needs at least three separate CLI operator turns.
+Only CLI user turns count as operator evidence by default; an embedding can
+bind `enchiridion.kernel:*adaptation-operator-channels*`. HTTP and Fluxer
+messages carry the user role, but they are not operator identity by themselves,
+even when the channel authenticated the sender. They still contribute to
+substantive memory and to tool experience. The harness checks the cited turn
+ids, their role, their channel, the quote and the category before it writes the
+entry.
 
 `ADAPT.md` is guidance. These bounds are enforced outside the prompt and an
 adaptation cannot change them:
@@ -95,6 +102,14 @@ adaptation cannot change them:
 | Tool names, arguments and availability | the tool registry and its schemas |
 | OS identity, sandbox and file access | the broker and the deployment |
 | Token caps and task claims | the budget code and the task queue |
+| Writes to `ADAPT.md` | the builtin `write-file` and `edit-file` refuse it |
+
+The builtin `write-file` and `edit-file` tools refuse the agent's `ADAPT.md` at
+every bootstrap state, including through a symlink. The builtin `shell` is not
+an OS sandbox and can still write the file as the agent user; a direct write
+during a maintenance pass is reverted, but a shell write between passes is only
+prompt text until the next pass and the operator's Git review. The same is true
+of the identity files after handover.
 
 A proposal that names an enforced bound, such as tool access, a permission, a
 refusal, a budget or the bootstrap, is refused. The category must be `style`,

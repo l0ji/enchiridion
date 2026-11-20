@@ -892,6 +892,79 @@ countable from the test."
                                  (list turn)))
                       :status)))))))
 
+(deftest preference-evidence-is-cli-only ()
+  (with-scratch-world (store supervisor)
+    (let* ((directory (enchiridion.supervisor:supervisor-directory supervisor))
+           (http-one (enchiridion.memory.store:turn-row-id
+                      (enchiridion.memory.store:record-turn
+                       store :session "web" :role "user" :channel :http
+                       :body "from now on use short answers")))
+           (http-two (enchiridion.memory.store:turn-row-id
+                      (enchiridion.memory.store:record-turn
+                       store :session "web" :role "user" :channel :http
+                       :body "from now on use short answers")))
+           (fluxer (enchiridion.memory.store:turn-row-id
+                    (enchiridion.memory.store:record-turn
+                     store :session "chat" :role "user" :channel :fluxer
+                     :body "from now on use short answers")))
+           (cli (enchiridion.memory.store:turn-row-id
+                 (enchiridion.memory.store:record-turn
+                  store :session "terminal" :role "user" :channel :cli
+                  :body "from now on use short answers"))))
+      (testing "HTTP user is not the operator identity"
+        (ok (eq :refused
+                (getf (enchiridion.kernel:adaptation-apply-proposal
+                       store directory
+                       (proposal "explicit" "style" "Use short answers."
+                                 (list http-one) "from now on use short answers"))
+                      :status))))
+      (testing "three non-CLI turns are still not one operator"
+        (ok (eq :refused
+                (getf (enchiridion.kernel:adaptation-apply-proposal
+                       store directory
+                       (proposal "inferred" "style" "Use short answers."
+                                 (list http-one http-two fluxer)))
+                      :status))))
+      (testing "a CLI turn is operator evidence"
+        (ok (eq :applied
+                (getf (enchiridion.kernel:adaptation-apply-proposal
+                       store directory
+                       (proposal "explicit" "style" "Use short answers."
+                                 (list cli) "from now on use short answers"))
+                      :status)))))))
+
+(deftest only-cli-turns-reach-the-operator-evidence-list ()
+  (with-scratch-world (store supervisor)
+    (enchiridion.memory.store:record-turn
+     store :session "terminal" :role "user" :channel :cli
+     :body "cli correction text")
+    (enchiridion.memory.store:record-turn
+     store :session "web" :role "user" :channel :http
+     :body "http correction text")
+    (enchiridion.memory.store:record-turn
+     store :session "chat" :role "user" :channel :fluxer
+     :body "fluxer correction text")
+    (let ((text (enchiridion.kernel::adaptation-evidence-text store)))
+      (ok (search "cli correction text" text))
+      (ng (search "http correction text" text))
+      (ng (search "fluxer correction text" text)))))
+
+(deftest saved-memories-do-not-age-the-bearing ()
+  (with-scratch-world (store supervisor)
+    (let ((before (enchiridion.kernel::adaptation-memory-count store)))
+      (enchiridion.memory.store:save-memory store "a note" "a saved memory body")
+      (ok (= before (enchiridion.kernel::adaptation-memory-count store))))))
+
+(deftest non-sleep-tool-experience-still-counts ()
+  (with-scratch-world (store supervisor)
+    (enchiridion.memory.store:record-turn
+     store :session "web-work" :role "tool" :channel :http :body "fetched")
+    (enchiridion.memory.store:record-turn
+     store :session "web-work" :role "tool" :channel :http :body "fetched again")
+    (enchiridion.memory.store:record-turn
+     store :session "web-work" :role "assistant" :channel :http :body "answered")
+    (ok (= 1 (enchiridion.kernel::adaptation-experience-count store)))))
+
 (deftest one-change-per-pass-and-a-direct-write-is-reverted ()
   (with-scratch-world (store supervisor)
     (let ((enchiridion.kernel::+adaptation-memory-full+ 2)

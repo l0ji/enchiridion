@@ -23,7 +23,12 @@ see [Plugins](plugins.md).
 | `web` | | `action`, `url`, `query`, `limit` | Fetch a URL or search the web |
 
 `index` reads with `*read-eval*` off, so a reader macro in the file cannot run.
-`read-file` refuses a range outside the file.
+`read-file` refuses a range outside the file. `write-file` and `edit-file`
+refuse the agent's `ADAPT.md` at every bootstrap state, including a symlink to
+it; the adaptation harness owns that file. `shell` is not an OS sandbox and can
+still write it as the agent user, so the refusal is a tool policy and not an
+isolation boundary. [Memory](memory.md#adaptation) covers the audit and the
+bypass.
 
 ### blockops
 
@@ -142,3 +147,4 @@ schema, so write it unquoted.
 | `The broker is not running.` | a tool call before the broker started | start `serve` or `chat` |
 | `Unknown block action`, `Unknown block label`, `Unknown search scope` | an argument outside the documented values | use one of the documented values |
 | A bootstrap write is refused | the identity files still belong to the operator | finish the bootstrap, or edit them with the CLI |
+| A write to `ADAPT.md` is refused | the adaptation harness owns the file | use the maintenance proposal path; see [Memory](memory.md#adaptation) |

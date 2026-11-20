@@ -111,6 +111,47 @@
             (enchiridion.compat:set-environment-variable "ENCHIRIDION_HOME" previous-home)
             (enchiridion.compat:unset-environment-variable "ENCHIRIDION_HOME"))))))
 
+(deftest adaptation-writes-are-refused-at-every-bootstrap-state ()
+  (with-scratch-directory (scratch)
+    (let ((previous-home (uiop:getenv "ENCHIRIDION_HOME")))
+      (enchiridion.compat:set-environment-variable "ENCHIRIDION_HOME" (namestring scratch))
+      (unwind-protect
+           (let* ((directory (merge-pathnames "agents/default/" scratch))
+                  (adaptation (merge-pathnames "ADAPT.md" directory)))
+             (enchiridion.tools:clear-registry)
+             (enchiridion.tools.builtin:register-builtin-tools)
+             (enchiridion.memory:init-agent directory)
+             (testing "before handover"
+               (ok (signals (enchiridion.tools:dispatch
+                             "write-file"
+                             (list :path (namestring adaptation) :text "new bearing"))
+                            'enchiridion.errors:tool-error))
+               (ok (signals (enchiridion.tools:dispatch
+                             "edit-file"
+                             (list :path (namestring adaptation)
+                                   :old "Bearing:" :new "Bearing: changed"))
+                            'enchiridion.errors:tool-error)))
+             (testing "after handover"
+               (dolist (step (enchiridion.memory:bootstrap-steps directory))
+                 (enchiridion.memory:mark-bootstrap-step directory (car step)))
+               (ok (signals (enchiridion.tools:dispatch
+                             "write-file"
+                             (list :path (namestring adaptation) :text "new bearing"))
+                            'enchiridion.errors:tool-error)))
+             (testing "a symlink to the same file is refused"
+               (let ((link (merge-pathnames "adapt-link.md" directory)))
+                 (sb-posix:symlink (namestring adaptation) (namestring link))
+                 (ok (signals (enchiridion.tools:dispatch
+                               "write-file"
+                               (list :path (namestring link) :text "through a link"))
+                              'enchiridion.errors:tool-error))))
+             (testing "and the harness file still holds its bearing"
+               (ok (search "Bearing:" (uiop:read-file-string adaptation)))))
+        (enchiridion.tools:clear-registry)
+        (if previous-home
+            (enchiridion.compat:set-environment-variable "ENCHIRIDION_HOME" previous-home)
+            (enchiridion.compat:unset-environment-variable "ENCHIRIDION_HOME"))))))
+
 (deftest an-empty-file-reads-as-nothing-by-default ()
   (with-scratch-directory (scratch)
     (let ((path (merge-pathnames "empty.txt" scratch)))

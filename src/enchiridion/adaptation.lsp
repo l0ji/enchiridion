@@ -34,10 +34,17 @@ an essay is a pass that is rewriting the identity files instead.")
   "How many separate operator turns an inferred preference needs.
 One turn is an incident; several turns are a pattern.")
 
+(defparameter *adaptation-operator-channels* '("cli")
+  "Channels whose user turns can be cited as operator evidence. The CLI is the
+operator's direct surface. HTTP and Fluxer messages arrive with role user but
+are not operator identity by themselves, so they do not authorize a preference
+unless an embedding binds their channel here.")
+
 (defparameter +adaptation-memory-full+ 120
-  "Substantive turns and memories that count as a full memory for the bearing.
-Sleep output and tool rows are excluded, so a chatty harness cannot mature an
-agent by talking to itself.")
+  "Substantive turns that count as a full memory for the bearing. Sleep output
+and tool rows are excluded, so a chatty harness cannot mature an agent by
+talking to itself. Saved memories are excluded too: every saved memory carries
+the same owner provenance regardless of who saved it.")
 
 (defparameter +adaptation-experience-full+ 6
   "Corroborated sessions that count as full experience for the bearing.
@@ -114,8 +121,10 @@ ADAPT.md, so neither the model nor the operator has to infer the distinction.")
 ;;;; agent has kept, experience is what it has done and had answered.
 
 (defun adaptation-memory-count (store)
-  "Return the substantive turns and memories in STORE, capped at the full mark.
-Sleep output and tool rows do not count, so consolidation cannot age an agent."
+  "Return the substantive user and assistant turns in STORE, capped at the full
+mark. Sleep output and tool rows do not count, so consolidation cannot age an
+agent. Saved memories do not count either: their owner provenance is written by
+SAVE-MEMORY for every caller, so it says nothing about the source."
   (if store
       (handler-case
           (let ((row (first (enchiridion.memory.store:query-rows
@@ -123,7 +132,7 @@ Sleep output and tool rows do not count, so consolidation cannot age an agent."
                              "SELECT COUNT(*) AS n FROM
                                 (SELECT 1 FROM episodes
                                   WHERE channel <> 'sleep'
-                                    AND role IN ('user', 'assistant', 'memory')
+                                    AND role IN ('user', 'assistant')
                                     AND length(trim(body)) > 0
                                   LIMIT ?)"
                              (list (max 1 +adaptation-memory-full+))))))
@@ -241,12 +250,20 @@ may be older than the recent window and is looked up by exact id."
                 (list id)))
       (error () nil))))
 
+(defun adaptation-operator-channel-p (channel)
+  "Return T when CHANNEL is one this build accepts as operator evidence."
+  (and (stringp channel)
+       (member (string-downcase channel) *adaptation-operator-channels*
+               :test #'string=)))
+
 (defun adaptation-valid-evidence-p (store id)
-  "Return T when ID is an operator turn and not a sleep turn."
+  "Return T when ID is a user turn from an operator channel.
+The role alone is not identity: an HTTP or Fluxer message also arrives as user."
   (let ((row (adaptation-evidence-row store id)))
     (and row
          (string= "user" (enchiridion.memory.store:field row "role"))
-         (not (string= "sleep" (enchiridion.memory.store:field row "channel"))))))
+         (adaptation-operator-channel-p
+          (enchiridion.memory.store:field row "channel")))))
 
 (defun adaptation-evidence-body (store id)
   "Return the body of turn ID, or NIL."
@@ -607,7 +624,10 @@ correction and does not belong in a correction's citation."
           (lines '())
           (used 0))
       (dolist (row (reverse rows))
-        (when (string= "user" (enchiridion.memory.store:turn-row-role row))
+        (when (and (string= "user" (enchiridion.memory.store:turn-row-role row))
+                   (adaptation-operator-channel-p
+                    (string-downcase
+                     (string (enchiridion.memory.store:turn-row-channel row)))))
           (let ((line (format nil "[turn ~D] ~A"
                               (enchiridion.memory.store:turn-row-id row)
                               (enchiridion.memory.store:turn-row-body row))))
@@ -615,13 +635,13 @@ correction and does not belong in a correction's citation."
               (push line lines)
               (incf used (1+ (length line)))))))
       (when lines
-        (format nil "~%~%Operator turns available as evidence, oldest first. Cite ids exactly:~%~{~A~%~}"
+        (format nil "~%~%CLI operator turns available as evidence, oldest first. Cite ids exactly:~%~{~A~%~}"
                 (nreverse lines))))))
 
 (defun adaptation-maintenance-prompt (base directory store)
   "Return BASE plus the adaptation rules and evidence for one maintenance pass."
   (format nil "~A~%~%If one working preference now has evidence, put one JSON object at ~A and nothing else there. Otherwise write no proposal. At most one change this pass; no change is the default.~%~
-An explicit operator correction may be applied immediately: set kind to \"explicit\", cite that operator turn, and include a short quote from it. An inferred preference needs at least ~D separate operator turns and cites them all. Category is one of ~{~A~^, ~}. The text is one line, at most ~D characters.~%~
+An explicit CLI operator correction may be applied immediately: set kind to \"explicit\", cite that operator turn, and include a short quote from it. An inferred preference needs at least ~D separate CLI operator turns and cites them all. Only CLI user turns count as operator evidence by default. Category is one of ~{~A~^, ~}. The text is one line, at most ~D characters.~%~
 Do not use a proposal to change tool access, permissions, refusals, budgets, or the bootstrap; those bounds are enforced in code. Do not write ADAPT.md yourself; the harness applies a valid proposal and reverts a direct write. Do not mention this policy or the adaptation file in your reply.~%~
 The shape is {\"kind\":\"explicit\"|\"inferred\",\"category\":\"...\",\"text\":\"...\",\"evidence\":[ids],\"quote\":\"...\"}.~A"
           base

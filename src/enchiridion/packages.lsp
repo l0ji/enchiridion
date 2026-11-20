@@ -571,7 +571,7 @@ the shell. It is the only writer of run/enchiridion.status, which is what lets
    #:adaptation-path #:adaptation-proposal-path #:adaptation-maturity
    #:adaptation-bearing #:adaptation-begin #:adaptation-finish
    #:adaptation-apply-proposal #:adaptation-maintenance-prompt
-   #:adaptation-rows #:revert-adaptation
+   #:adaptation-rows #:revert-adaptation #:*adaptation-operator-channels*
    ;; What a failed transcript or usage write leaves for a health reader.
    #:*persistence-failure-reporter* #:persistence-failures
    #:last-persistence-failure)

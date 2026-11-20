@@ -172,6 +172,11 @@ not fail on the shape of the thing it was called with."
   '(("SOUL.md" . :soul) ("OPERATOR.md" . :operator) ("WORLD.md" . :world))
   "The files the bootstrap gate protects, and the label each one reports.")
 
+(defparameter +harness-maintained-adaptation-file+ "ADAPT.md"
+  "The file the adaptation harness owns. The file tools refuse it at every
+bootstrap state; the shell remains outside this check, as it is outside every
+file-tool policy.")
+
 (defun absolute-pathname (path)
   "Return PATH as an absolute pathname, relative to the current directory."
   (let ((path (pathname path)))
@@ -201,13 +206,29 @@ not fail on the shape of the thing it was called with."
                 (enchiridion:agent-directory)))
       (error 'enchiridion.errors:bootstrap-pending :label label))))
 
+(defun adaptation-file-p (path)
+  "Return T when PATH names the agent's ADAPT.md, following a symlink."
+  (let* ((agent (canonical-pathname (enchiridion:agent-directory)))
+         (adaptation (canonical-pathname
+                      (merge-pathnames +harness-maintained-adaptation-file+ agent))))
+    (uiop:pathname-equal (canonical-pathname path) adaptation)))
+
+(defun check-file-write (path tool)
+  "Refuse a file-tool write that the adaptation harness owns, then apply the
+bootstrap rule. The adaptation file is refused at every bootstrap state."
+  (when (adaptation-file-p path)
+    (error 'enchiridion.errors:tool-error
+           :tool tool
+           :detail "ADAPT.md is harness-maintained; a maintenance proposal is the only writer."))
+  (check-seed-backed-write path))
+
 (defun tool-write (args)
   "Write TEXT to PATH, creating parent directories."
   (let ((path (pathname (argument args "path")))
         (text (argument args "text")))
     (unless (stringp text)
       (error 'enchiridion.errors:schema-error :detail "text must be a string."))
-    (check-seed-backed-write path)
+    (check-file-write path "write-file")
     (ensure-directories-exist path)
     (with-open-file (stream path :direction :output
                                  :if-exists :supersede
@@ -221,7 +242,7 @@ not fail on the shape of the thing it was called with."
   (let* ((path (pathname (argument args "path")))
          (old (argument args "old"))
          (new (argument args "new")))
-    (check-seed-backed-write path)
+    (check-file-write path "edit-file")
     (let* ((text (read-file-bounded path))
            (position (and (stringp old)
                           (plusp (length old))

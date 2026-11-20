@@ -145,6 +145,9 @@ countable from the test."
          (testing (format nil "~A is writable for the sleep agent"
                           (enchiridion.memory:block-label block))
            (ok (enchiridion.memory:block-writable-p block))))
+        (:adapt
+         (testing "the adaptation block stays harness-owned"
+           (ng (enchiridion.memory:block-writable-p block))))
         (t
          (testing (format nil "~A stays a harness block"
                           (enchiridion.memory:block-label block))
@@ -153,7 +156,7 @@ countable from the test."
       (let ((primary (enchiridion.kernel:make-agent :backend (make-counting-backend))))
         (dolist (block (enchiridion.kernel:agent-blocks primary))
           (when (member (enchiridion.memory:block-label block)
-                        '(:persona :operator :world)
+                        '(:persona :operator :world :adapt)
                         :test #'eq)
             (ng (enchiridion.memory:block-writable-p block))))))))
 
@@ -702,3 +705,294 @@ countable from the test."
       (testing "and the tick cap then refuses the next phase"
         (ok (search "tick cap"
                     (enchiridion.kernel::budget-refusal agent store start 0)))))))
+
+;;;; Adaptation.
+
+(defun adaptation-text (directory)
+  "Return ADAPT.md for DIRECTORY, or the empty string."
+  (let ((path (enchiridion.kernel:adaptation-path directory)))
+    (if (probe-file path) (uiop:read-file-string path) "")))
+
+(defun adaptation-write-for-test (directory text)
+  "Write TEXT as ADAPT.md without the evidence checks, as a model would."
+  (let ((path (enchiridion.kernel:adaptation-path directory)))
+    (ensure-directories-exist path)
+    (with-open-file (stream path :direction :output
+                                  :if-exists :supersede
+                                  :if-does-not-exist :create
+                                  :external-format :utf-8)
+      (write-string text stream))
+    text))
+
+(defun proposal (kind category text evidence &optional quote)
+  "Return one adaptation proposal as the plist the apply path takes."
+  (list :kind kind :category category :text text
+        :evidence evidence :quote quote))
+
+(defun proposal-table (kind category text evidence &optional quote)
+  "Return a jzon object for one adaptation proposal file."
+  (let ((table (make-hash-table :test #'equal)))
+    (setf (gethash "kind" table) kind
+          (gethash "category" table) category
+          (gethash "text" table) text
+          (gethash "evidence" table) (coerce evidence 'vector))
+    (when quote (setf (gethash "quote" table) quote))
+    table))
+
+(defun write-proposal (directory kind category text evidence &optional quote)
+  "Write one proposal file under DIRECTORY and return its path."
+  (let ((path (enchiridion.kernel:adaptation-proposal-path directory)))
+    (ensure-directories-exist path)
+    (with-open-file (stream path :direction :output
+                                  :if-exists :supersede
+                                  :if-does-not-exist :create
+                                  :external-format :utf-8)
+      (write-string (com.inuoe.jzon:stringify
+                     (proposal-table kind category text evidence quote))
+                    stream))
+    path))
+
+(defun add-user-turns (store count &key (session "operator") (ts (get-universal-time)))
+  "Add COUNT ordinary operator turns and return their ids."
+  (loop repeat count
+        collect (enchiridion.memory.store:turn-row-id
+                 (enchiridion.memory.store:record-turn
+                  store :session session :role "user"
+                  :body (format nil "operator turn ~D" (random most-positive-fixnum))
+                  :ts ts))))
+
+(defun add-experienced-sessions (store count)
+  "Add COUNT sessions that each hold two tool results and an answer."
+  (dotimes (index count)
+    (let ((session (format nil "work-~D" index)))
+      (enchiridion.memory.store:record-turn
+       store :session session :role "tool" :body "ran a command")
+      (enchiridion.memory.store:record-turn
+       store :session session :role "tool" :body "ran another command")
+      (enchiridion.memory.store:record-turn
+       store :session session :role "assistant" :body "answered from the result"))))
+
+(deftest the-bearing-starts-by-emulating-and-fades-with-both-terms ()
+  (with-scratch-world (store supervisor)
+    (let ((enchiridion.kernel::+adaptation-memory-full+ 6)
+          (enchiridion.kernel::+adaptation-experience-full+ 2))
+      (testing "a fresh agent borrows the operator's style"
+        (ok (search "Emulate the operator"
+                    (enchiridion.kernel:adaptation-bearing
+                     (enchiridion.kernel:adaptation-maturity store)))))
+      (add-user-turns store 6)
+      (testing "memory alone does not age it"
+        (ok (search "Emulate the operator"
+                    (enchiridion.kernel:adaptation-bearing
+                     (enchiridion.kernel:adaptation-maturity store)))))
+      (add-experienced-sessions store 2)
+      (testing "memory and corroborated experience together reach its own defaults"
+        (ok (search "your own defaults"
+                    (enchiridion.kernel:adaptation-bearing
+                     (enchiridion.kernel:adaptation-maturity store)))))
+      (testing "and elapsed time is not a term"
+        (add-user-turns store 1 :ts 0)
+        (ok (search "your own defaults"
+                    (enchiridion.kernel:adaptation-bearing
+                     (enchiridion.kernel:adaptation-maturity store))))))))
+
+(deftest sleep-output-does-not-age-the-bearing ()
+  (with-scratch-world (store supervisor)
+    (let ((enchiridion.kernel::+adaptation-memory-full+ 2)
+          (enchiridion.kernel::+adaptation-experience-full+ 1))
+      (let ((before (enchiridion.kernel:adaptation-maturity store)))
+        (dotimes (index 10)
+          (declare (ignore index))
+          (enchiridion.memory.store:record-turn
+           store :session "sleep" :role "assistant" :body "consolidated"
+           :channel :sleep))
+        (ok (= before (enchiridion.kernel:adaptation-maturity store)))))))
+
+(deftest the-bearing-line-moves-in-adapt-md ()
+  (with-scratch-world (store supervisor)
+    (let ((enchiridion.kernel::+adaptation-memory-full+ 4)
+          (enchiridion.kernel::+adaptation-experience-full+ 2))
+      (let ((directory (enchiridion.supervisor:supervisor-directory supervisor))
+            (agent (agent-of supervisor)))
+        (enchiridion.kernel:adaptation-begin agent store)
+        (testing "the first file carries the early bearing"
+          (ok (search "Emulate the operator" (adaptation-text directory))))
+        (add-user-turns store 4)
+        (add-experienced-sessions store 2)
+        (enchiridion.kernel:adaptation-begin agent store)
+        (testing "and the next pass carries the late one"
+          (ok (search "your own defaults" (adaptation-text directory))))))))
+
+(deftest an-explicit-operator-correction-sticks-immediately ()
+  (with-scratch-world (store supervisor)
+    (let* ((directory (enchiridion.supervisor:supervisor-directory supervisor))
+           (turn (first (add-user-turns store 1)))
+           (result (enchiridion.kernel:adaptation-apply-proposal
+                    store directory
+                    (proposal "explicit" "style" "Answer in one paragraph."
+                              (list turn) "operator turn"))))
+      (ok (eq :applied (getf result :status)))
+      (ok (search "Answer in one paragraph." (adaptation-text directory)))
+      (testing "and the late bearing does not delete it"
+        (let ((enchiridion.kernel::+adaptation-memory-full+ 1)
+              (enchiridion.kernel::+adaptation-experience-full+ 1))
+          (add-experienced-sessions store 1)
+          (enchiridion.kernel:adaptation-begin (agent-of supervisor) store)
+          (ok (search "Answer in one paragraph." (adaptation-text directory)))
+          (ok (search "your own defaults" (adaptation-text directory))))))))
+
+(deftest an-inferred-preference-needs-separate-operator-turns ()
+  (with-scratch-world (store supervisor)
+    (let* ((directory (enchiridion.supervisor:supervisor-directory supervisor))
+           (ids (add-user-turns store 3)))
+      (testing "two turns are an incident"
+        (let ((result (enchiridion.kernel:adaptation-apply-proposal
+                       store directory
+                       (proposal "inferred" "style" "Prefer terse replies."
+                                 (subseq ids 0 2)))))
+          (ok (eq :refused (getf result :status)))
+          (ng (search "Prefer terse replies." (adaptation-text directory)))))
+      (testing "three separate turns are a pattern"
+        (let ((result (enchiridion.kernel:adaptation-apply-proposal
+                       store directory
+                       (proposal "inferred" "style" "Prefer terse replies."
+                                 ids))))
+          (ok (eq :applied (getf result :status)))
+          (ok (search "Prefer terse replies." (adaptation-text directory)))))
+      (testing "and a repeated id is not separate evidence"
+        (let ((result (enchiridion.kernel:adaptation-apply-proposal
+                       store directory
+                       (proposal "inferred" "style" "Prefer numbered lists."
+                                 (list (first ids) (first ids) (second ids))))))
+          (ok (eq :refused (getf result :status))))))))
+
+(deftest an-adaptation-cannot-name-an-enforced-bound ()
+  (with-scratch-world (store supervisor)
+    (let* ((directory (enchiridion.supervisor:supervisor-directory supervisor))
+           (turn (first (add-user-turns store 1))))
+      (dolist (category '("tools" "permissions" "refusals" "bootstrap"))
+        (testing category
+          (ok (eq :refused
+                  (getf (enchiridion.kernel:adaptation-apply-proposal
+                         store directory
+                         (proposal "explicit" category "Change the rule."
+                                   (list turn) "operator turn"))
+                        :status)))))
+      (testing "and the text cannot rename a bound as a style"
+        (ok (eq :refused
+                (getf (enchiridion.kernel:adaptation-apply-proposal
+                       store directory
+                       (proposal "explicit" "style" "Change tool access."
+                                 (list turn) "operator turn"))
+                      :status))))
+      (testing "an explicit correction still needs its quote"
+        (ok (eq :refused
+                (getf (enchiridion.kernel:adaptation-apply-proposal
+                       store directory
+                       (proposal "explicit" "style" "Answer briefly."
+                                 (list turn)))
+                      :status)))))))
+
+(deftest one-change-per-pass-and-a-direct-write-is-reverted ()
+  (with-scratch-world (store supervisor)
+    (let ((enchiridion.kernel::+adaptation-memory-full+ 2)
+          (enchiridion.kernel::+adaptation-experience-full+ 1)
+          (directory (enchiridion.supervisor:supervisor-directory supervisor))
+          (agent (agent-of supervisor)))
+      (add-user-turns store 2)
+      (add-experienced-sessions store 1)
+      (adaptation-write-for-test
+       directory
+       (enchiridion.kernel::adaptation-template
+        (enchiridion.kernel:adaptation-bearing 0)))
+      (let ((state (enchiridion.kernel:adaptation-begin agent store)))
+        (testing "the bearing moved, so it is this pass's one change"
+          (ok (enchiridion.kernel::adaptation-pass-changed-p state))
+          (let ((turn (first (add-user-turns store 1))))
+            (write-proposal directory "explicit" "style" "Answer in one paragraph."
+                            (list turn) "operator turn"))
+          (let ((result (enchiridion.kernel:adaptation-finish state store)))
+            (ok (eq :bearing (getf result :status)))
+            (let ((rows (enchiridion.kernel:adaptation-rows store)))
+              (ok (= 1 (length rows)))
+              (ok (string= "bearing"
+                           (enchiridion.memory.store:field (first rows) "kind")))
+              (ok (search "memory"
+                          (enchiridion.memory.store:field (first rows) "evidence"))))
+            (ng (search "Answer in one paragraph." (adaptation-text directory))))))
+      (testing "a pass with a settled bearing may apply one proposal"
+        (let* ((state (enchiridion.kernel:adaptation-begin agent store))
+               (turn (first (add-user-turns store 1))))
+          (write-proposal directory "explicit" "style" "Answer in one paragraph."
+                          (list turn) "operator turn")
+          (let ((result (enchiridion.kernel:adaptation-finish state store)))
+            (ok (eq :applied (getf result :status)))
+            (ok (search "Answer in one paragraph." (adaptation-text directory)))
+            (let ((rows (enchiridion.kernel:adaptation-rows store)))
+              (ok (= 2 (length rows)))
+              (ok (string= "explicit"
+                           (enchiridion.memory.store:field (first rows) "kind")))))))
+      (testing "a direct write bypasses the evidence and is put back"
+        (let ((state (enchiridion.kernel:adaptation-begin agent store)))
+          (adaptation-write-for-test
+           directory
+           (concatenate 'string (adaptation-text directory)
+                        "- [explicit, style, turn 1] Direct write." (string #\Newline)))
+          (let ((result (enchiridion.kernel:adaptation-finish state store)))
+            (ok (eq :direct-reverted (getf result :status)))
+            (ng (search "Direct write." (adaptation-text directory)))))))))
+
+(deftest an-adaptation-can-be-reverted ()
+  (with-scratch-world (store supervisor)
+    (let* ((directory (enchiridion.supervisor:supervisor-directory supervisor))
+           (turn (first (add-user-turns store 1)))
+           (before (adaptation-text directory))
+           (result (enchiridion.kernel:adaptation-apply-proposal
+                    store directory
+                    (proposal "explicit" "style" "Answer in one paragraph."
+                              (list turn) "operator turn"))))
+      (ok (eq :applied (getf result :status)))
+      (let ((revert (enchiridion.kernel:revert-adaptation
+                     store directory (getf result :id))))
+        (ok (getf revert :reverted-p))
+        (ok (string= before (adaptation-text directory))))
+      (testing "and it cannot be reverted twice"
+        (ng (getf (enchiridion.kernel:revert-adaptation
+                   store directory (getf result :id))
+                  :reverted-p))))))
+
+(deftest one-tool-session-is-not-corroborated-experience ()
+  (with-scratch-world (store supervisor)
+    (let ((enchiridion.kernel::+adaptation-memory-full+ 10)
+          (enchiridion.kernel::+adaptation-experience-full+ 1))
+      (enchiridion.memory.store:record-turn
+       store :session "single" :role "tool" :body "ran once")
+      (enchiridion.memory.store:record-turn
+       store :session "single" :role "assistant" :body "answered once")
+      (ok (zerop (enchiridion.kernel::adaptation-experience-count store)))
+      (testing "a second result in the same session corroborates it"
+        (enchiridion.memory.store:record-turn
+         store :session "single" :role "tool" :body "ran again")
+        (ok (= 1 (enchiridion.kernel::adaptation-experience-count store)))))))
+
+(deftest the-adaptation-block-reaches-the-prompt ()
+  (with-scratch-world (store supervisor)
+    (let ((directory (enchiridion.supervisor:supervisor-directory supervisor)))
+      (enchiridion.kernel:adaptation-begin (agent-of supervisor) store)
+      (let ((fresh (enchiridion.kernel:make-agent
+                    :directory directory :store store)))
+        (ok (search "Bearing:" (enchiridion.kernel:prompt-text
+                                (enchiridion.kernel:agent-snapshot fresh))))
+        (ok (search "enforced in code" (enchiridion.kernel:prompt-text
+                                        (enchiridion.kernel:agent-snapshot fresh))))))))
+
+(deftest adaptation-is-silent-in-the-tick-report ()
+  (with-scratch-world (store supervisor)
+    (add-user-turns store 1)
+    (let ((report (getf (enchiridion.kernel:heartbeat supervisor) :report)))
+      (ok (search "maintenance pass" report))
+      (testing "the adaptation work is inside the one maintenance call"
+        (ok (= 1 (calls-made supervisor))))
+      (dolist (word '("adapt" "bearing" "emulat" "preference"))
+        (testing word
+          (ng (search word (string-downcase report))))))))

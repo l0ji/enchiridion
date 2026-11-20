@@ -29,7 +29,7 @@ identity, its instructions, and its memory. The directory is a git repository of
 its own, nested inside the enchiridion checkout, so every change to the agent is
 a commit that can be read and reverted.
 
-## The five files
+## The files
 
 | File | Written by | Contents |
 | --- | --- | --- |
@@ -37,11 +37,15 @@ a commit that can be read and reverted.
 | `OPERATOR.md` | the operator, then the agent | who it works for, and how |
 | `WORLD.md` | the operator, then the agent | the environment: paths, commands, conventions |
 | `BOOTSTRAP.md` | the operator | the first steps, worked through once |
+| `ADAPT.md` | the harness | the bearing and one-preference-at-a-time adaptation |
 | `GUIDE.md` | the operator | this file |
 
 Until the bootstrap hands over, the block and file tools refuse agent writes to
 the first three files. The built-in shell tool is unavailable during bootstrap. After handover,
-the sleep-time agent maintains all three.
+the sleep-time agent maintains all three identity files. `ADAPT.md` is
+harness-maintained: a maintenance pass may add one evidence-cited preference,
+and the bearing line fades from operator emulation toward the agent's own
+defaults as substantive memory and corroborated experience accumulate.
 
 ## The first run
 
@@ -211,6 +215,19 @@ short and dated, and delete the ones that stopped being true.
 "
   "The environment it lives in.")
 
+(defparameter +adapt+
+  "# Adaptation
+
+Guidance only. Tool access, permissions, refusals, budgets, and the bootstrap
+are enforced in code and do not change here. Explicit operator instructions
+and `OPERATOR.md` override this section.
+
+Bearing: Emulate the operator's demonstrated style and work habits closely. They are the default while your memory and experience are thin.
+"
+  "The harness-maintained bearing and the learned preferences it records.
+The bearing changes with accumulated memory and corroborated experience, not
+with elapsed time.")
+
 (defparameter +bootstrap+
   "# Bootstrap
 
@@ -367,6 +384,7 @@ calls one with no arguments.\"
     ("SOUL.md"                    :kind :markdown :contents +soul+         :description "identity")
     ("OPERATOR.md"                :kind :markdown :contents +operator+     :description "who it works for")
     ("WORLD.md"                   :kind :markdown :contents +world+        :description "the environment")
+    ("ADAPT.md"                   :kind :markdown :contents +adapt+        :description "bearing and learned preferences")
     ("BOOTSTRAP.md"               :kind :markdown :contents +bootstrap+    :description "first steps")
     ("skills/example-welcome.lsp"  :kind :lisp     :contents +example-skill+ :description "example skill")
     ("tools/example-echo.lsp"      :kind :lisp     :contents +example-tool+ :description "example tool")

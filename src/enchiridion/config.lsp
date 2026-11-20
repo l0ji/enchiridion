@@ -207,8 +207,8 @@ store path. The model defaults match the shipped adapter defaults."
     (:db nil)
     (:recent-turns 6)
     (:recent-window-chars 4000)
-    (:block-limits (:persona 6000 :operator 1600 :world 3000 :session 400 :ledger 250
-                    :bootstrap 300))
+    (:block-limits (:persona 6000 :operator 1600 :world 3000 :adapt 1200
+                    :session 400 :ledger 250 :bootstrap 300))
     ;; The limit for a block whose label :block-limits does not name.
     (:unlisted-block-limit 1200)
     ;; The episodic log and pull retrieval are on; push and promotion wait for

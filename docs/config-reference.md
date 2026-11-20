@@ -133,8 +133,8 @@ covers retrieval and promotion.
 | `:compaction-rebase-every` | `8` | Compaction passes between rebuilds from raw turns |
 | `:compaction-rebase-turns` | `24` | Raw turns read by a rebuild |
 
-Default block limits are `(:persona 6000 :operator 1600 :world 3000 :session 400
-:ledger 250 :bootstrap 300)`. Raising them increases prompt size.
+Default block limits are `(:persona 6000 :operator 1600 :world 3000 :adapt 1200
+:session 400 :ledger 250 :bootstrap 300)`. Raising them increases prompt size.
 
 ### Retrieval
 

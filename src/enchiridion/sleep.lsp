@@ -168,27 +168,37 @@ a capability the pass does not use."
 
 ;;;; One sleep pass.
 
-(declaim (ftype (function (agent t &key (:task t) (:channel keyword) (:model t)) list)
+(declaim (ftype (function (agent t &key (:task t) (:channel keyword)
+                                       (:model t) (:text t))
+                          list)
                 run-sleep-pass))
 
 (defun run-sleep-pass (agent store &key task (channel :sleep)
-                                        (model (enchiridion:model-for :sleep)))
+                                        (model (enchiridion:model-for :sleep))
+                                        text)
   "Run one sleep pass and return a plist describing what happened.
 
 One task per pass. The tick cap is a few thousand tokens and a task is a full
 turn with tools, so draining the queue in one pass would make a single tick
 unbounded and the cap meaningless.
 
+TEXT replaces the standing prompt for a maintenance pass. The maintenance pass
+uses it to carry the evidence turns the adaptation rules cite.
+
 The session is the pass's own and is closed afterwards: the operator's session
 is never written to by unattended work, and the transcript still records every
 turn under the channel that made it."
-  (let* ((session (make-session :agent agent))
+  (let* ((maintenance-p (null task))
+         (session (make-session :agent agent))
          (cut-p (and task (> (length (enchiridion.memory.store:task-row-body task))
                              +task-prompt-limit+)))
-         (text (if task (task-prompt task) +sleep-maintenance-prompt+)))
+         (adaptation (and maintenance-p
+                          (handler-case (adaptation-begin agent store)
+                            (error () nil))))
+         (prompt (or text (if task (task-prompt task) +sleep-maintenance-prompt+))))
     (unwind-protect
          (handler-case
-             (let ((completion (run-turn agent text
+             (let ((completion (run-turn agent prompt
                                          :model model
                                          :session session
                                          :store store
@@ -199,8 +209,16 @@ turn under the channel that made it."
                      :task-id (and task (enchiridion.memory.store:task-row-id task))
                      :status (if task :done :idle)
                      :cut-p cut-p
+                     :adaptation (and maintenance-p
+                                      (handler-case
+                                          (adaptation-finish adaptation store
+                                                             :success-p t)
+                                        (error () nil)))
                      :reply (enchiridion.llm:completion-text completion)))
            (error (condition)
+             (when maintenance-p
+               (ignore-errors (adaptation-finish adaptation store
+                                                :success-p nil)))
              (when task
                (enchiridion.memory.store:fail-task store (enchiridion.memory.store:task-row-id task)))
              (list :ran-p t
@@ -500,9 +518,9 @@ nothing, and the honest report for it is one word."
          (recent (enchiridion.memory.store:recent-turns store :limit 1
                                                               :not-channel :sleep))
          (newest (and recent (enchiridion.memory.store:turn-row-id (first recent)))))
-    (flet ((pass (&key task)
+    (flet ((pass (&key task text)
              (run-sleep-pass (sleep-pass-agent agent directory store)
-                             store :task task)))
+                             store :task task :text text)))
       (cond
         (task
          (let ((result (pass :task task)))
@@ -511,8 +529,12 @@ nothing, and the honest report for it is one word."
                    (getf result :cut-p) +task-prompt-limit+
                    (getf result :note))))
         ((and newest (> newest cursor))
-         (let ((result (pass)))
+         (let* ((prompt (adaptation-maintenance-prompt
+                         +sleep-maintenance-prompt+ directory store))
+                (result (pass :text prompt)))
            (setf (enchiridion.supervisor:supervisor-last-sleep-turn supervisor) newest)
+           ;; The adaptation status is internal. A pass reports that it ran,
+           ;; not that the bearing moved or a preference was learned.
            (format nil "maintenance pass~@[ (~A)~]" (getf result :note))))
         (t "idle")))))
 

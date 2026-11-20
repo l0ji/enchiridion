@@ -163,7 +163,22 @@ size test, and it costs one read of sixteen bytes."
        body TEXT NOT NULL,
        status TEXT NOT NULL DEFAULT 'pending',
        ts INTEGER NOT NULL)"
-    "CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status, id)")
+    "CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status, id)"
+
+    ;; The adaptation audit. The file is the prompt-visible form; this table
+    ;; keeps the evidence and the before/after text a revert needs. The
+    ;; bearing rows carry counters as evidence; learned rows carry turn ids.
+    "CREATE TABLE IF NOT EXISTS adaptations (
+       id INTEGER PRIMARY KEY AUTOINCREMENT,
+       kind TEXT NOT NULL,
+       category TEXT NOT NULL DEFAULT '',
+       text TEXT NOT NULL,
+       evidence TEXT NOT NULL DEFAULT '',
+       before_text TEXT NOT NULL DEFAULT '',
+       after_text TEXT NOT NULL DEFAULT '',
+       ts INTEGER NOT NULL,
+       reverted_p INTEGER NOT NULL DEFAULT 0)"
+    "CREATE INDEX IF NOT EXISTS adaptations_ts ON adaptations(ts)")
    ;; The episodic memory tables are appended rather than copied so that the
    ;; one schema list the store executes is also the one place a table is
    ;; declared. The DDL file loads before this one; see enchiridion.asd.
@@ -174,7 +189,7 @@ statements are appended from the DDL module, so the two halves cannot drift.")
 
 (defparameter +store-tables+
   (append
-   '("blocks" "usage" "tasks")
+   '("blocks" "usage" "tasks" "adaptations")
    enchiridion.memory:*episodic-tables*)
   "What DROP-STORE removes, child table before parent table. The episodic
 memory list is child-first because its foreign keys are on.")
@@ -381,7 +396,7 @@ that, because it is not text to a parser and NOT a term to match."
 
 ;;;; Opening and closing.
 
-(defparameter +schema-version+ 8
+(defparameter +schema-version+ 9
   "The schema version a store records in PRAGMA user_version once it is built.
 
 Every statement in +SCHEMA+ is CREATE ... IF NOT EXISTS, which adds a missing
@@ -415,7 +430,11 @@ the last. MIGRATE-EPISODE-VECTORS copies every row into the new shape; the
 vectors are a cache, but a switch back to a model is free only if they survive.
 
 Version 8 adds GENERATIONS.CLAIM_OWNER and CLAIM_TS, the lease a builder holds.
-They are in ADD-MISSING-COLUMNS and need no copy.")
+They are in ADD-MISSING-COLUMNS and need no copy.
+
+Version 9 adds the ADAPTATIONS audit table and the role, channel and session
+index the bearing counts read. Both are in the schema lists, so an older store
+only has to run the schema once more.")
 
 (defparameter +added-columns+
   '(("memory_state" "precision_reset_generation" "INTEGER")

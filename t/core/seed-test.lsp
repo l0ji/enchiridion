@@ -67,9 +67,10 @@ demands :VALIDATE T, and signals unless the directory is really there, so
       (ok (plusp (length (enchiridion.memory:seed-description name))))
       (ok (member (enchiridion.memory:seed-kind name) '(:markdown :lisp :json))))))
 
-(deftest the-five-seed-files-are-present ()
+(deftest the-seed-files-are-present ()
   (let ((names (enchiridion.memory:seed-file-names)))
-    (dolist (expected '("GUIDE.md" "SOUL.md" "OPERATOR.md" "WORLD.md" "BOOTSTRAP.md"))
+    (dolist (expected '("GUIDE.md" "SOUL.md" "OPERATOR.md" "WORLD.md"
+                        "ADAPT.md" "BOOTSTRAP.md"))
       (ok (member expected names :test #'string=)))))
 
 (deftest init-writes-every-file-onto-an-empty-directory ()
@@ -135,7 +136,8 @@ demands :VALIDATE T, and signals unless the directory is really there, so
                          (read-sequence text stream)
                          text))))
         (ok (equal (enchiridion.memory:init-created result) '("OPERATOR.md")))
-        (ok (= 7 (length (enchiridion.memory:init-existing result))))
+        (ok (= (1- (length (enchiridion.memory:seed-file-names)))
+               (length (enchiridion.memory:init-existing result))))
         (ok (plusp (length operator)))
         (ok (equal world "edited world"))))))
 

@@ -64,6 +64,10 @@ references.")
    "CREATE INDEX IF NOT EXISTS episodes_session ON episodes(session, id)"
    "CREATE INDEX IF NOT EXISTS episodes_ts ON episodes(ts)"
    "CREATE INDEX IF NOT EXISTS episodes_context ON episodes(context_key)"
+   ;; The adaptation bearing counts roles and channels at each maintenance
+   ;; pass. The index keeps those counts from scanning the whole log.
+   "CREATE INDEX IF NOT EXISTS episodes_adaptation
+      ON episodes(role, channel, session)"
    "CREATE UNIQUE INDEX IF NOT EXISTS episodes_source_turn
       ON episodes(source_turn_id) WHERE source_turn_id IS NOT NULL"
    "CREATE UNIQUE INDEX IF NOT EXISTS episodes_source_memory

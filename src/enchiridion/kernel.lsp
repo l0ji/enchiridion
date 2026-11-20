@@ -68,10 +68,10 @@ stopping the agent from starting."
         (enchiridion.memory:seed-template name))))
 
 (defun blocks-from-directory (&key directory store)
-  "Return the five blocks for DIRECTORY. The first three are read from their
+  "Return the six blocks for DIRECTORY. The first four are read from their
 Markdown files when those exist and fall back to the seed templates. The first
 three are not writable by the primary agent; the sleep agent gets its own
-writable copy later.
+writable copy later. ADAPT.md is harness-maintained and stays read-only to both.
 
 The last two blocks come from STORE when there is one. They are harness
 written and stored as rows rather than files, and reading them here is what
@@ -94,6 +94,7 @@ the empty strings the shape has always allowed."
       (list (read-block "SOUL.md" :persona nil)
             (read-block "OPERATOR.md" :operator nil)
             (read-block "WORLD.md" :world nil)
+            (read-block "ADAPT.md" :adapt nil)
             (stored-block :session #'enchiridion.memory.store:session-block)
             (stored-block :ledger #'enchiridion.memory.store:ledger-block)))))
 

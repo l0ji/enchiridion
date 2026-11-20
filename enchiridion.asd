@@ -145,6 +145,10 @@
          (:file "fluxer")))
        (:file "supervisor")
        (:file "kernel")
+       ;; The bearing, the evidence checks, and the one proposal a maintenance
+       ;; pass may leave. It loads after the kernel because it reads agents and
+       ;; before sleep because the maintenance pass calls it.
+       (:file "adaptation")
        ;; The heartbeat, the sleep agent and compaction. It is in the kernel
        ;; package and it loads after it, because it calls RUN-TURN and because
        ;; the supervisor schedules a tick through a hook rather than reaching

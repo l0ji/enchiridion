@@ -714,8 +714,11 @@ belongs in the listing the operator reads."
   '(("soul" . "SOUL.md")
     ("persona" . "SOUL.md")
     ("operator" . "OPERATOR.md")
-    ("world" . "WORLD.md"))
-  "The memory block labels that have a Markdown file, and the file each uses.")
+    ("world" . "WORLD.md")
+    ("adapt" . "ADAPT.md"))
+  "The memory block labels that have a Markdown file, and the file each uses.
+ADAPT.md is harness-maintained; the listing shows its size, and edits belong in
+a maintenance proposal rather than this command.")
 
 (declaim (ftype (function (list) integer) cmd-blocks))
 

@@ -4,13 +4,18 @@ The agent's identity is three Markdown files in its agent directory. You edit
 them before the first conversation; after the bootstrap, the sleep agent
 maintains them during `serve`.
 
-## The identity files
+## The files
 
 | File | Contents |
 | --- | --- |
 | `SOUL.md` | Who the agent is, how it speaks, what it refuses, what it is trying to improve |
 | `OPERATOR.md` | Who you are, what a good answer looks like, when the agent may act alone or interrupt |
 | `WORLD.md` | Real paths, commands, ports and conventions on this machine |
+| `ADAPT.md` | The bearing and the evidence-cited preferences the harness learns |
+
+`ADAPT.md` is not an identity file you are expected to edit. It is
+harness-maintained prompt guidance, included in every prompt, and normally
+changed during a maintenance pass. The revert helper is the other writer.
 
 The directory is `agents/default/` under `ENCHIRIDION_HOME`, or under the working
 directory when the variable is unset. `init` writes the files and never
@@ -24,11 +29,11 @@ nix run .#enchiridion -- world            # print WORLD.md
 nix run .#enchiridion -- blocks           # characters used of each limit
 ```
 
-The default limits are 6000 characters for `SOUL.md`, 1600 for `OPERATOR.md` and
-3000 for `WORLD.md`; `:block-limits` changes them, and the
-[settings reference](config-reference.md#memory) lists the keys. `blocks` shows
-the count, and the agent's `blockops` tool enforces the limit and refuses
-invisible Unicode and a short list of prompt-injection patterns. The same scan
+The default limits are 6000 characters for `SOUL.md`, 1600 for `OPERATOR.md`,
+3000 for `WORLD.md` and 1200 for `ADAPT.md`; `:block-limits` changes them, and
+the [settings reference](config-reference.md#memory) lists the keys. `blocks`
+shows the count; `blockops` and the adaptation writer enforce the limit and
+refuse invisible Unicode and a short list of prompt-injection patterns. The same scan
 runs at startup, so a hand-edited file that trips it stops the agent with
 `Configuration is wrong at BLOCK.`
 
@@ -54,6 +59,57 @@ custom checklists and recorded progress are preserved.
 The last step renames the file to `BOOTSTRAP.done.md` and commits the directory.
 `bootstrap reset` restores it when the live file is absent and clears the record.
 The bootstrap record lives in `state.json`, so deleting that file resets it.
+
+## Adaptation
+
+A young agent borrows its operator's style and work habits. As substantive
+memory and corroborated experience accumulate, the bearing moves toward the
+agent's own defaults. Elapsed time is not a term, and no tick announces the
+change.
+
+The two terms are counts the store already has:
+
+| Term | Counts | Full at |
+| --- | --- | --- |
+| Substantive memory | Non-sleep user and assistant turns and saved memories | 120 |
+| Corroborated experience | Sessions with at least two tool results and an assistant reply | 6 |
+
+Sleep output and tool rows do not enter the memory term, so consolidation
+cannot age an agent by talking to itself. `ADAPT.md` has five bearing bands and
+changes only when a maintenance pass runs and a band is crossed.
+
+The maintenance pass may add at most one learned entry, and a bearing change
+counts as that pass's one change. The default is no change. An explicit
+operator correction may be applied immediately with the operator turn id and a
+short quote. An inferred preference needs at least three separate operator
+turns. The harness checks the cited turn ids, their role, the quote and the
+category before it writes the entry.
+
+`ADAPT.md` is guidance. These bounds are enforced outside the prompt and an
+adaptation cannot change them:
+
+| Bound | Enforced by |
+| --- | --- |
+| Identity-file writes before handover | `blockops`, `file`, and the bootstrap state |
+| Block size and injection scan | `scan-block-text`, `set-block-text`, `adaptation-write-file` |
+| Tool names, arguments and availability | the tool registry and its schemas |
+| OS identity, sandbox and file access | the broker and the deployment |
+| Token caps and task claims | the budget code and the task queue |
+
+A proposal that names an enforced bound, such as tool access, a permission, a
+refusal, a budget or the bootstrap, is refused. The category must be `style`,
+`workflow`, `format`, `communication` or `priority`. The guard is a filter, not
+a proof: `ADAPT.md` never grants authority, and the code that enforces a bound
+never reads it.
+
+Every bearing change and learned entry records its evidence in the store's
+`adaptations` table. A bearing row names both counts; an entry row names its
+turn ids. The pass is silent: `health` and the tick report say that a
+maintenance pass ran, not that the bearing moved or that an entry was learned.
+`ADAPT.md` is in the agent directory, so `git -C agents/default log` shows
+every change and `nix run .#enchiridion -- undo N` reverts one. The latest
+change can also be reverted with `enchiridion.kernel:revert-adaptation` from a
+Lisp session.
 
 ## History
 

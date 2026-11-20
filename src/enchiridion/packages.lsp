@@ -565,6 +565,12 @@ the shell. It is the only writer of run/enchiridion.status, which is what lets
    #:session #:make-session #:session-id #:session-turns #:end-session
    #:heartbeat #:task-queue #:enqueue-task #:dequeue-task #:task-queue-length
    #:sleep-agent #:run-sleep-pass
+   ;; The bearing, the evidence checks, and the one learned entry a pass may
+   ;; add. They are exported because tests and an operator's own Lisp use them.
+   #:adaptation-path #:adaptation-proposal-path #:adaptation-maturity
+   #:adaptation-bearing #:adaptation-begin #:adaptation-finish
+   #:adaptation-apply-proposal #:adaptation-maintenance-prompt
+   #:adaptation-rows #:revert-adaptation
    ;; What a failed transcript or usage write leaves for a health reader.
    #:*persistence-failure-reporter* #:persistence-failures
    #:last-persistence-failure)

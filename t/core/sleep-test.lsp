@@ -802,7 +802,6 @@ countable from the test."
           (enchiridion.kernel::+adaptation-experience-full+ 1))
       (let ((before (enchiridion.kernel:adaptation-maturity store)))
         (dotimes (index 10)
-          (declare (ignore index))
           (enchiridion.memory.store:record-turn
            store :session "sleep" :role "assistant" :body "consolidated"
            :channel :sleep))

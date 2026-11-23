@@ -120,8 +120,8 @@ enchiridion memory canaries revoke FINGERPRINT
 ```
 
 Approval requires the check to pass live lexical retrieval. Approval copies the
-reviewed check into `canary-approvals/` beside the operator config, outside the
-memory database. Up to 32 checks can be approved.
+reviewed check into `canary-approvals/` on the Docker state volume, or beside
+the operator config on a native install. Up to 32 checks can be approved.
 Discard removes a proposal, not an approval. Revoke stops the check from blocking.
 If you delete a source episode, its proposal is deleted; revoke any approved
 check separately. For an `update` proposal, verify the stale value before

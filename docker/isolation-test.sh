@@ -27,6 +27,7 @@ set -eu
 
 PHASE=${ISOLATION_PHASE:-all}
 STATE_DIR=${ENCHIRIDION_HOME:-/var/lib/enchiridion}
+APPROVALS="$STATE_DIR/canary-approvals"
 SECRETS_DIR=/run/secrets
 SECRETS_FILE="$SECRETS_DIR/.env"
 HIDEPID=${ENCHIRIDION_HIDEPID:-2}
@@ -100,6 +101,11 @@ if [ "$(id -u)" -eq 0 ]; then
   [ "$mode" = "700" ] || fail "$SECRETS_DIR is mode $mode, not 700"
   [ "$(stat -c '%u' "$SECRETS_DIR")" = "0" ] || fail "$SECRETS_DIR is not owned by root"
 
+  [ "$(stat -c '%a:%u' "$STATE_DIR")" = "755:0" ] ||
+    fail "$STATE_DIR is not mode 755 owned by root"
+  [ ! -L "$APPROVALS" ] && [ "$(stat -c '%a:%u' "$APPROVALS")" = "700:0" ] ||
+    fail "$APPROVALS is not a root-only directory"
+
   check_proc_mount
 
   case "$PHASE" in
@@ -134,6 +140,14 @@ if [ "$(id -u)" -eq 0 ]; then
 fi
 
 [ "$(id -u)" -eq 1000 ] || fail "run this as uid 1000 or uid 0, not $(id -u)"
+
+[ ! -w "$STATE_DIR" ] || fail "the agent can replace directories under $STATE_DIR"
+[ -d "$APPROVALS" ] && [ ! -r "$APPROVALS" ] && [ ! -x "$APPROVALS" ] ||
+  fail "the agent can read approvals or the approvals directory was not created"
+for name in agents run tmp; do
+  [ -w "$STATE_DIR/$name" ] && [ -x "$STATE_DIR/$name" ] ||
+    fail "the agent cannot use $STATE_DIR/$name"
+done
 
 check_proc_mount
 

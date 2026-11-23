@@ -26,6 +26,7 @@ XDG_CONFIG_HOME=/opt/enchiridion-config
 ASDF_OUTPUT_TRANSLATIONS='(:output-translations (t "/opt/enchiridion-cache/common-lisp/") :ignore-inherited-configuration)'
 SBCL_HOME=${SBCL_HOME:-/usr/local/lib/sbcl}
 CL_SOURCE_REGISTRY="${ENCHIRIDION_SOURCE}//:/opt/quicklisp/dists/quicklisp/software//"
+export ENCHIRIDION_CANARY_APPROVALS="${ENCHIRIDION_HOME:-/var/lib/enchiridion}/canary-approvals"
 
 export ENCHIRIDION_SOURCE ENCHIRIDION_SBCL XDG_CACHE_HOME SBCL_HOME CL_SOURCE_REGISTRY
 export XDG_CONFIG_HOME ASDF_OUTPUT_TRANSLATIONS

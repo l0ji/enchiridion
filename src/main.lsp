@@ -201,7 +201,6 @@ the operator has to choose a provider and a state layout."
   "Return the directories the agent uid owns in a split run."
   (let ((home (sandbox-home)))
     (list (merge-pathnames "agents/" home)
-          (uiop:ensure-directory-pathname (agent-directory))
           (uiop:ensure-directory-pathname (enchiridion:run-directory))
           (merge-pathnames "tmp/" home))))
 
@@ -219,15 +218,21 @@ enter it."
                         :key :sandbox
                         :detail (format nil "The agent uid cannot traverse ~A. Set ENCHIRIDION_HOME to a directory below a world executable parent, such as /var/lib/enchiridion." directory)))))))
 
+(defun check-sandbox-directory (directory)
+  "Refuse a symbolic link at a writable state directory."
+  (when (enchiridion.compat:symlink-target (string-right-trim "/" (namestring directory)))
+    (error 'enchiridion.errors:configuration-error
+           :key :sandbox :detail (format nil "State directory must not be a symlink: ~A" directory))))
+
 (defun chown-tree (directory uid gid)
   "Give DIRECTORY and its contents to UID and GID. Signal on failure."
   (let ((owner (if (plusp gid)
                    (format nil "~D:~D" uid gid)
                    (format nil "~D" uid)))
-        (path (namestring directory)))
+        (path (string-right-trim "/" (namestring directory))))
     (multiple-value-bind (output status)
         (enchiridion.compat:run-program-capture
-         "chown" (list "-R" owner path) :timeout 60)
+         "chown" (list "-h" "-R" "-P" owner path) :timeout 60)
       (unless (eql 0 status)
         (error 'enchiridion.errors:configuration-error
                :key :sandbox
@@ -242,11 +247,16 @@ and gives the tree to the agent uid and gid."
   (let ((uid (agent-uid config))
         (gid (agent-gid config)))
     (when (and (plusp uid) (zerop (enchiridion.compat:process-uid)))
-      (let ((home (sandbox-home)))
-        (dolist (directory (sandbox-directories))
+      (let ((home (sandbox-home))
+            (directories (sandbox-directories))
+            (agent (agent-directory)))
+        (dolist (directory directories)
+          (check-sandbox-directory directory)
           (ensure-directories-exist (merge-pathnames "x" directory)))
+        (check-sandbox-directory agent)
+        (ensure-directories-exist (merge-pathnames "x" agent))
         (check-sandbox-traversal home)
-        (dolist (directory (sandbox-directories))
+        (dolist (directory directories)
           (chown-tree directory uid gid)))
       t)))
 

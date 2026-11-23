@@ -105,9 +105,9 @@ The image declares no anonymous volume, so a bare `docker run` without `-v`
 writes state into the container layer and loses it with the container. The
 Compose named volume is the supported route.
 
-The volume holds `agents/default` (seed files, `memory.db`, `skills/`, `tools/`,
-`state.json`), `run` (control and status files, broker socket), and `tmp`. Stop
-the service before copying, so the store and run files do not change. Compose
+The root-owned volume holds `canary-approvals/`. The agent owns `agents/`,
+`run/`, and `tmp/`, not their parent. Stop the service before copying so the
+backup captures the approvals and memory database together. Compose
 prefixes the volume with the project name `enchiridion`, so the volume is
 `enchiridion_enchiridion-state`.
 
@@ -133,8 +133,10 @@ docker run --rm \
 docker compose up -d
 ```
 
-To upgrade, back up first, then run `docker compose build` and `docker compose
-up -d`. The memory store migrates an older schema when it opens. The Dockerfile
+To upgrade, back up first. If your deployment has a separate canary approvals
+volume, follow [Canary approvals in Compose](#canary-approvals-in-compose) before
+restarting. Otherwise run `docker compose build` and `docker compose up -d`.
+The memory store migrates an older schema when it opens. The Dockerfile
 pins the base image, Debian snapshot and Quicklisp distribution; a built image
 records them in `/opt/enchiridion/dist-lock.txt`.
 
@@ -186,13 +188,41 @@ The caps do not stop chat or limit provider charges.
 ### Canary approvals in Compose
 
 Run operator commands as root in the container, with the same config path as
-`serve`. The `enchiridion-canary-approvals` volume keeps approvals across container
-replacement and is separate from the agent's memory volume.
+`serve`. Approvals are stored in `canary-approvals/` on `enchiridion-state` and
+included in its backups.
 
 ```sh
 docker compose exec -e ENCHIRIDION_CONFIG=/etc/enchiridion/config.lsp enchiridion \
   enchiridion memory canaries
 ```
+
+If you have approvals in the old separate volume, stop the service and
+initialize the new layout before copying them. This leaves the old volume intact
+and does not overwrite any existing approvals. If you renamed the Compose
+project, set `OLD_APPROVALS_VOLUME` and `STATE_VOLUME` to the actual volume names.
+
+```sh
+docker compose stop
+docker compose build enchiridion
+docker compose run --rm --no-deps -e ENCHIRIDION_HIDEPID=0 enchiridion version
+OLD_APPROVALS_VOLUME=${OLD_APPROVALS_VOLUME:-enchiridion_enchiridion-canary-approvals}
+STATE_VOLUME=${STATE_VOLUME:-enchiridion_enchiridion-state}
+if docker volume inspect "$OLD_APPROVALS_VOLUME" >/dev/null 2>&1; then
+  docker volume inspect "$STATE_VOLUME" >/dev/null &&
+    docker run --rm \
+    -v "$OLD_APPROVALS_VOLUME:/old:ro" \
+    -v "$STATE_VOLUME:/state" \
+    alpine sh -ec 'for file in /old/*.lsp; do
+      [ -f "$file" ] && [ ! -L "$file" ] || continue
+      cp -pn "$file" /state/canary-approvals/
+    done'
+else
+  printf 'No volume named %s. Check the original project name before skipping the copy.\n' "$OLD_APPROVALS_VOLUME" >&2
+fi
+docker compose run --rm --no-deps -e ENCHIRIDION_HIDEPID=0 enchiridion memory canaries
+```
+
+Confirm every previously approved check is listed before running `docker compose up -d`.
 
 ## Container requirements
 
@@ -212,6 +242,11 @@ it.
 `ENCHIRIDION_REQUIRE_HIDEPID=1`, so a kernel that refuses the remount stops the
 container. Set `ENCHIRIDION_HIDEPID=0` only when you accept that uid 1000 can
 read the supervisor's process details.
+
+The container state root must be an absolute, canonical path under root-owned
+parents that are not group- or world-writable. `agents/`, `run/`, `tmp/`, and
+`.gitconfig` cannot be symbolic links. Move a linked legacy directory into the
+volume before upgrading. Do not copy approvals from an agent-writable directory.
 
 The Compose file mounts `config.lsp` read-only at `/opt/enchiridion/config.lsp`.
 The entrypoint copies it to a root-owned `/etc/enchiridion/config.lsp` and points
@@ -255,7 +290,8 @@ docker exec -u agent enchiridion /usr/local/bin/isolation-test.sh
 Each command exits 0 and its last line says `passed`; a failure prints `FAIL:
 ...` and exits 1. The uid 0 phases check the secret file and the `/proc` mount.
 The uid 1000 phase checks that the directory is closed, the file and
-`/proc/1/environ` cannot be read, and no `.env` copy is reachable. With the
+`/proc/1/environ` cannot be read, and no `.env` copy is reachable. Both views
+also check the state directory and approval permissions. With the
 `env_file` route, the uid 0 `present` phase says that route is in use, and the
 uid 1000 phase fails at the environment check.
 

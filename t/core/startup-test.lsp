@@ -8,7 +8,8 @@
 
 (declaim (ftype (function (list) t) cl-user::broker-exec-drop-privileges)
          (ftype (function (t t) t) cl-user::broker-exec-setgroups)
-         (ftype (function () t) cl-user::initialize-supervisor-asdf))
+         (ftype (function () t) cl-user::initialize-supervisor-asdf)
+         (ftype (function (t) t) cl-user::check-sandbox-directory))
 
 (defun startup-definition (file name)
   "Read NAME's definition before the script starts the application."
@@ -23,7 +24,8 @@
 (eval-when (:load-toplevel :execute)
   (dolist (definition '(("src/broker-exec.lsp" "BROKER-EXEC-ARGUMENT")
                         ("src/broker-exec.lsp" "BROKER-EXEC-DROP-PRIVILEGES")
-                        ("src/main.lsp" "INITIALIZE-SUPERVISOR-ASDF")))
+                        ("src/main.lsp" "INITIALIZE-SUPERVISOR-ASDF")
+                        ("src/main.lsp" "CHECK-SANDBOX-DIRECTORY")))
     (eval `(locally
              (declare (notinline sb-posix:geteuid sb-posix:getuid
                                  sb-posix:getegid sb-posix:getgid
@@ -155,6 +157,20 @@
                    (enchiridion.compat:unset-environment-variable name)))
       (asdf:initialize-source-registry)
       (asdf:initialize-output-translations)
+      (uiop:delete-directory-tree scratch :validate t :if-does-not-exist :ignore))))
+
+(deftest writable-state-directories-must-not-be-symbolic-links ()
+  (let* ((scratch (merge-pathnames (format nil "sandbox-link-~D/" (random most-positive-fixnum))
+                                   *default-pathname-defaults*))
+         (target (merge-pathnames "canary-approvals/" scratch))
+         (link (merge-pathnames "default" scratch)))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist (merge-pathnames "placeholder" target))
+           (sb-posix:symlink (namestring target) (namestring link))
+           (ok (null (cl-user::check-sandbox-directory target)))
+           (ok (signals (cl-user::check-sandbox-directory (uiop:ensure-directory-pathname link))
+                        'enchiridion.errors:configuration-error)))
       (uiop:delete-directory-tree scratch :validate t :if-does-not-exist :ignore))))
 
 (deftest an-unprivileged-broker-does-not-attempt-an-identity-change ()

@@ -234,8 +234,8 @@ where one bad byte must not cost the whole result."
   "Return a directory the agent can write.
 
 Inside the container /tmp is root owned and mode 755, so a tool that writes
-there fails for uid 1000. ENCHIRIDION_HOME is the agent's writable state, and
-the host keeps using /tmp.
+there fails for uid 1000. The container uses tmp/ under ENCHIRIDION_HOME.
+The host keeps using /tmp when no state root is set.
 
 A state root that does not exist is not created here. A command that only prints,
 like `version`, must not create the tree it reports on, and root would create it

@@ -258,6 +258,12 @@ name fails, because a check with nothing to run must not pass."
 
 (defun canary-approval-directory ()
   (or *canary-approval-directory*
+      (let ((override (enchiridion.compat:environment-value "ENCHIRIDION_CANARY_APPROVALS")))
+        (when (and override (plusp (length override)))
+          (let ((directory (uiop:ensure-directory-pathname override)))
+            (unless (uiop:absolute-pathname-p directory)
+              (canary-input-error "ENCHIRIDION_CANARY_APPROVALS must be an absolute directory."))
+            directory)))
       (let ((config enchiridion:*config-source*))
         (when (pathnamep config)
           (merge-pathnames "canary-approvals/" (uiop:pathname-directory-pathname config))))))
@@ -318,8 +324,10 @@ name fails, because a check with nothing to run must not pass."
         (return-from approve-canary id))
       (when (>= (length approved) +canary-proposal-limit+)
         (canary-input-error "The approved list is full. Revoke a check first."))
-      (ensure-directories-exist path)
-      (checked-approval-path (uiop:pathname-directory-pathname path))
+      (let ((directory (uiop:pathname-directory-pathname path)))
+        (checked-approval-path (uiop:pathname-parent-directory-pathname directory))
+        (ensure-directories-exist path)
+        (checked-approval-path directory))
       (uiop:with-temporary-file (:stream stream :pathname temporary
                                  :directory (uiop:pathname-directory-pathname path)
                                  :type "tmp" :external-format :utf-8)

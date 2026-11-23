@@ -691,6 +691,29 @@ for five tasks."
         (ok (equal "fail" (enchiridion.memory.store:field row "result")))
         (ok (search id (enchiridion.memory.store:field row "detail")))))))
 
+(deftest the-approval-directory-can-be-set-outside-the-config-directory ()
+  (with-store (store directory)
+    (let* ((variable "ENCHIRIDION_CANARY_APPROVALS")
+           (previous (enchiridion.compat:environment-value variable))
+           (path (merge-pathnames "state/canary-approvals/" directory))
+           (enchiridion:*config-source* (merge-pathnames "config.lsp" directory)))
+      (unwind-protect
+           (progn
+             (ensure-directories-exist (merge-pathnames "state/parent" directory))
+             (enchiridion.compat:set-environment-variable variable (namestring path))
+             (let* ((episode (say store "user" "The apricot larder contains six jars."))
+                    (id (enchiridion.memory:propose-canary
+                         store "retrieval" "apricot larder" "six jars" episode)))
+               (ok (equal id (enchiridion.memory:approve-canary store id)))
+               (ok (probe-file (merge-pathnames (make-pathname :name id :type "lsp") path)))
+               (ng (probe-file (merge-pathnames "canary-approvals/" directory))))
+             (enchiridion.compat:set-environment-variable variable "relative/approvals")
+             (ok (rove:signals (enchiridion.memory:approved-canaries)
+                              'enchiridion.errors:schema-error)))
+        (if previous
+            (enchiridion.compat:set-environment-variable variable previous)
+            (enchiridion.compat:unset-environment-variable variable))))))
+
 (deftest the-operator-approves-a-snapshot-and-can-revoke-it ()
   (with-store (store directory)
     (let* ((enchiridion.memory::*canary-approval-directory*

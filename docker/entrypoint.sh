@@ -105,34 +105,72 @@ if [ -f /opt/enchiridion/config.lsp ]; then
   log "configuration copied to $ENCHIRIDION_CONFIG and closed to the agent"
 fi
 
-# run holds the broker socket and the control and status files. The broker
-# child drops to the agent uid and binds the socket there, so run must exist
-# before the chown and must belong to the agent. tmp is the agent's scratch
-# directory, because /tmp is not writable by uid 1000 in every image.
-mkdir -p "$STATE_DIR" "$STATE_DIR/agents/default" "$STATE_DIR/run" "$STATE_DIR/tmp" /run/enchiridion
-# The broker runs as the agent and must read and write the files it acts on.
-# The supervisor is root and reaches them anyway; the secrets tmpfs is the one
-# directory that stays 700 root.
-chown -R "$AGENT_UID:$AGENT_GID" "$STATE_DIR"
+root_controlled_directory() {
+  [ -d "$1" ] && [ ! -L "$1" ] && [ "$(stat -c %u -- "$1")" = 0 ] || return 1
+  mode=$(stat -c %a -- "$1") || return 1
+  [ -n "$mode" ] && [ "$((0$mode & 022))" -eq 0 ]
+}
+
+case "$STATE_DIR" in
+  /*) ;;
+  *) fail "ENCHIRIDION_HOME must be an absolute state directory" ;;
+esac
+while [ "${STATE_DIR%/}" != "$STATE_DIR" ]; do STATE_DIR=${STATE_DIR%/}; done
+[ -n "$STATE_DIR" ] && [ "$(realpath -m -- "$STATE_DIR")" = "$STATE_DIR" ] ||
+  fail "ENCHIRIDION_HOME must name a canonical state directory other than /"
+
+parent=$(dirname -- "$STATE_DIR")
+while :; do
+  root_controlled_directory "$parent" || fail "state ancestor is not root-controlled: $parent"
+  [ "$parent" != / ] || break
+  parent=$(dirname -- "$parent")
+done
+
+approvals="$STATE_DIR/canary-approvals"
+trusted_state=0
+if root_controlled_directory "$STATE_DIR"; then trusted_state=1; fi
+check_approvals() {
+  if [ -e "$approvals" ] || [ -L "$approvals" ]; then
+    # A legacy agent-writable volume could contain self-approved checks
+    [ "$trusted_state" = 1 ] && root_controlled_directory "$approvals" ||
+      fail "untrusted canary approvals at $approvals; move them aside before upgrading"
+  fi
+}
+
+check_approvals
+mkdir -p "$STATE_DIR"
+chown 0:0 "$STATE_DIR"
+chmod 755 "$STATE_DIR"
+check_approvals
+if [ ! -d "$approvals" ]; then
+  mkdir -m 700 "$approvals"
+fi
+chmod 700 "$approvals"
+
+# Only the agent's repository, runtime sockets and scratch need write access
+for name in agents run tmp; do
+  directory="$STATE_DIR/$name"
+  [ ! -L "$directory" ] || fail "state directory must not be a symlink: $directory"
+  mkdir -p "$directory"
+  chown -hR -P "$AGENT_UID:$AGENT_GID" "$directory"
+done
+mkdir -p /run/enchiridion
 chown "$AGENT_UID:$AGENT_GID" /run/enchiridion
 chmod 700 /run/enchiridion
 
-# The agent's own Git identity. Repository Git runs as the agent with HOME set
-# to the state root, so this is the configuration every commit uses. It holds no
-# secret: a name, an address, and signing off, because the agent has no key and a
-# refused commit would cost the turn its history.
+# Git reads the agent's identity from .gitconfig in the state root
 AGENT_GITCONFIG="$STATE_DIR/.gitconfig"
-if [ ! -f "$AGENT_GITCONFIG" ]; then
+[ ! -L "$AGENT_GITCONFIG" ] || fail "agent .gitconfig must not be a symlink"
+if [ ! -e "$AGENT_GITCONFIG" ]; then
   printf '%s\n' '[user]' '	name = enchiridion agent' \
     '	email = agent@enchiridion.invalid' '[commit]' '	gpgsign = false' \
     > "$AGENT_GITCONFIG"
   chown "$AGENT_UID:$AGENT_GID" "$AGENT_GITCONFIG"
   chmod 600 "$AGENT_GITCONFIG"
 fi
+[ -f "$AGENT_GITCONFIG" ] || fail "agent .gitconfig must be a regular file"
 
-# The agent gets a home it can write and nothing else. PATH is built here, not
-# inherited: nothing reaches this process's environment and is passed on by
-# default.
+# The agent writes only its own state subdirectories
 export ENCHIRIDION_HOME="$STATE_DIR"
 export PATH=/usr/local/bin:/usr/bin:/bin
 

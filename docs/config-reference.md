@@ -207,6 +207,7 @@ The packaged wrappers set the executable and library paths.
 | --- | --- |
 | `ENCHIRIDION_CONFIG` | Explicit config file path |
 | `ENCHIRIDION_HOME` | State root; defaults to the working directory |
+| `ENCHIRIDION_CANARY_APPROVALS` | Absolute approval directory; Docker sets it under the state root |
 | `ENCHIRIDION_SOURCE` | Installed source root, also searched for config and `.env` |
 | `ENCHIRIDION_SBCL` | SBCL executable for broker and verification children |
 | `ENCHIRIDION_GIT` | Git executable; defaults to `git` on `PATH` |

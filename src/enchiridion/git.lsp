@@ -118,7 +118,7 @@ not run repository Git at all: the fallback would be the supervisor's uid."
 (defun git-root-environment ()
   "Return the allowlisted environment a dropped Git child gets.
 
-HOME is the agent-owned state root and never root's home, so the agent's own
+HOME is the state root and never root's home, so the agent's own
 Git configuration and signing key are the ones used. TMPDIR is the agent's tmp
 directory, because /tmp is root-owned in the container."
   (let* ((state (uiop:getenv "ENCHIRIDION_HOME"))

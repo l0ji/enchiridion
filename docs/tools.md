@@ -19,6 +19,7 @@ see [Plugins](plugins.md).
 | `search` | `query` | `scope`, `path`, `limit` | Search the memory store or text files |
 | `blockops` | | `action`, `label`, `old`, `new`, `text`, `directory` | Read or change a memory block |
 | `memory` | `name`, `text` | | Save one named memory |
+| `canary` | `family`, `cue`, `expect`, `episode` | `stale` | Propose a shadow retrieval check |
 | `meta` | | `action`, `directory`, `limit`, `name`, `kind`, `text`, `confirm`, `step` | Read the journey, author a file, reload, undo |
 | `web` | | `action`, `url`, `query`, `limit` | Fetch a URL or search the web |
 
@@ -77,8 +78,8 @@ can.
 `scope` defaults to `memory` (sessions and saved memories). Use `sessions` or
 `memories` to search only one. `files`, or any `path`, walks text files
 instead. `limit` defaults to 20 for the store and 40 for the walk. A store hit
-prints as `session SESSION ROLE: TEXT` or `memory NAME: TEXT`, flattened to one
-line and cut at 400 characters. The file walk visits `md`, `txt`, `cl`, `lisp`,
+starts with `[ref episode-ID]`, followed by `session SESSION ROLE: TEXT` or
+`memory NAME: TEXT`. The text is flattened to one line and cut at 400 characters. The file walk visits `md`, `txt`, `cl`, `lisp`,
 `json` and `org` files, skips `.git`, `node_modules`, the state directory and
 `cache`, and visits at most 2000 files. No match prints `no matches`.
 

@@ -48,12 +48,12 @@
                (testing "a turn is found with its session and role"
                  (let ((output (enchiridion.tools.builtin:search-run
                                 (list :query "xylophone"))))
-                   (ok (search "session session-9 user" output))
+                   (ok (search "[ref episode-1] session session-9 user" output))
                    (ok (search "the xylophone index" output))))
                (testing "a memory is found with its name, on one line"
                  (let ((output (enchiridion.tools.builtin:search-run
                                 (list :query "glockenspiel"))))
-                   (ok (search "memory note" output))
+                   (ok (search "[ref episode-2] memory note" output))
                    (ok (search "on two lines" output))
                    (ok (not (search (format nil "~%on two lines") output)))))
                (testing "scopes select the matching record type"
@@ -64,6 +64,14 @@
                    (ok (string= "no matches" (lookup "xylophone" "memories")))
                    (ok (search "memory note" (lookup "glockenspiel" "memories")))
                    (ok (string= "no matches" (lookup "glockenspiel" "sessions")))))
+               (testing "the tool can cite a search result but cannot approve it"
+                 (let ((enchiridion.tools::*registry* (make-hash-table :test #'equal)))
+                   (enchiridion.tools.builtin:register-builtin-tools)
+                   (ok (search "Proposed shadow canary"
+                               (enchiridion.tools:dispatch
+                                "canary" '(:family "retrieval" :cue "xylophone"
+                                           :expect "xylophone index" :episode 1))))
+                   (ok (= 1 (length (enchiridion.memory:canary-proposals store))))))
                (testing "a query that matches nothing says so"
                  (ok (string= "no matches"
                               (enchiridion.tools.builtin:search-run

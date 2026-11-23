@@ -396,7 +396,7 @@ that, because it is not text to a parser and NOT a term to match."
 
 ;;;; Opening and closing.
 
-(defparameter +schema-version+ 10
+(defparameter +schema-version+ 11
   "The schema version a store records in PRAGMA user_version once it is built.
 
 Every statement in +SCHEMA+ is CREATE ... IF NOT EXISTS, which adds a missing
@@ -440,7 +440,9 @@ Version 10 adds EPISODES.FINAL_P, the final-answer marker the utility task set
 pairs on, in ADD-MISSING-COLUMNS. It is nullable on purpose: a legacy or
 imported row records no answer and the pairing rule infers one, while a live
 round records 1 for the reply a turn returned and 0 for a round that asked for
-tools. Version 10 also separates T2 preflight retries from completed passes.")
+tools. Version 10 also separates T2 preflight retries from completed passes.
+
+Version 11 adds the shadow canary proposal table.")
 
 (defparameter +added-columns+
   '(("memory_state" "precision_reset_generation" "INTEGER")

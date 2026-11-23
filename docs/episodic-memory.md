@@ -104,6 +104,32 @@ that used tools. Both arms score the same tasks in `:gate-pack-chars`. The tail
 sample ranks eligible answers across the log by rarity. It takes the rarest
 `:tail-rarity-fraction`, at least `:tail-min-n` when available and at most 400 pairs.
 
+### Agent proposals
+
+The `canary` tool takes a family, cue, expected text, and an episode ID containing
+that text verbatim. For `update`, it also takes the stale value; for `safety`,
+`expect` is the text that must stay out. An agent can queue up to 32 distinct
+checks. A candidate records each shadow result alongside the live result under
+`memory gates ID`. Shadow results do not count toward coverage or affect promotion.
+
+```sh
+enchiridion memory canaries
+enchiridion memory canaries approve FINGERPRINT
+enchiridion memory canaries discard FINGERPRINT
+enchiridion memory canaries revoke FINGERPRINT
+```
+
+Approval requires the check to pass live lexical retrieval. Approval copies the
+reviewed check into `canary-approvals/` beside the operator config, outside the
+memory database. Up to 32 checks can be approved.
+Discard removes a proposal, not an approval. Revoke stops the check from blocking.
+If you delete a source episode, its proposal is deleted; revoke any approved
+check separately. For an `update` proposal, verify the stale value before
+approving. If the stale text was never recorded, the check only tests retrieval
+of the new value. Invalid approval files stop T2 until the operator restores or removes
+them. A root supervisor requires root-owned approval paths. If the agent runs
+as the operator's UNIX user, the approval files are not a privilege boundary.
+
 ## The gates
 
 A candidate passes five gates in order and stops at the first failure.

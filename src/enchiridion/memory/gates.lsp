@@ -3,168 +3,6 @@
 (in-package #:enchiridion.memory)
 
 ;;;; ------------------------------------------------------------------
-;;;; 4. The canary set (store 12)
-;;;; ------------------------------------------------------------------
-
-(defun register-canary (store name expect &key (family "") (now (get-universal-time)))
-  "Add or replace a named behavioral canary."
-  (enchiridion.memory.store:exec
-   store
-   "INSERT INTO canary (name, expect, family, ts) VALUES (?, ?, ?, ?)
-    ON CONFLICT(name) DO UPDATE SET expect = ?, family = ?, ts = ?"
-   (list name expect family now expect family now)))
-
-(defparameter +canary-families+ '("retrieval" "update" "safety" "tail")
-  "The canary families required for promotion.")
-
-(defun canary-text (canary key)
-  "Return CANARY's KEY as a non-empty string, or NIL."
-  (let ((value (getf canary key)))
-    (and (stringp value) (plusp (length value)) value)))
-
-(defun valid-canary-p (canary)
-  "Return T when CANARY names a known family and carries what its check reads:
-a name, a cue, an expectation, and for the update family the stale value."
-  (let ((family (canary-text canary :family)))
-    (and (canary-text canary :name)
-         family
-         (member family +canary-families+ :test #'string-equal)
-         (canary-text canary :cue)
-         (canary-text canary :expect)
-         (or (not (string-equal family "update"))
-             (canary-text canary :stale))
-         t)))
-
-(defun canary-coverage (canaries)
-  "Return two values: the families the valid CANARIES cover, and whether they
-cover *CANARY-MIN-FAMILIES* of them."
-  (let ((families (remove-duplicates
-                   (mapcar (lambda (c) (string-downcase (getf c :family)))
-                           (remove-if-not #'valid-canary-p canaries))
-                   :test #'string=)))
-    (values families (>= (length families) *canary-min-families*))))
-
-(defun sync-canaries (store canaries)
-  "Make the canary table hold exactly the valid CANARIES and return how many.
-A canary removed from the configuration is removed here too."
-  (let ((valid (remove-if-not #'valid-canary-p canaries)))
-    (enchiridion.memory.store:with-store-transaction (store)
-      (dolist (canary valid)
-        (register-canary store (getf canary :name) (getf canary :expect)
-                         :family (string-downcase (getf canary :family))))
-      (dolist (row (enchiridion.memory.store:query-rows store "SELECT name FROM canary"))
-        (let ((name (enchiridion.memory.store:field row "name")))
-          (unless (find name valid :key (lambda (c) (getf c :name)) :test #'string=)
-            (enchiridion.memory.store:exec store "DELETE FROM canary WHERE name = ?"
-                                           (list name))))))
-    (length valid)))
-
-(defun canary-behaviour-p (store canary generation)
-  "Return T when CANARY's behaviour holds in a retrieval reading GENERATION.
-
-Each family asserts behaviour under a controlled cue, never mere presence in
-the store: retrieval and tail, that the cue brings back a record holding the
-expectation; update, that the newer value ranks above the stale one; safety,
-that no record holding the forbidden text reaches the pack."
-  (let* ((rows (retrieve-rows-for-turn store (getf canary :cue) :generation generation))
-         (bodies (mapcar (lambda (row) (format nil "~{~A~^~%~}" (row-texts row))) rows))
-         (expect (getf canary :expect)))
-    (flet ((rank (text)
-             (position-if (lambda (body) (search text body :test #'char-equal)) bodies)))
-      (let ((family (string-downcase (getf canary :family))))
-        (cond
-          ((member family '("retrieval" "tail") :test #'string=)
-           (not (null (rank expect))))
-          ((string= family "safety")
-           (null (rank expect)))
-          ((string= family "update")
-           (let ((new (rank expect)) (old (rank (getf canary :stale))))
-             (and new (or (null old) (< new old)))))
-          (t (error "~A is not a canary family." family)))))))
-
-(defparameter +canary-fixture-bodies+
-  '("The velarium map is in the copper cabinet."
-    "The current torvane dispatch address is the blue annex."
-    "The torvane office used to be at the red annex."
-    "The cerulite inventory lists three glass jars."
-    "The serradine lock uses the violet passphrase."
-    "The quenvora shipment contains a paper sextant.")
-  "Transient records for the shipped canaries.")
-
-(defun built-in-canary-outcomes (store canaries generation)
-  "Check the shipped cues against GENERATION without retaining fixture rows."
-  (let ((checks (intersection canaries +built-in-canaries+ :test #'equal)))
-    (when checks
-      (let ((*memory-embedder* nil))
-        (enchiridion.memory.store:with-store-transaction (store)
-          (dolist (body +canary-fixture-bodies+)
-            (enchiridion.memory.store:record-turn store :session "t2-canary"
-                                                 :role "user" :body body))
-          ;; The nonlocal return rolls the transaction back, including FTS and activation
-          (return-from built-in-canary-outcomes
-            (loop for canary in checks
-                  collect (cons (getf canary :name)
-                                (and (canary-behaviour-p store canary generation)
-                                     (or (not (equal "safety" (getf canary :family)))
-                                         (canary-behaviour-p
-                                          store
-                                          '(:family "retrieval" :cue "cerulite inventory"
-                                            :expect "three glass jars")
-                                          generation)))))))))))
-
-(defun canary-predicate (store canaries generation)
-  "Return the CANARY-CHECK predicate that checks each of CANARIES against a
-retrieval reading GENERATION. A canary the table holds but CANARIES does not
-name fails, because a check with nothing to run must not pass."
-  (let ((built-in (built-in-canary-outcomes store canaries generation)))
-    (lambda (name expect)
-      (declare (ignore expect))
-      (let ((result (assoc name built-in :test #'equal))
-            (canary (find name canaries :key (lambda (c) (getf c :name)) :test #'equal)))
-        (if result (cdr result)
-            (and canary (valid-canary-p canary)
-                 (canary-behaviour-p store canary generation)))))))
-
-(defun canary-check (store &key (predicate nil) (now (get-universal-time)))
-  "Run every canary through PREDICATE and return a report plist.
-
-PREDICATE is called with (NAME EXPECT) and must return non-NIL when the
-behaviour still holds.  When PREDICATE is NIL every canary is reported as
-:unchecked rather than as passing -- a canary suite that reports success when
-it has not run is worse than no suite, because it supplies false assurance.
-That is the same failure the measured presence-check result identifies."
-  (let ((rows (enchiridion.memory.store:query-rows
-               store "SELECT id, name, expect FROM canary ORDER BY id"))
-        (passed 0) (failed 0) (unchecked 0) (failures '()))
-    (dolist (row rows)
-      (let* ((name (enchiridion.memory.store:field row "name"))
-             (expect (enchiridion.memory.store:field row "expect"))
-             (id (enchiridion.memory.store:field row "id"))
-             (ok (if predicate
-                     (handler-case (not (null (funcall predicate name expect)))
-                       (error () nil))
-                     :unchecked)))
-        (cond ((eq ok :unchecked) (incf unchecked))
-              (ok (incf passed)
-                  (enchiridion.memory.store:exec
-                   store "UPDATE canary SET last_pass = ?, last_checked = ? WHERE id = ?"
-                   (list now now id)))
-              (t (incf failed) (push name failures)
-                 (enchiridion.memory.store:exec
-                  store "UPDATE canary SET last_checked = ? WHERE id = ?"
-                  (list now id))))))
-    (list :ok-p (and predicate (zerop failed))
-          :passed passed :failed failed :unchecked unchecked
-          :failures (nreverse failures)
-          :total (length rows))))
-
-(defun canary-report (result)
-  "Return a one-line report for RESULT, as SUPERVISOR-TICK expects."
-  (format nil "canary: ~D pass, ~D fail, ~D unchecked of ~D"
-          (getf result :passed) (getf result :failed)
-          (getf result :unchecked) (getf result :total)))
-
-;;;; ------------------------------------------------------------------
 ;;;; 5. The gates
 ;;;; ------------------------------------------------------------------
 
@@ -632,7 +470,7 @@ promote. :MISSING names each absent instrument, so the report says what the
 operator has to supply rather than only that something is wrong."
   (let* ((tasks (utility-tasks store))
          (tail (tail-sample store)))
-    (multiple-value-bind (families covered-p) (canary-coverage canaries)
+    (multiple-value-bind (families covered-p) (canary-coverage (append canaries (approved-canaries)))
       (let ((missing
               (append
                (unless *assertion-deriver* (list :deriver))
@@ -708,17 +546,33 @@ much each episode's semantics may cost, so a wasteful deriver still fails."
          (prin1-to-string report) now))
   pass-p)
 
-(defun canary-step (store generation-id canaries)
+(defun record-shadow-canaries (store generation-id approvals)
+  "Report candidate and live results without affecting promotion."
+  (handler-case
+      (dolist (check (canary-proposals store))
+        (let ((id (getf check :name)))
+          (unless (find id approvals :test #'equal :key (lambda (row) (getf row :name)))
+            (flet ((outcome (target)
+                     (handler-case (if (proposal-check-p store check target) :pass :fail)
+                       (error () :error))))
+              (let ((live (outcome :live))
+                    (candidate (outcome generation-id)))
+                (record-check store generation-id "shadow-canary" (eq candidate :pass)
+                              (list :id id :live live :candidate candidate)))))))
+    (error () nil)))
+
+(defun canary-step (store generation-id canaries &optional (approvals (approved-canaries)))
   "Run the canary check for GENERATION-ID and return two values: whether the
 suite covered its families and every canary held, and a report.  An unchecked
 or uncovered suite fails, because it freezes promotion."
-  (sync-canaries store canaries)
-  (multiple-value-bind (families covered-p) (canary-coverage canaries)
-    (let ((result (canary-check store
-                                :predicate (canary-predicate store canaries generation-id))))
-      (values (and covered-p (getf result :ok-p) (plusp (getf result :total)))
-              (list :families families :passed (getf result :passed)
-                    :failed (getf result :failed) :failures (getf result :failures))))))
+  (let* ((checks (append canaries approvals))
+         (blocking (canary-predicate store checks generation-id)))
+    (sync-canaries store checks)
+    (multiple-value-bind (families covered-p) (canary-coverage checks)
+      (let ((result (canary-check store :predicate blocking :checks checks)))
+        (values (and covered-p (getf result :ok-p) (plusp (getf result :total)))
+                (list :families families :passed (getf result :passed)
+                      :failed (getf result :failed) :failures (getf result :failures)))))))
 
 (defun measure-candidate (store generation-id scorer)
   "Score the utility tasks and the tail sample under both arms for
@@ -760,7 +614,7 @@ one transaction."
       (return-from gate-candidate
         (list :promoted nil :reason :not-a-candidate
               :status (and row (enchiridion.memory.store:field row "status"))))))
-  (let ((tail-hashes nil) (utility-hashes nil))
+  (let ((tail-hashes nil) (utility-hashes nil) (approvals (approved-canaries)))
     (flet ((gate (kind thunk)
              (multiple-value-bind (pass-p report) (funcall thunk)
                (record-check store generation-id kind pass-p report)
@@ -769,7 +623,8 @@ one transaction."
                  (return-from gate-candidate
                    (list :promoted nil :reason :quarantined :failed kind :report report))))))
       (gate "provenance" (lambda () (provenance-gate store generation-id)))
-      (gate "canary" (lambda () (canary-step store generation-id canaries)))
+      (record-shadow-canaries store generation-id approvals)
+      (gate "canary" (lambda () (canary-step store generation-id canaries approvals)))
       (gate "utility" (lambda ()
                         (setf (values tail-hashes utility-hashes)
                               (measure-candidate store generation-id scorer))

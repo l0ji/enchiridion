@@ -24,7 +24,7 @@ DROP-STORE drops these before the tables they read.")
 (defparameter *episodic-tables*
   '("generation_checks" "generation_derivations" "conflict_resolutions"
     "conflicts" "assertions_fts" "assertions" "change_events" "summaries" "procedures"
-    "schemas" "episodes_fts" "episode_vectors" "episodes" "cue_index" "activation" "links"
+    "schemas" "canary_proposals" "episodes_fts" "episode_vectors" "episodes" "cue_index" "activation" "links"
     "retrievals" "calibration" "canary" "gate_log" "change_proposals"
     "projections" "t2_preflight_retry" "memory_state" "generations")
   "What DROP-STORE removes, child table before parent table.
@@ -233,6 +233,14 @@ references.")
       config_hash         TEXT NOT NULL DEFAULT '',
       precision_reset_generation  INTEGER,
       last_t2_episode     INTEGER)"
+
+   "CREATE TABLE IF NOT EXISTS canary_proposals (
+       id      TEXT PRIMARY KEY,
+       family  TEXT NOT NULL,
+       cue     TEXT NOT NULL,
+       expect  TEXT NOT NULL,
+       stale   TEXT,
+       episode INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE)"
 
    "CREATE TABLE IF NOT EXISTS t2_preflight_retry (
        id        INTEGER PRIMARY KEY CHECK (id = 1),

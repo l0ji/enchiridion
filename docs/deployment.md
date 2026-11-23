@@ -183,6 +183,17 @@ two failed attempts, compaction waits for another eligible turn.
 Set either cap to `nil` to disable it. An in-flight request can overshoot a cap.
 The caps do not stop chat or limit provider charges.
 
+### Canary approvals in Compose
+
+Run operator commands as root in the container, with the same config path as
+`serve`. The `enchiridion-canary-approvals` volume keeps approvals across container
+replacement and is separate from the agent's memory volume.
+
+```sh
+docker compose exec -e ENCHIRIDION_CONFIG=/etc/enchiridion/config.lsp enchiridion \
+  enchiridion memory canaries
+```
+
 ## Container requirements
 
 | Requirement | Why | If missing |

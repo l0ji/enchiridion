@@ -310,6 +310,8 @@ did not think of."))
    #:learned-state-block #:fire-intentions #:assemble-pack
    #:register-canary #:canary-check #:canary-report #:+canary-families+
    #:valid-canary-p #:canary-coverage #:sync-canaries #:canary-behaviour-p
+   #:propose-canary #:canary-proposals #:approved-canaries
+   #:approve-canary #:discard-canary #:revoke-canary
    #:canary-predicate #:utility-tasks #:answer-hit-p #:answer-scorer
    #:rare-episode-ids #:tail-tasks #:t2-preflight
    #:sign-test-p #:paired-outcomes #:tail-gate #:provenance-gate #:cost-gate

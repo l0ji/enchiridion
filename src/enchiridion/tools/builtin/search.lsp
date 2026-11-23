@@ -159,14 +159,15 @@ file as the agent's memory."
              (progn
                (unless (string= scope "memories")
                  (dolist (row (enchiridion.memory.store:search-sessions store query :limit limit))
-                 (push (hit-line (format nil "session ~A ~A"
-                                         (enchiridion.memory.store:turn-row-session row)
+                 (push (hit-line (format nil "[ref episode-~D] session ~A ~A"
+                                          (enchiridion.memory.store:turn-row-id row)
+                                          (enchiridion.memory.store:turn-row-session row)
                                          (enchiridion.memory.store:turn-row-role row))
                                  (enchiridion.memory.store:turn-row-body row))
                          results)))
                (unless (string= scope "sessions")
                  (dolist (row (enchiridion.memory.store:search-memories store query :limit limit))
-                 (push (hit-line (format nil "memory ~A" (getf row :name))
+                 (push (hit-line (format nil "[ref episode-~D] memory ~A" (getf row :id) (getf row :name))
                                  (getf row :body))
                          results))))
           (enchiridion.memory.store:close-store store))))

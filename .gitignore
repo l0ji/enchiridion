@@ -21,6 +21,7 @@ research/
 # Operator configuration. config.example.lsp is tracked and is the template.
 # config.lsp holds local paths, allowed user ids, and model choices.
 /config.lsp
+/canary-approvals/
 
 # The agent directory is its own git repository. It holds the agent's files,
 # its nested history, and its runtime state, so the project repository tracks

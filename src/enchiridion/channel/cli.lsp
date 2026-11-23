@@ -780,6 +780,45 @@ file a block is backed by."
   "Show or point at WORLD.md, the agent's environment."
   (show-or-edit arguments "world" "WORLD.md"))
 
+(defun print-canary-proposal (check state)
+  (say "~A ~A ~A, episode ~D: cue ~S; expect ~S~@[; stale ~S~]"
+       state (getf check :name) (getf check :family) (getf check :episode)
+       (getf check :cue) (getf check :expect) (getf check :stale)))
+
+(defun cmd-canaries (store arguments)
+  "List or manage the operator's canary checks."
+  (destructuring-bind (&optional action id &rest extra) arguments
+    (cond
+      ((null action)
+       (let* ((configured enchiridion.memory:*memory-canaries*)
+              (approved (enchiridion.memory:approved-canaries))
+              (shadows (enchiridion.memory:canary-proposals store)))
+         (dolist (check configured)
+           (say "configured ~A ~A: ~S" (getf check :family) (getf check :name) (getf check :cue)))
+         (dolist (check approved) (print-canary-proposal check "approved"))
+         (dolist (check shadows)
+           (unless (member check approved :test #'equal)
+             (print-canary-proposal check "shadow")))
+         (multiple-value-bind (families covered-p)
+             (enchiridion.memory:canary-coverage (append configured approved))
+           (say "~D famil~:@P covered (~{~A~^, ~}), ~D needed: ~:[not enough for a T2 pass~;enough~]."
+                (length families) families enchiridion.memory:*canary-min-families* covered-p))
+         0))
+      ((or (null id) extra (not (member action '("approve" "discard" "revoke") :test #'equal)))
+       (say "Use `memory canaries` or `memory canaries {approve|discard|revoke} ID`.")
+       2)
+      ((equal action "approve")
+       (say "Approved canary ~A." (enchiridion.memory:approve-canary store id))
+       0)
+      ((equal action "discard")
+       (enchiridion.memory:discard-canary store id)
+       (say "Removed shadow proposal ~A if present." id)
+       0)
+      (t
+       (if (enchiridion.memory:revoke-canary id)
+           (progn (say "Revoked canary ~A." id) 0)
+           (progn (say "No approved canary ~A." id) 1))))))
+
 (declaim (ftype (function (list) integer) cmd-memory))
 
 (defun cmd-memory (arguments)
@@ -859,17 +898,7 @@ Anything else is a search query, so the common call keeps working."
                         (progn (say "generation ~D not rolled back: ~(~A~)." id (getf report :reason))
                                1)))))))
             ((string= action "canaries")
-             (let ((canaries enchiridion.memory:*memory-canaries*))
-               (multiple-value-bind (families covered-p)
-                   (enchiridion.memory:canary-coverage canaries)
-                 (dolist (canary canaries)
-                   (say "~:[invalid~;~:*~A~] ~A: ~S"
-                        (and (enchiridion.memory:valid-canary-p canary)
-                             (string-downcase (getf canary :family)))
-                        (or (getf canary :name) "unnamed") (getf canary :cue)))
-                 (say "~D famil~:@P covered (~{~A~^, ~}), ~D needed: ~:[not enough for a T2 pass~;enough~]."
-                      (length families) families enchiridion.memory:*canary-min-families* covered-p))
-               0))
+             (cmd-canaries store (rest arguments)))
             ((string= action "import")
              (let ((path (second arguments)))
                (cond

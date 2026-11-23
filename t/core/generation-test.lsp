@@ -675,6 +675,57 @@ for five tasks."
                                 :generation-id)))
          ,@body))))
 
+(deftest a-failing-shadow-is-reported-without-blocking-promotion ()
+  (with-gate-world (store directory generation)
+    (let* ((episode (say store "user" "apricot evidence"))
+           (id (enchiridion.memory:propose-canary
+                store "retrieval" "quassia" "apricot" episode)))
+      (ok (equal id (enchiridion.memory:propose-canary
+                     store "retrieval" "quassia" "apricot" episode)))
+      (ok (= 1 (length (enchiridion.memory:canary-proposals store))))
+      (ok (getf (enchiridion.memory:gate-candidate
+                 store generation :canaries (passing-canaries) :scorer #'assertion-scorer)
+                :promoted))
+      (let ((row (first (enchiridion.memory.store:query-rows
+                         store "SELECT result, detail FROM generation_checks WHERE kind = 'shadow-canary'"))))
+        (ok (equal "fail" (enchiridion.memory.store:field row "result")))
+        (ok (search id (enchiridion.memory.store:field row "detail")))))))
+
+(deftest the-operator-approves-a-snapshot-and-can-revoke-it ()
+  (with-store (store directory)
+    (let* ((enchiridion.memory::*canary-approval-directory*
+             (merge-pathnames "canary-approvals/" directory))
+           (episode (say store "user" "The apricot larder contains six jars."))
+           (id (enchiridion.memory:propose-canary
+                store "retrieval" "apricot larder" "six jars" episode)))
+      (ok (rove:signals (enchiridion.memory:propose-canary
+                         store "retrieval" "apricot larder" "nine jars" episode)
+                        'enchiridion.errors:schema-error))
+      (ok (null (enchiridion.memory:approved-canaries)))
+      (ng (getf (enchiridion.memory:t2-preflight store :canaries nil) :families))
+      (let ((unsafe (enchiridion.memory:propose-canary
+                     store "safety" "quassia" "six jars" episode)))
+        (ok (rove:signals (enchiridion.memory:approve-canary store unsafe)
+                         'enchiridion.errors:schema-error))
+        (enchiridion.memory:discard-canary store unsafe))
+      (ok (equal id (enchiridion.memory:approve-canary store id)))
+      (ok (equal '("retrieval")
+                 (getf (enchiridion.memory:t2-preflight store :canaries nil) :families)))
+      (enchiridion.memory.store:exec store "UPDATE canary_proposals SET expect = 'edited'")
+      (ok (null (enchiridion.memory:canary-proposals store)))
+      (let ((checks (enchiridion.memory:approved-canaries)))
+        (ok (equal "six jars" (getf (first checks) :expect)))
+        (ok (= 1 (getf (enchiridion.memory:canary-check
+                        store :checks checks :predicate (constantly nil)) :failed))))
+      (enchiridion.memory.store:exec store "DELETE FROM episodes WHERE id = ?" (list episode))
+      (ok (= 0 (count-rows store "SELECT COUNT(*) AS n FROM canary_proposals")))
+      (multiple-value-bind (pass report)
+          (enchiridion.memory::canary-step store 0 (passing-canaries))
+        (ng pass)
+        (ok (member id (getf report :failures) :test #'equal)))
+      (ok (enchiridion.memory:revoke-canary id))
+      (ok (null (enchiridion.memory:approved-canaries))))))
+
 (deftest an-unsourced-assertion-is-quarantined-at-provenance ()
   (with-gate-world (store directory generation)
     (enchiridion.memory.store:exec

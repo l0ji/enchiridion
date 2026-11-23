@@ -92,6 +92,7 @@
          (:file "cue")
          (:file "episodic-hooks")
          (:file "generations")
+         (:file "canaries")
          (:file "gates")
          (:file "derive")
          (:file "seed")

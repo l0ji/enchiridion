@@ -25,6 +25,7 @@ services:
       - /run/secrets:mode=0700
     volumes:
       - enchiridion-state:/var/lib/enchiridion
+      - enchiridion-canary-approvals:/etc/enchiridion/canary-approvals
       - ./config.lsp:/opt/enchiridion/config.lsp:ro
     stop_grace_period: 30s
     logging:
@@ -39,3 +40,4 @@ services:
 
 volumes:
   enchiridion-state:
+  enchiridion-canary-approvals:

@@ -1,4 +1,4 @@
-;;;; memory.lsp --- Save one named memory.
+;;;; memory.lsp --- Named memories and shadow canary proposals.
 ;;;;
 ;;;; The store has held memories since the first session, and the model had no
 ;;;; way to write one. This tool is the turn-surface half of SAVE-MEMORY: the
@@ -31,8 +31,26 @@
              (format nil "saved memory ~A as ~D" name id))
         (enchiridion.memory.store:close-store store)))))
 
+(defun canary-run (args)
+  "Propose a shadow canary from a stored episode."
+  (let ((store (enchiridion.memory.store:open-store :path (memory-store-path))))
+    (unwind-protect
+         (format nil "Proposed shadow canary ~A. Only the operator can make it blocking."
+                 (enchiridion.memory:propose-canary
+                  store (argument args "family") (argument args "cue")
+                  (argument args "expect") (argument args "episode")
+                  :stale (argument args "stale")))
+      (enchiridion.memory.store:close-store store))))
+
 (defparameter +memory-tools+
   (list
+   (enchiridion.tools:make-tool
+    :name "canary"
+    :description "Propose a nonblocking memory retrieval check. Cite a stored episode containing expect verbatim. Families: retrieval, update, safety, tail. For safety, expect is the text that must stay out. Only update takes stale."
+    :schema '(:object :required (:family :cue :expect :episode)
+              :properties ((:family :string) (:cue :string) (:expect :string)
+                           (:episode :integer) (:stale :string)))
+    :handler #'canary-run)
    (enchiridion.tools:make-tool
     :name "memory"
     :description "Save a named memory with the text the model wants to keep."
@@ -41,7 +59,7 @@
     :handler #'memory-run)))
 
 (defun register-memory-tools ()
-  "Register the memory tool. Idempotent."
+  "Register the memory tools. Idempotent."
   (dolist (tool +memory-tools+)
     (enchiridion.tools:register-tool tool))
   (length +memory-tools+))

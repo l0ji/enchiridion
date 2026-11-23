@@ -450,6 +450,32 @@ claims that stand alone and those shown under their episode, in pack order."
       (ng (enchiridion.memory:canary-behaviour-p
            store (canary "update" :expect "keychain" :stale "vault") nil)))))
 
+(deftest shipped-canary-setting-rejects-a-misspelled-mode ()
+  (ok (equal enchiridion.memory::+built-in-canaries+
+             (enchiridion.memory::configured-canaries :built-in)))
+  (ok (rove:signals (enchiridion.memory::configured-canaries :builtin)
+               'enchiridion.errors:configuration-error)))
+
+(deftest shipped-canaries-run-without-polluting-the-log ()
+  (with-store (store directory)
+    (let* ((canaries enchiridion.memory::+built-in-canaries+)
+           (embeddings 0)
+           (enchiridion.memory:*memory-embedder*
+             (lambda (texts) (declare (ignore texts)) (incf embeddings) nil)))
+      (ok (nth-value 1 (enchiridion.memory:canary-coverage canaries)))
+      (multiple-value-bind (pass report) (enchiridion.memory::canary-step store 0 canaries)
+        (ok pass)
+        (ok (= 4 (getf report :passed))))
+      (ok (zerop (count-rows store "SELECT COUNT(*) AS n FROM episodes")))
+      (let ((enchiridion.memory:*memory-embedder* nil))
+        (ng (enchiridion.memory:retrieve-rows-for-turn store "quenvora" :generation nil)))
+      (say store "user" "The cerulite inventory includes the violet passphrase.")
+      (multiple-value-bind (pass report) (enchiridion.memory::canary-step store 0 canaries)
+        (ng pass)
+        (ok (member "builtin-safety" (getf report :failures) :test #'equal)))
+      (ok (= 1 (count-rows store "SELECT COUNT(*) AS n FROM episodes")))
+      (ok (zerop embeddings)))))
+
 (deftest the-canary-table-follows-the-configuration ()
   (with-store (store directory)
     (enchiridion.memory:register-canary store "gone" "anything")
@@ -479,6 +505,39 @@ claims that stand alone and those shown under their episode, in pack order."
         (ok (search (princ-to-string q1) (getf (second tasks) :name)))
         (ok (search (princ-to-string q2) (getf (first tasks) :name)))))))
 
+(deftest utility-tasks-prefer-the-final-marker-over-a-preamble ()
+  (with-store (store directory)
+    (flet ((turn (role body &key final-p (session "s"))
+             (enchiridion.memory.store:turn-row-id
+              (enchiridion.memory.store:record-turn
+               store :session session :role role :body body :final-p final-p))))
+      (let* ((question (turn "user" "a tool question"))
+             (preamble (turn "assistant" "let me look" :final-p 0))
+             (tool (turn "tool" "tool output"))
+             (answer (turn "assistant" "the tool answer" :final-p t))
+             (interrupted-question (turn "user" "an interrupted question"))
+             (interrupted-preamble (turn "assistant" "still looking" :final-p 0))
+             (interrupted-tool (turn "tool" "interrupted output"))
+             (import-question (turn "user" "an imported question" :session "i"))
+             (import-preamble (turn "assistant" "import preamble" :session "i"))
+             (import-tool (turn "tool" "import tool" :session "i"))
+             (import-answer (turn "assistant" "import answer" :session "i"))
+             (tasks (enchiridion.memory:utility-tasks store)))
+        (declare (ignore question preamble tool interrupted-question
+                         interrupted-preamble interrupted-tool
+                         import-question import-preamble import-tool))
+        (flet ((answer-for (cue)
+                 (getf (find cue tasks :key (lambda (task) (getf task :cue))
+                             :test #'string=)
+                       :expect-episode)))
+          (testing "a marked final answer beats the round that asked for the tool"
+            (ok (= answer (answer-for "a tool question"))))
+          (testing "a live turn left on a tool result has no answer"
+            (ok (null (answer-for "an interrupted question"))))
+          (testing "an unmarked imported turn uses the last answer after its tools"
+            (ok (= import-answer (answer-for "an imported question")))))
+        (ok (= 2 (length tasks)))))))
+
 (deftest an-answer-counts-as-recalled-through-its-assertion ()
   (let ((task (list :expect-episode 7)))
     (ok (= 1.0 (enchiridion.memory:answer-scorer
@@ -491,7 +550,7 @@ claims that stand alone and those shown under their episode, in pack order."
 
 (deftest the-tail-sample-is-the-questions-with-rare-answers ()
   (with-store (store directory)
-    (let ((enchiridion.memory:*tail-rarity-fraction* 0.25)
+    (let ((enchiridion.memory:*tail-rarity-fraction* 0.5)
           (answers '()))
       (dotimes (i 4)
         (say store "user" (format nil "question ~D" i))
@@ -507,6 +566,30 @@ claims that stand alone and those shown under their episode, in pack order."
         (ok (= 2 (length tail)))
         (ok (subsetp (mapcar (lambda (task) (getf task :expect-episode)) tail)
                      (list (first answers) (second answers))))))))
+
+(deftest the-tail-sample-has-a-floor-and-a-cap-and-ignores-non-answers ()
+  (with-store (store directory)
+    (dotimes (i 6)
+      (say store "user" (format nil "question ~D" i))
+      (say store "assistant" (format nil "answer ~D" i)))
+    ;; The rarest tool result is not an answer and cannot take a tail place.
+    (let ((tool (say store "tool" "the rarest tool result")))
+      (enchiridion.memory.store:exec
+       store "UPDATE episodes SET derived_ts = 1, rarity_raw = 0.1")
+      (enchiridion.memory.store:exec
+       store "UPDATE episodes SET rarity_raw = 0.9 WHERE id = ?" (list tool))
+      (let ((enchiridion.memory:*tail-rarity-fraction* 0.1)
+            (enchiridion.memory:*tail-min-n* 3)
+            (enchiridion.memory::+tail-max-tasks+ 4))
+        (let ((tail (enchiridion.memory::tail-sample store)))
+          (testing "the floor is three even though a tenth of six is one"
+            (ok (= 3 (length tail))))
+          (testing "a rare tool result takes no place"
+            (ok (not (find tool (mapcar (lambda (task) (getf task :expect-episode))
+                                        tail))))))
+        (let ((enchiridion.memory::+tail-max-tasks+ 2))
+          (testing "the cap bounds the sample"
+            (ok (= 2 (length (enchiridion.memory::tail-sample store))))))))))
 
 (deftest a-pass-without-its-instruments-is-told-what-is-missing ()
   (with-store (store directory)
@@ -1002,16 +1085,26 @@ shipped schedule."
         unless (eq :building (getf report :outcome))
           return report))
 
+(deftest a-ready-store-can-promote-with-shipped-canaries ()
+  (with-t2-world (store directory)
+    (let* ((enchiridion.memory:*memory-canaries* enchiridion.memory::+built-in-canaries+)
+           (report (finish-t2-pass store :canaries enchiridion.memory:*memory-canaries*)))
+      (ok (eq :promoted (getf report :outcome)))
+      (ok (plusp (enchiridion.memory:live-generation-id store)))
+      (ok (plusp (count-rows store "SELECT COUNT(*) AS n FROM gate_log")))
+      (ok (= 10 (count-rows store "SELECT COUNT(*) AS n FROM episodes"))))))
+
 (deftest a-pass-missing-an-instrument-builds-nothing-and-spends-nothing ()
   (with-t2-world (store directory)
-    (let ((report (enchiridion.memory:run-t2-pass store :canaries '())))
+    (let ((report (enchiridion.memory:run-t2-pass store :canaries nil :now 1000)))
       (ok (eq :instrument-missing (getf report :outcome)))
       (ok (member :canary-coverage (getf report :missing)))
       (ok (zerop (generation-count store)))
       (ok (zerop (enchiridion.memory:t2-pass-spend store)))
-      (testing "and it counts as a pass, so the next one waits for the interval"
-        (ok (enchiridion.memory:last-t2-ts store))
-        (ng (enchiridion.memory:t2-due-p store))))))
+      (ng (enchiridion.memory:last-t2-ts store))
+      (ng (enchiridion.memory:t2-due-p store :canaries nil :now 1001))
+      (ok (enchiridion.memory:t2-due-p store :canaries (passing-canaries) :now 1001))
+      (ok (enchiridion.memory:t2-due-p store :canaries nil :now 1300)))))
 
 (deftest a-pass-is-due-daily-or-after-enough-new-episodes ()
   (with-store (store directory)
@@ -1033,20 +1126,18 @@ shipped schedule."
         (ng (enchiridion.memory:t2-due-p store :now (+ 1000 86400)))
         (ok (enchiridion.memory:t2-due-p store :now (+ 1000 604800)))))))
 
-(deftest a-pass-that-builds-nothing-does-not-leave-the-threshold-crossed ()
-  ;; Found driving the heartbeat over a real log: with more episodes than the
-  ;; threshold and an instrument missing, every tick ran the preflight.
+(deftest a-missing-instrument-does-not-reset-the-episode-threshold ()
   (with-t2-world (store directory)
     (let ((enchiridion.memory:*t2-episode-threshold* 3))
       (ok (= 10 (enchiridion.memory:new-episode-count store)))
       (ok (eq :instrument-missing
-              (getf (enchiridion.memory:run-t2-pass store :canaries '()) :outcome)))
-      (ok (zerop (enchiridion.memory:new-episode-count store)))
-      (ng (enchiridion.memory:t2-due-p store))
+              (getf (enchiridion.memory:run-t2-pass store :canaries nil :now 1000)
+                    :outcome)))
+      (ok (= 10 (enchiridion.memory:new-episode-count store)))
       (dotimes (i 3) (write-body store (format nil "note ~D" i)))
-      (testing "and new episodes after it count again"
-        (ok (= 3 (enchiridion.memory:new-episode-count store)))
-        (ok (enchiridion.memory:t2-due-p store))))))
+      (ok (= 13 (enchiridion.memory:new-episode-count store)))
+      (ng (enchiridion.memory:t2-due-p store :canaries nil :now 1001))
+      (ok (enchiridion.memory:t2-due-p store :canaries nil :now 1300)))))
 
 (deftest a-pass-resumes-across-ticks-and-gates-what-it-built ()
   (with-t2-world (store directory)
@@ -1361,6 +1452,26 @@ shipped schedule."
           (ok (zerop (getf again :turns)))
           (ok (= 2 (getf again :skipped-sessions))))))))
 
+(deftest an-imported-tool-turn-pairs-its-final-answer ()
+  (with-store (store directory)
+    (let ((path (merge-pathnames "tools.jsonl" directory)))
+      (ensure-directories-exist path)
+      (with-open-file (out path :direction :output :if-exists :supersede)
+        (write-line "{\"session\":\"a\",\"role\":\"user\",\"body\":\"which port\"}" out)
+        (write-line "{\"session\":\"a\",\"role\":\"assistant\",\"body\":\"let me check\"}" out)
+        (write-line "{\"session\":\"a\",\"role\":\"tool\",\"body\":\"9090\"}" out)
+        (write-line "{\"session\":\"a\",\"role\":\"assistant\",\"body\":\"port 9090\"}" out))
+      (enchiridion.memory:import-log store path)
+      (let ((tasks (enchiridion.memory:utility-tasks store)))
+        (ok (= 1 (length tasks)))
+        (ok (string= "which port" (getf (first tasks) :cue)))
+        (ok (string= "port 9090"
+                     (enchiridion.memory.store:field
+                      (first (enchiridion.memory.store:query-rows
+                              store "SELECT body FROM episodes WHERE id = ?"
+                              (list (getf (first tasks) :expect-episode))))
+                      "body")))))))
+
 (deftest t2-waits-for-maintenance-without-ending-its-pass ()
   ;; After a large import the first tick derives rarity for one batch, and a
   ;; preflight then would end the pass for a day for want of a tail sample.
@@ -1386,8 +1497,9 @@ shipped schedule."
       (enchiridion.memory.store:exec
        store "UPDATE episodes SET rarity_raw = 0.9
                WHERE id IN (SELECT id FROM episodes WHERE role = 'assistant' ORDER BY id LIMIT 2)")
-      (ok (zerop (length (enchiridion.memory:tail-tasks
-                          store (enchiridion.memory:utility-tasks store)))))
+      (ok (= 1 (length (enchiridion.memory:tail-tasks
+                        store (enchiridion.memory:utility-tasks store))))
+          "the newest pair set can only rank the two answers it holds")
       (ok (= 2 (length (enchiridion.memory::tail-sample store))))
       (ok (= 2 (getf (enchiridion.memory:t2-preflight store) :tail-tasks))))))
 

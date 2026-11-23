@@ -170,17 +170,18 @@ A tick runs memory maintenance and at most one queued task. Pending tasks
 survive restart. An interrupted task is marked failed and is not retried.
 Only the first 4000 characters of a task are sent to the sleep model.
 
-The cheap model compacts the session after four eligible turns. An unusable
-summary leaves the session unchanged. After two failed attempts, compaction
-waits for another eligible turn.
+After four eligible turns, the cheap model compacts the session before other
+model work in the tick. An inherited summary with no recorded compaction is
+rebuilt from raw turns. An unusable summary leaves the session unchanged. After
+two failed attempts, compaction waits for another eligible turn.
 
 | Setting under `:budget` | Default | Applies to |
 | --- | --- | --- |
-| `:max-tokens-per-tick` | 40000 | Sleep and embedding calls in one tick |
-| `:max-tokens-per-day` | 4000000 | Sleep and embedding calls over 24 hours |
+| `:max-tokens-per-tick` | 400000 | Sleep and embedding calls in one tick |
+| `:max-tokens-per-day` | 40000000 | All recorded usage over 24 hours, checked before background work |
 
-Set either cap to `nil` to disable it. A call in progress can exceed a cap.
-These limits do not cover chat or provider charges.
+Set either cap to `nil` to disable it. An in-flight request can overshoot a cap.
+The caps do not stop chat or limit provider charges.
 
 ## Container requirements
 

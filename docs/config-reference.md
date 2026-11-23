@@ -106,8 +106,8 @@ channel regardless. `--channel` selects a channel for one run; HTTP flags
 | --- | --- | --- | --- |
 | `:sleep` | `:enabled` | `t` | Schedule background work during `serve` |
 | `:sleep` | `:interval-seconds` | `900` | Time between ticks |
-| `:budget` | `:max-tokens-per-tick` | `40000` | Background token cap per tick |
-| `:budget` | `:max-tokens-per-day` | `4000000` | Rolling 24-hour token cap checked by background work |
+| `:budget` | `:max-tokens-per-tick` | `400000` | Background token cap per tick |
+| `:budget` | `:max-tokens-per-day` | `40000000` | Rolling 24-hour token cap checked by background work |
 | `:sandbox` | `:agent-uid` | `1000` | Agent process user id when started as root |
 | `:sandbox` | `:agent-gid` | `1000` | Agent process group id when started as root |
 
@@ -165,8 +165,8 @@ Default block limits are `(:persona 6000 :operator 1600 :world 3000 :adapt 1200
 ### T2 promotion
 
 T2 derives shorter claims from episodes and tests them before promotion.
-It needs evaluation inputs, including operator-written canaries; enabling it
-alone does not make it run. See [Episodic memory](episodic-memory.md).
+It ships with smoke checks and needs enough eligible task pairs to start.
+See [Episodic memory](episodic-memory.md).
 
 | Key | Default | Use |
 | --- | --- | --- |
@@ -175,21 +175,21 @@ alone does not make it run. See [Episodic memory](episodic-memory.md).
 | `:t2-frozen-interval-seconds` | `604800` | Interval when quarantine rate is too high |
 | `:t2-episode-threshold` | `200` | New episodes that make a pass due early |
 | `:t2-max-episodes-per-tick` | `5` | Episodes derived per tick |
-| `:t2-max-tokens-per-pass` | `200000` | Promotion token cap over a rolling 24 hours |
+| `:t2-max-tokens-per-pass` | `2000000` | Promotion token cap over a rolling 24 hours |
 | `:t2-deriver-max-tokens` | `16384` | Reply cap for one derivation request |
 | `:t2-deriver-model` | `nil` | Derivation model; unset uses the cheap model |
 | `:t2-deriver-concurrency` | `4` | Concurrent derivation requests |
-| `:t2-max-tokens-per-episode` | `3000` | Token cap per episode derived since the last promotion |
+| `:t2-max-tokens-per-episode` | `16000` | Token cap per episode derived since the last promotion |
 | `:t2-writes-per-episode` | `8` | Claim cap per derived episode |
-| `:canaries` | `nil` | Checks with `:name`, `:family`, `:cue`, `:expect` and optional `:stale` |
+| `:canaries` | `:built-in` | Shipped checks, or a list with `:name`, `:family`, `:cue`, `:expect` and `:stale` for updates |
 | `:canary-min-families` | `4` | Required canary families |
 | `:gate-margin` | `0.05` | Minimum mean utility gain |
 | `:gate-min-n` | `100` | Minimum non-tied utility pairs |
 | `:gate-alpha` | `0.05` | Utility significance threshold |
 | `:gate-pack-chars` | `1100` | Context character cap for both utility comparisons |
 | `:utility-max-tasks` | `400` | Maximum utility question-and-answer pairs |
-| `:tail-rarity-fraction` | `0.10` | Fraction of episodes treated as rare |
-| `:tail-min-n` | `50` | Minimum rare-answer questions |
+| `:tail-rarity-fraction` | `0.10` | Fraction of eligible answers sampled, rarest first |
+| `:tail-min-n` | `50` | Minimum tail sample size; the sample is capped at 400 |
 | `:tail-margin` | `0.02` | Allowed drop in rare-answer recall |
 | `:precision-min` | `0.8` | Minimum passing fraction of checked promotions |
 | `:precision-window` | `20` | Recent promotions used for the precision check |

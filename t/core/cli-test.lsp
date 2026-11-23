@@ -734,6 +734,12 @@ here the way the operator would see it."
       (ok (eql 1 status))
       (ok (search "no supervisor is running" text)))))
 
+(deftest heartbeat-time-prints-utc-or-never ()
+  (ok (equal "2026-11-20T04:57:36Z"
+             (enchiridion.channel.cli::heartbeat-time-line 4004139456)))
+  (ok (equal "never" (enchiridion.channel.cli::heartbeat-time-line 0)))
+  (ok (equal "never" (enchiridion.channel.cli::heartbeat-time-line nil))))
+
 (deftest health-prints-the-states-a-reader-could-not-see ()
   ;; A channel configured and off, a status write failing, a schedule with no
   ;; thread: none of the three was visible in `health`.
@@ -756,13 +762,16 @@ here the way the operator would see it."
              ;; The table is edited rather than provoked: this test is the
              ;; printer's, and the supervisor tests write the two states.
              (setf (gethash "enabled" beat) t
-                   (gethash "alive" beat) nil)
+                   (gethash "alive" beat) nil
+                   (gethash "ticks" beat) 0
+                   (gethash "last-tick" beat) 4004139456)
              (setf (gethash "ok" writes) nil
                    (gethash "report" writes) "the disk is full"
                    (gethash "age" writes) 3)
              (with-empty-context
                (let ((text (with-output-to-string (*standard-output*)
                              (enchiridion.channel.cli::report-health status))))
+                 (ok (search "last tick: never" text))
                  (ok (search "no live thread" text))
                  (ok (search "status writes failing: the disk is full" text))
                  (ok (search "channel http disabled" text))))))

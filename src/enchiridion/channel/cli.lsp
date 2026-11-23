@@ -1343,6 +1343,15 @@ of the entry script and a test can supply its own check.")
       (progn (say "This surface has no health check; run `enchiridion doctor` in a shell.")
              1)))
 
+(defun heartbeat-time-line (timestamp)
+  "Return the last heartbeat time in UTC, or never."
+  (if (and (integerp timestamp) (plusp timestamp))
+      (multiple-value-bind (second minute hour day month year)
+          (decode-universal-time timestamp 0)
+        (format nil "~4,'0D-~2,'0D-~2,'0DT~2,'0D:~2,'0D:~2,'0DZ"
+                year month day hour minute second))
+      "never"))
+
 (declaim (ftype (function (t) null) report-health))
 
 (defun report-health (status)
@@ -1362,12 +1371,13 @@ process."
            (or (gethash "age" writes) 0))))
   (let ((beat (enchiridion.supervisor:status-heartbeat status)))
     (when (hash-table-p beat)
-      (say "heartbeat ~:[off~;on~], ~D tick~:P, last at ~A~@[: ~A~]"
-           (gethash "enabled" beat)
-           (or (gethash "ticks" beat) 0)
-           (or (gethash "last-tick" beat) 0)
-           (let ((line (gethash "report" beat)))
-             (if (and (stringp line) (plusp (length line))) line nil)))
+      (let ((ticks (or (gethash "ticks" beat) 0)))
+        (say "heartbeat ~:[off~;on~], ~D tick~:P, last tick: ~A~@[; ~A~]"
+             (gethash "enabled" beat)
+             ticks
+             (heartbeat-time-line (and (plusp ticks) (gethash "last-tick" beat)))
+             (let ((line (gethash "report" beat)))
+               (if (and (stringp line) (plusp (length line))) line nil))))
       ;; A schedule with no thread runs nothing and still looks configured.
       (when (and (gethash "enabled" beat) (not (gethash "alive" beat)))
         (say "  the schedule has no live thread, so nothing will tick."))

@@ -26,7 +26,7 @@ DROP-STORE drops these before the tables they read.")
     "conflicts" "assertions_fts" "assertions" "change_events" "summaries" "procedures"
     "schemas" "episodes_fts" "episode_vectors" "episodes" "cue_index" "activation" "links"
     "retrievals" "calibration" "canary" "gate_log" "change_proposals"
-    "projections" "memory_state" "generations")
+    "projections" "t2_preflight_retry" "memory_state" "generations")
   "What DROP-STORE removes, child table before parent table.
 
 The order matters because foreign keys are on. A virtual table is dropped
@@ -36,6 +36,9 @@ references.")
 (defparameter +episodic-schema+
   (list
    ;; ---- 1. The immutable episodic log -------------------------------
+   ;; FINAL_P marks the assistant episode a turn returned: 1 final, 0 for a
+   ;; round that asked for tools, NULL for a legacy or imported row whose final
+   ;; answer the utility pairing rule must infer from the turn's boundaries.
    "CREATE TABLE IF NOT EXISTS episodes (
       id            INTEGER PRIMARY KEY AUTOINCREMENT,
       session       TEXT    NOT NULL,
@@ -60,7 +63,8 @@ references.")
       source_turn_id INTEGER,
       source_memory_id INTEGER,
       derived_ts    INTEGER,
-      run_id        INTEGER)"
+      run_id        INTEGER,
+      final_p       INTEGER)"
    "CREATE INDEX IF NOT EXISTS episodes_session ON episodes(session, id)"
    "CREATE INDEX IF NOT EXISTS episodes_ts ON episodes(ts)"
    "CREATE INDEX IF NOT EXISTS episodes_context ON episodes(context_key)"
@@ -229,6 +233,11 @@ references.")
       config_hash         TEXT NOT NULL DEFAULT '',
       precision_reset_generation  INTEGER,
       last_t2_episode     INTEGER)"
+
+   "CREATE TABLE IF NOT EXISTS t2_preflight_retry (
+       id        INTEGER PRIMARY KEY CHECK (id = 1),
+       ts        INTEGER NOT NULL,
+       signature TEXT NOT NULL)"
 
    "CREATE TABLE IF NOT EXISTS generation_checks (
       id            INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -46,8 +46,7 @@ cover *CANARY-MIN-FAMILIES* of them."
 
 (defun sync-canaries (store canaries)
   "Make the canary table hold exactly the valid CANARIES and return how many.
-config.lsp is the canaries' only source, so a canary the operator removed is
-removed here too rather than lingering as one that never runs."
+A canary removed from the configuration is removed here too."
   (let ((valid (remove-if-not #'valid-canary-p canaries)))
     (enchiridion.memory.store:with-store-transaction (store)
       (dolist (canary valid)
@@ -83,15 +82,48 @@ that no record holding the forbidden text reaches the pack."
              (and new (or (null old) (< new old)))))
           (t (error "~A is not a canary family." family)))))))
 
+(defparameter +canary-fixture-bodies+
+  '("The velarium map is in the copper cabinet."
+    "The current torvane dispatch address is the blue annex."
+    "The torvane office used to be at the red annex."
+    "The cerulite inventory lists three glass jars."
+    "The serradine lock uses the violet passphrase."
+    "The quenvora shipment contains a paper sextant.")
+  "Transient records for the shipped canaries.")
+
+(defun built-in-canary-outcomes (store canaries generation)
+  "Check the shipped cues against GENERATION without retaining fixture rows."
+  (let ((checks (intersection canaries +built-in-canaries+ :test #'equal)))
+    (when checks
+      (let ((*memory-embedder* nil))
+        (enchiridion.memory.store:with-store-transaction (store)
+          (dolist (body +canary-fixture-bodies+)
+            (enchiridion.memory.store:record-turn store :session "t2-canary"
+                                                 :role "user" :body body))
+          ;; The nonlocal return rolls the transaction back, including FTS and activation
+          (return-from built-in-canary-outcomes
+            (loop for canary in checks
+                  collect (cons (getf canary :name)
+                                (and (canary-behaviour-p store canary generation)
+                                     (or (not (equal "safety" (getf canary :family)))
+                                         (canary-behaviour-p
+                                          store
+                                          '(:family "retrieval" :cue "cerulite inventory"
+                                            :expect "three glass jars")
+                                          generation)))))))))))
+
 (defun canary-predicate (store canaries generation)
   "Return the CANARY-CHECK predicate that checks each of CANARIES against a
 retrieval reading GENERATION. A canary the table holds but CANARIES does not
 name fails, because a check with nothing to run must not pass."
-  (lambda (name expect)
-    (declare (ignore expect))
-    (let ((canary (find name canaries :key (lambda (c) (getf c :name)) :test #'equal)))
-      (and canary (valid-canary-p canary)
-           (canary-behaviour-p store canary generation)))))
+  (let ((built-in (built-in-canary-outcomes store canaries generation)))
+    (lambda (name expect)
+      (declare (ignore expect))
+      (let ((result (assoc name built-in :test #'equal))
+            (canary (find name canaries :key (lambda (c) (getf c :name)) :test #'equal)))
+        (if result (cdr result)
+            (and canary (valid-canary-p canary)
+                 (canary-behaviour-p store canary generation)))))))
 
 (defun canary-check (store &key (predicate nil) (now (get-universal-time)))
   "Run every canary through PREDICATE and return a report plist.
@@ -368,32 +400,86 @@ indistinguishable from zero, in which case the channel is retired."
 ;;;; 7. The utility task set and the tail sampler
 ;;;; ------------------------------------------------------------------
 
+(defparameter +tool-result-roles+ '("tool" "function" "tool_result")
+  "The episode roles that mark a tool result.
+
+A turn's final answer is the last assistant round after the last of these, so a
+preamble that asked for a tool is not mistaken for the reply the operator read.
+The live kernel writes TOOL; the other two are names imported logs use.")
+
+(defparameter +tail-max-tasks+ 400
+  "The most rare answers one tail sample scores.
+
+The rarity fraction scales with the log, and an imported log's rarest tenth can
+be thousands of answers. The sample is bounded so a preflight scores a fixed
+number of retrieval packs rather than a share of the whole log.")
+
+(defun pair-scope-sql ()
+  "Return the common table expression that pairs a question with its final
+answer in one scan.
+
+A turn starts at a user episode and ends before the next one. Inside it, an
+explicit FINAL_P marker wins: 1 names the reply a live turn returned, and 0
+names an interim round. An interrupted live turn with no final marker has no
+answer. For legacy or imported turns, the answer is the last assistant round
+after the turn's last tool result."
+  (format nil "WITH scoped AS (
+     SELECT e.id, e.session, e.role, e.final_p,
+            MAX(CASE WHEN e.role = 'user' THEN e.id END)
+              OVER (PARTITION BY e.session ORDER BY e.id
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS turn_key
+       FROM episodes e
+      WHERE e.role <> 'memory' AND e.channel <> 'sleep'),
+   turn_facts AS (
+     SELECT turn_key,
+            MAX(CASE WHEN role = 'assistant' AND final_p = 1 THEN id END) AS exact_id,
+            MAX(CASE WHEN role = 'assistant' AND final_p = 0 THEN id END) AS interim_id,
+            MAX(CASE WHEN role IN (~{'~A'~^, ~}) THEN id END) AS tool_id,
+            MAX(CASE WHEN role = 'assistant' THEN id END) AS last_assistant_id
+       FROM scoped
+      WHERE turn_key IS NOT NULL
+      GROUP BY turn_key),
+   answers AS (
+     SELECT turn_key, exact_id, interim_id, last_assistant_id, tool_id,
+            CASE WHEN exact_id IS NOT NULL THEN exact_id
+                 WHEN interim_id IS NOT NULL THEN NULL
+                 WHEN last_assistant_id IS NOT NULL
+                  AND last_assistant_id > COALESCE(tool_id, 0)
+                 THEN last_assistant_id
+                 ELSE NULL END AS answer_id
+       FROM turn_facts)"
+          +tool-result-roles+))
+
+(defun pair-row-task (row)
+  "Return ROW, one paired turn, as a utility task."
+  (let ((cue-id (enchiridion.memory.store:field row "cue_id")))
+    (list :name (format nil "answer-~D" cue-id)
+          :cue (enchiridion.memory.store:field row "cue")
+          :cue-episode cue-id
+          :expect-episode (enchiridion.memory.store:field row "answer_id"))))
+
 (defun utility-tasks (store &key (limit *utility-max-tasks*))
   "Return up to LIMIT tasks derived from the log, newest first.
 
-A task is a question the operator asked and the reply that answered it: the
-user episode is the cue, and the assistant episode that came next in the same
-session is the record a good memory brings back. Every exchange in the log is
-one, so the set grows with use and needs nobody to write it. The sleep
-channel's own turns are not exchanges and are left out."
-  (mapcar (lambda (row)
-            (list :name (format nil "answer-~D"
-                                (enchiridion.memory.store:field row "cue_id"))
-                  :cue (enchiridion.memory.store:field row "cue")
-                  :cue-episode (enchiridion.memory.store:field row "cue_id")
-                  :expect-episode (enchiridion.memory.store:field row "answer_id")))
+A task is a question the operator asked and the reply that answered it. A live
+turn marks the reply with FINAL_P; a legacy or imported turn has no marker, and
+its answer is the last assistant round after the turn's last tool result and
+before the next question. A round that asked for a tool is never taken for the
+reply, and a turn that stopped on a tool result has no task.
+
+Every exchange in the log is one, so the set grows with use and needs nobody to
+write it. The sleep channel's own turns are not exchanges and are left out."
+  (mapcar #'pair-row-task
           (enchiridion.memory.store:query-rows
            store
-           "SELECT u.id AS cue_id, u.body AS cue, a.id AS answer_id
-              FROM episodes u
-              JOIN episodes a
-                ON a.id = (SELECT MIN(x.id) FROM episodes x
-                            WHERE x.session = u.session AND x.id > u.id
-                              AND x.channel <> 'sleep' AND x.role <> 'memory')
-             WHERE u.role = 'user' AND u.channel <> 'sleep'
-               AND a.role = 'assistant'
-             ORDER BY u.id DESC
-             LIMIT ?"
+           (format nil "~A
+             SELECT a.turn_key AS cue_id, u.body AS cue, a.answer_id
+               FROM answers a
+               JOIN episodes u ON u.id = a.turn_key
+              WHERE a.answer_id IS NOT NULL
+              ORDER BY a.turn_key DESC
+              LIMIT ?"
+                   (pair-scope-sql))
            (list limit))))
 
 (defun answer-hit-p (rows episode-id)
@@ -466,24 +552,71 @@ reached yet is neither rare nor common."
         (setf (gethash (enchiridion.memory.store:field row "id") ids) t)))
     ids))
 
-(defun tail-tasks (store tasks)
-  "Return the TASKS whose answer is one of the rarest episodes.
-The tail gate scores these: what a consolidation loses first is the rare
-record, so its recall is measured on the questions whose answers are rare."
-  (let ((rare (rare-episode-ids store)))
+(defun tail-tasks (store tasks &key (fraction *tail-rarity-fraction*))
+  "Return the TASKS whose answer is among the rarest FRACTION of the answers
+TASKS name. A task whose answer maintenance has not derived is not ranked.
+
+This filters a bounded task list. TAIL-SAMPLE reads the whole log's eligible
+answers instead, because the rare records are wherever the log put them and a
+tail drawn from the newest utility tasks can miss them."
+  (let ((ids (remove-duplicates
+              (remove nil (mapcar (lambda (task) (getf task :expect-episode)) tasks))))
+        (rare (make-hash-table)))
+    (when ids
+      (let* ((rows (enchiridion.memory.store:query-rows
+                    store
+                    (format nil "SELECT id FROM episodes
+                                  WHERE id IN (~{~A~^,~}) AND derived_ts IS NOT NULL
+                                  ORDER BY rarity_raw DESC, id"
+                            (make-list (length ids) :initial-element "?"))
+                    ids))
+             (count (ceiling (* fraction (length rows)))))
+        (dolist (row (subseq rows 0 (min count (length rows))))
+          (setf (gethash (enchiridion.memory.store:field row "id") rare) t))))
     (remove-if-not (lambda (task) (gethash (getf task :expect-episode) rare))
                    tasks)))
 
-(defun tail-sample (store)
-  "Return the tasks with a rare answer from every question and answer in the
-log, not only the newest :UTILITY-MAX-TASKS.
+(defun tail-pair-rows (store)
+  "Return the rarest eligible answer pairs, at most +TAIL-MAX-TASKS+ rows.
 
-The utility set is the newest pairs because it bounds a run's size. The tail
-is not: the rare records are wherever the log put them, and on an imported log
-of 1,094 pairs the newest 400 held 6 rare answers where the whole log held
-111, so a tail drawn from the utility set kept the tail sampler missing for
-good. Scoring the tail is retrieval only and calls no model."
-  (tail-tasks store (utility-tasks store :limit most-positive-fixnum)))
+Each row carries CUE_ID, CUE, ANSWER_ID, RARITY, and ELIGIBLE: the number of
+derived eligible pairs before the limit. Rarity is maintenance's RARITY_RAW on
+the answer, and equal rarity is ordered by answer id so a sample is stable."
+  (enchiridion.memory.store:query-rows
+   store
+   (format nil "~A
+     SELECT a.turn_key AS cue_id, u.body AS cue, a.answer_id,
+            ans.rarity_raw AS rarity, COUNT(*) OVER () AS eligible
+       FROM answers a
+       JOIN episodes u ON u.id = a.turn_key
+       JOIN episodes ans ON ans.id = a.answer_id
+      WHERE a.answer_id IS NOT NULL
+        AND ans.derived_ts IS NOT NULL
+      ORDER BY ans.rarity_raw DESC, a.answer_id
+      LIMIT ?"
+           (pair-scope-sql))
+   (list +tail-max-tasks+)))
+
+(defun tail-sample (store)
+  "Return the rarest eligible question and answer pairs across the whole log.
+
+The tail is where consolidation loses first, so the sample is ordered by the
+answer's rarity and is not drawn from the newest utility tasks. Eligibility is
+a question whose final answer is identifiable: the rarest tool result or
+preamble is not a tail task. The size is the rarest *TAIL-RARITY-FRACTION* of
+the eligible answers, raised to *TAIL-MIN-N* when the log holds that many, so a
+ten percent fraction does not need five hundred pairs before it can name
+fifty, and bounded by +TAIL-MAX-TASKS+. An answer maintenance has not derived
+is not ranked.
+
+Scoring the tail is retrieval only and calls no model."
+  (let ((rows (tail-pair-rows store)))
+    (when rows
+      (let* ((eligible (or (enchiridion.memory.store:field (first rows) "eligible") 0))
+             (wanted (max *tail-min-n*
+                          (ceiling (* *tail-rarity-fraction* eligible))))
+             (size (min (length rows) +tail-max-tasks+ wanted)))
+        (mapcar #'pair-row-task (subseq rows 0 size))))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; 8. The T2 preflight
@@ -793,23 +926,49 @@ quarantine rate is over its ceiling, the ordinary one otherwise."
            store "SELECT last_t2_ts AS ts FROM memory_state WHERE id = 1"))
    "ts"))
 
+(defconstant +t2-preflight-retry-seconds+ 300)
+
+(defun t2-preflight-signature (canaries)
+  "Return the settings key for a missing-instrument retry."
+  (content-hash
+   (with-standard-io-syntax
+     (prin1-to-string
+      (list canaries *canary-min-families* (not (null *assertion-deriver*))
+            *memory-gate-min-n* *utility-max-tasks*
+            *tail-min-n* *tail-rarity-fraction*)))))
+
+(defun mark-t2-preflight-retry (store canaries now)
+  "Throttle the next missing-instrument check with unchanged settings."
+  (enchiridion.memory.store:exec
+   store "INSERT OR REPLACE INTO t2_preflight_retry (id, ts, signature) VALUES (1, ?, ?)"
+   (list now (t2-preflight-signature canaries))))
+
+(defun t2-preflight-wait-p (store canaries now)
+  "Return whether a recent preflight with the same settings found missing instruments."
+  (let ((row (first (enchiridion.memory.store:query-rows
+                     store "SELECT ts, signature FROM t2_preflight_retry WHERE id = 1"))))
+    (and row
+         (< (- now (enchiridion.memory.store:field row "ts"))
+            +t2-preflight-retry-seconds+)
+         (equal (enchiridion.memory.store:field row "signature")
+                (t2-preflight-signature canaries)))))
+
 (defun mark-t2-pass (store &key (now (get-universal-time)))
   "Record that a T2 pass ended at NOW, whatever it decided, with the newest
 episode it ended at, and return NOW."
-  (ensure-generation-state store)
-  (enchiridion.memory.store:exec
-   store "UPDATE memory_state
-             SET last_t2_ts = ?,
-                 last_t2_episode = (SELECT COALESCE(MAX(id), 0) FROM episodes)
-           WHERE id = 1"
-   (list now))
+  (enchiridion.memory.store:with-store-transaction (store)
+    (ensure-generation-state store)
+    (enchiridion.memory.store:exec
+     store "UPDATE memory_state
+               SET last_t2_ts = ?,
+                   last_t2_episode = (SELECT COALESCE(MAX(id), 0) FROM episodes)
+             WHERE id = 1"
+     (list now))
+    (enchiridion.memory.store:exec store "DELETE FROM t2_preflight_retry WHERE id = 1"))
   now)
 
 (defun new-episode-count (store)
-  "Return how many episodes arrived after the last T2 pass ended.
-It counts from the pass and not from what any build derived: a pass that built
-nothing, for a missing instrument, would otherwise leave the threshold crossed,
-and T2 would run on every tick."
+  "Return how many episodes arrived after the last T2 pass ended."
   (ensure-generation-state store)
   (or (enchiridion.memory.store:field
        (first (enchiridion.memory.store:query-rows
@@ -820,19 +979,20 @@ and T2 would run on every tick."
        "n")
       0))
 
-(defun t2-due-p (store &key (now (get-universal-time)))
+(defun t2-due-p (store &key (now (get-universal-time)) (canaries *memory-canaries*))
   "Return T when a T2 pass should run on this tick.
 A building candidate always continues, because a pass spans as many ticks as
 its episodes need. Otherwise it runs daily or after
 *T2-EPISODE-THRESHOLD* new episodes, whichever comes first. While the
 quarantine rate is over its ceiling the interval is weekly and the threshold
 is off, or a busy log would make weekly mean nothing."
-  (let ((last (last-t2-ts store)))
-    (or (and (current-building-generation store) t)
-        (null last)
-        (>= (- now last) (t2-interval store))
-        (and (not (quarantine-frozen-p store))
-             (>= (new-episode-count store) *t2-episode-threshold*)))))
+  (or (and (current-building-generation store) t)
+      (let ((last (last-t2-ts store)))
+        (and (or (null last)
+                 (>= (- now last) (t2-interval store))
+                 (and (not (quarantine-frozen-p store))
+                      (>= (new-episode-count store) *t2-episode-threshold*)))
+             (not (t2-preflight-wait-p store canaries now))))))
 
 (defun t2-pass-spend (store &key (now (get-universal-time)))
   "Return the tokens T2 has spent in the rolling twenty-four hours before NOW."
@@ -854,8 +1014,7 @@ of what is missing, and spends nothing doing so.
 
 A maintenance backlog is: the tail sample reads rarity, which maintenance
 derives a batch per tick, so after a large import the preflight would find too
-few rare answers, call the instruments missing, and end the pass for a whole
-interval although a few more ticks would have supplied them. A refusal ends no
+few rare answers and throttle the next check. A refusal ends no
 pass, so T2 runs on the first tick the backlog is clear."
   (cond
     ((or (not (enabled-p)) (not *t2-enabled-p*)) :disabled)
@@ -877,7 +1036,7 @@ pass, so T2 runs on the first tick the backlog is clear."
   "Gate GENERATION-ID, end the pass, and return the plist RUN-T2-PASS returns.
 RECOVERED says the candidate was built by an earlier pass and never gated."
   (let ((gate (gate-candidate store generation-id :canaries canaries :scorer scorer)))
-    (mark-t2-pass store :now now)
+    (mark-t2-pass store :now (or now (get-universal-time)))
     (list :outcome (cond ((getf gate :promoted) :promoted)
                          ((eq (getf gate :reason) :held) :held)
                          ((eq (getf gate :reason) :quarantined) :quarantined)
@@ -891,7 +1050,7 @@ RECOVERED says the candidate was built by an earlier pass and never gated."
 (defun run-t2-pass (store &key (canaries *memory-canaries*)
                                (scorer #'answer-scorer)
                                (limit *memory-t2-episodes-per-tick*)
-                               (now (get-universal-time)))
+                               now)
   "Run one tick of a T2 pass and return a report plist whose :OUTCOME is one
 of :ROLLED-BACK, :INSTRUMENT-MISSING, :BUILDING, :PROMOTED, :QUARANTINED,
 :HELD, or :SKIPPED. The caller has already asked T2-REFUSAL.
@@ -909,13 +1068,13 @@ pass ends, and not while a candidate is still building."
     (when (and (null building) (live-unchecked-p store live))
       (let ((check (check-promoted store live :canaries canaries :scorer scorer)))
         (unless (getf check :held)
-          (mark-t2-pass store :now now)
+          (mark-t2-pass store :now (or now (get-universal-time)))
           (return-from run-t2-pass
             (list :outcome :rolled-back :generation-id live :failed (getf check :failed))))))
     (unless building
       (let ((preflight (t2-preflight store :canaries canaries)))
         (unless (getf preflight :ready-p)
-          (mark-t2-pass store :now now)
+          (mark-t2-preflight-retry store canaries (or now (get-universal-time)))
           (return-from run-t2-pass
             (list :outcome :instrument-missing :missing (getf preflight :missing))))
         ;; A candidate an earlier pass built is judged before a new one is

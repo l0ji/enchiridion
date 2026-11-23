@@ -37,5 +37,5 @@
 
     :budget
     ;; Background token caps, not spending limits for chat or ask
-    (:max-tokens-per-tick 40000)
-    (:max-tokens-per-day 4000000)))
+    (:max-tokens-per-tick 400000)
+    (:max-tokens-per-day 40000000)))

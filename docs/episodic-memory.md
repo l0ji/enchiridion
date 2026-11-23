@@ -72,11 +72,10 @@ not what an agent does with the files and network its own user can reach.
 Push is off and not usable. `:push` is accepted for compatibility and defaults
 to nil, but no turn calls the push path.
 
-T2 is scheduled on (`:t2-enabled t`) and spends nothing without its instruments.
-With the shipped configuration the canary list is empty and a fresh log has too
-few question-and-answer pairs, so a due pass reports `T2 skipped: instruments
-missing` and ends. The gates and promotion path are implemented and tested; they
-run only when an operator supplies canaries and a log with enough pairs.
+T2 is scheduled on (`:t2-enabled t`). A fresh log can lack enough eligible pairs;
+a due pass reports `T2 skipped: instruments missing` without building a candidate.
+After a skip, a tick can retry once five minutes have elapsed or the instrument
+settings have changed. A skip does not reset the pass timer or episode threshold.
 
 Reranking and embeddings are off. Both switches are accepted and documented in
 the [settings reference](config-reference.md#retrieval).
@@ -91,16 +90,19 @@ missing one.
 | Deriver | An assertion deriver is installed, which `serve` does when a backend exists | `:deriver` |
 | Canary coverage | Valid `:canaries` cover `:canary-min-families` of the four families | `:canary-coverage` |
 | Utility task set | The log holds `:gate-min-n` question-and-answer pairs | `:utility-task-set` |
-| Tail sampler | `:tail-min-n` of all pairs have an answer among the rarest `:tail-rarity-fraction` of episodes | `:tail-sampler` |
+| Tail sampler | At least `:tail-min-n` pairs have ranked answers | `:tail-sampler` |
 
 The four canary families are retrieval, update, safety and tail. A canary names a
 `family`, a `cue`, an `expect` string, and a `stale` string for the update
 family. It checks behaviour in a retrieval, not presence in the store.
+`:canaries :built-in` runs four smoke checks against a candidate with temporary
+fixture records. The fixtures never enter the transcript. An explicit canary
+list replaces the shipped suite and should use records in your workspace.
 
-A utility task is a user turn and the assistant turn that answered it in the same
-session. Both arms are scored on the same questions in a pack of
-`:gate-pack-chars`, a quarter of the normal pack. The tail sample is the subset
-whose answers are rare.
+A utility task pairs a user turn with its final assistant reply, including turns
+that used tools. Both arms score the same tasks in `:gate-pack-chars`. The tail
+sample ranks eligible answers across the log by rarity. It takes the rarest
+`:tail-rarity-fraction`, at least `:tail-min-n` when available and at most 400 pairs.
 
 ## The gates
 

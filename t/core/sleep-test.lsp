@@ -16,6 +16,10 @@
   (calls 0 :type integer)
   (reply "done" :type string)
   (fail-p nil :type boolean)
+  ;; How many answers ask for a tool before the backend settles on TEXT. It
+  ;; is how a test gets a multi-round pass, which is the only shape that can
+  ;; overspend a tick cap between requests.
+  (tool-rounds 0 :type integer)
   (last-prompt "" :type string))
 
 (defmethod enchiridion.llm:complete ((backend counting-backend) messages
@@ -29,11 +33,25 @@
             (enchiridion.llm:message-content user))))
   (when (counting-backend-fail-p backend)
     (error 'enchiridion.errors:backend-error :backend "counting"))
-  (enchiridion.llm::%make-completion
-   :text (counting-backend-reply backend)
-   :model "counting-model"
-   :input-tokens 11
-   :output-tokens 5))
+  (if (plusp (counting-backend-tool-rounds backend))
+      (progn
+        (decf (counting-backend-tool-rounds backend))
+        (enchiridion.llm::%make-completion
+         :text ""
+         :model "counting-model"
+         :input-tokens 11
+         :output-tokens 5
+         :stop-reason "tool_calls"
+         :tool-calls (list (enchiridion.llm::%make-tool-call
+                            :id (format nil "call-~D"
+                                        (counting-backend-calls backend))
+                            :name "no_such_tool"
+                            :arguments "{}"))))
+      (enchiridion.llm::%make-completion
+       :text (counting-backend-reply backend)
+       :model "counting-model"
+       :input-tokens 11
+       :output-tokens 5)))
 
 (defmethod enchiridion.llm:model-capabilities ((backend counting-backend))
   (declare (ignore backend))
@@ -263,6 +281,10 @@ countable from the test."
   ;; window around the tick in which an operator's own turn counted as
   ;; unattended spend, and measuring it from the whole in-memory ledger let one
   ;; operator turn disable the sleep agent until the process restarted.
+  ;;
+  ;; The cap is soft at the first request: a provider reports usage only after
+  ;; the call returns, so one request may finish over the cap. What must not
+  ;; happen is that its spend carries into the next tick.
   (with-scratch-world (store supervisor)
     (setf (enchiridion.kernel:agent-budget (agent-of supervisor))
           '(:max-tokens-per-tick 10 :max-tokens-per-day 400000))
@@ -271,14 +293,89 @@ countable from the test."
     (let ((first (enchiridion.kernel:heartbeat supervisor)))
       (ok (getf first :ok-p))
       (ok (search "done" (getf first :report)))
-      (testing "the pass spent the cap, so compaction waits for the next tick"
-        (ok (search "compaction skipped" (getf first :report)))
-        (ok (search "tick cap" (getf first :report)))))
+      (testing "the one request that was already affordable may overshoot"
+        (ok (> (enchiridion.kernel::store-total store) 10))))
     (testing "and the next tick has its own budget"
       (let ((second (enchiridion.kernel:heartbeat supervisor)))
         (ok (getf second :ok-p))
         (ok (search "done" (getf second :report)))))
     (ok (= 2 (calls-made supervisor)))))
+
+(deftest due-compaction-has-first-claim-on-the-tick-cap ()
+  ;; Compaction used to run last. A task that made one tool call spent the cap
+  ;; first, so compaction was skipped on every tick and the session block went
+  ;; stale. A due compaction now runs before T2, embedding, and the sleep
+  ;; agent, and the task waits for the next tick.
+  (with-scratch-world (store supervisor)
+    (dotimes (index 4)
+      (enchiridion.memory.store:record-turn
+       store :session "operator" :role "user"
+       :body (format nil "turn ~D" index)))
+    (enchiridion.kernel:enqueue-task store "a task that must wait")
+    (setf (enchiridion.kernel:agent-budget (agent-of supervisor))
+          '(:max-tokens-per-tick 10 :max-tokens-per-day 400000))
+    (let ((first (enchiridion.kernel:heartbeat supervisor)))
+      (ok (getf first :ok-p))
+      (ok (search "session block was compacted" (getf first :report)))
+      (testing "and the sleep agent is the phase the cap stops"
+        (ok (search "sleep skipped" (getf first :report)))
+        (ok (search "tick cap" (getf first :report))))
+      (testing "the task is still waiting, not claimed"
+        (ok (= 1 (enchiridion.kernel:task-queue-length store)))
+        (ok (zerop (enchiridion.memory.store:count-tasks store :status :running))))
+      (ok (= 1 (calls-made supervisor))))
+    (testing "the next tick has its own budget and drains the task"
+      (let ((second (enchiridion.kernel:heartbeat supervisor)))
+        (ok (getf second :ok-p))
+        (ok (search "done" (getf second :report))))
+      (ok (= 2 (calls-made supervisor))))))
+
+(deftest a-spent-tick-cap-stops-a-pass-between-rounds ()
+  ;; A task with tools makes several requests. Checking the budget only before
+  ;; the pass let the later rounds spend many times the cap. The pre-request
+  ;; hook sees the two rounds' actual usage and refuses the third.
+  (with-scratch-world (store supervisor)
+    (let ((agent (agent-of supervisor))
+          (backend (backend-of supervisor)))
+      (setf (enchiridion.kernel:agent-budget agent)
+            '(:max-tokens-per-tick 25 :max-tokens-per-day 400000))
+      (setf (counting-backend-tool-rounds backend) 10)
+      (enchiridion.kernel:enqueue-task store "keep using the tool")
+      (let ((report (getf (enchiridion.kernel:heartbeat supervisor) :report)))
+        (ok (search "failed" report))
+        (ok (search "budget is spent" report))
+        (testing "two rounds ran, and the third was refused"
+          (ok (= 2 (calls-made supervisor))))
+        (testing "the task is failed, not complete, and not retried"
+          (ok (= 1 (enchiridion.memory.store:count-tasks store :status :failed)))
+          (ok (zerop (enchiridion.memory.store:count-tasks store :status :done)))
+          (ok (zerop (enchiridion.memory.store:count-tasks store :status :running)))))
+      (testing "and a later tick does not run it again"
+        (let ((before (calls-made supervisor)))
+          (enchiridion.kernel:heartbeat supervisor)
+          (ok (= before (calls-made supervisor)))
+          (ok (zerop (enchiridion.kernel:task-queue-length store))))))))
+
+(deftest a-round-the-store-missed-still-counts-against-the-tick ()
+  ;; The store and the in-memory ledger are the same spend seen twice. A usage
+  ;; write can fail while the call still happened, so the larger recorded
+  ;; total is what refuses the next request.
+  (with-scratch-world (store supervisor)
+    (let ((agent (agent-of supervisor)))
+      (setf (enchiridion.kernel:agent-budget agent)
+            '(:max-tokens-per-tick 100 :max-tokens-per-day 400000))
+      (flet ((record (input)
+               (enchiridion.kernel:record-spend
+                agent
+                (enchiridion.llm::%make-completion
+                 :text "spent" :model "counting" :input-tokens input :output-tokens 0)
+                :channel :sleep)))
+        (record 60)
+        (ok (null (enchiridion.kernel::budget-refusal agent store 0 0)))
+        (record 60)
+        (testing "the second row is only in memory, and the cap still closes"
+          (ok (search "tick cap"
+                      (enchiridion.kernel::budget-refusal agent store 0 0))))))))
 
 (deftest a-spent-day-cap-stops-the-tick-before-it-spends ()
   (with-scratch-world (store supervisor)
@@ -359,6 +456,8 @@ countable from the test."
                  supervisor store (agent-of supervisor)))
           "three turns are not worth a summary")
       (ok (string= "" (enchiridion.memory.store:session-block store)))
+      (testing "an empty block is a normal first compaction, not a rebase"
+        (ng (enchiridion.kernel::compaction-rebase-due-p store)))
       (add-turns 1)
       (ok (enchiridion.kernel::compact-when-due
            supervisor store (agent-of supervisor))
@@ -372,6 +471,27 @@ countable from the test."
 (defun projection-rows (store)
   (enchiridion.memory.store:query-rows
    store "SELECT from_turn, to_turn, rebased_p FROM projections ORDER BY id"))
+
+(deftest a-stale-summary-is-rebuilt-from-raw-turns-once ()
+  ;; A store that arrives with a nonempty session block and no projection has
+  ;; no evidence the block came from this transcript. Feeding it back into the
+  ;; compactor would keep a stale summary alive; the first pass reads raw
+  ;; turns instead, and the projection it records restores the cadence.
+  (with-scratch-world (store supervisor)
+    (enchiridion.memory.store:set-session-block store "an imported summary")
+    (dotimes (index 4)
+      (enchiridion.memory.store:record-turn
+       store :session "operator" :role "user"
+       :body (format nil "fresh turn ~D" index)))
+    (ok (enchiridion.kernel::compaction-rebase-due-p store))
+    (let ((report (enchiridion.kernel::compact-when-due
+                   supervisor store (agent-of supervisor)
+                   :rebase-p (enchiridion.kernel::compaction-rebase-due-p store))))
+      (ok (search "raw turns" report)))
+    (testing "the block is what the compactor answered, not the old summary"
+      (ok (string= "done" (enchiridion.memory.store:session-block store))))
+    (testing "and the next pass is ordinary again"
+      (ng (enchiridion.kernel::compaction-rebase-due-p store)))))
 
 (deftest every-nth-compaction-rebuilds-from-raw-turns ()
   ;; Every eighth compaction rebases from the last 24 raw turns; here
@@ -571,17 +691,17 @@ countable from the test."
               :body (format nil "turn ~D" index))))
       (dotimes (index 4) (add-turn index))
       (setf (counting-backend-reply (backend-of supervisor)) "")
-      (enchiridion.memory.store:set-session-block store "the session so far")
       (let ((cursor (enchiridion.supervisor:supervisor-last-compacted-turn supervisor))
             (first-report (enchiridion.kernel:heartbeat supervisor)))
         (testing "the blank answer is visible in the phase report"
           (ok (search "compaction produced no text" (getf first-report :report))))
-        (testing "and the cursor, the block and the projections are untouched"
+        (testing "and the cursor and the projections are untouched"
           (ok (= cursor
                  (enchiridion.supervisor:supervisor-last-compacted-turn supervisor)))
-          (ok (null (projection-rows store)))
-          (ok (string= "the session so far"
-                      (enchiridion.memory.store:session-block store))))
+          (ok (null (projection-rows store))))
+        (testing "the harness fallback fills the empty block, but is not a summary"
+          (ok (search "Tick " (enchiridion.memory.store:session-block store)))
+          (ng (enchiridion.kernel::inherited-session-summary-p store)))
         (testing "the next tick summarises the same four rows"
           (setf (counting-backend-reply (backend-of supervisor)) "done")
           (let ((second-report (enchiridion.kernel:heartbeat supervisor)))

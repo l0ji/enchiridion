@@ -140,6 +140,11 @@
                (ok (= 1 (length hits)))
                (ok (string= "fake-model"
                             (enchiridion.memory.store:turn-row-model (first hits))))))
+           (testing "the answer is marked as the turn's final reply"
+             (let ((row (first (enchiridion.memory.store::query-rows
+                                store "SELECT final_p FROM episodes
+                                        WHERE role = 'assistant'"))))
+               (ok (= 1 (getf row :final_p)))))
            (testing "and the spend row is in the usage ledger"
              (let ((rows (enchiridion.memory.store:usage-rows store)))
                (ok (= 1 (length rows)))

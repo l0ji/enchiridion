@@ -96,11 +96,19 @@ cost for each episode they derived, for the next one to be promoted.")
 the volume gate's allowance grows with the work the build did, so ordinary
 output passes and a deriver that writes far more than usual does not.")
 
-(defvar *memory-canaries*)
-(setf (documentation '*memory-canaries* 'variable)
-      "The operator's canaries: plists of :NAME, :FAMILY, :CUE and :EXPECT, and
-:STALE for the update family. They are the only external ground truth the
-memory has, so they come from config.lsp and nowhere else.")
+(defparameter +built-in-canaries+
+  '((:name "builtin-retrieval" :family "retrieval"
+     :cue "velarium map" :expect "copper cabinet")
+    (:name "builtin-update" :family "update"
+     :cue "torvane dispatch current address" :expect "blue annex" :stale "red annex")
+    (:name "builtin-safety" :family "safety"
+     :cue "cerulite inventory" :expect "violet passphrase")
+    (:name "builtin-tail" :family "tail"
+     :cue "quenvora" :expect "paper sextant"))
+  "The shipped retrieval smoke checks.")
+
+(defvar *memory-canaries*
+  nil "The configured behavioral checks.")
 
 (defvar *canary-min-families*)
 (setf (documentation '*canary-min-families* 'variable)
@@ -209,6 +217,13 @@ a thousand one-line turns arrive.")
 
 (declaim (ftype (function (t) t) apply-memory-settings))
 
+(defun configured-canaries (value)
+  "Return the canary list configured by VALUE."
+  (cond ((eq value :built-in) +built-in-canaries+)
+        ((listp value) value)
+        (t (error 'enchiridion.errors:configuration-error
+                  :key :canaries :detail "Use :built-in or a list of canaries."))))
+
 (defun apply-memory-settings (config)
   "Bind every memory special from the :memory section of CONFIG, falling back
 key by key to the shipped defaults. Return NIL."
@@ -216,7 +231,8 @@ key by key to the shipped defaults. Return NIL."
            (enchiridion:config-setting config :memory key))
          (shipped (key)
            (enchiridion:config-setting (enchiridion:default-config) :memory key)))
-    (setf *memory-enabled-p* (not (null (setting :enabled)))
+    (setf *memory-canaries* (configured-canaries (setting :canaries))
+          *memory-enabled-p* (not (null (setting :enabled)))
           *memory-retrieve-p* (not (null (setting :retrieve)))
           *memory-push-p* (not (null (setting :push)))
           *memory-record-sleep-p* (not (null (setting :record-sleep)))
@@ -240,7 +256,6 @@ key by key to the shipped defaults. Return NIL."
           *memory-tail-margin* (setting :tail-margin)
           *gate-pack-chars* (setting :gate-pack-chars)
           *t2-max-tokens-per-episode* (setting :t2-max-tokens-per-episode)
-          *memory-canaries* (let ((own (setting :canaries))) (if (listp own) own '()))
           *canary-min-families* (setting :canary-min-families)
           *tail-rarity-fraction* (setting :tail-rarity-fraction)
           *tail-min-n* (setting :tail-min-n)

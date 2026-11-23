@@ -197,8 +197,8 @@ store path. The model defaults match the shipped adapter defaults."
              (:custom-status-cooldown-seconds 60))
 
     :budget
-    (:max-tokens-per-tick 40000)
-    (:max-tokens-per-day 4000000)
+    (:max-tokens-per-tick 400000)
+    (:max-tokens-per-day 40000000)
 
     :sandbox
     (:agent-uid 1000)
@@ -236,10 +236,7 @@ store path. The model defaults match the shipped adapter defaults."
     (:t2-interval-seconds 86400)
     (:t2-episode-threshold 200)
     (:t2-max-episodes-per-tick 5)
-    ;; Sized from 20 measured episodes at about 1,500 tokens each: half of the
-    ;; shared day cap, so a 200-episode pass spans about a day and a half and
-    ;; chat keeps the other half.
-    (:t2-max-tokens-per-pass 200000)
+    (:t2-max-tokens-per-pass 2000000)
     ;; The reply cap of one T2 deriver call, apart from the :llm section's
     ;; :max-tokens: a reasoning model spends its cap thinking, and at 4096 it
     ;; was cut off before it answered on most records.
@@ -247,11 +244,9 @@ store path. The model defaults match the shipped adapter defaults."
     (:t2-deriver-concurrency 4)
     ;; The model the T2 deriver calls; NIL is the :llm section's :model-cheap.
     (:t2-deriver-model nil)
-    ;; Per episode derived since the last promotion: about twice a measured
-    ;; 1,500, and it scales to a first build of an imported log.
-    (:t2-max-tokens-per-episode 3000)
+    (:t2-max-tokens-per-episode 16000)
     (:t2-writes-per-episode 8)
-    (:canaries nil)
+    (:canaries :built-in)
     (:canary-min-families 4)
     (:gate-margin 0.05)
     (:gate-min-n 100)

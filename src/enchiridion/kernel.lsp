@@ -587,7 +587,7 @@ broken reply."
 ;; wants every keyword of an F-TYPE lambda list declared in an earlier one, and
 ;; a dummy declaration per keyword costs more than the annotation catches.
 
-(defun persist-turn (store session role body &key model (channel :cli))
+(defun persist-turn (store session role body &key model (channel :cli) final-p)
   "Record one turn in STORE when there is a store and text to record.
 
 An empty body is skipped: a tool-calling assistant message often has no words
@@ -595,7 +595,9 @@ in it, and a row that matches nothing is noise in every later search. A store
 that refuses the write prints one line and lets the turn finish, because
 losing the transcript is bad and losing the reply is worse. MODEL names what
 answered, which is empty for the operator's own turn. CHANNEL names the
-surface the turn arrived on, so the usage report can group by it."
+surface the turn arrived on, so the usage report can group by it. FINAL-P is
+the final-answer marker RECORD-TURN stores; a live assistant round says T when
+it returned the reply and 0 when it asked for a tool."
   (when (and store
              (stringp body)
              (plusp (length body))
@@ -608,7 +610,8 @@ surface the turn arrived on, so the usage report can group by it."
                     :role role
                     :body body
                     :model (or model "")
-                    :channel channel)))
+                    :channel channel
+                    :final-p final-p)))
           ;; RECORD-TURN writes the episode directly. The transcript, the
           ;; search surface, and the cue candidates are the same log now.
           row)
@@ -641,15 +644,22 @@ all silent, and none of them may cost the operator the reply."
            (format nil "Agent turn ~D via ~A" (agent-turn agent) channel))
         (error () nil)))))
 
-(declaim (ftype (function (agent string t t t keyword t) (values t t))
+(declaim (ftype (function (agent string t t t keyword t t) (values t t))
                 run-turn-locked))
 
-(defun run-turn-locked (agent text model session store channel cancel-p)
+(defun run-turn-locked (agent text model session store channel cancel-p
+                        pre-request)
   "Run one turn on AGENT with the agent's lock already held.
 
 The body of RUN-TURN, separated so that the lock is taken in exactly one place
 and every path out of the body releases it. Nothing else may call this: a
-caller that does is a caller that runs two turns at once."
+caller that does is a caller that runs two turns at once.
+
+PRE-REQUEST is a function of the zero-based round index, or NIL. It runs
+before every model call, after the cancellation check and before the request
+is sent, and it stops the turn by signalling. A hook that only has to look at
+what the turn has spent so far can decide between rounds; a cap it enforces is
+soft, because a request already on the wire still finishes and is recorded."
   (check-type text string)
   (let ((backend (agent-backend agent))
         (*turn-proposal* nil))
@@ -715,6 +725,10 @@ caller that does is a caller that runs two turns at once."
       (loop
         (when (and cancel-p (funcall cancel-p))
           (error 'enchiridion.errors:turn-cancelled :turn rounds))
+        ;; The pre-request hook sees the spend the previous rounds actually
+        ;; recorded, which is the only number a soft cap can honestly use.
+        (when pre-request
+          (funcall pre-request rounds))
         (note-progress :request :round rounds)
         (setf completion (complete-with-tools backend messages model tools)
               tool-message (enchiridion.llm:take-completion-tool-message completion))
@@ -725,26 +739,29 @@ caller that does is a caller that runs two turns at once."
                                   (enchiridion.llm:completion-text completion))
                        :calls (length (enchiridion.llm:completion-tool-calls completion)))
         (persist-usage store session (record-spend agent completion :channel channel))
-        (when session
-          (push completion (session-turns session))
-          (setf (session-turns session)
-                (keep-newest (session-turns session) +session-turns-keep+)))
         ;; Every round is written down, and the last one is the reply the
         ;; operator reads. Persisting only the rounds that asked for a tool
-        ;; would store the questions and forget every answer.
-        (persist-turn store session "assistant"
-                      (enchiridion.llm:completion-text completion)
-                      :model (enchiridion.llm:completion-model completion)
-                      :channel channel)
-        (unless (blank-text-p (enchiridion.llm:completion-text completion))
-          (setf last-words (enchiridion.llm:completion-text completion)))
-        (let ((calls (enchiridion.llm:completion-tool-calls completion)))
-          (when (null calls)
-            (return (values completion *turn-proposal*)))
-          (when wrapped-up
-            (return (values (setf completion
-                                  (wrap-up-completion completion last-words))
-                            *turn-proposal*)))
+        ;; would store the questions and forget every answer. The effective
+        ;; reply is computed before the write: a wrap-up round replaces a
+        ;; request for tools with the answer the operator gets, and that answer
+        ;; is written once as final rather than patched after the fact.
+        (let* ((final (if wrapped-up
+                          (wrap-up-completion completion last-words)
+                          completion))
+               (text (enchiridion.llm:completion-text final))
+               (calls (enchiridion.llm:completion-tool-calls final)))
+          (when session
+            (push final (session-turns session))
+            (setf (session-turns session)
+                  (keep-newest (session-turns session) +session-turns-keep+)))
+          (persist-turn store session "assistant" text
+                        :model (enchiridion.llm:completion-model final)
+                        :channel channel
+                        :final-p (if (or wrapped-up (null calls)) t 0))
+          (unless (blank-text-p text)
+            (setf last-words text))
+          (when (or wrapped-up (null calls))
+            (return (values (setf completion final) *turn-proposal*)))
           ;; At the cap the pending calls are dropped and the model gets one
           ;; more round to answer. Returning the capped completion would hand
           ;; the operator a reply with no text, because a round that asks for
@@ -787,7 +804,7 @@ caller that does is a caller that runs two turns at once."
 ;; than it costs.
 
 (defun run-turn (agent text &key model session store (channel :cli) (cancel-p nil)
-                             (block-p t))
+                             (pre-request nil) (block-p t))
   "Send TEXT to AGENT and run any tool calls the model asks for.
 
 The system message is the snapshot compiled by MAKE-AGENT. A block written
@@ -802,6 +819,13 @@ CANCEL-P is a function of no arguments, or NIL. It is asked before each round
 and a true answer signals TURN-CANCELLED, which is what /stop needs: the round
 in flight finishes, the turn does not start another one, and nothing already
 spent is undone.
+
+PRE-REQUEST is a function of the round index, or NIL, called before every
+model request. It stops the turn by signalling, which is how the sleep pass
+refuses a round its budget can no longer cover. The check is deliberately
+after the accounting of the previous round: provider usage is known only once
+a call returns, so a cap enforced here can stop the next call and not the one
+already in flight.
 
 One agent answers one turn at a time. The prompt is frozen per agent, the
 spend ledger and the turn counter are pushed without a lock, and the store is
@@ -818,6 +842,7 @@ reason the body lives in RUN-TURN-LOCKED."
       (unless (bordeaux-threads:acquire-lock lock block-p)
         (error 'enchiridion.errors:turn-busy :agent (agent-name agent))))
     (unwind-protect
-         (run-turn-locked agent text model session store channel cancel-p)
+         (run-turn-locked agent text model session store channel cancel-p
+                          pre-request)
       (when lock
         (bordeaux-threads:release-lock lock)))))

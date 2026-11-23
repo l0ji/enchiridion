@@ -396,7 +396,7 @@ that, because it is not text to a parser and NOT a term to match."
 
 ;;;; Opening and closing.
 
-(defparameter +schema-version+ 9
+(defparameter +schema-version+ 10
   "The schema version a store records in PRAGMA user_version once it is built.
 
 Every statement in +SCHEMA+ is CREATE ... IF NOT EXISTS, which adds a missing
@@ -434,14 +434,21 @@ They are in ADD-MISSING-COLUMNS and need no copy.
 
 Version 9 adds the ADAPTATIONS audit table and the role, channel and session
 index the bearing counts read. Both are in the schema lists, so an older store
-only has to run the schema once more.")
+only has to run the schema once more.
+
+Version 10 adds EPISODES.FINAL_P, the final-answer marker the utility task set
+pairs on, in ADD-MISSING-COLUMNS. It is nullable on purpose: a legacy or
+imported row records no answer and the pairing rule infers one, while a live
+round records 1 for the reply a turn returned and 0 for a round that asked for
+tools. Version 10 also separates T2 preflight retries from completed passes.")
 
 (defparameter +added-columns+
   '(("memory_state" "precision_reset_generation" "INTEGER")
     ("memory_state" "last_t2_episode" "INTEGER")
     ("generations" "episodes_derived" "INTEGER NOT NULL DEFAULT 0")
     ("generations" "claim_owner" "TEXT NOT NULL DEFAULT ''")
-    ("generations" "claim_ts" "INTEGER"))
+    ("generations" "claim_ts" "INTEGER")
+    ("episodes" "final_p" "INTEGER"))
   "Columns added to an existing table after it shipped: table, column, type.
 CREATE TABLE IF NOT EXISTS never adds one to a table that exists, so
 ADD-MISSING-COLUMNS does.")
@@ -606,6 +613,11 @@ not an exposure."
                 (dolist (statement +schema+)
                   (exec store statement))
                 (add-missing-columns store)
+                (when (< (schema-version store) 10)
+                  ;; Without a generation, the old watermark could only be a skip
+                  (exec store "UPDATE memory_state
+                                  SET last_t2_ts = NULL, last_t2_episode = NULL
+                                WHERE NOT EXISTS (SELECT 1 FROM generations)"))
                 (migrate-episode-vectors store)
                 (when reindex
                   (exec store "INSERT INTO episodes_fts(episodes_fts) VALUES ('rebuild')"))))
@@ -684,16 +696,22 @@ because two write paths share the column."
   (format nil ",~A,~A" session (string-downcase (string channel))))
 
 (defun record-turn (store &key session (role "user") (body "") model
-                              (channel :cli) (ts (get-universal-time)))
+                              (channel :cli) (ts (get-universal-time)) final-p)
   "Store one raw message and return it as a TURN-ROW.
 
 SESSION groups the turns of one conversation and defaults to the single name
 DEFAULT. Every string in the row is scrubbed, the session id and the role
 included: the store is readable by the agent through the search tool, so a
-secret that reached a turn must not reach the disk, whatever field it sits in."
+secret that reached a turn must not reach the disk, whatever field it sits in.
+
+FINAL-P is the final-answer marker: T for the assistant reply a live turn
+returned, 0 for a round that asked for tools, and NIL for a row that does not
+know. A user row, a tool result, and an imported row all take NIL, and the
+utility task set infers the final answer from the turn's boundaries for them."
   (check-type body string)
   (check-type session (or null string))
   (check-type ts integer)
+  (check-type final-p (or null (eql t) (integer 0 1)))
   (let ((session (scrubbed (or session "default")))
         (role (scrubbed (normalise-role role)))
         (body (scrubbed body))
@@ -707,7 +725,7 @@ secret that reached a turn must not reach the disk, whatever field it sits in."
             "INSERT INTO episodes
                (session, role, body, model, ts, channel, provenance, authority,
                 cue_type, depth, span, context_key, horizon,
-                source_turn_id, source_memory_id)
+                source_turn_id, source_memory_id, final_p)
                VALUES (?, ?, ?, ?, ?, ?,
                        CASE ? WHEN 'user' THEN 'owner'
                               WHEN 'assistant' THEN 'agent'
@@ -715,11 +733,12 @@ secret that reached a turn must not reach the disk, whatever field it sits in."
                        CASE ? WHEN 'user' THEN 5
                               WHEN 'assistant' THEN 3
                               ELSE 1 END,
-                       'episodic', 0, '', ?, 2592000, NULL, NULL)"
+                       'episodic', 0, '', ?, 2592000, NULL, NULL, ?)"
             (list session role body model ts (string-downcase (string channel))
                   role
                   role
-                  (turn-context-key session channel)))
+                  (turn-context-key session channel)
+                  (if (eq final-p t) 1 final-p)))
       (%make-turn-row :id (last-row-id store)
                       :session session
                       :role role

@@ -149,10 +149,117 @@
              (testing "and the empty assistant round was not written down"
                (ok (= 1 (length (enchiridion.memory.store:search-sessions
                                  store "done")))))
+             (testing "the reply is final and the tool result is not"
+               (let ((rows (enchiridion.memory.store:query-rows
+                            store "SELECT role, final_p FROM episodes ORDER BY id")))
+                 (ok (equal '(("user" nil) ("tool" nil) ("assistant" 1))
+                            (mapcar (lambda (row)
+                                      (list (enchiridion.memory.store:field row "role")
+                                            (enchiridion.memory.store:field row "final_p")))
+                                    rows)))))
              (testing "so the transcript is the question, the tool, and the answer"
                (ok (= 3 (getf (first (enchiridion.memory.store:recent-sessions store))
                               :turns)))
                (ok (= 1 (length (enchiridion.memory.store:search-sessions store "go")))))))
+      (enchiridion.tools:clear-registry)
+      (enchiridion.memory.store:close-store store)
+      (uiop:delete-directory-tree directory
+                                  :validate t
+                                  :if-does-not-exist :ignore))))
+
+(deftest a-tool-preamble-is-interim-and-the-reply-is-final ()
+  (enchiridion.tools:clear-registry)
+  (let* ((directory (uiop:ensure-directory-pathname
+                     (merge-pathnames
+                      (format nil "enchiridion-tool-loop-test-~D/"
+                              (random most-positive-fixnum))
+                      (uiop:ensure-directory-pathname *default-pathname-defaults*))))
+         (store (enchiridion.memory.store:open-store
+                 :path (merge-pathnames "memory.db" directory))))
+    (unwind-protect
+         (progn
+           (enchiridion.tools:register-tool
+            (enchiridion.tools:make-tool
+             :name "echo"
+             :description "Echo text."
+             :schema '(:object :required (:text) :properties ((:text :string)))
+             :handler (lambda (arguments) (gethash "text" arguments))))
+           (let* ((backend (make-scripted-backend
+                            :replies (list (completion "checking"
+                                                       :tool-calls
+                                                       (list (call "c1" "echo"
+                                                                   "{\"text\":\"hi\"}")))
+                                            (completion "done"))))
+                  (agent (test-agent backend)))
+             (enchiridion.kernel:run-turn agent "go" :store store)
+             (testing "the round that asked for the tool is interim, the reply final"
+               (let ((rows (enchiridion.memory.store:query-rows
+                            store "SELECT role, body, final_p FROM episodes ORDER BY id")))
+                 (ok (equal '(("user" nil) ("assistant" 0) ("tool" nil)
+                              ("assistant" 1))
+                            (mapcar (lambda (row)
+                                      (list (enchiridion.memory.store:field row "role")
+                                            (enchiridion.memory.store:field row "final_p")))
+                                    rows)))
+                 (ok (string= "done" (enchiridion.memory.store:field
+                                      (car (last rows)) "body")))))))
+      (enchiridion.tools:clear-registry)
+      (enchiridion.memory.store:close-store store)
+      (uiop:delete-directory-tree directory
+                                  :validate t
+                                  :if-does-not-exist :ignore))))
+
+(deftest a-wrap-up-reply-is-written-once-as-final ()
+  ;; The last round at the cap still carries the tools, and it can ask for one
+  ;; while saying nothing. The reply the operator reads is then the turn's
+  ;; earlier words, and that is what must be marked final and stored once.
+  (enchiridion.tools:clear-registry)
+  (let* ((directory (uiop:ensure-directory-pathname
+                     (merge-pathnames
+                      (format nil "enchiridion-tool-loop-test-~D/"
+                              (random most-positive-fixnum))
+                      (uiop:ensure-directory-pathname *default-pathname-defaults*))))
+         (store (enchiridion.memory.store:open-store
+                 :path (merge-pathnames "memory.db" directory))))
+    (unwind-protect
+         (progn
+           (enchiridion.tools:register-tool
+            (enchiridion.tools:make-tool
+             :name "echo"
+             :description "Echo text."
+             :schema '(:object :required (:text) :properties ((:text :string)))
+             :handler (lambda (arguments) (gethash "text" arguments))))
+           (let* ((backend (make-scripted-backend
+                            :replies (list (completion "checking"
+                                                       :tool-calls
+                                                       (list (call "c1" "echo"
+                                                                   "{\"text\":\"one\"}")))
+                                            (completion "still checking"
+                                                       :tool-calls
+                                                       (list (call "c2" "echo"
+                                                                   "{\"text\":\"two\"}")))
+                                            (completion ""
+                                                       :tool-calls
+                                                       (list (call "c3" "echo"
+                                                                   "{\"text\":\"three\"}"))))))
+                  (agent (enchiridion.kernel:make-agent
+                          :blocks (list (enchiridion.memory:make-block
+                                         :label :persona :text "identity"))
+                          :backend backend :tools-p t :tool-rounds 1))
+                  (result (enchiridion.kernel:run-turn agent "go" :store store)))
+             (testing "the operator reads the last words, not an empty request"
+               (ok (string= "still checking"
+                            (enchiridion.llm:completion-text result))))
+             (testing "the final row is stored once and marked final"
+               (let ((rows (enchiridion.memory.store:query-rows
+                            store "SELECT role, body, final_p FROM episodes ORDER BY id")))
+                 (ok (equal '(nil 0 nil 0 1)
+                            (mapcar (lambda (row)
+                                      (enchiridion.memory.store:field row "final_p"))
+                                    rows)))
+                 (ok (string= "still checking"
+                              (enchiridion.memory.store:field
+                               (car (last rows)) "body")))))))
       (enchiridion.tools:clear-registry)
       (enchiridion.memory.store:close-store store)
       (uiop:delete-directory-tree directory

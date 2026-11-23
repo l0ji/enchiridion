@@ -605,6 +605,35 @@ itself is what proves the trigger ran."
                  store "SELECT id FROM assertions"))
           "what was derived from the session went with it"))))
 
+(deftest a-version-9-store-gains-the-final-answer-marker-and-retries-a-skip ()
+  (let* ((directory (scratch-directory))
+         (path (merge-pathnames "memory.db" directory))
+         (store (enchiridion.memory.store:open-store :path path)))
+    (unwind-protect
+         (let ((turn (enchiridion.memory.store:record-turn
+                      store :session "s" :role "assistant" :body "an old answer")))
+           (enchiridion.memory.store::exec
+            store "ALTER TABLE episodes DROP COLUMN final_p")
+           (enchiridion.memory.store::exec store "DROP TABLE t2_preflight_retry")
+           (enchiridion.memory.store::exec
+            store "INSERT INTO memory_state (id, last_t2_ts, last_t2_episode)
+                   VALUES (1, 1000, 1)")
+           (enchiridion.memory.store::set-schema-version store 9)
+           (enchiridion.memory.store:close-store store)
+           (setf store (enchiridion.memory.store:open-store :path path))
+           (ok (= enchiridion.memory.store::+schema-version+
+                  (enchiridion.memory.store::schema-version store)))
+           (ok (enchiridion.memory.store::column-exists-p store "episodes" "final_p"))
+           (ok (null (enchiridion.memory:last-t2-ts store)))
+           (ok (= 1 (enchiridion.memory:new-episode-count store)))
+           (testing "a row from before the marker reads as unknown"
+             (ok (null (getf (first (enchiridion.memory.store::query-rows
+                                     store "SELECT final_p FROM episodes WHERE id = ?"
+                                     (list (enchiridion.memory.store:turn-row-id turn))))
+                             :final_p)))))
+      (ignore-errors (enchiridion.memory.store:close-store store))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
 (deftest a-current-store-is-not-rebuilt-on-open ()
   (let* ((directory (scratch-directory))
          (path (merge-pathnames "memory.db" directory)))

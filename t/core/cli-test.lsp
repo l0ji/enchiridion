@@ -547,6 +547,15 @@ here the way the operator would see it."
       (unwind-protect
            (let ((enchiridion.channel.cli:*command-context*
                    (enchiridion.channel.cli:make-command-context :store store)))
+             (testing "preflight reports the counts without building a candidate"
+               (let ((enchiridion.memory:*memory-gate-min-n* 100)
+                     (enchiridion.memory:*tail-min-n* 50)
+                     (enchiridion.memory:*assertion-deriver* nil))
+                 (multiple-value-bind (text status) (captured-run "memory" '("preflight"))
+                   (ok (zerop status))
+                   (ok (search "utility pairs: 0/100" text))
+                   (ok (search "tail pairs: 0/50 (0 answers awaiting rarity)" text))
+                   (ok (search "assertion deriver: not installed" text)))))
              (testing "an empty store has no generations"
                (ok (search "no generations yet" (captured-run "memory" '("candidates")))))
              (enchiridion.memory.store:exec
@@ -558,7 +567,7 @@ here the way the operator would see it."
                        VALUES (1, 'utility', 'fail', 0.4, '(:PAIRS 120)', 0)")
              (testing "candidates lists each generation with its verdict"
                (let ((text (captured-run "memory" '("candidates"))))
-                 (ok (search "1 quarantined: 40 episodes derived, 180 writes, 61000 tokens" text))
+                 (ok (search "1 quarantined: 40 episodes processed, 0 assertions, 180 writes, 61000 tokens" text))
                  (ok (search "(utility)" text))))
              (testing "gates shows its checks"
                (ok (search "utility fail" (captured-run "memory" '("gates" "1")))))

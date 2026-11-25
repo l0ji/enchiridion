@@ -90,7 +90,8 @@ Tail recall counts an outcome as one
 when the answer reached the pack at all, whatever its position: the utility
 outcomes are graded, and a rare answer moved down the pack is still recalled."
   (flet ((recall (outcome) (if (plusp outcome) 1 0)))
-    (let* ((pairs (paired-outcomes store generation-id :task-hashes task-hashes))
+    (let* ((pairs (when task-hashes
+                    (paired-outcomes store generation-id :task-hashes task-hashes)))
            (n (length pairs))
            (retention (if pairs (/ (reduce #'+ pairs :key (lambda (p) (recall (car p)))) n) 0))
            (candidate (if pairs (/ (reduce #'+ pairs :key (lambda (p) (recall (cdr p)))) n) 0)))
@@ -415,74 +416,66 @@ tail drawn from the newest utility tasks can miss them."
                    tasks)))
 
 (defun tail-pair-rows (store)
-  "Return the rarest eligible answer pairs, at most +TAIL-MAX-TASKS+ rows.
-
-Each row carries CUE_ID, CUE, ANSWER_ID, RARITY, and ELIGIBLE: the number of
-derived eligible pairs before the limit. Rarity is maintenance's RARITY_RAW on
-the answer, and equal rarity is ordered by answer id so a sample is stable."
+  "Return the rarest eligible answer pairs and their rarity coverage."
   (enchiridion.memory.store:query-rows
    store
-   (format nil "~A
-     SELECT a.turn_key AS cue_id, u.body AS cue, a.answer_id,
-            ans.rarity_raw AS rarity, COUNT(*) OVER () AS eligible
-       FROM answers a
-       JOIN episodes u ON u.id = a.turn_key
-       JOIN episodes ans ON ans.id = a.answer_id
-      WHERE a.answer_id IS NOT NULL
-        AND ans.derived_ts IS NOT NULL
-      ORDER BY ans.rarity_raw DESC, a.answer_id
-      LIMIT ?"
+   (format nil "~A, sample AS (
+     SELECT a.turn_key AS cue_id, a.answer_id, ans.rarity_raw AS rarity,
+            ans.derived_ts IS NULL AS unscored,
+            COUNT(*) OVER () AS eligible, COUNT(ans.derived_ts) OVER () AS ranked
+       FROM answers a JOIN episodes ans ON ans.id = a.answer_id
+      ORDER BY unscored, rarity DESC, a.answer_id
+      LIMIT ?)
+     SELECT s.cue_id, u.body AS cue, s.answer_id, s.eligible, s.ranked
+       FROM sample s JOIN episodes u ON u.id = s.cue_id
+      ORDER BY s.unscored, s.rarity DESC, s.answer_id"
            (pair-scope-sql))
    (list +tail-max-tasks+)))
 
 (defun tail-sample (store)
-  "Return the rarest eligible question and answer pairs across the whole log.
+  "Return the rarest scored answer pairs, unscored count, and eligible count."
+  (let* ((rows (tail-pair-rows store))
+         (eligible (or (enchiridion.memory.store:field (first rows) "eligible") 0))
+         (ranked (or (enchiridion.memory.store:field (first rows) "ranked") 0))
+         (wanted (max *tail-min-n* (ceiling (* *tail-rarity-fraction* ranked))))
+         (size (min (length rows) ranked wanted)))
+    (values (mapcar #'pair-row-task (subseq rows 0 size)) (- eligible ranked) eligible)))
 
-The tail is where consolidation loses first, so the sample is ordered by the
-answer's rarity and is not drawn from the newest utility tasks. Eligibility is
-a question whose final answer is identifiable: the rarest tool result or
-preamble is not a tail task. The size is the rarest *TAIL-RARITY-FRACTION* of
-the eligible answers, raised to *TAIL-MIN-N* when the log holds that many, so a
-ten percent fraction does not need five hundred pairs before it can name
-fifty, and bounded by +TAIL-MAX-TASKS+. An answer maintenance has not derived
-is not ranked.
-
-Scoring the tail is retrieval only and calls no model."
-  (let ((rows (tail-pair-rows store)))
-    (when rows
-      (let* ((eligible (or (enchiridion.memory.store:field (first rows) "eligible") 0))
-             (wanted (max *tail-min-n*
-                          (ceiling (* *tail-rarity-fraction* eligible))))
-             (size (min (length rows) +tail-max-tasks+ wanted)))
-        (mapcar #'pair-row-task (subseq rows 0 size))))))
+(defun score-pending-tail-answers (store)
+  "Score at most one maintenance batch of eligible answers."
+  (score-rarity-rows
+   store
+   (enchiridion.memory.store:query-rows
+    store
+    (format nil "~A
+      SELECT e.id, e.body, e.ts FROM answers a JOIN episodes e ON e.id = a.answer_id
+       WHERE e.derived_ts IS NULL ORDER BY e.id LIMIT ?"
+            (pair-scope-sql))
+    (list (max 1 *memory-maintenance-batch*)))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; 8. The T2 preflight
 ;;;; ------------------------------------------------------------------
 
 (defun t2-preflight (store &key (canaries *memory-canaries*))
-  "Return a plist saying whether a T2 pass has every instrument it needs.
-
-A pass with a missing deriver, canary coverage,
-utility task set, or tail sampler is a reported no-op with reason
-:INSTRUMENT-MISSING, so it never spends tokens on a candidate nobody could
-promote. :MISSING names each absent instrument, so the report says what the
-operator has to supply rather than only that something is wrong."
-  (let* ((tasks (utility-tasks store))
-         (tail (tail-sample store)))
+  "Return readiness counts and the current tail sample without writing or calling a model."
+  (multiple-value-bind (tail pending eligible) (tail-sample store)
     (multiple-value-bind (families covered-p) (canary-coverage (append canaries (approved-canaries)))
-      (let ((missing
-              (append
-               (unless *assertion-deriver* (list :deriver))
-               (unless covered-p (list :canary-coverage))
-               (unless (>= (length tasks) *memory-gate-min-n*) (list :utility-task-set))
-               (unless (>= (length tail) *tail-min-n*) (list :tail-sampler)))))
-        (list :ready-p (null missing)
-              :reason (and missing :instrument-missing)
-              :missing missing
-              :families families
-              :utility-tasks (length tasks)
-              :tail-tasks (length tail))))))
+      (let* ((utility (if (minusp *utility-max-tasks*) eligible (min eligible *utility-max-tasks*)))
+             (missing (append
+                       (unless *assertion-deriver* (list :deriver))
+                       (unless covered-p (list :canary-coverage))
+                       (when (< utility *memory-gate-min-n*) (list :utility-task-set))
+                       (when (< (min eligible +tail-max-tasks+) *tail-min-n*) (list :tail-sampler)))))
+        (values (list :ready-p (and (null missing) (zerop pending))
+                      :reason (cond (missing :instrument-missing)
+                                    ((plusp pending) :maintenance-pending))
+                      :missing missing
+                      :families families
+                      :utility-tasks utility
+                      :tail-tasks (length tail)
+                      :tail-pending pending)
+                tail)))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; 9. The gate pipeline
@@ -574,12 +567,12 @@ or uncovered suite fails, because it freezes promotion."
                 (list :families families :passed (getf result :passed)
                       :failed (getf result :failed) :failures (getf result :failures)))))))
 
-(defun measure-candidate (store generation-id scorer)
+(defun measure-candidate (store generation-id scorer tail)
   "Score the utility tasks and the tail sample under both arms for
 GENERATION-ID, and return two values: the tail tasks' hashes and the utility
 tasks' hashes, so each gate reads only its own pairs."
   (let* ((tasks (utility-tasks store))
-         (tail (tail-sample store))
+         (tail (if (eq tail :current) (tail-sample store) tail))
          (utility-hashes (mapcar #'task-hash tasks))
          (scored (append tasks (remove-if (lambda (task)
                                             (member (task-hash task) utility-hashes
@@ -601,7 +594,7 @@ tasks' hashes, so each gate reads only its own pairs."
    (list result now reason result result generation-id)))
 
 (defun gate-candidate (store generation-id &key (canaries *memory-canaries*)
-                                               (scorer #'answer-scorer))
+                                               (scorer #'answer-scorer) (tail :current))
   "Run GENERATION-ID through the promotion gates in order and return a report.
 
 The order is provenance, canary, utility, tail, then
@@ -627,7 +620,7 @@ one transaction."
       (gate "canary" (lambda () (canary-step store generation-id canaries approvals)))
       (gate "utility" (lambda ()
                         (setf (values tail-hashes utility-hashes)
-                              (measure-candidate store generation-id scorer))
+                              (measure-candidate store generation-id scorer tail))
                         (utility-gate store generation-id :task-hashes utility-hashes)))
       (gate "tail" (lambda () (tail-gate store generation-id tail-hashes)))
       (gate "cost" (lambda () (cost-gate store generation-id)))
@@ -646,7 +639,7 @@ one transaction."
               (list :promoted t :generation-id generation-id)))))))
 
 (defun check-promoted (store generation-id &key (canaries *memory-canaries*)
-                                               (scorer #'answer-scorer))
+                                               (scorer #'answer-scorer) (tail :current))
   "Re-run the canary and utility checks on GENERATION-ID, now live, and return
 a report. A failure rolls back to the parent and freezes the next pass. The
 post-check rows are what the freeze and promotion precision read."
@@ -657,7 +650,7 @@ post-check rows are what the freeze and promotion precision read."
     (record-check store generation-id "post-canary" canary-ok canary-report)
     (let ((utility-ok
             (and canary-ok
-                 (let ((utility-hashes (nth-value 1 (measure-candidate store generation-id scorer))))
+                 (let ((utility-hashes (nth-value 1 (measure-candidate store generation-id scorer tail))))
                         (multiple-value-bind (ok report)
                             (utility-gate store generation-id :task-hashes utility-hashes)
                           (record-check store generation-id "post-utility" ok report))))))
@@ -854,30 +847,12 @@ is off, or a busy log would make weekly mean nothing."
   (getf (enchiridion.memory.store:usage-total-since store (- now 86400) :channel :t2)
         :total))
 
-(defun maintenance-backlog (store)
-  "Return how many episodes maintenance has not derived yet."
-  (or (enchiridion.memory.store:field
-       (first (enchiridion.memory.store:query-rows
-               store "SELECT COUNT(*) AS n FROM episodes WHERE derived_ts IS NULL"))
-       "n")
-      0))
-
 (defun t2-refusal (store &key (now (get-universal-time)))
-  "Return why no T2 pass may run on this tick, as a keyword, or NIL.
-A missing instrument is not a refusal here: the pass reports it with the list
-of what is missing, and spends nothing doing so.
-
-A maintenance backlog is: the tail sample reads rarity, which maintenance
-derives a batch per tick, so after a large import the preflight would find too
-few rare answers and throttle the next check. A refusal ends no
-pass, so T2 runs on the first tick the backlog is clear."
+  "Return why no T2 pass may run on this tick, or NIL."
   (cond
     ((or (not (enabled-p)) (not *t2-enabled-p*)) :disabled)
     ((not (t2-due-p store :now now)) :not-due)
-    ((plusp (maintenance-backlog store)) :maintenance-pending)
-    ;; Only the operator lifts a precision freeze, so a pass during one could
-    ;; only spend. A quarantine-rate freeze is not refused: held candidates
-    ;; are what lift it, and T2-INTERVAL already slows it to weekly.
+    ;; Held candidates can lift a quarantine freeze, but only the operator lifts a precision freeze
     ((precision-frozen-p store) :frozen-precision)
     ((>= (t2-pass-spend store :now now) *t2-max-tokens-per-pass*) :pass-budget-spent)
     (t nil)))
@@ -887,10 +862,10 @@ pass, so T2 runs on the first tick the backlog is clear."
   (and (plusp generation-id)
        (null (first-check-result store generation-id "post-canary"))))
 
-(defun gate-t2-candidate (store generation-id &key canaries scorer now (recovered nil))
+(defun gate-t2-candidate (store generation-id &key canaries scorer now tail (recovered nil))
   "Gate GENERATION-ID, end the pass, and return the plist RUN-T2-PASS returns.
 RECOVERED says the candidate was built by an earlier pass and never gated."
-  (let ((gate (gate-candidate store generation-id :canaries canaries :scorer scorer)))
+  (let ((gate (gate-candidate store generation-id :canaries canaries :scorer scorer :tail tail)))
     (mark-t2-pass store :now (or now (get-universal-time)))
     (list :outcome (cond ((getf gate :promoted) :promoted)
                          ((eq (getf gate :reason) :held) :held)
@@ -907,8 +882,8 @@ RECOVERED says the candidate was built by an earlier pass and never gated."
                                (limit *memory-t2-episodes-per-tick*)
                                now)
   "Run one tick of a T2 pass and return a report plist whose :OUTCOME is one
-of :ROLLED-BACK, :INSTRUMENT-MISSING, :BUILDING, :PROMOTED, :QUARANTINED,
-:HELD, or :SKIPPED. The caller has already asked T2-REFUSAL.
+of :ROLLED-BACK, :INSTRUMENT-MISSING, :MAINTENANCE-PENDING, :BUILDING,
+:PROMOTED, :QUARANTINED, :HELD, or :SKIPPED. The caller has already asked T2-REFUSAL.
 
 A pass that starts after a promotion first re-checks the live generation:
 A failed post-promotion check rolls back and
@@ -918,44 +893,54 @@ tokens go to a candidate nobody could promote. A candidate an earlier pass built
 and never gated is gated before a new build starts, so a crash between building
 and gating does not waste its derivations. LAST_T2_TS is written whenever a
 pass ends, and not while a candidate is still building."
-  (let ((live (live-generation-id store))
-        (building (current-building-generation store)))
-    (when (and (null building) (live-unchecked-p store live))
-      (let ((check (check-promoted store live :canaries canaries :scorer scorer)))
-        (unless (getf check :held)
-          (mark-t2-pass store :now (or now (get-universal-time)))
-          (return-from run-t2-pass
-            (list :outcome :rolled-back :generation-id live :failed (getf check :failed))))))
-    (unless building
-      (let ((preflight (t2-preflight store :canaries canaries)))
-        (unless (getf preflight :ready-p)
-          (mark-t2-preflight-retry store canaries (or now (get-universal-time)))
-          (return-from run-t2-pass
-            (list :outcome :instrument-missing :missing (getf preflight :missing))))
-        ;; A candidate an earlier pass built is judged before a new one is
-        ;; built: its derivations are paid for, and the instruments must still
-        ;; be present so it is not quarantined for a check the schedule lost.
-        (let ((stranded (complete-candidate-generation store)))
-          (when stranded
+  (let* ((live (live-generation-id store))
+         (building (current-building-generation store))
+         (unchecked (and (null building) (live-unchecked-p store live)))
+         (caught-up nil))
+    (flet ((prepare-tail (sample pending &optional eligible)
+             (declare (ignore eligible))
+             (when (and (plusp pending) (not caught-up))
+               (setf caught-up t)
+               (score-pending-tail-answers store)
+               (setf (values sample pending) (tail-sample store)))
+             (when (plusp pending)
+               (return-from run-t2-pass
+                 (list :outcome :maintenance-pending :tail-pending pending)))
+             sample))
+      (when unchecked
+        (let* ((tail (multiple-value-call #'prepare-tail (tail-sample store)))
+               (check (check-promoted store live :canaries canaries :scorer scorer :tail tail)))
+          (unless (getf check :held)
+            (mark-t2-pass store :now (or now (get-universal-time)))
             (return-from run-t2-pass
-              (gate-t2-candidate store stranded :canaries canaries
-                                 :scorer scorer :now now
-                                 :recovered t))))))
-    (let ((build (build-candidate store :limit limit)))
-      (cond
-        ((eq (getf build :reason) :claimed)
-         (list :outcome :building
-               :generation-id (getf build :generation-id)
-               :remaining (getf build :remaining)
-               :claimed t))
-        ((not (getf build :built))
-         (list :outcome :skipped :reason (getf build :reason)))
-        ((eq (getf build :status) :building)
-         (list :outcome :building
-               :generation-id (getf build :generation-id)
-               :remaining (getf build :remaining)
-               :skipped (getf build :skipped)
-               :failed (getf build :failed)))
-        (t
-         (gate-t2-candidate store (getf build :generation-id)
-                            :canaries canaries :scorer scorer :now now))))))
+              (list :outcome :rolled-back :generation-id live :failed (getf check :failed))))))
+      (unless building
+        (multiple-value-bind (preflight sample) (t2-preflight store :canaries canaries)
+          (when (getf preflight :missing)
+            (mark-t2-preflight-retry store canaries (or now (get-universal-time)))
+            (return-from run-t2-pass (list* :outcome :instrument-missing preflight)))
+          (let ((tail (prepare-tail sample (getf preflight :tail-pending)))
+                (stranded (complete-candidate-generation store)))
+            (when stranded
+              (return-from run-t2-pass
+                (gate-t2-candidate store stranded :canaries canaries :scorer scorer
+                                   :now now :tail tail :recovered t))))))
+      (let ((build (build-candidate store :limit limit)))
+        (cond
+          ((eq (getf build :reason) :claimed)
+           (list :outcome :building
+                 :generation-id (getf build :generation-id)
+                 :remaining (getf build :remaining)
+                 :claimed t))
+          ((not (getf build :built))
+           (list :outcome :skipped :reason (getf build :reason)))
+          ((eq (getf build :status) :building)
+           (list :outcome :building
+                 :generation-id (getf build :generation-id)
+                 :remaining (getf build :remaining)
+                 :skipped (getf build :skipped)
+                 :failed (getf build :failed)))
+          (t
+           (let ((tail (multiple-value-call #'prepare-tail (tail-sample store))))
+             (gate-t2-candidate store (getf build :generation-id)
+                                :canaries canaries :scorer scorer :now now :tail tail))))))))

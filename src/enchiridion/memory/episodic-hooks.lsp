@@ -573,41 +573,36 @@ Return the number of episodes marked."
     (enchiridion.memory.store:exec
      store "UPDATE episodes SET derived_ts = NULL")))
 
+(defun score-rarity-rows (store rows)
+  "Score rarity and optional lexical links for ROWS."
+  (dolist (row rows (length rows))
+    (let* ((id (enchiridion.memory.store:field row "id"))
+           (body (enchiridion.memory.store:field row "body"))
+           (ts (or (enchiridion.memory.store:field row "ts") (get-universal-time)))
+           (rarity (rarity-of store body :before-id id)))
+      (when (graph-terms-on-p)
+        (link-co-occurrences store id body ts *memory-parameters*))
+      (enchiridion.memory.store:with-store-transaction (store)
+        (enchiridion.memory.store:exec
+         store "UPDATE activation SET distinctness = ? WHERE kind = 'episode' AND id = ?"
+         (list rarity id))
+        (enchiridion.memory.store:exec
+         store "UPDATE episodes SET rarity_raw = ?, derived_ts = ? WHERE id = ?"
+         (list rarity (get-universal-time) id))))))
+
 (defun maintenance (store &key (limit *memory-maintenance-batch*))
   "Run the model-free T1a pass and return a report plist.
-The pass copies old turns into the log, then derives the cheap scalars for
-episodes that have not been derived yet: rarity, and lexical co-occurrence
-links when GRAPH-TERMS-ON-P. Rarity is measured against the episodes before it
-in the log, because the row is already indexed when this pass reaches it.
-Nothing here calls a model and nothing rewrites an episode body.
+Score a batch of unscored episodes, oldest first. Rarity is measured against
+earlier episodes. This pass does not call a model or rewrite episode bodies.
 Never signal: the heartbeat reports a failure."
   (when (and store (enabled-p))
     (handler-case
-        (let* ((rows (enchiridion.memory.store:query-rows
-                      store
-                      "SELECT id, body, ts FROM episodes
-                        WHERE derived_ts IS NULL ORDER BY id ASC LIMIT ?"
-                      (list (max 1 limit))))
-               (derived 0))
-          (dolist (row rows derived)
-            (let* ((id (enchiridion.memory.store:field row "id"))
-                   (body (enchiridion.memory.store:field row "body"))
-                   (ts (or (enchiridion.memory.store:field row "ts")
-                           (get-universal-time)))
-                   (rarity (rarity-of store body :before-id id)))
-              (when (graph-terms-on-p)
-                (link-co-occurrences store id body ts *memory-parameters*))
-              (enchiridion.memory.store:exec
-               store
-               "UPDATE episodes SET rarity_raw = ?, derived_ts = ? WHERE id = ?"
-               (list rarity (get-universal-time) id))
-              (enchiridion.memory.store:exec
-               store
-               "UPDATE activation SET distinctness = ?
-                 WHERE kind = 'episode' AND id = ?"
-               (list rarity id))
-              (incf derived)))
-          (list :derived derived))
+        (list :derived
+              (score-rarity-rows
+               store (enchiridion.memory.store:query-rows
+                      store "SELECT id, body, ts FROM episodes
+                              WHERE derived_ts IS NULL ORDER BY id LIMIT ?"
+                      (list (max 1 limit)))))
       (error (c)
         (list :failed (enchiridion.errors:condition-report-line c))))))
 

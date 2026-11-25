@@ -90,7 +90,7 @@ missing one.
 | Deriver | An assertion deriver is installed, which `serve` does when a backend exists | `:deriver` |
 | Canary coverage | Valid `:canaries` cover `:canary-min-families` of the four families | `:canary-coverage` |
 | Utility task set | The log holds `:gate-min-n` question-and-answer pairs | `:utility-task-set` |
-| Tail sampler | At least `:tail-min-n` pairs have ranked answers | `:tail-sampler` |
+| Tail sampler | At least `:tail-min-n` pairs have eligible answers | `:tail-sampler` |
 
 The four canary families are retrieval, update, safety and tail. A canary names a
 `family`, a `cue`, an `expect` string, and a `stale` string for the update
@@ -143,7 +143,8 @@ A candidate passes five gates in order and stops at the first failure.
 | Cost | At most `:t2-writes-per-episode` claims per derived episode, and at most `:t2-max-tokens-per-episode` tokens per derived episode since the last promotion |
 
 Each gate writes a `generation_checks` row. A failure quarantines the candidate
-with the gate's name and leaves the live layer alone. A candidate that passes is
+with the gate's name and leaves the live layer alone. Paired scores enter `gate_log` only when a candidate
+reaches utility scoring. A candidate that passes is
 promoted in one transaction. Thresholds are compared exactly, so a mean delta of
 0.05 meets a margin of 0.05.
 
@@ -159,9 +160,12 @@ candidates lift a quarantine freeze, and T2 slows to
 The heartbeat runs a model-free maintenance pass before the sleep agent and
 before compaction. It derives rarity for episodes that have none, in batches,
 and writes lexical links only when a retrieval weight reads them. The tick
-reports `N episodes derived`, and says nothing when there is no backlog.
+reports `Rarity scored for N episodes` when it scores a batch.
 
-T2 runs after maintenance, so the tail sample reads fresh rarity. A pass is due
+T2 runs after maintenance. If eligible answers still lack rarity scores, it can
+score one extra maintenance batch before taking the tail sample. It defers the
+sample if eligible answers remain unscored. Other pending episodes do not block T2.
+A pass is due
 daily or after `:t2-episode-threshold` new episodes, whichever comes first, and
 derives `:t2-max-episodes-per-tick` episodes per tick. A candidate that is still
 building is always due, so one pass can span several ticks.
@@ -176,6 +180,7 @@ budget is spent. Its spend counts toward the day cap, not the tick cap.
 
 ```sh
 enchiridion memory status        # counts, live generation, retrieval switches
+enchiridion memory preflight     # T2 readiness without building a candidate
 enchiridion memory "open ports"  # search memories, turns and episodes
 enchiridion memory candidates    # every generation and its verdict
 enchiridion memory gates ID      # one generation's checks

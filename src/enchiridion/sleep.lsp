@@ -837,7 +837,6 @@ puts a Lisp symbol in a line the operator reads."
   (case refusal
     (:not-due "not due")
     (:disabled "memory is switched off")
-    (:maintenance-pending "maintenance has a backlog to derive first")
     (:frozen-precision "promotion precision is frozen; reset it to lift the freeze")
     (:pass-budget-spent "the pass budget is spent")
     (:no-store "no memory store is open")
@@ -862,8 +861,15 @@ puts a Lisp symbol in a line the operator reads."
                              id (getf report :freeze)))
               (:rolled-back (format nil "T2 rolled back generation ~D: its ~A check failed"
                                     id (getf report :failed)))
-              (:instrument-missing (format nil "T2 skipped: instruments missing (~{~(~A~)~^, ~})"
-                                           (getf report :missing)))
+              (:instrument-missing
+               (format nil "T2 skipped: instruments missing (~{~(~A~)~^, ~}); utility pairs ~D/~D, tail pairs ~D/~D (~D answers awaiting rarity)"
+                       (getf report :missing)
+                       (getf report :utility-tasks) enchiridion.memory:*memory-gate-min-n*
+                       (getf report :tail-tasks) enchiridion.memory:*tail-min-n*
+                       (getf report :tail-pending)))
+              (:maintenance-pending
+               (format nil "T2 deferred: ~D eligible answer~:P still awaiting rarity"
+                       (getf report :tail-pending)))
               (:skipped (format nil "T2 skipped: ~A"
                                 (t2-refusal-line (getf report :reason)))))))
       (if (getf report :recovered)
@@ -1031,7 +1037,7 @@ carries the spend of the pass before it. Then the sleep agent."
                         (format nil "memory maintenance failed: ~A"
                                 (getf report :failed)))
                        ((plusp (getf report :derived 0))
-                        (format nil "~D episode~:P derived"
+                        (format nil "Rarity scored for ~D episode~:P"
                                 (getf report :derived)))
                        (t nil))))))
       (when (and store agent)

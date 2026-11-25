@@ -819,12 +819,25 @@ file a block is backed by."
            (progn (say "Revoked canary ~A." id) 0)
            (progn (say "No approved canary ~A." id) 1))))))
 
+(defun print-t2-preflight (store)
+  (let ((report (enchiridion.memory:t2-preflight store)))
+    (say "utility pairs: ~D/~D" (getf report :utility-tasks) enchiridion.memory:*memory-gate-min-n*)
+    (say "tail pairs: ~D/~D (~D answers awaiting rarity)"
+         (getf report :tail-tasks) enchiridion.memory:*tail-min-n* (getf report :tail-pending))
+    (say "canary families: ~D/~D"
+         (length (getf report :families)) enchiridion.memory:*canary-min-families*)
+    (say "assertion deriver: ~:[not installed~;installed~]" enchiridion.memory:*assertion-deriver*)
+    (cond
+      ((getf report :missing) (say "missing: ~{~(~A~)~^, ~}" (getf report :missing)))
+      ((getf report :ready-p) (say "instruments ready"))
+      (t (say "waiting for rarity scores")))))
+
 (declaim (ftype (function (list) integer) cmd-memory))
 
 (defun cmd-memory (arguments)
   "Search sessions, memories and episodes, or run a log action.
 The first argument selects an action when it is STATUS, BUILD, IMPORT,
-CANDIDATES, GATES, PROMOTE, REGATE, ROLLBACK or CANARIES.
+PREFLIGHT, CANDIDATES, GATES, PROMOTE, REGATE, ROLLBACK or CANARIES.
 Anything else is a search query, so the common call keeps working."
   (let ((missing (require-store "memory")))
     (if missing
@@ -839,6 +852,9 @@ Anything else is a search query, so the common call keeps working."
                               :cue-index :canaries))
                  (say "~(~A~): ~A" key (getf status key))))
              0)
+            ((string= action "preflight")
+             (print-t2-preflight store)
+             0)
             ((string= action "candidates")
              (let ((rows (enchiridion.memory.store:query-rows
                           store "SELECT id, status, episodes_derived, writes, tokens_used,
@@ -848,8 +864,10 @@ Anything else is a search query, so the common call keeps working."
                    (say "no generations yet.")
                    (dolist (row rows)
                      (flet ((f (name) (enchiridion.memory.store:field row name)))
-                       (say "~D ~A: ~D episode~:P derived, ~D write~:P, ~D tokens~@[, ~A~]~@[ (~A)~]"
-                            (f "id") (f "status") (f "episodes_derived") (f "writes")
+                       (say "~D ~A: ~D episode~:P processed, ~D assertion~:P, ~D write~:P, ~D tokens~@[, ~A~]~@[ (~A)~]"
+                            (f "id") (f "status") (f "episodes_derived")
+                            (enchiridion.memory:generation-assertion-count store (f "id"))
+                            (f "writes")
                             (f "tokens_used")
                             (let ((r (f "promotion_result"))) (and r (plusp (length r)) r))
                             (let ((r (f "quarantine_reason"))) (and r (plusp (length r)) r))))))
@@ -1588,7 +1606,8 @@ the default, so the table stays one source of command names and handlers."
          '(:default (:directory)))
    (list "memory" 1 nil #'cmd-memory "Search sessions, memories and episodes"
          '(:default (:config :store)
-           :actions (("build" . (:config :directory :secrets :store :backend))
+           :actions (("preflight" . (:config :directory :secrets :store :backend))
+                     ("build" . (:config :directory :secrets :store :backend))
                      ("promote" . (:config :directory :secrets :store :backend))
                      ("regate" . (:config :directory :secrets :store :backend)))))
    (list "sessions" 0 0 #'cmd-sessions "Stored sessions with turn counts"

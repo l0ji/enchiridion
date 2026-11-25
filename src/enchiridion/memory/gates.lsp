@@ -23,13 +23,15 @@ of at least WINS heads in N fair coin flips, as an exact rational."
       (/ (loop for i from wins to n sum (binomial n i))
          (expt 2 n))))
 
-(defun paired-outcomes (store generation-id &key task-hashes)
+(defun paired-outcomes (store generation-id &key (task-hashes :all))
   "Return GENERATION-ID's outcome pairs as a list of (RETENTION . CANDIDATE),
 one per task both arms scored, from the latest row of each.
 
 The rows are the ones RUN-ARM wrote under the candidate's id and each task's
-hash, so a pair is the same question asked of the two arms. TASK-HASHES, when
-given, keeps only those tasks."
+hash, so a pair is the same question asked of the two arms. TASK-HASHES is
+:ALL or a list of tasks to keep. An empty list matches nothing."
+  (when (null task-hashes)
+    (return-from paired-outcomes nil))
   (let ((by-task (make-hash-table :test #'equal)))
     (dolist (row (enchiridion.memory.store:query-rows
                   store
@@ -43,7 +45,7 @@ given, keeps only those tasks."
                        ON latest.id = g.id"
                   (list generation-id)))
       (let ((hash (enchiridion.memory.store:field row "task_hash")))
-        (when (or (null task-hashes) (member hash task-hashes :test #'string=))
+        (when (or (eq task-hashes :all) (member hash task-hashes :test #'string=))
           (let ((pair (or (gethash hash by-task) (cons nil nil)))
                 (value (enchiridion.memory.store:field row "value")))
             (if (string= (enchiridion.memory.store:field row "arm") "retention")
@@ -56,7 +58,7 @@ given, keeps only those tasks."
 (defun utility-gate (store generation-id &key (margin *memory-gate-margin*)
                                               (min-n *memory-gate-min-n*)
                                               (alpha *memory-gate-alpha*)
-                                              (task-hashes nil))
+                                              (task-hashes :all))
   "Return two values: T when GENERATION-ID beats retention-only, and a report.
 
 Compare candidate and retention-only on paired tasks at
@@ -90,8 +92,7 @@ Tail recall counts an outcome as one
 when the answer reached the pack at all, whatever its position: the utility
 outcomes are graded, and a rare answer moved down the pack is still recalled."
   (flet ((recall (outcome) (if (plusp outcome) 1 0)))
-    (let* ((pairs (when task-hashes
-                    (paired-outcomes store generation-id :task-hashes task-hashes)))
+    (let* ((pairs (paired-outcomes store generation-id :task-hashes task-hashes))
            (n (length pairs))
            (retention (if pairs (/ (reduce #'+ pairs :key (lambda (p) (recall (car p)))) n) 0))
            (candidate (if pairs (/ (reduce #'+ pairs :key (lambda (p) (recall (cdr p)))) n) 0)))
@@ -639,7 +640,7 @@ one transaction."
               (list :promoted t :generation-id generation-id)))))))
 
 (defun check-promoted (store generation-id &key (canaries *memory-canaries*)
-                                               (scorer #'answer-scorer) (tail :current))
+                                               (scorer #'answer-scorer))
   "Re-run the canary and utility checks on GENERATION-ID, now live, and return
 a report. A failure rolls back to the parent and freezes the next pass. The
 post-check rows are what the freeze and promotion precision read."
@@ -650,7 +651,7 @@ post-check rows are what the freeze and promotion precision read."
     (record-check store generation-id "post-canary" canary-ok canary-report)
     (let ((utility-ok
             (and canary-ok
-                 (let ((utility-hashes (nth-value 1 (measure-candidate store generation-id scorer tail))))
+                 (let ((utility-hashes (nth-value 1 (measure-candidate store generation-id scorer nil))))
                         (multiple-value-bind (ok report)
                             (utility-gate store generation-id :task-hashes utility-hashes)
                           (record-check store generation-id "post-utility" ok report))))))
@@ -891,14 +892,13 @@ freezes the next pass, so a rollback ends this pass with nothing built. A new
 candidate is started only when the preflight finds every instrument, so no
 tokens go to a candidate nobody could promote. A candidate an earlier pass built
 and never gated is gated before a new build starts, so a crash between building
-and gating does not waste its derivations. LAST_T2_TS is written whenever a
-pass ends, and not while a candidate is still building."
+and gating does not waste its derivations. LAST_T2_TS is written when a pass
+ends, not while a candidate is building or waiting for rarity."
   (let* ((live (live-generation-id store))
          (building (current-building-generation store))
          (unchecked (and (null building) (live-unchecked-p store live)))
          (caught-up nil))
-    (flet ((prepare-tail (sample pending &optional eligible)
-             (declare (ignore eligible))
+    (flet ((prepare-tail (sample pending)
              (when (and (plusp pending) (not caught-up))
                (setf caught-up t)
                (score-pending-tail-answers store)
@@ -908,8 +908,7 @@ pass ends, and not while a candidate is still building."
                  (list :outcome :maintenance-pending :tail-pending pending)))
              sample))
       (when unchecked
-        (let* ((tail (multiple-value-call #'prepare-tail (tail-sample store)))
-               (check (check-promoted store live :canaries canaries :scorer scorer :tail tail)))
+        (let ((check (check-promoted store live :canaries canaries :scorer scorer)))
           (unless (getf check :held)
             (mark-t2-pass store :now (or now (get-universal-time)))
             (return-from run-t2-pass
@@ -941,6 +940,7 @@ pass ends, and not while a candidate is still building."
                  :skipped (getf build :skipped)
                  :failed (getf build :failed)))
           (t
-           (let ((tail (multiple-value-call #'prepare-tail (tail-sample store))))
+           (multiple-value-bind (sample pending) (tail-sample store)
              (gate-t2-candidate store (getf build :generation-id)
-                                :canaries canaries :scorer scorer :now now :tail tail))))))))
+                                :canaries canaries :scorer scorer :now now
+                                :tail (prepare-tail sample pending)))))))))

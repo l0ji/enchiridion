@@ -143,10 +143,9 @@ A candidate passes five gates in order and stops at the first failure.
 | Cost | At most `:t2-writes-per-episode` claims per derived episode, and at most `:t2-max-tokens-per-episode` tokens per derived episode since the last promotion |
 
 Each gate writes a `generation_checks` row. A failure quarantines the candidate
-with the gate's name and leaves the live layer alone. Paired scores enter `gate_log` only when a candidate
-reaches utility scoring. A candidate that passes is
-promoted in one transaction. Thresholds are compared exactly, so a mean delta of
-0.05 meets a margin of 0.05.
+with the gate's name and leaves the live layer alone. Paired scores enter
+`gate_log` at utility scoring. A candidate that passes is promoted in one
+transaction. A mean delta of 0.05 meets a margin of 0.05.
 
 Promotion precision and quarantine rate can freeze promotion even for a
 candidate that passes every gate. A precision freeze has no reset command;
@@ -163,12 +162,12 @@ and writes lexical links only when a retrieval weight reads them. The tick
 reports `Rarity scored for N episodes` when it scores a batch.
 
 T2 runs after maintenance. If eligible answers still lack rarity scores, it can
-score one extra maintenance batch before taking the tail sample. It defers the
-sample if eligible answers remain unscored. Other pending episodes do not block T2.
-A pass is due
-daily or after `:t2-episode-threshold` new episodes, whichever comes first, and
-derives `:t2-max-episodes-per-tick` episodes per tick. A candidate that is still
-building is always due, so one pass can span several ticks.
+score one extra maintenance batch. If eligible answers remain unscored, T2
+defers candidate gating. Other pending episodes do not block T2.
+
+A pass is due daily or after `:t2-episode-threshold` new episodes, whichever comes
+first, and derives `:t2-max-episodes-per-tick` episodes per tick. A candidate
+that is still building is always due, so one pass can span several ticks.
 
 A pass first re-checks a live generation that was promoted and not yet checked; a
 failure rolls it back and ends the pass. A new candidate starts only when the

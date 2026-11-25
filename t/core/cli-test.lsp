@@ -664,9 +664,11 @@ here the way the operator would see it."
       (ok (equal '(:config :directory) (requirements "blocks" '())))
       (ok (equal '(:config :directory) (requirements "blocks" '("show"))))
       (ok (equal '(:directory) (requirements "blocks" '("edit" "1")))))
-    (testing "memory derivation needs the backend and its directory"
+    (testing "memory preflight and derivation need the backend and its directory"
       (ok (equal '(:config :store) (requirements "memory" '("status"))))
       (ok (equal '(:config :store) (requirements "memory" '("search" "x"))))
+      (ok (equal '(:config :directory :secrets :store :backend)
+                 (requirements "memory" '("preflight"))))
       (ok (equal '(:config :directory :secrets :store :backend)
                  (requirements "memory" '("build"))))
       (ok (equal '(:config :directory :secrets :store :backend)

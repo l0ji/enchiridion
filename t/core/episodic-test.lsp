@@ -411,6 +411,18 @@
     (let ((pairs (enchiridion.memory:paired-outcomes store 1)))
       (ok (equal '((0.0d0 . 1.0d0)) pairs)))))
 
+(deftest an-empty-task-set-does-not-borrow-other-scores ()
+  (with-store (store)
+    (record-pair store 1 "another-task" 0.0 1.0)
+    (ok (enchiridion.memory:utility-gate store 1 :min-n 1 :alpha 1.0))
+    (multiple-value-bind (pass report)
+        (enchiridion.memory:utility-gate store 1 :min-n 1 :alpha 1.0 :task-hashes nil)
+      (ng pass)
+      (ok (zerop (getf report :pairs))))
+    (multiple-value-bind (pass report) (enchiridion.memory:tail-gate store 1 nil :min-n 1)
+      (ng pass)
+      (ok (zerop (getf report :n))))))
+
 (deftest a-mean-delta-of-exactly-the-margin-meets-it ()
   ;; "At least 0.05": one win among twenty tasks is a delta of exactly 1/20.
   (with-store (store)

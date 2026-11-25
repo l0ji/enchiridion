@@ -1229,19 +1229,24 @@ shipped schedule."
         (ok (= (getf last :generation-id) (enchiridion.memory:live-generation-id store)))))))
 
 (deftest the-pass-after-a-promotion-checks-it-first ()
-  (testing "a failed check rolls back and builds nothing"
+  (testing "a failed check rolls back before spending a batch on rarity"
     (with-t2-world (store directory)
-      (let* ((promoted (getf (finish-t2-pass store) :generation-id))
-             (before (generation-count store))
-             (report (enchiridion.memory:run-t2-pass
-                      store :canaries (cons (canary "safety" :name "leak" :cue "alpha"
-                                                             :expect "alpha")
-                                            (passing-canaries))
-                            :scorer #'assertion-scorer)))
-        (ok (eq :rolled-back (getf report :outcome)))
-        (ok (= promoted (getf report :generation-id)))
-        (ok (zerop (enchiridion.memory:live-generation-id store)))
-        (ok (= before (generation-count store))))))
+      (let ((promoted (getf (finish-t2-pass store) :generation-id))
+            (before (generation-count store))
+            (enchiridion.memory::*memory-maintenance-batch* 1))
+        (dotimes (i 2)
+          (say store "user" (format nil "pending question ~D" i))
+          (say store "assistant" (format nil "pending answer ~D" i)))
+        (let ((report (enchiridion.memory:run-t2-pass
+                       store :canaries (cons (canary "safety" :name "leak" :cue "alpha"
+                                                              :expect "alpha")
+                                             (passing-canaries))
+                             :scorer #'assertion-scorer)))
+          (ok (eq :rolled-back (getf report :outcome)))
+          (ok (= promoted (getf report :generation-id)))
+          (ok (zerop (enchiridion.memory:live-generation-id store)))
+          (ok (= before (generation-count store)))
+          (ok (= 4 (count-rows store "SELECT COUNT(*) AS n FROM episodes WHERE derived_ts IS NULL")))))))
   (testing "a check that holds lets the same pass build"
     (with-t2-world (store directory)
       (let* ((promoted (getf (finish-t2-pass store) :generation-id))
@@ -1559,6 +1564,7 @@ shipped schedule."
         (ok (= 7 (getf report :utility-tasks)))
         (ok (= 2 (getf report :tail-pending)))
         (ng (getf report :ready-p)))
+      (ok (null (enchiridion.memory:t2-refusal store)))
       (let ((report (enchiridion.memory:run-t2-pass store :canaries (passing-canaries))))
         (ok (eq :maintenance-pending (getf report :outcome)))
         (ok (= 1 (getf report :tail-pending))))
@@ -1571,16 +1577,19 @@ shipped schedule."
       (ok (= 1 (count-rows store "SELECT COUNT(*) AS n FROM generation_derivations")))
       (ok (zerop (count-rows store "SELECT COUNT(*) AS n FROM gate_log"))))))
 
-(deftest unrelated-rarity-backlog-does-not-hide-missing-utility-pairs ()
+(deftest missing-utility-pairs-are-reported-before-rarity-catch-up ()
   (with-t2-world (store directory)
-    (let ((enchiridion.memory:*memory-gate-min-n* 6))
+    (let ((enchiridion.memory:*memory-gate-min-n* 7))
+      (say store "user" "extra question")
+      (say store "assistant" "extra answer")
       (enchiridion.memory.store:record-turn
        store :channel :sleep :session "sleep" :body "compaction input")
       (let ((report (enchiridion.memory:run-t2-pass store :canaries (passing-canaries))))
         (ok (eq :instrument-missing (getf report :outcome)))
         (ok (equal '(:utility-task-set) (getf report :missing)))
-        (ok (= 5 (getf report :utility-tasks)))
-        (ok (zerop (getf report :tail-pending))))
+        (ok (= 6 (getf report :utility-tasks)))
+        (ok (= 1 (getf report :tail-pending))))
+      (ok (= 3 (count-rows store "SELECT COUNT(*) AS n FROM episodes WHERE derived_ts IS NULL")))
       (ok (zerop (generation-count store)))
       (ok (zerop (count-rows store "SELECT COUNT(*) AS n FROM gate_log"))))))
 

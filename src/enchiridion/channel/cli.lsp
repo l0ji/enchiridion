@@ -1,59 +1,28 @@
-;;;; cli.lsp --- The command table that backs both the shell and the REPL.
-;;;;
-;;;; One table, two surfaces. A shell command is one program invocation that
-;;;; prints and exits; the REPL is the same commands with a live process behind
-;;;; them. Keeping the rows in one list is what stops the two from drifting: a
-;;;; command added for the shell is a command the REPL already has, and the
-;;;; arity check is written once.
-;;;;
-;;;; Everything here is ordinary Lisp rather than a framework. A row is a list,
-;;;; a handler is a function of the argument list, and the live objects a
-;;;; handler needs travel in *COMMAND-CONTEXT* rather than in a second
-;;;; parameter, so every handler keeps the one argument the table promises.
-;;;;
-;;;; A handler prints and returns an exit status. It does not signal for a
-;;;; usage mistake: the operator gets a line, not a backtrace. The conditions
-;;;; stay for the code paths that call these functions in process.
+;;;; cli.lsp --- Shared command table and REPL for shell and interactive use.
 
 (in-package #:enchiridion.channel.cli)
 
-;;;; The context.
+;;;; Context.
 
-;; Every slot is opaque to this file except GENERATION, RESPOND and CANCEL.
-;; A command handler reads what it needs and nothing here depends on the shape
-;; of a store, a broker or an agent, which is what lets the same handler run in
-;; a one-shot shell process and in the supervisor.
 (defstruct command-context
-  (directory nil :type t)                 ; the agent directory
-  (config nil :type t)                    ; the active configuration
-  (store nil :type t)                     ; the open memory store
-  (agent nil :type t)                     ; the live agent, or NIL
-  (session nil :type t)                   ; the live session, or NIL
-  (broker nil :type t)                    ; the broker handle, or NIL
-  (generation nil :type (or null integer)) ; the loaded code generation
-  (supervisor nil :type t)                ; the supervisor this process owns
-  (channel nil :type t)                   ; the channel this command arrived on
-  (respond nil :type (or null function))  ; one string in, one turn out
-  (cancel nil :type (or null function)))  ; ask the turn in flight to stop
+  (directory nil :type t)                  ; agent directory
+  (config nil :type t)                     ; active configuration
+  (store nil :type t)                      ; open memory store
+  (agent nil :type t)                      ; live agent, or NIL
+  (session nil :type t)                    ; live session, or NIL
+  (broker nil :type t)                     ; broker handle, or NIL
+  (generation nil :type (or null integer)) ; loaded plugin generation
+  (supervisor nil :type t)                 ; process-owned supervisor
+  (channel nil :type t)                    ; originating channel
+  (respond nil :type (or null function))   ; string -> turn exit status
+  (cancel nil :type (or null function)))   ; cancel turn in flight
 
 (defparameter *command-context* (make-command-context)
-  "The live objects the current command reads.
-
-The caller binds this around RUN-COMMAND or RUN-REPL. A handler never takes a
-second argument, so the shell path and the REPL path call the same function
-object with the same shape.")
+  "Live state bound around RUN-COMMAND and RUN-REPL.")
 
 (defvar *repl-p* nil
-  "True when the command being read came from the REPL and not from a shell.
+  "True when evaluating a command from the REPL rather than the shell.")
 
-One table backs both surfaces, and a command name is spelled differently on
-each: the operator types `/help` at the REPL and `enchiridion help` at a shell.
-This is the flag that lets a message name the command the way the surface in
-front of the operator spells it. REPL-EVALUATE binds it around a whole line.")
-
-;; The table itself is filled at the end of this file, after every handler it
-;; names exists. The special proclamation lets the lookup functions below refer
-;; to it before the DEFPARAMETER that gives it a value.
 (declaim (special *commands*))
 
 ;;;; Small helpers.
@@ -704,19 +673,9 @@ left off the slash, and the REPL says so instead of spending a turn on it."
 (defun run-repl (&key (context *command-context*)
                       (input *standard-input*)
                       (output *standard-output*))
-  "Read lines from INPUT and evaluate each, until the operator quits or INPUT
-ends. Return :QUIT or :EOF.
-
-Ctrl-C does not leave the session. An interrupt aborts the line being read, or
-the turn being answered, prints one line, and the loop asks again. The throw is
-what makes that work: the handler has to leave READ-LINE or RESPOND, and the
-catch is the nearest place the loop can pick up from. Nothing calls the cancel
-function here, because the flag behind it stays set and every later turn would
-be cancelled with it.
-
-SIGTERM and SIGHUP are the other case. They ask the process to stop rather than
-the line to stop, so the handler declines them and the top level answers, which
-is what makes `docker stop` end a chat session instead of interrupting it."
+  "Read lines from INPUT and evaluate each until /quit or EOF.
+SIGINT aborts the current line or turn and returns to the prompt; SIGTERM and
+SIGHUP are declined so the top-level shutdown handler stops the process."
   (let ((*command-context* context)
         (*standard-input* input)
         (*standard-output* output))
@@ -1172,15 +1131,7 @@ Anything else is a search query, so the common call keeps working."
 (declaim (ftype (function (list) integer) cmd-usage))
 
 (defun cmd-usage (arguments)
-  "Print the token ledger grouped by model, by channel and by day.
-
-The four numbers a provider reports are the point of the ledger, so cache read
-and cache write are named in the header: a report that hides them cannot answer
-whether the frozen prompt is keeping the prefix cache warm, which is the most
-expensive quiet failure this system has.
-
-The rows come from one SQL grouping rather than from the raw rows, so the
-report is the same whether a shell or the webhook asks for it."
+  "Print the token ledger grouped by model, channel, and day."
   (declare (ignore arguments))
   (let ((missing (require-store "usage")))
     (if missing
@@ -1308,12 +1259,7 @@ and the operator has to be able to see which is which."
 (declaim (ftype (function (list) integer) cmd-secrets))
 
 (defun cmd-secrets (arguments)
-  "List the loaded secret names and their sources, never their values. Then
-report the secrets file, its mode, and whether it is still there. When this
-process loaded a file, the line reports the file it opened and the mode it had
-at the time, remembered rather than resolved again: the container copy is
-unlinked once its values are in memory, and a second resolution would name the
-host fallback instead. That report makes the container copy's absence visible."
+  "List loaded secret names and sources (never values), plus secrets file status."
   (declare (ignore arguments))
   (let ((names (enchiridion.llm.secrets:secret-names)))
     (if names
@@ -1821,16 +1767,7 @@ other channel."))
   (make-instance 'cli-channel :name "cli" :context context :output output))
 
 (defmethod enchiridion.channel:channel-start ((channel cli-channel) &key config)
-  "Run the REPL to completion and return CHANNEL.
-
-The channel is live for as long as the REPL reads, which is what a supervisor
-owning this channel on a thread needs to see.
-
-A terminal is what makes this channel real. Under `serve` in a container there
-is no terminal: the REPL would read end of file at once, the channel would
-return, and the supervisor's restart loop would start a new one every second
-for the life of the process. A channel with no terminal says so once and stops
-instead, and the operator reads that line rather than a restart every second."
+  "Run the REPL until exit. Marks the channel :unavailable if stdin is not a TTY."
   (declare (ignore config))
   (unless (interactive-stream-p *standard-input*)
     (format *error-output*

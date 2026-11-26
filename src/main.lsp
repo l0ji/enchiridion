@@ -1,17 +1,8 @@
-;;;; main.lsp --- The entry point.
+;;;; main.lsp --- CLI entry point (run with sbcl --script).
 ;;;;
-;;;; Run with sbcl --script. It reads the command line, loads config.lsp when
-;;;; there is one, and hands the command to the command table.
-;;;;
-;;;; This file is a script rather than a system component on purpose: loading a
-;;;; system must never start an agent, and the top level form of this file is
-;;;; the program. #check compiles it separately so it is still covered.
+;;;; Kept outside enchiridion.asd so loading the system never starts an agent.
 
-;; ASDF first, before the defpackage. The standard prefers that defpackage
-;; opens a file, and this is the one place where it cannot: this file is a
-;; script, so nothing has loaded the system yet, and both UIOP and ASDF have
-;; to exist at read time for the import and the qualified references below.
-;; SBCL accepts it.
+;; Load ASDF before defpackage so UIOP/ASDF exist at read time under --script.
 (require :sb-posix)
 (require :asdf)
 
@@ -55,52 +46,27 @@
 
 (in-package #:enchiridion.main)
 
-;; ASDF adds the SBCL implementation directory to its wrapping source
-;; registry. SBCL ships duplicate .asd files in contrib, and ASDF warns about
-;; each duplicate only while *VERBOSE-OUT* is true. The duplicates are
-;; harmless and the warnings are noise, so a command-line run silences the
-;; scan. The package and the symbol are looked up by name: both are ASDF
-;; internals, and a version that renames one must not stop the program.
+;; Silence harmless duplicate contrib .asd scan warnings during CLI startup.
 (let ((package (find-package "ASDF/SOURCE-REGISTRY")))
   (when package
     (let ((symbol (find-symbol "*VERBOSE-OUT*" package)))
       (when symbol
         (setf (symbol-value symbol) nil)))))
 
-;; DBI's DEFCLASS/A and DEFINE-CONDITION/A macros define a DEFTYPE for each
-;; <NAME> and then redefine that same name as a class, so SBCL warns nineteen
-;; times on every load of the library. The pattern is the library's own and it
-;; changes nothing here, but it is not something the operator should read on
-;; every run. Only that exact message is muffled: any other warning still
-;; reaches the terminal, which is what makes this a silence and not a blindfold.
+;; Muffle DBI's known DEFTYPE-to-class redefinition warnings on load; let all
+;; other warnings through.
 (defun muffled-library-warning-p (condition)
-  "Return T for the one library warning this program does not print.
-
-The test is on the report and not on SIMPLE-CONDITION-FORMAT-CONTROL, because
-SBCL keeps that control as an SB-FORMAT::FMT-CONTROL object rather than as the
-string the operator sees."
+  "Return T for DBI's DEFTYPE-to-class redefinition warning."
   (let ((report (princ-to-string condition)))
     (and (>= (length report) 40)
          (eql 0 (search "redefining DEFTYPE type to be a class" report)))))
 
-;; ASDF binds *VERBOSE-OUT* to the standard output while it loads a system,
-;; so setting the variable globally is not enough. VERBOSE NIL is the switch
-;; that reaches the source-registry scan. REQUIRE has no such argument.
 (handler-bind ((warning (lambda (condition)
                           (when (muffled-library-warning-p condition)
                             (muffle-warning condition)))))
   (asdf:load-system "enchiridion" :verbose nil))
 
-;; The command table lives in the channel package now. This file only builds
-;; the context a command reads, so nothing here is forward referenced.
-
 ;;;; Roots.
-;;;;
-;;;; The wrapper sets ENCHIRIDION_SOURCE to the directory it installed and
-;;;; ENCHIRIDION_HOME to where the agent directory belongs. A checkout sets
-;;;; neither, so the nearest directory holding an enchiridion.asd wins. That
-;;;; is how a checkout and a container both land somewhere sensible from one
-;;;; code path.
 
 (declaim (ftype (function (pathname) (or null pathname)) parent-directory))
 
@@ -291,66 +257,22 @@ broker runs as uid 1000 and SQLite cannot lock a file its user cannot write."
 (declaim (ftype (function () pathname) secrets-path))
 
 (defun secrets-path ()
-  "Return the .env path to read. The container tmpfs wins, then the operator's
-directory, then the source root. OPERATOR-SECRETS-FILE owns that order, so this
-function and the `secrets` command report the same file; the two call sites
-only spelled the order out once, and a second copy here is how they would come
-to disagree about which file was loaded."
+  "Return the resolved .env path (container tmpfs, then cwd, then source root)."
   (enchiridion.llm.secrets:operator-secrets-file))
 
 (declaim (ftype (function (&optional t) string) load-configured-secrets))
 
 (defun load-configured-secrets (&optional config)
-  "Load every secret the configuration names, then unset those names, and
-return the API key.
+  "Load configured and provider secrets into memory, unset them from the process
+environment, unlink /run/secrets/.env if applicable, and return the active API key.
 
-The key comes from the loader rather than from getenv so that there is one
-path to a secret. .env is read here, held in memory by the loader, and not
-written anywhere; the process is short lived and nothing is logged.
-
-A file the world can read is refused before one pair is read. Mode 600 is the
-documented contract in docs/deployment.md, and it is a contract the file cannot
-keep on its own: an operator's umask writes what it likes and a cp preserves
-what it was given. The check is here, after the file is resolved and before the
-loader opens it, and it fails closed with the path and the mode in the message.
-A group-readable file passes, because a group-shared file is a normal
-deployment; the world read bit is the one that admits uid 1000, which is the
-whole point of the split.
-
-Every name the configuration mentions is read, not only the LLM key: a Fluxer
-bot token and a webhook token are secrets too, and a token that never reaches
-the loader is a token the scrubber does not know and the shape filter cannot
-recognise. The provider key names are read as well, whatever provider this
-process ends up choosing, because a key for the provider it did not choose is
-still a key in this process. Loading them here is also what lets `enchiridion
-secrets` list them by name and source without ever printing a value.
-
-The names are then removed from this process's environment: a child inherits
-nothing and a later read of /proc finds nothing. The configured names are
-not the whole story, because an operator can export a credential this
-configuration never heard of, so every credential-shaped variable in the
-environment goes as well. The predicate that
-decides which names those are never selects PATH, HOME, TERM, SBCL_HOME,
-CL_SOURCE_REGISTRY, LD_LIBRARY_PATH, the DYLD_ paths, or an XDG_ name, so the
-process keeps everything it needs to run. The value stays in memory for the
-life of the process.
-
-The container copy of the file is unlinked once its values are in memory:
-without it the file outlives the read by the life of the container. The
-operator's checkout .env is never touched, because DISCARD-SECRETS-FILE
-refuses every path but /run/secrets/.env and this call site cannot overrule
-it. A read-only bind mount refuses the unlink, and that is a deployment
-docs/deployment.md supports, so the failure is one warning line on the error
-stream and not a stopped supervisor."
+Refuses a world-readable secrets file before reading any entries."
   (let* ((config (or config (load-config)))
          (path (secrets-path))
          (present (probe-file path))
          (configured (enchiridion:configured-secret-names config))
          (names (append configured
                         (enchiridion.llm:provider-key-names config))))
-    ;; The gate comes before the load. A check after it would be a report on a
-    ;; leak rather than a refusal of one, and the file is the input, so the
-    ;; check is on the input.
     (when (and present
                (not (enchiridion.llm.secrets:secret-file-mode-ok-p path)))
       (error 'enchiridion.errors:configuration-error
@@ -360,8 +282,6 @@ stream and not a stopped supervisor."
                              path
                              (enchiridion.compat:file-mode path)
                              path)))
-    ;; Load .env before choosing the provider. A key in the file is a key the
-    ;; provider detection can see, and the file is not the process environment.
     (enchiridion.llm.secrets:load-secrets
      :path (and present path)
      :names names)
@@ -372,11 +292,6 @@ stream and not a stopped supervisor."
         (when (enchiridion.llm.secrets:credential-variable-p name)
           (enchiridion.compat:unset-environment-variable name))))
     (let ((discarded (enchiridion.llm.secrets:discard-secrets-file path)))
-      ;; A declined discard is the host case and needs no words. A failure on
-      ;; the container copy leaves the file exactly where the discard was meant
-      ;; to remove it, and the operator is owed one line about it. The message
-      ;; goes through the scrubber like every other outbound string, so a
-      ;; mistake here cannot print a value.
       (when (and (not discarded)
                  (probe-file path)
                  (uiop:pathname-equal
@@ -432,29 +347,8 @@ interval: an interval of zero is a tick loop and a string is a mistyped key."
 (declaim (ftype (function (t) boolean) refresh-provider-knowledge))
 
 (defun refresh-provider-knowledge (config)
-  "Refresh what this process knows about providers.
-Return T when both refreshes ran and NIL when one was reported and skipped.
-
-ASK calls this before its turn. CHAT and SERVE reach it from
-START-PROVIDER-REFRESH on a thread of its own, so a stalled provider delays the
-answer and not the listener.
-
-TWO THINGS ARE REFRESHED, and only on the commands that run a turn. The
-models.dev catalog is fetched when the cached copy is missing or older than
-:PROVIDERS-TTL-SECONDS, and the selected provider's own model list is fetched
-when a key is present and its cache is stale. The list is what the account can
-actually reach, which no catalog can know, so a turn that is about to spend
-money is the right moment to learn it.
-
-INSPECTION COMMANDS DO NOT REACH HERE. `help`, `version`, `secrets', `providers
-list' and the rest build a context and never call this, so a command that only
-looks at the configuration cannot fetch models.dev or write a cache file.
-
-:OFFLINE T stops both. A failure is one warning line and never stops the
-process: a provider whose endpoint is down is still a provider whose configured
-model can be asked for, and the cache from the last successful run is still the
-best answer available. The value says whether anything was skipped, which the
-health report repeats."
+  "Refresh the models.dev catalog and the active provider's model list when stale.
+Return T if both succeeded (or :OFFLINE is set), NIL if either failed."
   (let ((complete-p t))
     (unless (enchiridion:config-value config :offline)
       (let ((ttl (enchiridion:config-value config :providers-ttl-seconds)))
@@ -477,18 +371,9 @@ health report repeats."
 (declaim (ftype (function (t) t) start-provider-refresh))
 
 (defun start-provider-refresh (context)
-  "Start the provider refresh on its own thread and return a reader for it.
-
-A provider that stalls rather than refuses would otherwise hold up the listener
-for minutes, with the container up and no socket open. The refresh runs beside
-the server instead.
-
-The reader returns (:state STATE :report TEXT) with STATE one of :pending,
-:done, :failed or :skipped. A failed refresh changes nothing: the cache from the
-last successful run is still the best answer, and the next start tries again.
-
-A process with no backend has no key and no account whose model list could be
-learned, so the refresh is skipped."
+  "Run provider refresh on a background thread and return a status reader.
+The reader returns (:state STATE :report TEXT) with STATE in :pending, :done,
+:failed, or :skipped."
   (let* ((config (context-config context))
          (state (list :pending "")))
     (flet ((record (new report)
@@ -567,21 +452,8 @@ embeddings provider other than the chat one."
                 make-command-state))
 
 (defun make-command-state (requirements &key (refresh-models nil))
-  "Build only the state REQUIREMENTS names, and leave the rest NIL.
-
-A command that prints the command list has no reason to load a configuration, a
-secret, a backend, a store, or an agent, and one that does those things on a
-fresh install fails where it should have printed a line. The capability list
-comes from the command table, so the table is the one place a command says what
-it needs.
-
-The store is opened before the agent because the agent's prompt is compiled from
-the blocks, and two of those blocks are rows in the store.
-
-REFRESH-MODELS is T for ASK, the one-shot command about to spend a turn, and NIL
-for every other command; CHAT and SERVE refresh on their own thread through
-START-PROVIDER-REFRESH, after the listener can bind. The refresh is the one
-thing here that can open a socket: it is bounded, and it honours :OFFLINE."
+  "Build only the context subsystems named in REQUIREMENTS, leaving others NIL.
+When REFRESH-MODELS is T (used by ASK), refresh stale provider catalogs first."
   (let* ((config (when (requirement-p requirements :config) (load-config)))
          (tool-rounds (when (requirement-p requirements :agent)
                         (enchiridion:config-tool-rounds config))))
@@ -1119,22 +991,10 @@ over the webhook is not filed as a turn typed at the terminal."
   (list :ok-p nil :reply "" :error message :reason reason :usage nil))
 
 (defun make-channel-turn (context &key (block-p nil))
-  "Return the function a channel calls to run one turn.
-
-The result is a plist, because every channel formats its own answer and none
-of them should have to know what a completion is: :ok-p says whether the turn
-ran, :reply is the text to send, :error is one line when it did not, :reason
-separates a busy agent from a failure, :status is the presence proposal a tool
-made (a string or :CLEAR, or NIL), and :usage sums what the turn cost. A
-channel that shows presence reads :status; every other channel ignores it.
-
-By default the turn takes the agent lock without waiting. A webhook client is
-better served by a 503 and a retry than by a connection held open behind
-somebody else's turn. BLOCK-P T waits instead, which is what a channel with its
-own queue wants: the Fluxer worker answers one message at a time, and a message
-refused as busy is a message nobody ever answers. The reply is scrubbed here
-as well as in the kernel: the model can echo a secret back, and the outbound
-path is the last gate."
+  "Return a turn handler for a channel, returning a result plist
+(:ok-p :reply :error :reason :status :usage).
+When BLOCK-P is NIL (default), return :busy if another turn is in flight;
+when T, wait for the agent lock."
   (lambda (message)
     (handler-case
         (let ((text (enchiridion.channel:msg-text message))
@@ -1226,20 +1086,9 @@ false and read like a real answer."
 (declaim (ftype (function (t t) t) make-http-health))
 
 (defun make-http-health (supervisor context)
-  "Return the function GET /health reads.
-
-The answer comes from the live supervisor rather than from the status file: a
-file left by a process that stopped reports an uptime that grows forever.
-
-READY is not the running flag alone. A channel the process wants on that is
-failed or stopped degrades it, and so does an enabled heartbeat whose thread is
-gone: a surface that is not answering, and unattended work that silently
-stopped. A channel that is disabled, or cannot run here, is a choice and does
-not count.
-
-Persistence and provider refreshes are reported and not gated: a process-lifetime
-counter and a refresh that finishes after the listener starts do not belong in a
-readiness answer."
+  "Return the health callback for GET /health.
+Reports not ready if any enabled channel is failed/stopped or an enabled
+heartbeat thread is dead."
   (lambda ()
     (when (enchiridion.supervisor:supervisor-running-p supervisor)
       (let* ((rows (enchiridion.supervisor:supervisor-channel-rows supervisor))
@@ -1520,20 +1369,9 @@ of dying mid reload or channel stop."
 (declaim (ftype (function (string list &optional list) integer) run-supervised-command))
 
 (defun run-supervised-command (name arguments &optional options)
-  "Run chat or serve with a supervisor this process owns.
-
-CHAT runs the REPL in the foreground with the control poll on a thread beside
-it, so a reload typed at the REPL reaches a supervisor that answers. SERVE
-hands the supervisor to the command, which starts it and polls in the
-foreground itself.
-
-The channels are built and handed over before the supervisor starts. It starts
-whatever is in its list, and an empty list is why `serve` used to come up with
-no channels at all.
-
-The provider refresh runs on its own thread, after the context is built and
-beside the supervisor: a provider that stalls delays the answer, not the
-listener, and GET /health reports the refresh's state."
+  "Run `chat` or `serve` with a supervisor owned by this process.
+Starts provider refresh on a background thread and wires channels and
+factories before starting the supervisor."
   (when (and (string= name "serve")
              (not (enchiridion.memory:agent-seeded-p (agent-directory))))
     (error 'enchiridion.errors:configuration-error

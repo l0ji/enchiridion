@@ -119,6 +119,9 @@ volume, or beside your config locally).
 
 ## Adaptation (`ADAPT.md`)
 
+Live replies take style cues from the current exchange. A correction about
+length, tone, or format applies to the next reply without waiting for maintenance.
+
 As substantive conversations and tool-using sessions accumulate (120 non-sleep
 turns, 6 tool-using sessions), maintenance passes silently shift `ADAPT.md` from
 borrowing your style toward the agent's own defaults, and may record at most one

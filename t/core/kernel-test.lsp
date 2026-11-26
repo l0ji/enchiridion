@@ -36,6 +36,19 @@
   (enchiridion.memory:make-block :label label :text text
                                  :limit limit :writable-p writable-p))
 
+(deftest live-style-guidance-keeps-the-current-user-message-in-place ()
+  (let* ((backend (make-fake-backend))
+         (agent (enchiridion.kernel:make-agent :backend backend :tools-p nil))
+         (correction "Please drop the headings from now on."))
+    (enchiridion.kernel:run-turn agent correction :channel :fluxer)
+    (let ((messages (fake-backend-transcript backend)))
+      (ok (search enchiridion.kernel::+live-style-note+
+                  (enchiridion.llm:message-content (first messages))))
+      (ok (equal correction (enchiridion.llm:message-content (car (last messages))))))
+    (enchiridion.kernel:run-turn agent "maintenance" :channel :sleep)
+    (ng (search enchiridion.kernel::+live-style-note+
+                (enchiridion.llm:message-content (first (fake-backend-transcript backend)))))))
+
 (deftest opencode-deepseek-replays-only-the-current-tool-rounds ()
   (let* ((directory (merge-pathnames (format nil "enchiridion-replay-~D/"
                                             (random most-positive-fixnum))

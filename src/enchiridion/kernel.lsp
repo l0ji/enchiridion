@@ -137,6 +137,12 @@ Allocates a per-agent turn lock unless LOCK is supplied."
         (setf (agent-snapshot agent) (compile-prompt blocks)
               (agent-blocks agent) blocks)))))
 
+(defparameter +live-style-note+
+  "Take your cues from the current exchange. A style correction applies to this
+reply. Prior replies and learned preferences are defaults, not a script. Match
+the detail and formality to what the person is doing now. In casual chat, skip
+headings, recaps, and canned reassurance. Don't mimic typos or slang.")
+
 (defun turn-prompt-text (agent tools channel)
   (let* ((text (prompt-text (agent-snapshot agent)))
          (directory (agent-directory agent))
@@ -145,6 +151,8 @@ Allocates a per-agent turn lock unless LOCK is supplied."
          (next (first (getf status :remaining))))
     (with-output-to-string (stream)
       (write-string text stream)
+      (unless (eq channel :sleep)
+        (format stream "~%~%~A" +live-style-note+))
       (when tools
         (format stream "~%~%Tool budget: ~D rounds per turn. A round may contain multiple tool calls."
                 (agent-tool-rounds agent)))

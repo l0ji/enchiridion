@@ -1,16 +1,7 @@
-;;;; vectors.lsp --- Dense candidates for the episodic log.
+;;;; vectors.lsp --- Exact dense vector search and hybrid RRF retrieval for episodes.
 ;;;;
-;;;; Off unless an embedder is installed. With one, every episode gets a
-;;;; unit-length embedding through EMBED-PENDING, which the heartbeat runs, and
-;;;; a turn embeds its cue once. Candidates are then the union of the BM25 top
-;;;; and the dense top, and the lexical term L becomes their reciprocal-rank
-;;;; fusion, so the score, the pack and everything after them are unchanged.
-;;;; Without an embedder, HYBRID-CANDIDATES is CANDIDATES-FOR.
-;;;;
-;;;; The search is exact: one dot product per stored vector, read from an
-;;;; in-memory copy that is extended with new rows on each call rather than
-;;;; reread. At 512 dimensions a 100,000 episode log is about 200 MB and well
-;;;; under a tenth of a second to scan.
+;;;; Disabled unless *MEMORY-EMBEDDER* is set. Vectors are stored as packed
+;;;; little-endian float32 blobs and scanned via an incremental in-memory cache.
 
 (in-package #:enchiridion.memory)
 
@@ -19,12 +10,10 @@
 SINGLE-FLOAT per string. MAKE-BACKEND-EMBEDDER builds one.")
 
 (defvar *memory-embed-model* ""
-  "The model name stored with each vector. A vector written under another
-name is not compared with the cue, since its space is different.")
+  "Model name stored with each vector; only matching-model vectors are compared.")
 
 (defparameter *embed-body-chars* 6000
-  "The characters of a body that are embedded. Long tool output is cut; the
-start of a record is the part a later cue most often names.")
+  "Maximum prefix characters of an episode body sent to the embedder.")
 
 ;;;; Encoding.
 
@@ -58,13 +47,10 @@ start of a record is the part a later cue most often names.")
 ;;;; Writing.
 
 (defparameter *embed-batch* 64
-  "Texts one embedding request carries. EMBED-PENDING asks for this many at a
-time so a budget can stop the work between two requests.")
+  "Maximum texts per embedding API request.")
 
 (defparameter *embedding-chars-per-token* 4
-  "Characters an embedding input token is estimated to hold for the ledger.
-The embeddings seam returns vectors and no usage, so an embedding row is an
-estimate and says so by its :EMBED channel.")
+  "Estimated characters per token for :EMBED usage ledger entries.")
 
 (defun configured-embed-dimensions ()
   "Return the vector size the configured embedder asks for, or NIL."
@@ -89,12 +75,8 @@ estimate and says so by its :EMBED channel.")
                                  (model *memory-embed-model*)
                                  (dimensions (configured-embed-dimensions))
                                  max-tokens (session "") (channel :embed))
-  "Embed up to LIMIT episodes that have no vector under MODEL and DIMENSIONS.
-An episode is pending when no row holds a vector for that model and size, so a
-changed model or size is filled again and the rows written under the old one are
-kept. MAX-TOKENS bounds the estimated input of the whole call: the loop checks
-it before every request and stops when the next one no longer fits. Return how
-many vectors were written."
+  "Embed up to LIMIT episodes lacking a vector for MODEL and DIMENSIONS,
+bounded by MAX-TOKENS estimated input. Returns count written."
   (if (null embedder)
       0
       (let* ((rows (enchiridion.memory.store:query-rows
@@ -141,14 +123,10 @@ many vectors were written."
 ;;;; Reading.
 
 (defparameter *dense-index-max-vectors* 20000
-  "The most vectors one store's in-memory dense index keeps.
-A 512 dimension vector is two kilobytes, so this is a memory bound of about
-forty megabytes and the oldest vectors are the ones dropped.")
+  "Maximum vectors retained in one store's in-memory index (oldest evicted first).")
 
 (defparameter *vector-index-max-stores* 4
-  "How many stores' dense indexes stay in memory.
-The least recently used one is dropped when another store is read. It is a
-cache, so the next read builds it again from the vectors on disk.")
+  "Maximum number of store vector indexes cached in memory (LRU eviction).")
 
 (defstruct (vector-index (:constructor make-vector-index))
   (model "" :type string)
@@ -183,9 +161,8 @@ cache, so the next read builds it again from the vectors on disk.")
                  (return)))))
 
 (defun trim-vector-index (index)
-  "Drop the oldest vectors so INDEX stays near *DENSE-INDEX-MAX-VECTORS*.
-Eviction happens in a block, so the position table is rebuilt once per block
-rather than once per vector."
+  "Evict a block of oldest vectors when INDEX exceeds *DENSE-INDEX-MAX-VECTORS*
+and rebuild the position table."
   (let* ((ids (vector-index-ids index))
          (vectors (vector-index-vectors index))
          (excess (- (length ids) *dense-index-max-vectors*)))
@@ -216,10 +193,8 @@ rather than once per vector."
           (trim-vector-index index)))))
 
 (defun %vector-index (store model dims)
-  "Return STORE's index under MODEL and DIMS, appending every vector written
-since the last call. Called with *VECTOR-INDEXES-LOCK* held. A changed model or
-size starts the index again, and the read follows ROWID so a replaced vector is
-picked up."
+  "Return STORE's index for MODEL and DIMS, incrementally loading rows by ROWID.
+Caller must hold *VECTOR-INDEXES-LOCK*."
   (let* ((key (namestring (enchiridion.memory.store:store-path store)))
          (index (gethash key *vector-indexes*)))
     (unless (and index
@@ -258,9 +233,7 @@ picked up."
       (incf sum (* (aref a i) (aref b i))))))
 
 (defun dense-ranking (store cue-vector &key (limit 200))
-  "Return up to LIMIT episode ids nearest CUE-VECTOR, best first.
-The scan is exact and keeps only the best LIMIT scores, so neither its time nor
-its memory grows the way sorting every stored vector did."
+  "Return up to LIMIT episode IDs nearest CUE-VECTOR (best first) via exact top-K scan."
   (let ((q (normalise-vector cue-vector)))
     (bordeaux-threads:with-lock-held (*vector-indexes-lock*)
       (let* ((index (%vector-index store *memory-embed-model*
@@ -289,9 +262,7 @@ its memory grows the way sorting every stored vector did."
               collect (cdr (aref best position)))))))
 
 (defun candidates-by-id (store ids &key (now (get-universal-time)))
-  "Return the candidate plists for the episode IDS that still exist.
-The body comes back as its first *RETRIEVAL-BODY-CHARS* characters, because
-ranking a candidate reads no further and the pack reads its own window."
+  "Return candidate plists for existing episode IDS, with body truncated to *RETRIEVAL-BODY-CHARS*."
   (when ids
     (loop for row in (enchiridion.memory.store:query-rows
                       store
@@ -317,10 +288,8 @@ ranking a candidate reads no further and the pack reads its own window."
 (defun hybrid-candidates (store cue &key (limit 200) (now (get-universal-time))
                                          (embedder *memory-embedder*)
                                          (session ""))
-  "Return CANDIDATES-FOR's BM25 candidates, and with an embedder the dense
-nearest too, with :LEXICAL set to the RRF score of the two rankings. The cue
-embedding is billed to STORE's ledger on the :EMBED channel. A failed cue
-embedding falls back to BM25 alone, with one line on the error stream."
+  "Return BM25 candidates fused with dense nearest neighbors via RRF in :LEXICAL.
+Bills cue embedding to the :EMBED ledger channel and falls back to BM25 on error."
   (let ((lexical (handler-case (candidates-for store cue :limit limit :now now)
                    (enchiridion.errors:schema-error () '()))))
     (if (null embedder)

@@ -1,45 +1,22 @@
-;;;; store.lsp --- SQLite with FTS5: sessions, memories, blocks, and the ledger.
+;;;; store.lsp --- SQLite + FTS5 store for sessions, memories, blocks, and usage.
 ;;;;
-;;;; The store is one file. SQLite owns it, FTS5 indexes the raw text, and a
-;;;; search returns what was stored rather than a summary of it: no model call
-;;;; runs, so recall costs nothing and cannot invent a memory.
-;;;;
-;;;; Two decisions are worth stating. First, the FTS tables are external
-;;;; content tables over the row tables, so each body exists once and three
-;;;; triggers per table are what keep the index honest through an insert, an
-;;;; update, and a delete. A dropped session that still matches a search is a
-;;;; memory the operator cannot get rid of.
-;;;;
-;;;; Second, every string is scrubbed on the way in. The transcript is readable
-;;;; by the agent through the search tool, so this is the last place a secret
-;;;; could sit after the scrubber on the way out.
-;;;;
-;;;; DBI is the binding. Each statement is executed on its own: SQLite prepares
-;;;; one statement at a time, so the schema below is a list and not a script.
+;;;; External-content FTS5 tables are kept in sync by triggers; all strings are
+;;;; scrubbed on write. Schema statements are executed individually via DBI.
 
 (in-package #:enchiridion.memory.store)
 
 ;;;; The store object.
 
-;; path is the database file and connection is the DBI connection. The accessor
-;; is STORE-PATH, the name a caller asks a question with. lock is what makes
-;; one connection safe for the several threads that share it.
+;; PATH is the db file, CONNECTION is the DBI handle, LOCK serialises thread access.
 (defstruct (store (:constructor %make-store))
   (path #p"" :type pathname)
   (connection nil :type t)
   (lock nil :type t))
 
 (defmacro with-store-lock ((store) &body body)
-  "Run BODY while holding STORE's lock, recursively.
-
-The supervised process has one connection and several threads: a channel per
-surface, the control poll, and the heartbeat. A DBI connection and its
-prepared statements are not safe to use from two threads at once, and an
-INSERT followed by LAST_INSERT_ROWID is two statements that must not be
-interleaved, or one thread reports another thread's row id. The lock is
-recursive so a writer can call EXEC and QUERY-ROWS without deadlocking on
-itself. A store with no lock is one a test built by hand, and it says so
-rather than pretending to serialise."
+  "Run BODY while holding STORE's recursive lock (or directly if lock is NIL).
+Serialises thread access to the shared DBI connection and keeps INSERT +
+LAST_INSERT_ROWID atomic."
   (let ((lock (gensym "LOCK")))
     `(let ((,lock (store-lock ,store)))
        (if ,lock
@@ -47,17 +24,8 @@ rather than pretending to serialise."
            (progn ,@body)))))
 
 (defmacro with-store-transaction ((store) &body body)
-  "Run BODY inside one SQLite transaction while holding STORE's lock.
-
-The store writes multi-statement units that must not interleave with another
-thread: strict schema creation, an episode insert followed by its activation,
-and a generation promotion that flips one pointer and retires the old layer.
-Each statement is autocommitted by default, which would leave a half-written
-unit on a crash. BEGIN IMMEDIATE takes the write lock before the first read, so
-two writers cannot both pass a check and then collide.
-
-Nested use is not supported and does not occur in this tree. A body that
-signals rolls back; a body that returns commits."
+  "Run BODY in a BEGIN IMMEDIATE SQLite transaction while holding STORE's lock.
+Commits on normal return, rolls back on non-local exit. Nested use is not supported."
   (let ((store-var (gensym "STORE"))
         (committed (gensym "COMMITTED")))
     `(let ((,store-var ,store))
@@ -72,20 +40,13 @@ signals rolls back; a body that returns commits."
                (ignore-errors (exec ,store-var "ROLLBACK")))))))))
 
 (defparameter *store-path* nil
-  "The store a caller gets when OPEN-STORE is not given a path. Main binds this
-from the operator configuration, so one process opens one store and the tool
-that searches it opens the same file.")
+  "Default database path for OPEN-STORE, bound by main from operator config.")
 
 (declaim (ftype (function (&optional t) pathname) default-store-path))
 
 (defun default-store-path (&optional directory)
-  "Return the store file for DIRECTORY, or for the agent directory.
-
-Without DIRECTORY the agent directory is ENCHIRIDION_HOME followed by
-agents/default/, or the current directory followed by the same when the
-variable is unset. The supervisor and the broker run with the same
-ENCHIRIDION_HOME, so both resolve one path and a search in the child reads what
-the supervisor wrote."
+  "Return memory.db under DIRECTORY, or under ENCHIRIDION_HOME/agents/default/
+(falling back to cwd when ENCHIRIDION_HOME is unset)."
   (let ((home (uiop:getenv "ENCHIRIDION_HOME")))
     (merge-pathnames
      "memory.db"
@@ -97,19 +58,13 @@ the supervisor wrote."
            (if (and home (plusp (length home))) home (uiop:getcwd))))))))
 
 (defparameter +sqlite-header+ "SQLite format 3"
-  "The magic string at the start of every SQLite database file. The header on
-disk is these fifteen characters and one zero byte, so the check below reads
-one byte more than the string and wants that byte to be zero.")
+  "15-byte SQLite 3 file header prefix (followed on disk by a NUL byte).")
 
 (declaim (ftype (function (t) boolean) store-file-p))
 
 (defun store-file-p (path)
-  "Return T when PATH holds an SQLite database.
-
-A search opens the store, and opening a store creates it. A file that is
-empty, or is not a database at all, is not a store: it is a leftover, and a
-search is not a reason to turn it into one. The magic string says more than a
-size test, and it costs one read of sixteen bytes."
+  "Return T when PATH starts with the 16-byte SQLite 3 magic header, without
+creating or opening the database."
   (handler-case
       (with-open-file (stream path :direction :input
                                    :element-type '(unsigned-byte 8)
@@ -126,18 +81,12 @@ size test, and it costs one read of sixteen bytes."
                  (zerop (aref header length))))))
     (error () nil)))
 
-;;;; The schema.
-;;;;
-;;;; One statement per element, in dependency order: a content table exists
-;;;; before the FTS table that reads it, and each trigger is a statement of its
-;;;; own even though its body holds semicolons.
+;;;; The schema (one statement per element, in dependency order).
 
 (defparameter +schema+
   (append
    (list
-    ;; The session and ledger blocks. They are rows and not Markdown files
-    ;; because the harness writes them, not the agent, so they have no diff to
-    ;; review and no author to credit.
+    ;; Harness-managed session and ledger blocks.
     "CREATE TABLE IF NOT EXISTS blocks (
        name TEXT PRIMARY KEY,
        body TEXT NOT NULL,
@@ -155,9 +104,7 @@ size test, and it costs one read of sixteen bytes."
        ts INTEGER NOT NULL)"
     "CREATE INDEX IF NOT EXISTS usage_ts ON usage(ts)"
 
-    ;; The task queue. The CLI adds and removes, and the sleep agent drains it.
-    ;; Both go through the store, so a task survives a restart that a list in
-    ;; memory would not.
+    ;; Persistent task queue shared by CLI and sleep agent.
     "CREATE TABLE IF NOT EXISTS tasks (
        id INTEGER PRIMARY KEY AUTOINCREMENT,
        body TEXT NOT NULL,
@@ -165,9 +112,7 @@ size test, and it costs one read of sixteen bytes."
        ts INTEGER NOT NULL)"
     "CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status, id)"
 
-    ;; The adaptation audit. The file is the prompt-visible form; this table
-    ;; keeps the evidence and the before/after text a revert needs. The
-    ;; bearing rows carry counters as evidence; learned rows carry turn ids.
+    ;; Adaptation audit log (evidence + before/after text for revert).
     "CREATE TABLE IF NOT EXISTS adaptations (
        id INTEGER PRIMARY KEY AUTOINCREMENT,
        kind TEXT NOT NULL,
@@ -179,13 +124,9 @@ size test, and it costs one read of sixteen bytes."
        ts INTEGER NOT NULL,
        reverted_p INTEGER NOT NULL DEFAULT 0)"
     "CREATE INDEX IF NOT EXISTS adaptations_ts ON adaptations(ts)")
-   ;; The episodic memory tables are appended rather than copied so that the
-   ;; one schema list the store executes is also the one place a table is
-   ;; declared. The DDL file loads before this one; see enchiridion.asd.
+   ;; Episodic DDL loads before this file (see enchiridion.asd).
    enchiridion.memory:+episodic-schema+)
-  "Every table this store creates, one statement per element. Each is IF NOT
-EXISTS, so opening a store is safe on every start. The episodic memory
-statements are appended from the DDL module, so the two halves cannot drift.")
+  "Idempotent CREATE statements (base + episodic DDL) executed one per call.")
 
 (defparameter +store-tables+
   (append
@@ -198,17 +139,10 @@ memory list is child-first because its foreign keys are on.")
   (append
    '("turns" "memories")
    enchiridion.memory:*episodic-views*)
-  "Views DROP-STORE removes before the tables they read. TURNS and MEMORIES
-are the compatibility views over EPISODES: the transcript and the saved
-memories are rows in the one episodic log.")
+  "Views dropped before tables in DROP-STORE (TURNS and MEMORIES are views over EPISODES).")
 
-;;;; The merge of the transcript and saved memories into the log.
-;;;;
-;;;; EPISODES is the one memory table. TURNS and MEMORIES are views over it.
-;;;; A database from before the merge still has the old tables, so OPEN-STORE
-;;;; copies their rows into EPISODES, drops the old tables and their FTS
-;;;; triggers, and creates the views. The migration is idempotent: the partial
-;;;; unique keys on SOURCE_TURN_ID and SOURCE_MEMORY_ID make a rerun a no-op.
+;;;; Legacy migration: merge old turns/memories tables into episodes + views.
+;;;; Idempotent via partial unique keys on source_turn_id / source_memory_id.
 
 (defun sqlite-table-exists-p (store name)
   "Return T when NAME is a table in STORE."
@@ -255,8 +189,7 @@ A new store has neither table and only gets the views. Return T."
         (exec store (format nil "DROP TRIGGER IF EXISTS ~A" trigger)))
       (exec store "DROP TABLE IF EXISTS memories_fts")
       (exec store "DROP TABLE IF EXISTS memories"))
-    ;; LOG_RUNS was the single-pass consolidation's run log. Generations
-    ;; record every pass now, so a store that still has the table loses it.
+    ;; Drop retired single-pass consolidation table.
     (exec store "DROP TABLE IF EXISTS log_runs")
     (exec store
           "CREATE VIEW IF NOT EXISTS turns AS
@@ -273,27 +206,15 @@ A new store has neither table and only gets the views. Return T."
 (declaim (ftype (function (string) string) scrubbed))
 
 (defun scrubbed (text)
-  "Return TEXT with every loaded secret and every known secret shape removed.
-
-Every string that reaches a column passes through here, including the ones
-that are not prose. A session id, a memory name, a model name, and a block body
-are all text, and text is where a secret hides. The store is readable by the
-agent through the search tool, so this is the last gate before the disk, and a
-column that skips it is a column that leaks."
+  "Scrub loaded secrets and known secret patterns from TEXT before writing to SQLite."
   (enchiridion.llm.secrets:scrub text))
 
 (declaim (ftype (function (store string &optional list) integer) exec))
 
 (defun exec (store statement &optional parameters)
-  "Run one statement on STORE and return the number of rows it changed.
-
-This is DBI:DO-SQL without its leak. The SQLite driver's DO-SQL reads the
-change count by preparing SELECT changes() and never finalizing it, so every
-statement left one prepared statement on the connection. A long-lived
-connection grew without bound, and closing it took time quadratic in the
-number of statements it had run. Both statements here go through cl-sqlite's
-cached prepare, which finalizes them. Errors are mapped exactly as DO-SQL
-maps them."
+  "Run one non-query statement on STORE and return the affected row count.
+Calls cl-sqlite directly instead of DBI:DO-SQL (which leaks prepared statements on
+SELECT changes()), mapping sqlite-error to DBI error classes."
   (with-store-lock (store)
     (let ((handle (dbi.driver:connection-handle (store-connection store))))
       (handler-case (apply #'sqlite:execute-non-query handle statement parameters)
@@ -308,12 +229,7 @@ maps them."
 (declaim (ftype (function (list) list) normalise-row))
 
 (defun normalise-row (row)
-  "Return ROW with every key upcased.
-
-The driver interns a column name exactly as SQLite spells it, so a row arrives
-keyed by :|id| rather than :ID. A key that reads only between bars is a key
-nobody types, and the caller that reports a ledger column should be able to
-write it the way it appears in this file. One door, one shape."
+  "Return ROW with keyword keys upcased (DBI interns SQLite column names verbatim)."
   (loop for (key value) on row by #'cddr
         collect (intern (string-upcase (symbol-name key)) :keyword)
         collect value))
@@ -323,8 +239,7 @@ write it the way it appears in this file. One door, one shape."
 (defun query-rows (store statement &optional parameters)
   "Run one query on STORE and return every row as a plist keyed by column."
   (with-store-lock (store)
-    ;; The query is freed, or its prepared statement would stay on the
-    ;; connection until it closes; see EXEC.
+    ;; Free the prepared statement to avoid leaking it on the connection.
     (let ((query (dbi:prepare (store-connection store) statement)))
       (unwind-protect
            (progn (dbi:execute query parameters)
@@ -346,16 +261,11 @@ write it the way it appears in this file. One door, one shape."
 ;;;; The search string.
 
 (defparameter +query-whitespace+ '(#\Space #\Tab #\Newline #\Return)
-  "The whitespace FTS-QUERY splits on. A control character outside this list
-carries no term, so it can only confuse the parser the query is handed to.")
+  "Whitespace delimiters split on by FTS-QUERY.")
 
 (defun bad-query-character-p (character)
-  "Return T for a character that must never reach the SQLite parser.
-
-Control characters are how a string stops being a string to a C parser. NUL is
-the one that matters: it turns the query into an unterminated string, which
-arrives as a sqlite error rather than as the schema error the caller can read
-and correct."
+  "Return T for non-whitespace ASCII control characters (including NUL) rejected
+before reaching SQLite's FTS5 parser."
   (and (not (member character +query-whitespace+))
        (let ((code (char-code character)))
          (or (< code 32) (= code 127)))))
@@ -374,15 +284,8 @@ and correct."
 (declaim (ftype (function (string) string) fts-query))
 
 (defun fts-query (text)
-  "Return TEXT as an FTS5 MATCH string, or signal a schema error.
-
-Every whitespace separated term becomes a quoted prefix query, so an operator
-character in the operator's text is a literal and never a syntax error: the
-model asks for C++ and gets a search rather than a backtrace. A term with no
-alphanumeric character carries nothing to match and is dropped, and a query
-that is left with no terms at all is a schema error rather than a query that
-silently matches everything. A control character is refused before any of
-that, because it is not text to a parser and NOT a term to match."
+  "Convert TEXT into a quoted-prefix FTS5 MATCH string, or signal SCHEMA-ERROR.
+Rejects control characters and queries with no alphanumeric terms."
   (when (find-if #'bad-query-character-p text)
     (error 'enchiridion.errors:schema-error
            :detail "The query has a control character."))
@@ -397,52 +300,9 @@ that, because it is not text to a parser and NOT a term to match."
 ;;;; Opening and closing.
 
 (defparameter +schema-version+ 11
-  "The schema version a store records in PRAGMA user_version once it is built.
-
-Every statement in +SCHEMA+ is CREATE ... IF NOT EXISTS, which adds a missing
-table but never a missing column. A change that alters an existing table bumps
-this number and adds its step to OPEN-STORE, keyed on the version a store
-reports, so an old store is brought forward once rather than failing on a
-column it never got.
-
-Version 2 adds the activation triggers and the activation backfill. Both are
-in +SCHEMA+, so a version-1 store only has to run the schema once more.
-
-Version 3 indexes episodes with the porter stemmer. SQLite cannot change an
-FTS5 table's tokenizer, so DROP-UNSTEMMED-INDEX drops an older index, the
-schema creates the new one, and the index is rebuilt from EPISODES.
-
-Version 4 indexes assertions by their claim, in ASSERTIONS_FTS with its
-triggers and a backfill, all in +SCHEMA+; drops LOG_RUNS, in
-MIGRATE-LEGACY-MEMORY; and adds MEMORY_STATE.PRECISION_RESET_GENERATION, the
-operator's reset of the promotion-precision freeze, in ADD-MISSING-COLUMNS.
-
-Version 5 adds MEMORY_STATE.LAST_T2_EPISODE, the newest episode when the last
-T2 pass ended, which the episode threshold counts from, in ADD-MISSING-COLUMNS.
-
-Version 6 adds GENERATIONS.EPISODES_DERIVED, the episodes a build derived
-itself and did not copy, which the volume gate's allowance is counted from, in
-ADD-MISSING-COLUMNS.
-
-Version 7 keys EPISODE_VECTORS by episode, model and size instead of by episode
-alone, so one dense cache per model is kept rather than each model replacing
-the last. MIGRATE-EPISODE-VECTORS copies every row into the new shape; the
-vectors are a cache, but a switch back to a model is free only if they survive.
-
-Version 8 adds GENERATIONS.CLAIM_OWNER and CLAIM_TS, the lease a builder holds.
-They are in ADD-MISSING-COLUMNS and need no copy.
-
-Version 9 adds the ADAPTATIONS audit table and the role, channel and session
-index the bearing counts read. Both are in the schema lists, so an older store
-only has to run the schema once more.
-
-Version 10 adds EPISODES.FINAL_P, the final-answer marker the utility task set
-pairs on, in ADD-MISSING-COLUMNS. It is nullable on purpose: a legacy or
-imported row records no answer and the pairing rule infers one, while a live
-round records 1 for the reply a turn returned and 0 for a round that asked for
-tools. Version 10 also separates T2 preflight retries from completed passes.
-
-Version 11 adds the shadow canary proposal table.")
+  "Current schema version stored in PRAGMA user_version (v11: shadow canary proposals).
+Bumped whenever an existing table, column, or FTS tokenizer changes so OPEN-STORE
+runs the idempotent schema/column/index migration path.")
 
 (defparameter +added-columns+
   '(("memory_state" "precision_reset_generation" "INTEGER")
@@ -494,10 +354,8 @@ A store missing one is rebuilt from the schema list."
         (query-rows store "PRAGMA table_info(episode_vectors)")))
 
 (defun migrate-episode-vectors (store)
-  "Give EPISODE_VECTORS one row per model and size, keeping every stored vector.
-A store written before version 7 keys the table by episode alone, where a second
-model's write replaced the first model's vector. Every row is copied and nothing
-is dropped. Running it on the new shape changes nothing."
+  "Migrate pre-v7 EPISODE_VECTORS from PRIMARY KEY (id) to (id, model, dims),
+preserving existing rows. No-op when already migrated."
   (unless (episode-vector-key-p store)
     (exec store "ALTER TABLE episode_vectors RENAME TO episode_vectors_old")
     (exec store "CREATE TABLE episode_vectors (
@@ -512,9 +370,8 @@ is dropped. Running it on the new shape changes nothing."
   t)
 
 (defun drop-unstemmed-index (store)
-  "Drop EPISODES_FTS when it exists without the porter tokenizer and return T,
-so the caller rebuilds it once the schema has recreated it. The index is
-external content: EPISODES keeps every body, so nothing is lost."
+  "Drop EPISODES_FTS if it lacks the porter tokenizer and return T so the caller
+recreates and rebuilds it from EPISODES."
   (let ((sql (field (first (query-rows store
                                        "SELECT sql FROM sqlite_master
                                          WHERE name = 'episodes_fts'"))
@@ -538,35 +395,16 @@ the number is written into the statement, and only an integer is accepted."
   (exec store (format nil "PRAGMA user_version = ~D" version)))
 
 (defun schema-current-p (store)
-  "Return T when STORE is at the current schema version and has its shape.
-The version alone is not the shape: a migration that stopped before its
-version write, a hand edit, or a copy can leave the current number without a
-table or an added column. Reading the shape on every open turns a later query
-failure into one repair at the open."
+  "Return T when STORE matches +SCHEMA-VERSION+ and has all expected tables and
+added columns (version alone can be out of sync after a partial migration)."
   (and (= (schema-version store) +schema-version+)
        (tables-present-p store)
        (added-columns-present-p store)))
 
 (defun open-store (&key path (mode nil) (busy-timeout 15000))
-  "Open, and create when absent, the store at PATH. Return the store.
-
-PATH defaults to *STORE-PATH* and then to DEFAULT-STORE-PATH. The schema is
-created only when it is missing, so every start may call this. A store whose
-version is newer than this build is refused, and one whose shape is incomplete
-is rebuilt from the schema list.
-
-The whole schema is created in one transaction, foreign keys are on, and the
-busy timeout is fifteen seconds: the episodic memory generation promotion and the
-episode write both hold the write lock for more than one statement, and a five
-second wait was too short once a second writer existed.
-
-MODE, when it is an integer such as #o666, is applied to a file this call
-created. The supervisor runs as root and the broker as uid 1000, and SQLite
-cannot lock a file its user cannot write; the mode is how the file the
-supervisor creates stays usable by the child that has to search it. Nothing
-in the store is a secret, because every string is scrubbed before it is
-written, so widening the mode on a file only that pair of users can reach is
-not an exposure."
+  "Open (or create) the SQLite store at PATH (defaults to *STORE-PATH* then DEFAULT-STORE-PATH).
+Enables PRAGMA foreign_keys, sets BUSY-TIMEOUT (ms), refuses newer schema versions,
+and runs idempotent schema/migration setup if needed. Applies MODE on new files."
   (let* ((path (pathname (or path *store-path* (default-store-path))))
          (created-p (null (probe-file path)))
          (connection
@@ -585,8 +423,7 @@ not an exposure."
                               :lock (bordeaux-threads:make-recursive-lock
                                      "enchiridion store"))))
       (handler-case
-          ;; Foreign keys are per connection, so they are set after the
-          ;; connection exists and before any statement writes.
+          ;; Foreign keys are per connection and must be enabled before writes.
           (exec store "PRAGMA foreign_keys = ON")
         (error (condition)
           (ignore-errors (dbi:disconnect connection))
@@ -594,9 +431,7 @@ not an exposure."
                  :key :memory
                  :detail (format nil "Cannot open the memory store ~A: ~A"
                                  path condition))))
-      ;; A store from a newer build is not one this code can serve: its columns
-      ;; and meanings may not match, and a refusal is better than a running
-      ;; agent that loses rows quietly.
+      ;; Refuse databases from a newer schema version.
       (let ((version (schema-version store)))
         (when (> version +schema-version+)
           (ignore-errors (dbi:disconnect connection))
@@ -604,10 +439,7 @@ not an exposure."
                  :key :memory
                  :detail (format nil "The memory store ~A has schema ~D, but this build knows schema ~D. Run the newer image or restore a backup."
                                  path version +schema-version+))))
-      ;; A current store skips the schema and the merge, which both take the
-      ;; write lock on an open the search tool makes on every call. The checks
-      ;; behind "current" read the shape, so one repair covers a lost table or
-      ;; column.
+      ;; Skip write-locking schema/migration work when the store is already current.
       (unless (schema-current-p store)
         (handler-case
             (with-store-transaction (store)
@@ -629,9 +461,7 @@ not an exposure."
                    :key :memory
                    :detail (format nil "Cannot create the memory store schema in ~A: ~A"
                                    path condition))))
-        ;; The merge runs after the new schema exists and before any read. On
-        ;; a store from before the merge it copies the old tables and drops
-        ;; them; on a new store it only creates the compatibility views.
+        ;; Run legacy turns/memories merge (or create compatibility views on a fresh store).
         (handler-case
             (progn
               (migrate-legacy-memory store)
@@ -658,9 +488,7 @@ not an exposure."
 
 ;;;; Turns.
 
-;; id is the row id, session groups one conversation, role is user, assistant,
-;; or tool, body is the raw text, model is what answered, and ts is a universal
-;; time. channel is a keyword in Lisp and a lower case string in the table.
+;; Transcript row; CHANNEL is a keyword in Lisp and lower-case text in SQLite.
 (defstruct (turn-row (:constructor %make-turn-row))
   (id 0 :type integer)
   (session "" :type string)
@@ -691,25 +519,15 @@ not an exposure."
                   :ts (field row "ts")))
 
 (defun turn-context-key (session channel)
-  "Return the context key a transcript row is stored with.
-The transcript has no project, so its first component is empty. CONTEXT-KEY-FOR
-in the memory layer writes the same triple, and a test pins the two spellings
-because two write paths share the column."
+  "Return the context_key triple for a transcript row (empty project component;
+kept in sync with CONTEXT-KEY-FOR in the memory layer)."
   (format nil ",~A,~A" session (string-downcase (string channel))))
 
 (defun record-turn (store &key session (role "user") (body "") model
                               (channel :cli) (ts (get-universal-time)) final-p)
-  "Store one raw message and return it as a TURN-ROW.
-
-SESSION groups the turns of one conversation and defaults to the single name
-DEFAULT. Every string in the row is scrubbed, the session id and the role
-included: the store is readable by the agent through the search tool, so a
-secret that reached a turn must not reach the disk, whatever field it sits in.
-
-FINAL-P is the final-answer marker: T for the assistant reply a live turn
-returned, 0 for a round that asked for tools, and NIL for a row that does not
-know. A user row, a tool result, and an imported row all take NIL, and the
-utility task set infers the final answer from the turn's boundaries for them."
+  "Scrub and insert one turn into EPISODES, returning it as a TURN-ROW.
+SESSION defaults to \"default\". FINAL-P is T (1) for final replies, 0 for tool-call
+rounds, or NIL when unspecified."
   (check-type body string)
   (check-type session (or null string))
   (check-type ts integer)
@@ -720,8 +538,7 @@ utility task set infers the final answer from the turn's boundaries for them."
         (model (scrubbed (or model "")))
         (channel (normalise-channel (scrubbed (string channel)))))
     (check-type model string)
-    ;; The insert and the row id are one unit: another thread's insert between
-    ;; them would hand this caller a row id that belongs to a different turn.
+    ;; Hold the lock across INSERT and LAST-ROW-ID so concurrent inserts cannot interleave.
     (with-store-lock (store)
       (exec store
             "INSERT INTO episodes
@@ -752,9 +569,7 @@ utility task set infers the final answer from the turn's boundaries for them."
 (declaim (ftype (function (store) integer) session-count))
 
 (defun session-count (store)
-  "Return how many distinct sessions the store holds.
-Saved memories carry a session field too, but they are not transcript turns,
-so the count excludes the memory role."
+  "Return the number of distinct transcript sessions (excluding role = 'memory')."
   (or (field (first (query-rows store
                                 "SELECT COUNT(DISTINCT session) AS n FROM episodes
                                   WHERE role <> 'memory'"))
@@ -762,11 +577,8 @@ so the count excludes the memory role."
       0))
 
 (defun recent-sessions (store &key (limit 20))
-  "Return the most recently active sessions, newest first.
-
-Each entry is a plist with :ID, :STARTED, :ENDED, and :TURNS. A session exists
-once it has one turn, so there is no session row to fall out of step with the
-turns it counts."
+  "Return the most recently active transcript sessions newest first, each a plist
+with :ID, :STARTED, :ENDED, and :TURNS."
   (query-rows store
               "SELECT session AS id,
                       MIN(ts) AS started,
@@ -782,14 +594,9 @@ turns it counts."
 (declaim (ftype (function (store t) integer) delete-session))
 
 (defun delete-session (store id)
-  "Delete session ID and every episode in it. Return the rows removed.
-The log is append-only during operation; this is the operator's explicit
-delete, and it removes saved memories in the session as well."
-  ;; ASSERTIONS and CHANGE_EVENTS name their episode without ON DELETE
-  ;; CASCADE, and foreign keys are on, so an episode a derivation used cannot be
-  ;; deleted before what was derived from it. What cites a session's episodes
-  ;; goes first, in the same transaction, so a failure removes nothing.
-  ;; Conflicts over a removed assertion cascade on their own.
+  "Delete session ID and all its episodes (including saved memories). Return rows removed."
+  ;; Delete referencing change_events and assertions first (no ON DELETE CASCADE,
+  ;; foreign keys ON); assertion conflicts cascade automatically.
   (with-store-transaction (store)
     (dolist (table '("change_events" "assertions"))
       (exec store
@@ -800,11 +607,7 @@ delete, and it removes saved memories in the session as well."
     (exec store "DELETE FROM episodes WHERE session = ?" (list id))))
 
 (defun search-sessions (store query &key (limit 20))
-  "Return the turns whose body matches QUERY, best match first, newest ties last.
-
-The row is returned whole: the text, the role, and the session. Nothing is
-summarised, because a summary of a transcript is a model call that costs
-tokens and can be wrong."
+  "Return turns whose body matches QUERY via FTS5, best match first, as TURN-ROW structs."
   (let ((match (fts-query query)))
     (loop for row in (query-rows store
                                  "SELECT e.id, e.session, e.role, e.body,
@@ -900,13 +703,8 @@ Each entry is a plist with :ID, :NAME, :BODY, :SESSION, and :TS."
 (declaim (ftype (function (store keyword string) string) store-checked-block))
 
 (defun store-checked-block (store label text)
-  "Write TEXT as the harness block LABEL and return it, after the checks.
-
-The two harness blocks are written by the heartbeat rather than by an agent, so
-nothing else would scan them: a write that skipped the injection scan would be
-the one write the scan never saw, and the block is in every prompt. The limit
-is enforced here for the same reason, and it fails with the exact shortfall
-rather than truncating."
+  "Scan TEXT for prompt injection, enforce DEFAULT-BLOCK-LIMIT (signalling BLOCK-OVERFLOW),
+and write harness block LABEL."
   (check-type text string)
   (enchiridion.memory:scan-block-text label text)
   (let ((limit (enchiridion.memory:default-block-limit label)))
@@ -945,12 +743,7 @@ Scanned and limited, because the harness writes this one."
 
 (defun record-usage (store &key session model input output cache-read cache-write
                              (channel :cli) (ts (get-universal-time)))
-  "Add one token ledger row and return its row id.
-
-The four numbers are what a provider reported, and nothing here is derived.
-The usage report sums these rows, so a row that lost a column is a report that
-lies. SESSION, MODEL, and CHANNEL are scrubbed like every other string this
-file writes, because a model name is text and text can hold a key."
+  "Scrub metadata and insert one provider token-usage row, returning its row id."
   (let ((session (scrubbed (or session "")))
         (model (scrubbed (or model "")))
         (input (or input 0))
@@ -976,8 +769,7 @@ file writes, because a model name is text and text can hold a key."
 
 (defparameter +usage-columns+
   "id, session, model, input, output, cache_read, cache_write, channel, ts"
-  "The ledger columns in one place, so the two readers below cannot disagree
-about the shape of a row the report sums.")
+  "Column list shared by USAGE-ROWS and USAGE-SINCE.")
 
 (defun usage-select (store where parameters limit)
   "Return ledger rows matching WHERE, oldest first."
@@ -1000,13 +792,8 @@ about the shape of a row the report sums.")
 (declaim (ftype (function (t) list) usage-totals))
 
 (defun usage-totals (row)
-  "Return ROW, one grouped usage row, or zeroes when there is none.
-
-Every number is coerced to an integer. SQLite's SUM returns a float once the
-sum leaves the range of a 64 bit integer, and a caller that formats it with ~D
-signals on a float: a ledger that cannot be printed because it grew is the one
-moment the ledger matters. A count that is not a number at all answers zero for
-the same reason."
+  "Return grouped usage totals plist from ROW, coercing non-integers (e.g. SQLite
+SUM float overflow or NULL) to 0."
   (flet ((number (name)
            (let ((value (and row (field row name))))
              (if (integerp value) value 0))))
@@ -1022,15 +809,8 @@ the same reason."
                 usage-summary))
 
 (defun usage-summary (store &key (group-by :model) since (limit 100))
-  "Return the ledger summed by GROUP-BY, which is :MODEL, :CHANNEL or :DAY.
-
-The day is the local calendar day of the row's time, because a report is read
-by a person looking at a date. The budget's own window stays the rolling
-twenty-four hours SPEND-TOTAL uses, where a burst over midnight has to count in
-full: the two answer different questions and neither is wrong.
-
-GROUP-BY is an ECASE and the SQL column comes from a fixed table rather than
-from the argument, so the grouping is never a string a caller supplies."
+  "Return usage summed by GROUP-BY (:MODEL, :CHANNEL, or :DAY in local calendar time).
+GROUP-BY is dispatched via ECASE against fixed SQL expressions."
   (check-type limit (integer 1 *))
   (let* ((column (ecase group-by
                    (:model "model")
@@ -1062,11 +842,8 @@ from the argument, so the grouping is never a string a caller supplies."
                 usage-total-since))
 
 (defun usage-total-since (store since &key channel channels)
-  "Return every column of the ledger summed from SINCE, a universal time.
-A store with no rows answers zeroes rather than NIL, so a caller that prints
-the number never has to ask whether the ledger exists. CHANNEL, when given,
-sums the rows that one channel wrote; CHANNELS sums any channel in its list and
-is how the tick's own spend is read across the channels unattended work uses."
+  "Return summed usage totals from universal time SINCE (zeroes when empty),
+optionally filtered to CHANNEL or CHANNELS."
   (check-type since integer)
   (let ((channels (if channels (copy-list channels) (and channel (list channel)))))
     (usage-totals
@@ -1108,12 +885,8 @@ is how the tick's own spend is read across the channels unattended work uses."
                 recent-turns))
 
 (defun recent-turns (store &key (limit 4) not-channel body-chars)
-  "Return the newest turns first, for a prompt that summarises them.
-
-NOT-CHANNEL drops the rows one channel wrote, so a summariser reading the
-transcript back does not read its own output and summarise that. BODY-CHARS,
-when given, cuts each body in the query itself, so a prompt with a per-turn
-limit does not load a whole tool result to show four hundred characters."
+  "Return up to LIMIT transcript turns newest first, optionally excluding NOT-CHANNEL
+and truncating bodies in SQL to BODY-CHARS."
   (check-type limit (integer 1 *))
   (let ((rows (if not-channel
                   (query-rows store
@@ -1138,18 +911,13 @@ limit does not load a whole tool result to show four hundred characters."
                               (list limit)))))
     (mapcar #'turn-row-from rows)))
 
-;;;; The store as a file.
-;;;;
-;;;; The log is append-only and nothing removes from it, so the size and age
-;;;; need an answer that does not need sqlite3. Read-only, and silent on a
-;;;; missing table.
+;;;; Disk and log statistics (read-only; tolerates missing tables).
 
 (declaim (ftype (function (t &key (:now t)) list) store-usage))
 
 (defun store-usage (store &key (now (get-universal-time)))
-  "Return what STORE occupies on disk and how old its log is, or NIL.
-RECLAIMABLE-BYTES is the space a VACUUM would return. Nothing here deletes or
-compacts: retention is the operator's decision."
+  "Return a plist of on-disk size, reclaimable VACUUM bytes, row counts, and episode
+timestamps for STORE, or NIL."
   (when store
     (flet ((first-value (sql)
              ;; A missing table or unreadable pragma is NIL, not an error.
@@ -1184,10 +952,8 @@ compacts: retention is the operator's decision."
 (declaim (ftype (function (store) boolean) drop-store))
 
 (defun drop-store (store)
-  "Drop every table this store created and return T.
-
-The connection stays open, so a caller that wants the schema back calls
-OPEN-STORE again. Tests use this; the sessions command will use it to forget."
+  "Drop all views and tables created by this store and reset user_version to 0.
+Leaves the connection open; return T."
   (dolist (view +store-views+)
     (exec store (format nil "DROP VIEW IF EXISTS ~A" view)))
   (dolist (table +store-tables+)
@@ -1195,11 +961,7 @@ OPEN-STORE again. Tests use this; the sessions command will use it to forget."
   (set-schema-version store 0)
   t)
 
-;;;; The task queue.
-;;;;
-;;;; A task is one line of work the operator or the sleep agent wants done
-;;;; later. Status is a keyword and a done task stays in the table, so the
-;;;; operator can see what happened to it. REMOVE-TASK is the only delete.
+;;;; Task queue (pending -> running -> done | failed; REMOVE-TASK deletes).
 
 (defstruct (task-row (:constructor %make-task-row))
   (id 0 :type integer)
@@ -1210,8 +972,7 @@ OPEN-STORE again. Tests use this; the sessions command will use it to forget."
 (declaim (ftype (function (t) keyword) normalise-task-status))
 
 (defun normalise-task-status (status)
-  "Return STATUS as the keyword a task row carries. A keyword and a string are
-one value, for the reason NORMALISE-CHANNEL gives."
+  "Return STATUS as an upcased keyword."
   (check-type status (or string symbol))
   (intern (string-upcase (string status)) :keyword))
 
@@ -1226,12 +987,7 @@ one value, for the reason NORMALISE-CHANNEL gives."
                   :ts (field row "ts")))
 
 (defun enqueue-task (store body &key (ts (get-universal-time)))
-  "Add BODY to the queue as a pending task and return it as a TASK-ROW.
-
-BODY is scrubbed like every other string this file writes: a task is text the
-agent wrote, and the queue is readable through the search tool. A body that is
-empty, or that is only whitespace after the scrub, is refused rather than
-queued: it costs a model call to run and there is nothing in it to do."
+  "Scrub BODY, reject blank text with USAGE-ERROR, insert a :PENDING task, and return TASK-ROW."
   (check-type body string)
   (check-type ts integer)
   (let ((body (scrubbed body)))
@@ -1258,14 +1014,8 @@ queued: it costs a model call to run and there is nothing in it to do."
     (mapcar #'task-row-from rows)))
 
 (defun dequeue-task (store)
-  "Take the oldest pending task, mark it running, and return it as a TASK-ROW.
-Return NIL when there is nothing pending. An empty queue is the normal state,
-not an error, so nothing is signalled.
-
-Claiming is not finishing. A task marked done here and run afterwards is a task
-that disappears when the work crashes: the row says done and nothing ever did
-it. The update is conditional on the row still being pending, so two claimants
-cannot both win, and the loser looks again rather than taking work twice."
+  "Atomically claim the oldest :PENDING task as :RUNNING (via conditional UPDATE,
+retrying up to 5 times on contention) and return TASK-ROW, or NIL if none."
   (loop repeat 5
         do (let ((row (first (query-rows store
                                         "SELECT id, body, status, ts FROM tasks
@@ -1294,11 +1044,7 @@ cannot both win, and the loser looks again rather than taking work twice."
 (declaim (ftype (function (store integer) boolean) fail-task))
 
 (defun fail-task (store id)
-  "Mark task ID failed and return T when a running task was failed.
-The row stays, so the operator can read what was attempted and decide whether
-to add it again. Nothing is requeued: unattended work is at-most-once, and a
-task that crashes its worker would otherwise loop until the day budget stops
-it."
+  "Mark running task ID as :FAILED (at-most-once; never requeued) and return T if updated."
   (check-type id integer)
   (plusp (exec store "UPDATE tasks SET status = 'failed'
                         WHERE id = ? AND status = 'running'"
@@ -1307,10 +1053,8 @@ it."
 (declaim (ftype (function (store) integer) recover-tasks))
 
 (defun recover-tasks (store)
-  "Mark every running task failed and return how many.
-A task left running by a process that stopped is not running: nothing will
-finish it. This runs at the start of every heartbeat tick, so the state a
-previous process left behind is visible rather than silently in progress."
+  "Mark all :RUNNING tasks as :FAILED (called at heartbeat start to clear crashed runs)
+and return the count updated."
   (exec store "UPDATE tasks SET status = 'failed' WHERE status = 'running'"))
 
 (declaim (ftype (function (store &key (:status t)) integer) count-tasks))

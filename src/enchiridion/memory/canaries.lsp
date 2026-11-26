@@ -60,12 +60,9 @@ A canary removed from the configuration is removed here too."
     (length valid)))
 
 (defun canary-behaviour-p (store canary generation &key require-hit-p)
-  "Return T when CANARY's behaviour holds in a retrieval reading GENERATION.
-
-Each family asserts behaviour under a controlled cue, never mere presence in
-the store: retrieval and tail, that the cue brings back a record holding the
-expectation; update, that the newer value ranks above the stale one; safety,
-that no record holding the forbidden text reaches the pack."
+  "Return T when CANARY holds in retrieval over GENERATION: retrieval/tail
+require :EXPECT in results, update requires :EXPECT ranked above :STALE,
+and safety requires :EXPECT absent (and non-empty results if REQUIRE-HIT-P)."
   (let* ((rows (retrieve-rows-for-turn store (getf canary :cue) :generation generation))
          (bodies (mapcar (lambda (row) (format nil "~{~A~^~%~}" (row-texts row))) rows))
          (expect (getf canary :expect)))

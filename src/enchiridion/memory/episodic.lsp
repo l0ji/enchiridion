@@ -3,11 +3,7 @@
 (in-package #:enchiridion.memory)
 
 ;;;; ---------------------------------------------------------------------
-;;;; 1. Parameters.  One plist, so a caller can rebind one key and every
-;;;; function that reads it sees the same value.  Every numeric default is
-;;;; INVENTED-DESIGN and is a hyperparameter to be fitted: the ACT-R reference
-;;;; manual states no numeric default for d or s, and the values in common use
-;;;; are recorded only from Tier D teaching material.
+;;;; 1. Parameters.
 
 (defparameter *memory-parameters*
   (list
@@ -45,9 +41,7 @@
    :pack-claims-attached 2    ; claims shown under their own episode in the pack
    :pack-claims-alone  3      ; claims in the pack whose episode the cue missed
    :pack-claims-alone-per-episode 1 ; of those, from any one source episode
-   :pack-header        t      ; prefix each record with its date and role; with the
-                              ; cheap model answering, +9.4 points of LongMemEval-S
-                              ; accuracy, temporal questions 0.394 -> 0.701
+   :pack-header        t      ; prefix each record with its date and role
    :rerank-pool        30     ; candidates a configured reranker may reorder
    :dense-candidates   200    ; nearest episodes an embedder adds as candidates
    :rrf-k              60     ; reciprocal rank fusion constant, BM25 with dense
@@ -64,8 +58,7 @@
    :episode-threshold  200    ; episodes since the last run that trigger one
    :idle-seconds       300    ; idle window that triggers a run
    :batch              400)   ; the per-run bound
-  "Every tunable in one place.  See section 7 of the design for the rationale
-and the provenance of each default.")
+  "All memory model hyperparameters in a single plist.")
 
 (defun parameter (key &optional (parameters *memory-parameters*))
   "Return the value of KEY in PARAMETERS, or signal when it is absent.
@@ -89,10 +82,8 @@ in the store, where the search tool reads it.")
   *episodic-tables*)
 
 (defun ensure-episodic-schema (store)
-  "Create every memory table on STORE and return the number of statements run.
-
-The statements are the same shape as the store's own: one per call, IF NOT
-EXISTS, so a second call changes nothing."
+  "Create all episodic memory tables on STORE (idempotent via IF NOT EXISTS)
+and return the number of statements executed."
   (let ((count 0))
     (dolist (statement +episodic-schema+ count)
       (enchiridion.memory.store:exec store statement)
@@ -221,8 +212,7 @@ EXISTS, so a second call changes nothing."
 (defparameter +stop-words+
   '("the" "a" "an" "and" "or" "of" "to" "in" "is" "it" "that" "for" "on"
     "with" "as" "at" "by" "be" "this" "are" "was" "from" "not" "but" "if")
-  "Words a cue almost always contains.  Left in, they would make every record
-match every cue a little, which is the opposite of what the fan term is for.")
+  "Common stop words stripped by TOKENISE.")
 
 (defun tokenise (text)
   "Return the content tokens of TEXT as a list of lowercase strings."
@@ -232,13 +222,8 @@ match every cue a little, which is the opposite of what the fan term is for.")
                                                 (string-downcase text)))))
 
 (defun term-coverage (cue-tokens text)
-  "Return the fraction of CUE-TOKENS that occur in TEXT, in 0..1.
-
-This is the Calibrator's cue-coverage feature and the seed weight for
-spreading.  Coverage is used rather than SQLite's BM25 because BM25's sign
-convention is a property of the index rather than of the record, and because
-coverage is computable from the stored body with no second query.  The design
-records BM25 as the alternative and requires the two to be compared."
+  "Return the fraction of unique CUE-TOKENS present in TEXT, in 0..1.
+Used as the Calibrator's cue-coverage feature and spreading seed weight."
   (if (null cue-tokens)
       0.0
       (let* ((unique (remove-duplicates cue-tokens :test #'string=))
@@ -249,12 +234,7 @@ records BM25 as the alternative and requires the two to be compared."
                          unique)
                (float (length unique)))))))
 
-;;;; Model call accounting.
-;;;;
-;;;; A few calls in this module are optional extras on top of a turn's own call:
-;;;; the reranker, the cue embedder, and the embedder that fills the cache. Each
-;;;; one bills through RECORD-MEMORY-USAGE, so the ledger the day cap reads sees
-;;;; it and no call is free just because the reply path did not make it.
+;;;; Model call accounting for optional retrieval-path calls (reranker, embedder).
 
 (defvar *memory-usage-store* nil
   "The store the optional model calls inside a retrieval bill to, or NIL.")
@@ -277,10 +257,8 @@ such as the reranker, passes its own.")
                               (session *memory-usage-session*)
                               model input output cache-read cache-write
                               (channel *memory-usage-channel*))
-  "Write one optional model call's usage to STORE's ledger and return its row id.
-Nothing is written without a store, so a caller with no ledger still works. A
-store that refuses the write prints one line: the tokens are spent either way,
-and a broken report must not be a broken answer."
+  "Record one optional model call's token usage to STORE and return its row id.
+No-op when STORE is NIL; logs to *ERROR-OUTPUT* and returns NIL on write error."
   (when store
     (handler-case
         (enchiridion.memory.store:record-usage
@@ -309,12 +287,8 @@ and a broken report must not be a broken answer."
              (float (- (+ (length l) (length r)) shared)))))))
 
 (defun context-match (item-context current-context)
-  "Return C-hat_i, the context match between an item and the current turn.
-
-The proposal's scale is 1 for the same project and session, 0.5 for the same
-project only, and 0 otherwise.  A context key is the triple
-project, session, channel, so the comparison reads the first two components
-and ignores the channel."
+  "Return C-hat_i between ITEM-CONTEXT and CURRENT-CONTEXT: 1.0 for same project
+and session, 0.5 for same project only, else 0.0 (ignores channel)."
   (let* ((item (ensure-list item-context))
          (current (ensure-list current-context))
          (same-project (and (string= (or (first item) "") (or (first current) ""))
@@ -329,10 +303,7 @@ and ignores the channel."
   '(("semantic" . ("identity")) ("identity" . ("semantic"))
     ("episodic" . ("temporal")) ("temporal" . ("episodic"))
     ("procedural" . ("episodic" "temporal")))
-  "Cue types that are not equal but are in the same compatibility class.
-The classes are INVENTED-DESIGN: the transfer-appropriate-processing finding
-licenses matching the retrieval cue to the encoding operation, and does not
-supply a taxonomy of operations.")
+  "Alist mapping each cue type to its partially compatible cue types (score 0.5).")
 
 (defun cue-type-match (stored implied)
   "Return P-hat_i: 1 when the cue types agree, 0.5 in one class, else 0."
@@ -345,13 +316,9 @@ supply a taxonomy of operations.")
           (t 0.0))))
 
 (defun temporal-match (valid-from valid-to query-time)
-  "Return T-hat_i: +1 inside the interval, 0 when no time is named, -1 outside.
-
-The half-open convention is used, so VALID-TO is the first instant the
-assertion stops holding.  A NULL bound is an open end.  The term is signed and
-is therefore NOT rank-normalised, which is a correction to the proposal: a
-rank normalisation onto [0, 1] would destroy the sign and remove the penalty
-for an assertion whose interval the query falls outside."
+  "Return T-hat_i: +1.0 inside [VALID-FROM, VALID-TO), 0.0 if QUERY-TIME is NIL,
+else -1.0. Uses half-open intervals with NIL bounds as open ends; signed and
+excluded from rank-normalisation."
   (if (null query-time)
       0.0
       (let ((from (or valid-from 0))
@@ -359,19 +326,11 @@ for an assertion whose interval the query falls outside."
         (if (and (<= from query-time) (< query-time to)) 1.0 -1.0))))
 
 ;;;; ---------------------------------------------------------------------
-;;;; 5. ACT-R base level, with the two event populations the design requires
-;;;; and the functional-form switch the design requires.
-;;;;
-;;;; ACT-R counts a presentation as a presentation.  The human evidence does
-;;;; not: retrieval practice produced about 80% recall at one week against
-;;;; about 36% for repeated study.  Collapsing the two populations into one
-;;;; count would discard the largest effect in the evidence base, so encoding
-;;;; events carry weight LAMBDA-E and retrieval-practice events carry 1.
+;;;; 5. ACT-R base level (two event populations: encoding weighted by LAMBDA-E,
+;;;; retrieval by 1.0) with selectable functional form.
 
 (defparameter +base-level-forms+ '(:power :exponential :logarithmic :exponential-power)
-  "The four forms the switch admits.  The default is :POWER.  The proposal
-requires the switch because the functional form is contested: a survey of 916
-data sets found the power function was not the best-fitting form most often.")
+  "Supported functional forms for BASE-LEVEL (default :POWER).")
 
 (defun base-level-forms ()
   "Return the functional forms BASE-LEVEL accepts."
@@ -379,11 +338,9 @@ data sets found the power function was not the best-fitting form most often.")
 
 (defun base-level-exact (encoding-refs retrieval-refs now
                          &key (d 0.5) (lambda-e 0.5) (beta 0.0))
-  "Return B_i = ln( lambda-E * sum_E t_j^-d + sum_R t_k^-d ) + beta_i.
-
-ENCODING-REFS and RETRIEVAL-REFS are lists of universal times, one per event.
-This is the exact two-population form.  A reference in the future is clamped
-to one second of age so the power term stays finite."
+  "Return B_i = ln(lambda-E * sum_E t_j^-d + sum_R t_k^-d) + beta_i.
+ENCODING-REFS and RETRIEVAL-REFS are universal-time lists; future references
+clamp to age 1s."
   (let ((encoding (reduce (lambda (sum reference)
                             (+ sum (expt (max 1 (- now reference)) (- d))))
                           encoding-refs :initial-value 0.0))
@@ -396,21 +353,9 @@ to one second of age so the power term stays finite."
 (defun base-level-approx (n-enc n-ret lifetime now
                           &key (d 0.5) (lambda-e 0.5) (beta 0.0)
                             (form :power) (time-constant 2592000))
-  "Return B_i from the reference summary, under the selected functional form.
-
-N-ENC and N-RET are the two counts and LIFETIME is the age of the record at
-NOW.  The effective count is n = lambda-E * n-enc + n-ret, which is what makes
-the two-population form collapse to the manual's lifetime approximation
-B_i = ln( n / (1 - d) ) - d * ln(L) + beta_i when lambda-E is 1.
-
-The four forms are all anchored so that a record with no history returns BETA,
-and so that they agree in sign and rough magnitude.  Their absolute values are
-NOT comparable across forms, which is why the form is a switch on the whole
-score and not a per-record field: a candidate set scored under two forms at
-once would not be ordered correctly.  The exponential and exponential-power
-forms use the record's own horizon as their time constant, because an
-exponential decay implies a characteristic scale and the record's horizon is
-the only scale the design has."
+  "Return B_i from summary counts N-ENC, N-RET and LIFETIME under FORM.
+Effective count is n = lambda-E * n-enc + n-ret; returns BETA when n = 0.
+Absolute values are not comparable across forms, so FORM must be uniform per query."
   (declare (ignore now))
   (let ((n (+ (* (float lambda-e) (float n-enc)) (float n-ret)))
         (life (float (max 1 lifetime)))
@@ -428,10 +373,8 @@ the only scale the design has."
 
 (defun base-level (activation now &key (d 0.5) (beta 0.0) (lambda-e 0.5)
                                       (form :power) (time-constant 2592000))
-  "Return B_i for ACTIVATION at NOW, from the summary the table stores.
-
-A record with no reference at all returns BETA, which is the offset and not a
-positive activation."
+  "Return B_i for ACTIVATION at NOW from its stored reference summary.
+Returns BETA when the record has no references."
   (let* ((n-enc (activation-n-enc activation))
          (n-ret (activation-n-ret activation))
          (created (activation-created-ts activation))
@@ -441,15 +384,9 @@ positive activation."
                        :form form :time-constant time-constant)))
 
 (defun decay-update (activation now &key (parameters *memory-parameters*))
-  "Recompute ACTIVATION's base level at NOW and return two values.
-
-The first value is B_i under the configured functional form.  The second is T
-when the record is a *derived* record that has fallen below the prune floor.
-
-Nothing is written: B_i is a function of the reference summary, so decay needs
-no update pass to be correct and a stored activation column cannot drift from
-the history it claims to summarise.  The episodic log is never a retirement
-candidate, because it is the substrate every derived row is rebuilt from."
+  "Recompute ACTIVATION's base level at NOW without writing to the store.
+Returns (values B_i PRUNE-P), where PRUNE-P is T for non-retained kinds below
+:PRUNE-BELOW."
   (let* ((form (parameter :base-form parameters))
          (base (base-level activation now
                                      :d (parameter :decay parameters)
@@ -464,18 +401,9 @@ candidate, because it is the substrate every derived row is rebuilt from."
                  (< base (parameter :prune-below parameters))))))
 
 (defun decay-sweep (store now &key (parameters *memory-parameters*))
-  "Recompute every activation summary in STORE and return a report plist.
-
-The report holds :SCANNED, :LIVE, :EXEMPT -- the records the retained kinds
-protected -- and :DORMANT, a list of (KIND ID BASE) for derived records below
-the floor.
-
-The floor is meaningful only for the derived layer.  With the default d of 0.5,
-a single-reference derived row reaches -4.0 at about 3.3 hours of age and a
-three-reference row at about 30 hours; the log is exempt because deleting the
-substrate is not forgetting, it is data loss.  Retiring a record is a separate
-call, because a sweep that writes while it reads is what makes a rebuild
-unsafe."
+  "Read-only sweep of all activation rows at NOW, returning a plist with
+:SCANNED, :LIVE, :EXEMPT (retained kinds), and :DORMANT ((KIND ID BASE) below
+:PRUNE-BELOW). Does not delete or retire rows."
   (let ((rows (enchiridion.memory.store:query-rows
                store
                "SELECT kind, id, n_enc, last_enc, n_ret, last_ret, created_ts,
@@ -516,13 +444,8 @@ unsafe."
 ;;;; 6. Inhibition: a bounded, decaying accessibility penalty.
 
 (defun inhibition-after-loss (activation now &key (parameters *memory-parameters*))
-  "Raise ACTIVATION's suppression by one increment and return the new value.
-
-The increment is bounded at 1.0 and is raised only when the record competed
-with a retrieved record and lost.  Suppression is never a deletion and it
-always decays, which is the design's answer to the contested mechanism behind
-retrieval-induced forgetting: the phenomenon is implemented as a change in
-accessibility, never as loss of content."
+  "Decay ACTIVATION's suppression to NOW, add :SUPP-INCREMENT (capped at 1.0),
+update ACTIVATION in place, and return the new value."
   (let* ((previous (if (and (activation-supp-ts activation)
                             (plusp (activation-supp activation)))
                        (decay-inhibition activation now :parameters parameters)
@@ -533,11 +456,7 @@ accessibility, never as loss of content."
     raised))
 
 (defun decay-inhibition (activation now &key (parameters *memory-parameters*))
-  "Return ACTIVATION's suppression decayed to NOW, with a one-day half-life.
-
-The decay is applied on read rather than written on a timer, for the same
-reason the base level is: a stored value that decays only when a job runs is
-wrong between jobs."
+  "Return ACTIVATION's suppression decayed on read to NOW using :SUPP-HALF-LIFE."
   (let ((supp (activation-supp activation))
         (stamp (activation-supp-ts activation)))
     (if (or (null stamp) (zerop supp))
@@ -558,29 +477,15 @@ wrong between jobs."
   (cons kind id))
 
 (defun fan (graph kind id)
-  "Return fan(src): the number of distinct neighbours of (KIND . ID), plus one.
-
-ACT-R defines fan_ji as (slots_j + 1) / slots_ji, the number of chunks in
-which j is the value of a slot.  The operational analogue is out-degree plus
-one: a cue that links to many records contributes less to each of them.  The
-design states that this is an analogue and not a derivation; the property it
-preserves -- self-limiting cue specificity -- is the one that matters."
+  "Return fan(src): out-degree of (KIND . ID) in GRAPH plus one."
   (1+ (length (gethash (node kind id) graph))))
 
 (defun associative-strength (graph src-kind src &key (max-associative 2.0))
-  "Return S_ji = max(0, S - ln fan_ji).
-
-The manual records that \"The S_ji value can become negative as the fan_ji
-value grows, but that is generally an undesirable situation\", and that the
-implementation prints a warning and uses 0.0 instead.  This clamps, which is
-what the manual says the implementation does."
+  "Return S_ji = max(0.0, S - ln(fan_ji)), clamped at 0.0."
   (max 0.0 (- (float max-associative) (log (float (fan graph src-kind src))))))
 
 (defun edge-weight (obs fan-count &key (alpha 0.5) (beta 0.5))
-  "Return w(e) = (1 + obs)^alpha / (1 + fan)^beta.
-
-Repeated co-occurrence strengthens a link and a hub node's links are
-discounted, which is the same self-limiting property the fan term has."
+  "Return w(e) = (1 + obs)^alpha / (1 + fan)^beta."
   (/ (expt (float (1+ obs)) alpha)
      (expt (float (1+ fan-count)) beta)))
 
@@ -594,25 +499,11 @@ discounted, which is the same self-limiting property the fan term has."
 (defun spread-activation (graph sources &key (max-hops 2) (decay 0.5)
                                           (max-associative 2.0) (now 0)
                                           (half-life 2592000))
-  "Return a hash table of (KIND . ID) to S_i, the spreading activation value.
-
-SOURCES is a list of plists with :KIND, :ID and an optional :WEIGHT.  The
-proposal weights each cue term by W_kj = 1/|sources|, which the caller applies
-before the call; this function treats the weights as given.  Activation
-spreads at most MAX-HOPS hops, each hop multiplying by DECAY, by the link
-weight (decayed by the edge half-life), and by the associative strength of the
-source node.  A node's value is the sum over every path that reached it, which
-is S_i = sum_k sum_j W_kj * S_ji with W_kj folded into the per-hop weight.
-
-A CONTRADICTS edge does not propagate activation: it sets the conflict flag on
-both of its endpoints instead.  Propagating along it would make a record easier
-to retrieve *because* something contradicts it, which is the opposite of what
-the conflict ledger is for."
-  ;; The frontier is a table from node to the amount that reached it this
-  ;; hop. Every gain is linear in the amount, so expanding a node once with
-  ;; the summed amount gives the same totals as expanding each path to it
-  ;; separately, and the cost is one expansion per node per hop rather than
-  ;; one per path, which grows as fan^hops.
+  "Spread activation from SOURCES (plists of :KIND :ID :WEIGHT) up to MAX-HOPS
+over GRAPH, returning a hash table of (KIND . ID) -> S_i (plus :CONFLICT-FLAG).
+CONTRADICTS edges do not propagate activation; they flag both endpoints."
+  ;; Frontier sums gains per node per hop (linear in amount), keeping cost
+  ;; proportional to active nodes rather than paths (fan^hops).
   (let ((total (make-hash-table :test #'equal))
         (flagged (make-hash-table :test #'equal))
         (frontier (make-hash-table :test #'equal)))
@@ -658,20 +549,9 @@ the conflict ledger is for."
     (and (hash-table-p flagged) (not (null (gethash key flagged))))))
 
 ;;;; ---------------------------------------------------------------------
-;;;; 8. The score.
-;;;;
-;;;; R_i = w_B*B-hat_i + w_S*S-hat_i + w_T*T-hat_i + w_I*I-hat_i
-;;;;     + w_P*P-hat_i + w_C*C-hat_i - w_X*X-hat_i + w_D*D-hat_i
-;;;;
-;;;; Only the two unbounded terms are rank-normalised.  The proposal says
-;;;; every term is normalised to [0, 1] by rank, which cannot be right for the
-;;;; signed temporal term: a rank normalisation would map the worst candidate
-;;;; onto 0 and the best onto 1 regardless of sign, so an assertion whose
-;;;; interval the query falls outside would stop being penalised and would
-;;;; stop being distinguishable from one with no temporal information at all.
-;;;; The bounded terms already have a defined scale, so they are used as
-;;;; defined and only B-hat and S-hat are rank-normalised.  This is a
-;;;; correction to the proposal and it is recorded as a defect.
+;;;; 8. Retrieval scoring.
+;;;; Only unbounded terms (base, spread, lexical) are rank-normalised; bounded
+;;;; and signed terms (notably temporal in {-1, 0, +1}) keep their raw scale.
 
 (defstruct (terms (:constructor make-terms
                                 (&key (base 0.0) (spread 0.0) (temporal 0.0)
@@ -689,12 +569,8 @@ the conflict ledger is for."
   (lexical 0.0 :type real))    ; L-hat, BM25 relevance to the cue
 
 (defun rank-normalise (values)
-  "Return VALUES mapped onto [0, 1] by rank, preserving ties.
-
-The proposal chooses rank normalisation over min-max because min-max is
-sensitive to a single outlier.  Tied values receive the mean of the ranks they
-span, so two identical candidates keep identical scores and a deterministic
-tie-break stays possible, which the prompt prefix cache requires."
+  "Map VALUES onto [0, 1] by rank; tied values receive the mean of their
+spanned ranks (preserving deterministic tie-breaking). Single element -> (0.5)."
   (let* ((n (length values))
          (indexed (sort (loop for value in values
                               for position from 0
@@ -733,12 +609,7 @@ tie-break stays possible, which the prompt prefix cache requires."
     term-list))
 
 (defun retrieval-score (terms &optional (parameters *memory-parameters*))
-  "Return R_i, the weighted retrieval score of TERMS.
-
-Units are arbitrary because every term is on a comparable scale and the
-weights carry the ordering.  The weights are hyperparameters and every default
-is INVENTED-DESIGN; the design states the evidence order they encode and the
-fitting procedure that replaces them."
+  "Return R_i, the weighted linear combination of TERMS using PARAMETERS."
   (+ (* (parameter :base-weight parameters) (terms-base terms))
      (* (parameter :spread-weight parameters) (terms-spread terms))
      (* (parameter :temporal-weight parameters) (terms-temporal terms))
@@ -750,56 +621,35 @@ fitting procedure that replaces them."
      (* (parameter :lexical-weight parameters) (terms-lexical terms))))
 
 (defun retrieval-probability (score &key (threshold 0.0) (noise 0.4))
-  "Return 1 / (1 + exp( -( score - tau ) / s )), the ACT-R logistic.
-
-The design does NOT use this as the Calibrator's readout: tau and s have no
-verified default, and the quantity ACT-R computes is the probability that a
-chunk exceeds a threshold in a model of human retrieval, not the probability
-that a machine retrieval will be useful.  It is kept because the Calibrator
-fits its own logistic to the same margin, and because a caller that wants a
-bounded transform of the score has one."
+  "Return 1 / (1 + exp(-(score - threshold) / noise)), the ACT-R logistic
+transform of SCORE."
   (/ 1.0 (+ 1.0 (exp (- (/ (- (float score) (float threshold))
                            (float (max 0.0001 noise))))))))
 
 (defun retrieval-latency (score &key (latency-factor 1.0))
-  "Return F * exp( -A ), the ACT-R latency, for reporting only.
-
-The design drops latency as a ranking term: there is no mapping from an
-activation value to a machine latency, and claiming the equation in the score
-would be decorative."
+  "Return F * exp(-score), the ACT-R latency metric (reporting only)."
   (* (float latency-factor) (exp (- (float score)))))
 
 ;;;; ---------------------------------------------------------------------
 ;;;; 9. Retrieval.
 
 (defun candidate-fan (graph key candidate-keys)
-  "Return fan_i for KEY: its neighbours that are themselves candidates.
-
-The proposal defines D-hat_i = 1 - fan_i / max(fan), where fan_i counts the
-neighbours sharing the query's cue terms.  The candidate set *is* the set of
-records the cue reached, so its intersection with the neighbour set is the
-quantity the definition asks for, and it needs no second index."
+  "Return fan_i for KEY: count of its outgoing neighbours in CANDIDATE-KEYS."
   (count-if (lambda (edge)
               (member (node (link-dst-kind edge) (link-dst edge))
                       candidate-keys :test #'equal))
             (gethash key graph)))
 
 (defun distinctiveness (graph key candidate-keys max-fan)
-  "Return D-hat_i = 1 - fan_i / max(fan), or 0.0 when no candidate has a fan.
-
-The relative form is the only defensible one on the evidence the design
-retrieved, so distinctiveness is a tie-breaker and never a driver."
+  "Return D-hat_i = 1 - fan_i / max(fan), or 0.0 when MAX-FAN is 0 or NIL."
   (if (or (null max-fan) (zerop max-fan))
       0.0
       (- 1.0 (/ (float (candidate-fan graph key candidate-keys)) (float max-fan)))))
 
 (defun item-terms (item context spread graph candidate-keys max-fan
                         now parameters)
-  "Return the TERMS of one candidate ITEM.
-
-ITEM is a plist with :KIND, :ID, :BODY, :SESSION, :PROJECT, :CUE-TYPE,
-:VALID-FROM, :VALID-TO, :ACTIVATION and :CONFLICT-FLAGGED.  Every term of the
-score is computed here from stored fields; none is inferred."
+  "Return TERMS for candidate plist ITEM (:KIND :ID :BODY :SESSION :PROJECT
+:CUE-TYPE :VALID-FROM :VALID-TO :ACTIVATION :LEXICAL :QUERY-TIME)."
   (let* ((key (node (getf item :kind) (getf item :id)))
          (record (getf item :activation))
          (query-time (getf item :query-time)))
@@ -831,23 +681,9 @@ score is computed here from stored fields; none is inferred."
                                          (query-time nil)
                                          (cue-type "episodic")
                                          (top-k nil))
-  "Return the TOP-K candidates ranked by R_i, best first.
-
-CANDIDATES is a list of plists as ITEM-TERMS documents, each already carrying
-its activation summary.  The cue tokens seed the spread at weight
-coverage/|sources|, which is the proposal's W_kj = 1/|sources| applied to the
-terms the cue actually matched.  Each result is a plist of :ITEM, :TERMS,
-:SCORE, :PROBABILITY, :LATENCY and :CONFLICT.
-
-CUE-TYPE is the kind of retrieval the cue implies.  NIL says the cue was not
-classified, and the cue-type term then gives every candidate the same value
-instead of ranking one kind of record over another.
-
-This function reads nothing and writes nothing.  A candidate that participates
-in an unresolved conflict is NOT penalised: the pack is required to include the
-conflicting partner or to carry the conflict flag, because a system that can
-silently drop the losing side of a conflict is the system the TANGLE benchmark
-measures as failing."
+  "Rank CANDIDATES for CUE and CONTEXT by R_i (best first), returning up to TOP-K
+plists (:ITEM :TERMS :SCORE :PROBABILITY :LATENCY :CONFLICT). Pure (no I/O);
+NIL CUE-TYPE gives all candidates 1.0, and conflicts are flagged without penalty."
   (let* ((cue-tokens (tokenise cue))
          (candidates (mapcar (lambda (item)
                                (list* :query-time query-time
@@ -922,15 +758,9 @@ behaviour."
         (enchiridion.memory.store:fts-query cue))))
 
 (defun candidates-for (store cue &key (limit 200) (now (get-universal-time)))
-  "Return episode candidates for CUE from the FTS5 index.
-
-The lexical pass is a *candidate generator*, not a ranker: its output is
-re-scored by RETRIEVE.  The activation summary is joined in the same query, so
-scoring a candidate costs no second round trip.  Each body is its first
-*RETRIEVAL-BODY-CHARS* characters: the score reads the body only for cue
-coverage, and the pack re-reads what it renders.  A cue with no searchable term
-signals SCHEMA-ERROR, which is the existing FTS-QUERY behaviour and is not
-changed."
+  "Return up to LIMIT episode candidate plists matching CUE via FTS5, joined
+with activation rows. Loads the first *RETRIEVAL-BODY-CHARS* chars of body;
+signals SCHEMA-ERROR if CUE has no searchable terms."
   (let ((match (cue-match cue)))
     (loop for row in (enchiridion.memory.store:query-rows
                       store
@@ -1003,12 +833,8 @@ changed."
    COALESCE(act.supp_ts, eact.supp_ts) AS supp_ts,
    COALESCE(act.imp, eact.imp) AS imp,
    COALESCE(act.distinctness, eact.distinctness) AS distinctness"
-  "The columns both routes to an assertion select.
-
-A claim with no activation row of its own takes each value from its source
-episode's.  Without that, every claim defaulted to created now with importance
-5, so it looked freshly encoded at every retrieval while its evidence aged, and
-one episode's claims outranked the episode on base level alone.")
+  "Shared SELECT column list for assertion candidates; falls back to the source
+episode's activation row via COALESCE when an assertion has no row of its own.")
 
 (defun assertion-candidate (row now)
   "Return ROW, one assertion and its supporting episode, as a candidate plist."
@@ -1050,18 +876,9 @@ one episode's claims outranked the episode on base level alone.")
 
 (defun assertion-candidates-for (store cue &key generation (limit 200)
                                               (now (get-universal-time)))
-  "Return GENERATION's assertion candidates for CUE, or NIL when GENERATION is
-NIL or 0.
-
-Two routes reach an assertion.  The claim route matches the cue against the
-assertion's own words, so a claim is found by a term its source episode never
-used: that is the recall the semantic layer can add.  The support route
-matches the episode the claim came from, so a claim is never harder to find
-than its evidence.  A candidate found by both appears once.  :CLAIM-RANK is
-its rank in the claim route, or NIL; the support route records no rank of its
-own, because its order is the episode ranking repeated once per claim, and
-FUSE-SEMANTIC-CANDIDATES reads that ranking directly.  Only the named
-generation is read, so a candidate is invisible to the live layer."
+  "Return GENERATION's assertion candidates for CUE (NIL when GENERATION is NIL
+or 0), deduplicated across claim-FTS (:CLAIM-RANK set) and supporting-episode
+FTS routes. Restricts to live rows (tx_to IS NULL) in GENERATION."
   (when (and generation (plusp generation))
     (let ((match (cue-match cue))
           (by-id (make-hash-table))
@@ -1129,12 +946,8 @@ generation is read, so a candidate is invisible to the live layer."
     graph))
 
 (defun split-context-key (key)
-  "Return a stored context key as a list.  The column holds a comma-joined
-triple of project, session, and channel.
-
-A key whose first two components are the same non-empty session is one the old
-transcript writer stored, with the session in the project slot. Reading it as
-no-project lets those rows rank on the context term."
+  "Split a comma-joined \"project,session,channel\" context key into a list.
+Legacy keys whose project duplicates session are normalised to an empty project."
   (when (and (stringp key) (plusp (length key)))
     (let ((parts (uiop:split-string key :separator ",")))
       (if (and (rest parts)
@@ -1147,53 +960,31 @@ no-project lets those rows rank on the context term."
 ;;;; 11. The encoding filter: two filters, not one.
 
 (defun capture-p (text)
-  "Return T when TEXT may be appended to the episodic log, and signal otherwise.
-
-Capture filters almost nothing: the log is the fallback retrieval substrate, so
-filtering at capture would remove the safety net.  The only rejections are the
-existing block scan's -- invisible Unicode and injection phrasing -- reused
-here rather than reimplemented, because a second copy of a security check is a
-second copy that drifts."
+  "Return T when TEXT passes SCAN-BLOCK-TEXT (no invisible Unicode or injection
+phrasing), or NIL if it signals CONFIGURATION-ERROR."
   (handler-case
       (progn (enchiridion.memory:scan-block-text :episode text) t)
     (enchiridion.errors:configuration-error () nil)))
 
 (defparameter +promotion-conditions+
   '(:novelty :conflict :self-relevance :prospective :procedural :correction)
-  "The six conditions of which any one promotes a captured episode into the
-derived layer.  Capture is nearly unfiltered; promotion is selective.  Every
-condition is model-free and runs on the asynchronous pass.")
+  "Model-free conditions any one of which promotes an episode to derivation.")
 
 (defun promotion-condition (features)
-  "Return the first promotion condition FEATURES satisfies, or NIL.
-
-FEATURES is a plist of booleans the derivation pass computes.  Returning the
-condition rather than a boolean is deliberate: the condition is what selects
-which derivation runs, and a pass that only knows *that* an episode is
-interesting does not know what to do with it."
+  "Return the first condition keyword in +PROMOTION-CONDITIONS+ that is true in
+FEATURES plist, or NIL."
   (find-if (lambda (key) (getf features key)) +promotion-conditions+))
 
 (defparameter +filter-weights+
   '(:novelty 0.35 :goal 0.20 :self-reference 0.15 :arousal 0.15
     :length 0.15 :redundancy -0.40 :source-authority 0.10)
-  "Weights of the depth chooser.  Novelty dominates because a duplicate costs a
-row and teaches nothing; redundancy is the only negative term.")
+  "Feature weights for ENCODING-FILTER depth selection.")
 
 (defun encoding-filter (features &key (weights +filter-weights+)
                                      (skip-below 0.15) (deep-above 0.45))
-  "Return the encoding depth for one candidate experience: 0, 1, or 2.
-
-Depth 0 means do not derive anything.  Depth 1 is a verbatim episode.  Depth 2
-is an episode that additionally carries an agent-relative form, which is the
-self-reference mechanism: the assertion is stored twice, once as a world-state
-proposition and once as a proposition about the agent's own goals, capabilities
-or commitments.  The design requires the retrieval cue to match the stored cue
-type for the second form to help, and states that storing the form without
-matching the cue is an unvalidated analogy.
-
-The arousal input is used only to prioritise consolidation.  It is never a term
-in the retrieval score, and the design states that no retrieved source licenses
-a mapping from a machine signal to human arousal."
+  "Return encoding depth (0 skip derivation, 1 verbatim, 2 with agent-relative
+form) from weighted FEATURES. Arousal prioritises consolidation only and is
+excluded from retrieval scoring."
   (let ((score (+ (* (getf weights :novelty) (float (or (getf features :novelty) 1.0)))
                   (* (getf weights :goal) (float (or (getf features :goal-relevance) 0.0)))
                   (* (getf weights :self-reference)
@@ -1212,24 +1003,17 @@ a mapping from a machine signal to human arousal."
 
 (defparameter +authority-by-provenance+
   '(("owner" . 5) ("system" . 4) ("agent" . 3) ("untrusted" . 1))
-  "The authority ordinal assigned from the provenance class.  The provenance
-classes are a closed set adopted from documented prior art; the 1..5 ordinal
-is INVENTED-DESIGN, because no retrieved human finding fixes a scale.")
+  "Mapping from provenance class string to authority ordinal (1..5).")
 
 (defun authority-for (provenance)
-  "Return the authority ordinal for PROVENANCE, defaulting to the lowest.
-
-The default is the lowest on purpose: content whose provenance cannot be
-determined is never promoted to the highest authority."
+  "Return the authority ordinal (1..5) for PROVENANCE, defaulting to 1."
   (or (cdr (assoc (string-downcase (string provenance))
                   +authority-by-provenance+ :test #'string=))
       1))
 
 (defun prior-document-frequency (store token before-id)
-  "Return how many episodes before BEFORE-ID hold TOKEN.
-BEFORE-ID NIL counts every episode, which is what the write path wants before it
-inserts the row it is weighing. The rowid bound keeps an episode out of its own
-count once the index has it."
+  "Return the count of episodes with rowid < BEFORE-ID matching TOKEN in FTS5
+(or all episodes when BEFORE-ID is NIL)."
   (or (enchiridion.memory.store:field
        (first (enchiridion.memory.store:query-rows
                store
@@ -1241,9 +1025,8 @@ count once the index has it."
       0))
 
 (defparameter *hint-token-limit* 64
-  "The most distinct tokens one lexical hint reads from a body.
-RARITY-OF runs one index count per token and LINK-CO-OCCURRENCES one query per
-token, so the tokens are the body's first and the limit keeps a hint a hint.")
+  "Maximum distinct tokens inspected per body by RARITY-OF and
+LINK-CO-OCCURRENCES.")
 
 (defun hint-tokens (body)
   "Return the distinct searchable content tokens the lexical hints read from BODY.
@@ -1255,19 +1038,9 @@ FTS-QUERY rejects tokens with no alphanumeric character, such as underscore runs
         tokens)))
 
 (defun rarity-of (store body &key before-id)
-  "Return a cheap lexical rarity hint for BODY, in 0..1, with no model call.
-
-A token's commonness is df/(df+1), where df is how many episodes before
-BEFORE-ID hold it, and BODY's rarity is one minus the mean commonness of its
-distinct content tokens. The prior documents are what matter: maintenance runs
-after the episode is indexed, so counting the whole index let every ordinary
-body see its own words and the measure collapsed to zero. The result depends on
-the insert order alone, not on the batch a maintenance pass happened to use.
-
-This is a proxy for the distinctiveness claim and it is INVENTED-DESIGN: the
-original distinctiveness studies were not retrieved, so only the relative form
-of the claim is used. It weighs at most *HINT-TOKEN-LIMIT* of BODY's distinct
-tokens."
+  "Return lexical rarity for BODY in 0..1 as 1 - mean(df/(df+1)) over up to
+*HINT-TOKEN-LIMIT* distinct tokens, counting only episodes before BEFORE-ID so
+an episode does not dilute its own rarity."
   (let ((tokens (hint-tokens body)))
     (if (null tokens)
         0.0
@@ -1279,12 +1052,8 @@ tokens."
             (max 0.0 (min 1.0 rarity)))))))
 
 (defun arousal-proxy (body)
-  "Return a bounded lexical arousal proxy for BODY, in 0..1, with no model call.
-
-The proxy counts operator correction markers, explicit failure words, negation
-of a prior assertion, and evaluative intensifiers, and saturates.  It is
-INVENTED-DESIGN and it is used only to prioritise consolidation.  It is not a
-retrieval term and the design forbids presenting it as an affective mechanism."
+  "Return a bounded lexical arousal proxy in 0..1 from emphasis, negation, and
+correction markers. Used only for consolidation priority, never retrieval."
   (let ((markers 0))
     (when (stringp body)
       (incf markers (min 3 (count #\! body)))
@@ -1295,10 +1064,7 @@ retrieval term and the design forbids presenting it as an affective mechanism."
     (min 1.0 (/ (float markers) 12.0))))
 
 (defun context-key-for (&key project session channel)
-  "Return the context key the write path stores: a comma-joined triple.
-A transcript row has no project, and its empty first component is what
-retrieval compares a live turn against. TURN-CONTEXT-KEY writes the same
-triple."
+  "Format a comma-joined \"project,session,channel\" context key."
   (format nil "~A,~A,~A"
           (or project "")
           (or session "")
@@ -1310,18 +1076,9 @@ triple."
                                    (cue-type "episodic") (depth 0) (span "")
                                    (horizon 2592000) source-turn-id
                                    (derive-p t) (parameters *memory-parameters*))
-  "Append one episode to STORE, tag it, and open its activation summary.
-
-This is the whole interactive write path and it calls no model: a row is
-inserted, an activation summary is opened, and lexical co-occurrence links are
-recorded.  Assertions, schemas and procedures are NOT derived here -- that is
-the consolidation pass's job, so a slow parse can never delay a turn.  That
-split is the design's answer to the measured fragility of synchronous
-structured generation under weaker backbones.
-
-Every string passes through the store's own SCRUBBED before it reaches a
-column, which is the invariant the existing store already enforces.  Returns
-the new EPISODE, or NIL when the capture filter refused the text."
+  "Append an episode to STORE, scrub text fields, upsert its activation row,
+and (when DERIVE-P) compute rarity and co-occurrence links. Returns the new
+EPISODE, or NIL if CAPTURE-P rejects BODY."
   (check-type body string)
   (unless (capture-p body)
     (return-from write-episode nil))
@@ -1371,20 +1128,12 @@ the new EPISODE, or NIL when the capture filter refused the text."
                     :context-key context :horizon horizon :run-id nil))))
 
 (defun importance-from-depth (depth)
-  "Return the write-time importance 1..10 from the encoding depth.
-
-INVENTED-DESIGN: the filter chose the deeper form only when the features said
-so, and a deeper encoding is treated as a more important one.  The evaluation
-plan fits this mapping rather than assuming it."
+  "Map encoding depth (0, 1, 2+) to initial write-time importance (3, 5, 7)."
   (case depth (0 3) (1 5) (t 7)))
 
 (defun link-co-occurrences (store episode-id body ts parameters)
-  "Record a CO_OCCURS link from EPISODE-ID to episodes sharing a token with BODY.
-
-Returns the number of links written.  The links are lexical and cheap on
-purpose: they are the seed of the association graph and they are derived, so a
-later consolidation run may rebuild them, which is what makes the graph
-disposable."
+  "Upsert CO_OCCURS links from EPISODE-ID to top :LINK-FANOUT FTS5 matches per
+token in BODY, and return the number of link writes."
   (let ((written 0))
     (dolist (token (hint-tokens body))
       (dolist (row (enchiridion.memory.store:query-rows
@@ -1412,23 +1161,16 @@ disposable."
 ;;;; 13. Contradiction: update distinguished from revision.
 
 (defun conflicting-p (left right)
-  "Return T when two ASSERTIONs cannot both be applied as stated.
-
-Two assertions conflict when they share a subject and a relation and differ in
-object or in polarity.  The test is deliberately narrow: a relation whose
-object is a set is not handled, and the design states that limitation."
+  "Return T when LEFT and RIGHT share subject and relation but differ in object
+or polarity."
   (and (string-equal (assertion-subject left) (assertion-subject right))
        (string-equal (assertion-relation left) (assertion-relation right))
        (or (not (string-equal (assertion-object left) (assertion-object right)))
            (/= (assertion-polarity left) (assertion-polarity right)))))
 
 (defun conflict-kind-for (left right)
-  "Return the conflict kind of LEFT and RIGHT, or NIL when they do not conflict.
-
-The three kinds are the benchmark's: Context-Partitioned, Behaviour-Oscillation
-and Source-Contradiction.  The mapping from two records to a kind is this
-design's own and is INVENTED-DESIGN: the benchmark defines the kinds as
-categories and does not give a classifier."
+  "Return conflict kind for LEFT and RIGHT (\"scc\", \"boc\", or \"cpc\"), or
+NIL if they do not conflict."
   (when (conflicting-p left right)
     (cond
       ((not (string-equal (assertion-provenance left)
@@ -1440,13 +1182,8 @@ categories and does not give a classifier."
       (t "cpc"))))
 
 (defun valid-intervals-overlap-p (left right)
-  "Return T when the asserted validity intervals of LEFT and RIGHT overlap.
-
-The intervals are half-open: VALID-FROM is the first instant the assertion
-holds and VALID-TO the first instant it stops holding, so an assertion ending
-where another begins is an update and not a revision.  With an inclusive test
-every clean hand-over of a value would be classified as a conflict.  A NULL
-bound is an open end, and two open assertions overlap."
+  "Return T when half-open validity intervals [VALID-FROM, VALID-TO) of LEFT
+and RIGHT overlap (NIL bounds are open; abutting intervals do not overlap)."
   (let ((left-from (or (assertion-valid-from left) 0))
         (left-to (or (assertion-valid-to left) most-positive-fixnum))
         (right-from (or (assertion-valid-from right) 0))
@@ -1454,27 +1191,9 @@ bound is an open end, and two open assertions overlap."
     (and (< left-from right-to) (< right-from left-to))))
 
 (defun update-conditions-hold-p (old new &key change-event-p continuing-evidence-p)
-  "Return T when NEW supersedes OLD, and NIL when the pair is a revision.
-
-The five conditions, all of which must hold for an update:
-
-  (i)   the subject and the relation are identical;
-  (ii)  the two validity intervals are disjoint, or the new interval starts
-        after the old one's start;
-  (iii) a CHANGE EVENT exists in the episodic log that explains the
-        transition -- an observation that the world changed, rather than
-        merely a later statement of the opposite;
-  (iv)  the two share a provenance class, or the new one's authority is
-        strictly higher;
-  (v)   the old assertion has no evidence of continuing validity after the new
-        one's VALID-FROM.
-
-Condition (iii) is the one that makes this rule different from every documented
-one.  An update is a claim about the world's history and is checkable against
-the log; a revision is a claim that one source should outrank another, and the
-one benchmark that measures that case reports that fixed rules are
-insufficient.  So the asymmetry is the design: an update can be decided by the
-system, and a revision cannot."
+  "Return T when NEW supersedes OLD (update) rather than conflicting (revision).
+Requires matching subject/relation, disjoint or later VALID-FROM, CHANGE-EVENT-P,
+same provenance or strictly higher authority, and no CONTINUING-EVIDENCE-P."
   (and (string-equal (assertion-subject old) (assertion-subject new))
        (string-equal (assertion-relation old) (assertion-relation new))
        (or (not (valid-intervals-overlap-p old new))
@@ -1488,11 +1207,7 @@ system, and a revision cannot."
        (not continuing-evidence-p)))
 
 (defun conflict-basis-for (old new &key change-event-p continuing-evidence-p)
-  "Return the one-line basis of the conflict between OLD and NEW.
-
-The basis distinguishes an update from a revision, which is what makes the
-ledger auditable: an operator can read why the system decided that a value
-changed rather than that a source won."
+  "Return a one-line audit string classifying OLD vs NEW as update or revision."
   (format nil "~A ~A ~A | ~A ~A ~A | ~A~@[ | change event~]~@[ | continuing evidence~]"
           (assertion-subject old) (assertion-relation old) (assertion-object old)
           (assertion-subject new) (assertion-relation new) (assertion-object new)
@@ -1505,16 +1220,9 @@ changed rather than that a source won."
 
 (defun detect-conflicts (new existing &key (now (get-universal-time))
                                           change-event-p continuing-evidence-p)
-  "Return the CONFLICT records NEW opens against EXISTING, and the updates.
-
-Two values.  The first is the list of CONFLICT records to insert.  The second
-is the list of OLD assertions that the update rule supersedes, which the caller
-closes by setting TX-TO; a superseded row is never deleted.
-
-Nothing is resolved here.  Detection produces records, and resolution happens
-at the point of action, which is the requirement that the conflict-bearing
-relation survive extraction: the relation is a row in its own table referencing
-both assertions by id."
+  "Compare NEW against EXISTING assertions without mutating either.
+Returns (values CONFLICTS SUPERSEDED): new CONFLICT records to insert, and old
+assertions superseded under the update rule (caller closes via tx_to)."
   (let ((conflicts '()) (superseded '()))
     (dolist (old existing)
       (when (conflicting-p new old)
@@ -1537,13 +1245,8 @@ both assertions by id."
 (defun resolve-conflict (conflict &key resolution (resolver "action-time")
                                         (query "") (now (get-universal-time))
                                         (at-action-p t))
-  "Return CONFLICT with a resolution recorded, or unchanged when not at action.
-
-Resolution is deferred to the point of action by construction: with
-AT-ACTION-P false the conflict comes back untouched, so a consolidation pass
-can call this and cannot resolve anything by accident.  Neither referenced
-assertion is modified -- a resolution is a new fact about the pair, which is
-what keeps the earlier assertion legible."
+  "Record RESOLUTION on CONFLICT in place when AT-ACTION-P is true; otherwise
+return CONFLICT unchanged. Does not modify the referenced assertions."
   (if (not at-action-p)
       conflict
       (progn
@@ -1555,36 +1258,22 @@ what keeps the earlier assertion legible."
         conflict)))
 
 ;;;; ---------------------------------------------------------------------
-;;;; 14. The Calibrator: a machine judgement of learning, fitted per family.
-;;;;
-;;;; Human judgements of learning are cue-based inferences, not readouts of
-;;;; trace strength, and foresight bias makes a write-time judgement nearly
-;;;; worthless: at write time the content is present and fluent.  The design
-;;;; therefore computes no confidence at write time, and the prediction below
-;;;; is made before a retrieval from features available without one.
+;;;; 14. The Calibrator: pre-retrieval probability estimation per query family.
 
 (defparameter +calibration-features+
   '(:max-score :score-gap :cue-coverage :cue-type-match :conflict-load
     :family-prior :degraded)
-  "The features the Calibrator reads.  All are model-free and all are available
-before the retrieval is issued.")
+  "Model-free pre-retrieval feature keys consumed by the Calibrator.")
 
 (defparameter *calibration-weights*
   (list :max-score 1.6 :score-gap 0.9 :cue-coverage 1.2 :cue-type-match 0.7
         :conflict-load -1.1 :family-prior 0.6 :degraded -0.8 :bias -0.4)
-  "Fallback logistic weights, in log-odds units, used when a family has too
-few observed outcomes to fit an isotonic curve.  Every magnitude is
-INVENTED-DESIGN; the signs encode the design's expectations.")
+  "Fallback log-odds weights used when a family has too few observations for an
+isotonic fit.")
 
 (defun isotonic-fit (points)
-  "Return a monotone step curve fitted to POINTS by pool-adjacent-violators.
-
-POINTS is a list of (PREDICTED . OBSERVED) pairs.  The result is a list of
-(THRESHOLD . VALUE) breakpoints with non-decreasing VALUE, which is what makes
-the fitted calibration monotone: a higher prediction can never map to a lower
-calibrated probability.  Isotonic regression is used because it makes no
-distributional assumption and is cheap enough to refit on the asynchronous
-path.  The design labels the choice INVENTED-DESIGN."
+  "Fit a non-decreasing step curve of (THRESHOLD . VALUE) breakpoints to
+(PREDICTED . OBSERVED) POINTS via pool-adjacent-violators."
   (let ((sorted (sort (copy-list points) #'< :key #'car))
         (blocks '()))
     (dolist (point sorted)
@@ -1602,12 +1291,8 @@ path.  The design labels the choice INVENTED-DESIGN."
                       blocks))))
 
 (defun isotonic-predict (curve value)
-  "Return the calibrated probability CURVE assigns to VALUE.
-
-CURVE is the output of ISOTONIC-FIT, a step function.  Below the first
-breakpoint the first value is used and above the last the last value is used,
-which is the standard convention for a step calibration and avoids inventing
-behaviour outside the fitted range."
+  "Evaluate step curve CURVE (from ISOTONIC-FIT) at VALUE, clamping outside
+the fitted breakpoint range to the endpoint values."
   (if (null curve)
       nil
       (let ((answer (cdr (first curve))))
@@ -1618,13 +1303,8 @@ behaviour outside the fitted range."
 
 (defun calibration-features (scored &key (cue-coverage 0.0) (family-prior 0.5)
                                          (degraded-p nil))
-  "Return the Calibrator's feature plist from a scored retrieval.
-
-SCORED is the output of RETRIEVE, best first.  CUE-COVERAGE is the fraction of
-the query's terms that occur anywhere in the index, which the caller computes
-from the candidate set.  Every feature is available before the retrieval is
-issued, which is the property that makes the judgement a prediction rather than
-a report."
+  "Extract the Calibrator feature plist from RETRIEVE output SCORED (best first)
+along with CUE-COVERAGE, FAMILY-PRIOR, and DEGRADED-P."
   (let* ((top (first scored))
          (second (second scored))
          (max-score (if top (getf top :score) 0.0))
@@ -1640,13 +1320,8 @@ a report."
           :degraded (if degraded-p 1.0 0.0))))
 
 (defun judgement-of-learning (features &key curve (weights *calibration-weights*))
-  "Return the predicted probability that the retrieval will be useful, in 0..1.
-
-CURVE, when supplied, is an isotonic fit for the query's family and takes
-precedence.  Without one the fallback logistic is used.  The design computes
-this *before* the retrieval and writes it to RETRIEVALS, so that the outcome
-can be compared with the prediction; a prediction recorded after the fact is
-not a prediction."
+  "Return predicted retrieval usefulness in 0..1 from FEATURES.
+Uses isotonic CURVE when supplied, else the fallback logistic with WEIGHTS."
   (if curve
       (or (isotonic-predict curve (float (or (getf features :max-score) 0.0)))
           0.5)
@@ -1667,19 +1342,8 @@ not a prediction."
         (/ 1.0 (+ 1.0 (exp (- log-odds)))))))
 
 (defun recalibrate (observations &key (minimum 20))
-  "Return an isotonic curve fitted to OBSERVATIONS, or NIL when there are too
-few.
-
-OBSERVATIONS is a list of plists with :PREDICTED and :OBSERVED.  The feedback
-signal is what closes the loop, and it is sourced from the environment rather
-than from the model: the operator's correction, the outcome of an action that
-depended on the retrieval, or a later episode that contradicts the retrieved
-assertion.  A retrieval with none of those has OBSERVED NULL and is excluded,
-because a window of guesses teaches the predictor its own bias.
-
-MINIMUM is the point below which a family falls back to the logistic: fitting a
-monotone curve to a handful of points produces a step function that looks
-confident and carries no information."
+  "Fit an isotonic curve to OBSERVATIONS (plists of :PREDICTED and :OBSERVED),
+or return NIL when fewer than MINIMUM observations are present."
   (if (< (length observations) minimum)
       nil
       (isotonic-fit (mapcar (lambda (row)
@@ -1689,17 +1353,9 @@ confident and carries no information."
 
 (defun gate-action (predicted conflict-load &key (parameters *memory-parameters*)
                                                    (external-available-p t))
-  "Return the Calibrator's routing decision as one of four keywords.
-
-  :RELY            P-hat at or above the rely threshold with no conflict load
-  :RETRIEVE-MORE   0.50 <= P-hat < 0.80: widen k, add a hop, or promote a tier
-  :SEARCH-EXTERNAL P-hat below 0.50, or any conflict load on an action query
-  :ABSTAIN         P-hat below 0.50 and no external channel exists
-
-Confidence gates action selection and never rewrites an answer in place: the
-self-correction result is that models struggle to correct their own responses
-without external feedback and sometimes degrade.  The thresholds are
-INVENTED-DESIGN."
+  "Route retrieval based on PREDICTED probability and CONFLICT-LOAD:
+:RELY (>= rely, no conflicts), :RETRIEVE-MORE (>= search), :SEARCH-EXTERNAL
+(any conflict or below search with external channel), or :ABSTAIN."
   (let ((rely (parameter :rely-threshold parameters))
         (search (parameter :search-threshold parameters)))
     (cond ((and (>= predicted rely) (zerop conflict-load)) :rely)
@@ -1718,11 +1374,8 @@ INVENTED-DESIGN."
 (defun record-outcome (store kind ref predicted observed
                        &key (query-id "") (cue-type "")
                             (ts (get-universal-time)))
-  "Write one retrieval outcome and return its row id.
-
-OBSERVED is 1 when the retrieved record was used and the action succeeded, 0
-when it was used and failed, and the call refuses anything else: an outcome
-that was never observed must not enter the calibration window."
+  "Insert one retrieval outcome row (OBSERVED must be 0 or 1) into RETRIEVALS
+and return its row id."
   (check-type observed (integer 0 1))
   (enchiridion.memory.store:exec
    store
@@ -1735,17 +1388,8 @@ that was never observed must not enter the calibration window."
 ;;;; 15. Procedure admission and selection.
 
 (defun admission-rule (procedure)
-  "Return T when a PROCEDURE has earned admission, and NIL otherwise.
-
-Four conditions, each a documented negative result rather than a preference.
-Granularity must be subtask, because the reported effect flips sign on that
-axis alone: task-level skills mostly reduced performance below a no-memory
-baseline while subtask-level skills raised it.  Reuse must be demonstrated on
-distinct task classes, because model-authored procedures were reported to
-deliver no gain where curated ones delivered +16.2 percentage points.
-Failures must not have caught up with successes.  And the precondition
-predicate must be evaluable in-process, because evaluating it with a model
-would put a model call on the interactive path."
+  "Return T when PROCEDURE meets admission criteria: subtask granularity, >= 2
+distinct tasks, >= 3 evidence count, failures < evidence, and in-process predicate."
   (and (string-equal (getf procedure :granularity) "subtask")
        (>= (or (getf procedure :distinct-tasks) 0) 2)
        (>= (or (getf procedure :evidence-count) 0) 3)
@@ -1755,26 +1399,13 @@ would put a model call on the interactive path."
        (getf procedure :in-process-p)))
 
 (defun procedure-eligible-p (procedure state)
-  "Return T when PROCEDURE's preconditions are satisfied in STATE.
-
-STUB for the predicate evaluation itself: the design requires the predicate to
-be an S-expression over the world block, the working directory, the tools in
-the registry, the session kind and the previous step's outcome, evaluated
-in-process by the reader.  The evaluation is not implemented here because it
-needs a sandbox the harness does not yet expose, and inventing one in a design
-sketch would misrepresent what exists.  The contract is that this function
-returns T only when the predicate evaluates true and every required input is
-present, and that it signals no condition a caller has to distinguish."
+  "STUB: return T when PROCEDURE's in-process precondition holds in STATE.
+Always returns NIL until the precondition evaluation sandbox is implemented."
   (declare (ignore procedure state))
   nil)
 
 ;;;; ---------------------------------------------------------------------
-;;;; 16. The consolidation entry point.
-;;;;
-;;;; One function, called between sessions and never inside a turn.  It is
-;;;; idempotent by construction: it works from a watermark, every insert
-;;;; carries the run id, and the uniqueness constraints make a second pass
-;;;; over the same range a no-op.
+;;;; 16. Derivation helpers.
 
 (defun episode-from-row (row)
   "Return ROW, one episodes row as a plist, as an EPISODE."
@@ -1795,25 +1426,17 @@ present, and that it signals no condition a caller has to distinguish."
                              2592000)))
 
 (defvar *derivation-tokens* nil
-  "NIL, or the tokens the deriver has spent in the build batch that bound it.
-BUILD-CANDIDATE binds it to 0 and adds the total to the candidate's
-TOKENS_USED, which is what the cost gate reads; a deriver that makes a model
-call adds what the provider billed.")
+  "Token counter bound to 0 by BUILD-CANDIDATE; model-backed derivers add
+billed tokens here for the cost gate.")
 
 (defparameter *assertion-deriver* nil
-  "A function of (STORE EPISODE) returning (values ASSERTIONS CHANGE-EVENTS).
-NIL means no derivation is installed: the builder must not watermark an
-episode it cannot derive. The production deriver is a model call; tests bind a
-deterministic function.")
+  "Function (STORE EPISODE) -> (values ASSERTIONS CHANGE-EVENTS), or NIL when
+no deriver is installed (builder must not watermark un-derived episodes).")
 
 (defun assertions-for-episode (store episode)
-  "Return the ASSERTIONs derived from EPISODE, and the change events.
-The production deriver is installed in *ASSERTION-DERIVER*. A NIL deriver
-returns no rows rather than inventing a parser. The contract the deriver must
-satisfy: every assertion carries the episode's id, a character span, the
-episode's provenance and authority, and the run id it was derived under; an
-assertion with no span is rejected by the caller; and the composite unique key
-makes a second pass over the same episode insert nothing."
+  "Derive (values ASSERTIONS CHANGE-EVENTS) from EPISODE via *ASSERTION-DERIVER*,
+or (values NIL NIL) when NIL. Derivers must attach episode-id, character span,
+provenance, authority, and run-id."
   (if *assertion-deriver*
       (funcall *assertion-deriver* store episode)
       (values nil nil)))
@@ -1836,11 +1459,3 @@ makes a second pass over the same episode insert nothing."
    :cue-type (enchiridion.memory.store:field row "cue_type")
    :schema-id (enchiridion.memory.store:field row "schema_id")
    :run-id (enchiridion.memory.store:field row "run_id")))
-
-;;;; ---------------------------------------------------------------------
-;;;; 17. End of the sketch.
-;;;;
-;;;; One stub remains: PROCEDURE-ELIGIBLE-P, which needs an evaluation sandbox
-;;;; this document does not specify.  The sketch's single-pass CONSOLIDATE is
-;;;; gone: derivation runs through candidate generations (generations.lsp), and
-;;;; only the gates in cue.lsp can make one live.

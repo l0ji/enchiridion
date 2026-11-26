@@ -1,13 +1,7 @@
-;;;; settings.lsp --- The memory module's settings, bound from the :memory section.
+;;;; settings.lsp --- Memory module settings bound from the :memory config section.
 ;;;;
-;;;; Every value here comes from the configuration. None carries a default of
-;;;; its own: DEFAULT-CONFIG holds the one shipped default for each key, and
-;;;; this file binds the specials from it when it loads, so a reader that ran
-;;;; before CONFIGURE-MEMORY still sees the shipped values rather than a second
-;;;; copy of them that can drift. CONFIGURE-MEMORY rebinds them from config.lsp.
-;;;;
-;;;; The file loads first in the module, because the blocks, the pack, and the
-;;;; gates all read these specials.
+;;;; Loads first in the module; initialized from DEFAULT-CONFIG at load time
+;;;; and rebound by CONFIGURE-MEMORY.
 
 (in-package #:enchiridion.memory)
 
@@ -52,11 +46,7 @@ separately, so this is not the whole prompt.")
 
 (defvar *push-max-fraction*)
 (setf (documentation '*push-max-fraction* 'variable)
-      "The most of the pack that push may occupy. INVENTED-DESIGN. The
-justification is structural rather than measured: push must not be able to
-evict a retrieved record the cue ranked above it, and capping push at a
-fraction of the budget makes that guarantee enforceable rather than
-aspirational.")
+      "Maximum fraction of the cue pack budget that push channels may occupy.")
 
 (defvar *memory-graph-limit*)
 (setf (documentation '*memory-graph-limit* 'variable)
@@ -76,9 +66,7 @@ aspirational.")
 
 (defvar *gate-pack-chars*)
 (setf (documentation '*gate-pack-chars* 'variable)
-      "The pack budget, in characters, that both utility arms are scored in.
-Smaller than the turn's pack, so the gate rewards a semantic layer that says
-the same thing in less room.")
+      "Pack budget in characters used to score both utility gate arms.")
 
 (defvar *memory-tail-margin*)
 (setf (documentation '*memory-tail-margin* 'variable)
@@ -92,9 +80,7 @@ cost for each episode they derived, for the next one to be promoted.")
 
 (defvar *memory-writes-per-episode*)
 (setf (documentation '*memory-writes-per-episode* 'variable)
-      "The most semantic rows a candidate may write per episode it derived:
-the volume gate's allowance grows with the work the build did, so ordinary
-output passes and a deriver that writes far more than usual does not.")
+      "Maximum semantic rows a T2 candidate may write per derived episode (volume gate).")
 
 (defparameter +built-in-canaries+
   '((:name "builtin-retrieval" :family "retrieval"
@@ -161,15 +147,11 @@ own with this cap, so the chat path keeps the :llm section's :max-tokens.")
 
 (defvar *t2-deriver-concurrency*)
 (setf (documentation '*t2-deriver-concurrency* 'variable)
-      "How many T2 deriver calls may be in flight at once. A call is mostly
-waiting on the provider, so a batch takes about its slowest calls rather than
-the sum of them. 1 derives one episode at a time.")
+      "Maximum concurrent T2 deriver calls (1 derives episodes serially).")
 
 (defvar *t2-deriver-model*)
 (setf (documentation '*t2-deriver-model* 'variable)
-      "The model the T2 deriver calls, or NIL for the cheap tier's model. A
-deriver wants a model that answers in JSON without a long reasoning pass,
-which is not always the model a turn wants.")
+      "Model used by the T2 deriver, or NIL to use the cheap tier's model.")
 
 (defvar *t2-interval-seconds*)
 (defvar *t2-frozen-interval-seconds*)
@@ -178,9 +160,7 @@ which is not always the model a turn wants.")
 
 (defvar *compaction-rebase-every*)
 (setf (documentation '*compaction-rebase-every* 'variable)
-      "Every this many compaction passes, one rebuilds the session block from raw
-turns instead of the previous summary, so the summary cannot drift by
-summarising itself.")
+      "Rebuild the session block from raw turns every N compaction passes to avoid summary drift.")
 
 (defvar *compaction-rebase-turns*)
 (setf (documentation '*compaction-rebase-turns* 'variable)
@@ -188,9 +168,7 @@ summarising itself.")
 
 (defvar *block-limits*)
 (setf (documentation '*block-limits* 'variable)
-      "Character limits per block label, the shipped :block-limits with the
-operator's merged over them key by key. Raising a limit raises the fixed token
-cost of every prompt.")
+      "Character limits per block label, merged key by key over the shipped :block-limits.")
 
 (defvar *unlisted-block-limit*)
 (setf (documentation '*unlisted-block-limit* 'variable)
@@ -200,11 +178,7 @@ cost of every prompt.")
   "How many recent turns a prompt may carry, before the character budget.")
 
 (defvar *recent-window-chars* 4000
-  "The total characters of recent conversation a prompt may carry.
-
-The count and the character budget are both bounds: a turn count alone lets six
-long replies cost more than the frozen prompt, and a character budget alone lets
-a thousand one-line turns arrive.")
+  "Maximum total characters of recent conversation carried in a prompt (joint bound with *RECENT-TURN-COUNT*).")
 
 (declaim (ftype (function (list list) list) merge-plist))
 

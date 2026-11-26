@@ -1,14 +1,6 @@
 ;;;; generations.lsp --- Candidate generations and promotion.
-;;;;
-;;;; A generation is a versioned set of semantic derived rows. A T2 pass writes
-;;;; a candidate generation and leaves the live layer alone. Promotion swaps one
-;;;; pointer in one transaction; rollback swaps it back. Phase 2 builds a
-;;;; candidate from the whole log for simplicity; an incremental copy of the
-;;;; live generation is a later optimisation, not a change to the read contract.
-;;;;
-;;;; This file does not run a model. It calls *ASSERTION-DERIVER*, which is the
-;;;; model-dependent seam. With no deriver installed, BUILD-CANDIDATE reports
-;;;; :no-deriver and writes nothing.
+;;;; Builds versioned semantic generations via *ASSERTION-DERIVER*, with atomic
+;;;; pointer-swap promotion and rollback.
 
 (in-package #:enchiridion.memory)
 
@@ -56,15 +48,9 @@ CONFIG-DIGEST; the empty string is the valid first value.")
            store (format nil "PRAGMA table_info(~A)" table))))
 
 (defun copy-generation-rows (store table from to &key (remap (constantly nil)))
-  "Copy TABLE's rows of generation FROM into generation TO and return a hash
-table of old id to new id, empty for a table with no id column.
-
-The columns come from the table itself, so a column added to the schema is
-copied without a change here. REMAP is called with a column name, the row, the
-value, and this copy's own map so far, and returns the replacement or NIL to
-keep the value: it is how a reference to a row this copy renumbered follows the
-row. Rows are copied in id order, so a row that names an earlier row of the same
-table, a schema's parent, finds it in the map."
+  "Copy TABLE rows from generation FROM to TO in rowid order, returning an
+old-id -> new-id hash table. REMAP is called as (column row value id-map)
+to rewrite foreign/self references (rowid order ensures parents precede children)."
   (let* ((columns (table-columns store table))
          (id-p (member "id" columns :test #'string=))
          (copied (remove-if (lambda (c) (member c '("id" "generation_id")
@@ -90,12 +76,9 @@ table, a schema's parent, finds it in the map."
     map))
 
 (defun copy-live-generation (store from to)
-  "Copy generation FROM's semantic layer into generation TO, renumbering every
-reference so the copy points at its own rows and never at FROM's.
-
-Schemas go first, because assertions and later schemas name them; assertions
-next, because conflicts and semantic links name them. The derivation marks go
-too, which is what makes the candidate derive only what FROM never saw."
+  "Copy generation FROM's semantic layer and derivation marks into TO, remapping
+all internal IDs. Copies schemas before assertions, then conflicts and links
+so foreign keys resolve to the new generation."
   (let* ((schemas (copy-generation-rows
                    store "schemas" from to
                    :remap (lambda (column row value own)
@@ -131,10 +114,8 @@ too, which is what makes the candidate derive only what FROM never saw."
     (hash-table-count assertions)))
 
 (defparameter *generation-claim-seconds* 1800
-  "How long a builder's claim on a generation lasts without renewal.
-A build derives one bounded batch and ends, so half an hour is longer than any
-live batch. A process that dies holding a claim blocks the generation for this
-long, then the next pass resumes it.")
+  "Lease duration in seconds for a builder's claim on a generation before
+another process may take over.")
 
 (defun generation-claim-token ()
   "Return a value that names one builder for one build."
@@ -199,14 +180,9 @@ A build whose lease expired and was taken over must not clear the new claim."
 (defun start-candidate (store &key (parser-version *memory-parser-version*)
                                    (config-hash *memory-config-hash*)
                                    (rebuild nil))
-  "Create a building generation and return its id.
-
-The parent is the live generation, or NIL when none has been promoted. A
-candidate starts as a copy of the live semantic layer, derivation marks
-included, so the builder derives only the episodes the live generation never
-saw and a pass costs what the log grew by, not what the log holds. A first
-generation starts empty. REBUILD starts empty even with a live parent, so the
-whole log is derived again; it is the operator's choice, never the schedule's."
+  "Create a building generation in a transaction and return its id.
+Copies the live generation (and its derivation marks) for incremental builds;
+REBUILD starts empty even when a live parent exists."
   (ensure-generation-state store)
   (enchiridion.memory.store:with-store-transaction (store)
     (%start-candidate store :parser-version parser-version
@@ -227,11 +203,8 @@ no candidate and both insert one."
                                  :rebuild rebuild))))
 
 (defun complete-candidate-generation (store)
-  "Return the oldest generation that was fully built and never gated, or NIL.
-A crash between building and gating leaves status 'candidate' with no
-promotion_checked_ts. A candidate the gates have already judged is not answered
-here: retrying a verdict is the operator's `memory promote ID`, not the
-schedule's."
+  "Return the oldest candidate generation with NULL promotion_checked_ts, or NIL
+(recovers candidates built before a crash without re-gating judged ones)."
   (enchiridion.memory.store:field
    (first (enchiridion.memory.store:query-rows
            store "SELECT id FROM generations
@@ -401,16 +374,9 @@ The table's unique pair key makes a duplicate detection a no-op."
                  (assertion-id assertion)))))
 
 (defun detect-candidate-conflicts (store generation-id assertion now)
-  "Detect ASSERTION's conflicts in GENERATION-ID and return a plist of counts.
-An update closes the old interval; every other pair becomes a conflict row.
-The change-event test is a SQL query over the candidate, not a model call.
-
-Two pairs are not conflicts. An assertion from the same episode: one record
-that lists several values for a relation is not contradicting itself. And any
-pair once the subject and relation already hold two live objects: the relation
-has many values, a hummus and its ingredients, and every new object opening a
-conflict with every earlier one was quadratic, 1,806 rows for one relation on
-the trial log. A one-valued relation still conflicts on its second object."
+  "Detect conflicts for ASSERTION in GENERATION-ID and return (:CONFLICTS :CLOSED).
+Skips same-episode assertions and suppresses new conflict rows once 2+ live
+objects exist for (subject, relation); updates still close superseded rows."
   (let* ((existing (candidate-existing-assertions store generation-id assertion))
          (set-p (>= (length existing) 2))
          (others (remove (assertion-episode-id assertion) existing
@@ -437,10 +403,8 @@ the trial log. A one-valued relation still conflicts on its second object."
     (list :conflicts conflicts :closed closed)))
 
 (defun derive-one (store deriver episode)
-  "Call DERIVER on EPISODE and return a plist: :ASSERTIONS and :EVENTS, or
-:ERROR with the report line, and :TOKENS either way. It binds the token count
-itself, so it gives the same answer in a worker thread, where the caller's
-dynamic bindings do not reach."
+  "Call DERIVER on EPISODE, returning (:ASSERTIONS :EVENTS :TOKENS) or
+(:ERROR :TOKENS). Binds *DERIVATION-TOKENS* locally for thread safety."
   (let ((*derivation-tokens* 0))
     (handler-case
         (multiple-value-bind (assertions events) (funcall deriver store episode)
@@ -452,27 +416,9 @@ dynamic bindings do not reach."
 (defun derive-concurrently (store episodes &key (deriver *assertion-deriver*)
                                                 (concurrency *t2-deriver-concurrency*)
                                                 (attempts 2))
-  "Return DERIVE-ONE's plist for each of EPISODES, in their order, with up to
-CONCURRENCY model calls in flight at once. A failed call goes back on the
-queue until it has had ATTEMPTS tries, and its result carries the tokens of
-every try.
-
-The retry is in the pool and not a second round after it: a round waits for
-its slowest call, so a batch with a retry round idled through two tails, which
-on the trial was three minutes in a row with no call in flight.
-
-Twice CONCURRENCY failures in a row, with no success between them, stop the
-pool taking new episodes: the provider is down, not the episodes, and on the
-trial an outage ground through a 384-episode batch for 85 minutes of calls
-timing out one after another. The episodes not tried come back NIL, which the
-caller reads as failures and leaves for the next tick.
-
-A deriver call is almost all waiting on the provider, and one episode's call
-does not depend on another's result: the deriver reads the raw log, never the
-candidate. So the calls overlap, and every store access inside them takes the
-store's lock. Applying the results stays in the caller, one at a time and in
-episode order, because conflict detection depends on that order. A worker
-that dies without a result leaves NIL, which the caller reads as a failure."
+  "Run DERIVE-ONE across EPISODES with up to CONCURRENCY threads, returning
+results in input order with cumulative :TOKENS. Failed calls requeue up to
+ATTEMPTS times; 2*CONCURRENCY consecutive errors trip the breaker, leaving untried items NIL."
   (let* ((items (coerce episodes 'vector))
          (n (length items))
          (results (make-array n :initial-element nil))
@@ -552,16 +498,9 @@ that dies without a result leaves NIL, which the caller reads as a failure."
                                   (parser-version *memory-parser-version*)
                                   (config-hash *memory-config-hash*)
                                   (rebuild nil))
-  "Build or resume a candidate generation and return a report plist.
-With no deriver installed the function reports :no-deriver and writes nothing.
-The build is resumable: a limited batch leaves the generation in :building and
-the next call continues the same generation. A new candidate copies the live
-layer and derives what is new; REBUILD starts it empty instead, and has no
-effect on a build already under way.
-
-The builder takes a lease on the generation before it derives. A caller that
-finds the lease held returns :REASON :CLAIMED and derives nothing, so two
-processes cannot pay for the same batch or count it twice."
+  "Build or resume a candidate generation under a lease and return a report plist.
+Copies the live layer unless REBUILD is set; returns :REASON :CLAIMED if
+another builder holds the lease, or :NO-DERIVER if *ASSERTION-DERIVER* is NIL."
   (cond
     ((null store) (list :built nil :reason :no-store))
     ((not (enabled-p)) (list :built nil :reason :disabled))
@@ -575,9 +514,7 @@ processes cannot pay for the same batch or count it twice."
             (owner (generation-claim-token))
             (claim-now (get-universal-time)))
        (if (not (claim-generation store generation-id owner :now claim-now))
-           ;; Another builder holds the lease. The candidate is not abandoned:
-           ;; its next batch is due on the next tick, after the holder's lease
-           ;; ends or its release lands.
+           ;; Another builder holds the lease; retry on the next tick.
            (list :built nil
                  :reason :claimed
                  :generation-id generation-id
@@ -588,22 +525,9 @@ processes cannot pay for the same batch or count it twice."
                       (accepted 0) (rejected 0) (conflicts 0) (closed 0)
                       (tokens 0) (derived '()) (failure nil) (failure-note nil)
                       (skipped 0))
-                  ;; A failed deriver call ends the batch, and the counters below
-                  ;; still record the episodes derived before it: they have their
-                  ;; rows and their marks, and a gate that read counters without
-                  ;; them would undercount. The failed episode is not marked, so
-                  ;; the next tick tries it again. The model calls run
-                  ;; concurrently; the results are applied here, in episode
-                  ;; order, and every call's tokens count. A failed call is tried
-                  ;; once more. An episode that fails twice is marked derived
-                  ;; with nothing written, so it stays an episode and the batch
-                  ;; goes on: stopping at the first failure threw away every paid
-                  ;; result after it, which on a trial batch of 96 was 98 of 105
-                  ;; calls, and an episode that always fails would stop every
-                  ;; batch at the same place. When most of a batch fails the
-                  ;; provider is the problem and not the episodes, so nothing
-                  ;; past the first failure is applied or marked, and the next
-                  ;; tick tries.
+                  ;; Derive concurrently, bill tokens upfront, then apply in episode order.
+                  ;; If >50% fail (outage), stop at the first failure so untried episodes retry next tick;
+                  ;; otherwise mark individual failed episodes derived with no writes so the batch progresses.
                   (let ((results (derive-concurrently store episodes)))
                     (dolist (result results)
                       (incf tokens (or (getf result :tokens) 0)))
@@ -707,10 +631,8 @@ the gate path is a later phase and calls this function only after it passes."
          (list :promoted t :generation-id generation-id :previous old))))))
 
 (defun rollback-generation (store generation-id)
-  "Roll GENERATION-ID back and return a report plist.
-If it is live, the pointer returns to its parent and the parent is live again.
-If it is a candidate, its status becomes rolled-back and the live layer is
-untouched."
+  "Roll GENERATION-ID back and return a report plist. If live, atomically
+retires it and restores its parent as live; if a candidate, marks it rolled-back."
   (ensure-generation-state store)
   (let ((row (generation-row store generation-id)))
     (cond
@@ -730,9 +652,7 @@ untouched."
                 store
                 "UPDATE memory_state SET live_generation_id = ? WHERE id = 1"
                 (list (or parent 0)))
-               ;; The pointer swap and the parent's status are one fact: a
-               ;; live pointer at a generation marked retired is a store that
-               ;; contradicts itself.
+               ;; Restore parent status in the same transaction as the pointer swap.
                (when parent
                  (enchiridion.memory.store:exec
                   store
@@ -745,15 +665,8 @@ untouched."
                :status "rolled-back"))))))
 
 (defun requeue-generation (store generation-id)
-  "Return a quarantined GENERATION-ID to the gates as a candidate, and return a
-report plist.
-
-This is for a quarantine the reading code caused rather than the claims: the
-trial's first generation was quarantined by a ranking bug, and gating its
-8,693 claims again costs no model call where deriving them again cost 5.2
-million tokens.  Its checks stay in generation_checks as the record of the
-earlier verdict; its promotion result is cleared, so the quarantine rate
-counts the verdict the gates give it next and not both."
+  "Reset a quarantined GENERATION-ID back to candidate status, clearing
+promotion_result/checked_ts while preserving historical generation_checks rows."
   (let ((row (generation-row store generation-id)))
     (cond
       ((null row) (list :requeued nil :reason :no-such-generation))

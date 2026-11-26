@@ -2,15 +2,9 @@
 
 (in-package #:enchiridion.memory)
 
-;;;; ------------------------------------------------------------------
-;;;; 0. Constants
-;;;; ------------------------------------------------------------------
-
 ;; Pack and proactive retrieval limits are configured in settings.lsp
 
-;;;; ------------------------------------------------------------------
-;;;; 1. Schema for the three new stores
-;;;; ------------------------------------------------------------------
+;;;; Schema.
 
 (defun ensure-ext-schema (store)
   "Create the extension's three tables on STORE and return the count run."
@@ -19,18 +13,11 @@
       (enchiridion.memory.store:exec store statement)
       (incf count))))
 
-;;;; ------------------------------------------------------------------
-;;;; 2. The cue index
-;;;; ------------------------------------------------------------------
+;;;; Cue index.
 
 (defun cue-terms (terms)
-  "Return TERMS, a string or a list of strings, as a de-duplicated token list.
-
-The core's NORMALISE-TERMS operates on TERMS structs, not on strings, so it
-cannot be reused here.  This is the string-side counterpart, and it uses the
-core's own TOKENISE and stop-word list so that a cue recorded at write time and
-a cue computed at read time are comparable by construction rather than by
-convention."
+  "Tokenize TERMS (string or list of strings) via TOKENISE, dropping stop words,
+single-char tokens, and duplicates."
   (let ((seen (make-hash-table :test #'equal))
         (out '()))
     (dolist (text (ensure-list terms) (nreverse out))
@@ -42,15 +29,8 @@ convention."
           (push tok out))))))
 
 (defun index-cue (store terms kind ref &key (used nil) (now (get-universal-time)))
-  "Record that TERMS were the live cue when KIND/REF was used, or not used.
-
-One row per (term, kind, ref).  A repeat sighting raises USES rather than
-inserting, so a fact seen a hundred times stays one row -- the same discipline
-the harness's neighbour documents as recall-loop prevention.
-
-USED says whether the record was actually referenced.  The distinction is the
-whole point of the index: a cue that reliably precedes USE is a cue worth
-pushing, and a cue that precedes mere presence is not."
+  "Record co-occurrence of TERMS with KIND/REF in cue_index (one row per triple),
+incrementing USES when USED is true."
   (let ((n 0))
     (dolist (term (cue-terms terms) n)
       (when (plusp (length term))
@@ -67,12 +47,8 @@ pushing, and a cue that precedes mere presence is not."
         (incf n)))))
 
 (defun cue-index-for (store term &key (limit 20) (min-uses 1))
-  "Return (KIND . REF) pairs whose cue is TERM and which have been USED.
-
-Ranked by USES descending then recency, which is a frequency-and-recency
-ordering rather than a similarity one.  A record enters the cue index only
-because it was USED under that cue before, so this channel is keyed on
-demonstrated prior usefulness by construction."
+  "Return (KIND . REF) pairs indexed under TERM with at least MIN-USES,
+ordered by uses descending then recency."
   (mapcar (lambda (row)
             (cons (enchiridion.memory.store:field row "kind")
                   (enchiridion.memory.store:field row "ref")))
@@ -86,10 +62,7 @@ demonstrated prior usefulness by construction."
            (list term min-uses limit))))
 
 (defun cue-index-many (store terms &key (limit 20) (min-uses 1))
-  "Union CUE-INDEX-FOR over every term in TERMS, best first, de-duplicated.
-
-Defined before PUSH-PACK, which calls it: a forward reference would compile
-with a style warning that this project's own build treats as a failure."
+  "Return deduplicated union of CUE-INDEX-FOR across all terms in TERMS."
   (let ((seen (make-hash-table :test #'equal))
         (out '()))
     (dolist (term (cue-terms terms) (nreverse out))
@@ -105,28 +78,15 @@ with a style warning that this project's own build treats as a failure."
     (or (enchiridion.memory.store:field row "n") 0)))
 
 (defun prune-cue-index (store &key (older-than 7776000) (now (get-universal-time)))
-  "Drop cue rows unused for OLDER-THAN seconds (default 90 days).  Return count.
-
-Pruning is safe because the index is derived: a pruned row is rebuilt the next
-time its cue and its record co-occur and the record is used."
+  "Delete cue_index rows unused for OLDER-THAN seconds (default 90 days) and return count."
   (enchiridion.memory.store:exec
    store "DELETE FROM cue_index WHERE last_used < ?" (list (- now older-than))))
 
-;;;; ------------------------------------------------------------------
-;;;; 3. The four push channels (T1)
-;;;; ------------------------------------------------------------------
+;;;; Push channels (T1).
 
 (defun precondition-surfacing (store state &key (limit 4))
-  "Return procedures whose APPLICABLE-WHEN conditions all hold in STATE.
-
-STATE is a list of observable keywords (tool names available, the working
-directory's basename, the last tool's outcome, world-block terms).  This is the
-structural counterpart of the hint: the system supplies the cue rather than
-waiting for a request.
-
-A procedure is surfaced when every whitespace-separated term in its
-APPLICABLE_WHEN appears in STATE, and it has been admitted (ADMITTED_TS is not
-null).  No model is called: the check is set containment over upcased strings."
+  "Return admitted, unretired procedures whose whitespace-separated APPLICABLE_WHEN
+terms all appear in STATE (case-insensitive)."
   (let ((rows (handler-case
                   (enchiridion.memory.store:query-rows
                    store
@@ -159,19 +119,8 @@ null).  No model is called: the check is set containment over upcased strings."
 (defun learned-state-block (store &key (limit 12) (char-budget 1200)
                                       (now (get-universal-time))
                                       (generation (live-generation-id store)))
-  "Return the compiled learned-state block: the highest-importance assertions
-of GENERATION, the live one by default, so a candidate never reaches a turn.
-
-This is structurally the harness's operator blocks, except its content is
-derived from the log rather than written by the operator, which is what makes
-it passive.  It is refreshed only at T1, so a turn never sees it change
-mid-flight and the prompt prefix cache survives.
-
-\"Live\" means the validity interval is open (VALID_TO IS NULL) or still running.
-Importance comes from the activation summary, which is where write-time
-importance lives in this schema.
-
-Returns a string, possibly empty.  It never signals."
+  "Return a bulleted string of the highest-importance live assertions in GENERATION,
+capped at CHAR-BUDGET. Never signals."
   (let ((rows (handler-case
                   (enchiridion.memory.store:query-rows
                    store
@@ -198,16 +147,8 @@ Returns a string, possibly empty.  It never signals."
               (incf used (length line)))))))))
 
 (defun fire-intentions (store state &key (limit 3) (now (get-universal-time)))
-  "Return intentions whose trigger holds in STATE and which are still pending.
-
-The prospective store already exists in the core; this makes it FIRE rather
-than wait to be retrieved.  Measured support is the strongest of the four
-channels: a prospective term raised recall@5 on the hard stratum from 0.000 to
-0.955, bounded by the same source's finding that it matters on only 17 to 29
-per cent of naturally phrased cases.
-
-A pending intention with an empty trigger_expr fires unconditionally, which is
-the right reading of \"no condition recorded\": it is due."
+  "Return pending, unexpired intentions whose trigger_expr matches any keyword in STATE
+(or is empty, which fires unconditionally)."
   (let ((rows (handler-case
                   (enchiridion.memory.store:query-rows
                    store
@@ -231,15 +172,8 @@ the right reading of \"no condition recorded\": it is due."
 
 (defun push-pack (store cue &key (state nil) (limit 4) (char-budget 1200)
                                 (now (get-universal-time)))
-  "Assemble the pushed pack for CUE.  Returns a string, possibly empty.
-
-Four channels in priority order, and the order is the design: cue-indexed
-preloading first because it is keyed on demonstrated usefulness, then
-precondition surfacing and intention firing because they are structural hints
-whose precondition has just become true, then the learned-state block last
-because it is the least specific.
-
-No model call.  No retrieval of anything the agent did not ask for by cue."
+  "Assemble pushed context for CUE within CHAR-BUDGET in priority order:
+cue index, applicable procedures, pending intentions, then learned-state block."
   (declare (ignore now))
   (let ((lines '())
         (used 0))
@@ -274,18 +208,8 @@ No model call.  No retrieval of anything the agent did not ask for by cue."
         (write-string line s)))))
 
 (defun assemble-pack (retrieved pushed &key (char-budget *memory-pack-chars*))
-  "Assemble the final pack: retrieved first and whole, then push in what is left.
-
-The hard bound from model-unified.md §5.2 is that push may not evict a
-retrieved record the cue ranked above it.  This function enforces that by
-ORDER OF PRIORITY, and the first version got it backwards: it truncated the
-retrieved side to make room for the push, which is precisely the eviction the
-bound forbids.  The test caught it, which is the argument for writing the test
-before believing the docstring.
-
-Retrieved material is therefore never truncated by push.  Push is capped at
-*PUSH-MAX-FRACTION* of the budget and then further truncated to whatever
-remains, and if nothing remains, the pack is the retrieved material alone."
+  "Concatenate RETRIEVED (never truncated) with PUSHED, capping PUSHED to
+*PUSH-MAX-FRACTION* and remaining CHAR-BUDGET."
   (let* ((push-cap (floor (* char-budget *push-max-fraction*)))
          (pushed (if (> (length pushed) push-cap)
                      (subseq pushed 0 push-cap)

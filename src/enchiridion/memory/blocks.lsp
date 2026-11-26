@@ -1,31 +1,16 @@
-;;;; blocks.lsp --- Memory blocks, their limits, and the write scan.
+;;;; blocks.lsp --- Named memory blocks, character limits, and write-time injection scan.
 ;;;;
-;;;; A block is one named piece of the agent's memory. The first three are
-;;;; backed by Markdown files, so personality evolution is a git diff. The
-;;;; prompt is a compiled view of the blocks, taken once per session. A write
-;;;; updates the block and, when it has a file, the file; it never changes a
-;;;; prompt that was already compiled.
-;;;;
-;;;; Every write is scanned first. Invisible Unicode can hide an instruction
-;;;; from the operator while the model still reads it, and a line that tells
-;;;; the model to ignore its instructions or to exfiltrate a secret is not
-;;;; memory. The scan is deliberately small and readable: a pattern list that
-;;;; is easy to audit beats a classifier that cannot explain itself.
+;;;; Writes are scanned for invisible Unicode and prompt-injection patterns before
+;;;; updating the backing file atomically.
 
 (in-package #:enchiridion.memory)
 
 ;;;; Limits.
 
-;; The limits are settings: *BLOCK-LIMITS* and *UNLISTED-BLOCK-LIMIT*, in
-;; settings.lsp, bound from :block-limits and :unlisted-block-limit. Raising a
-;; limit raises the fixed token cost of every prompt. The bootstrap block holds
-;; the status line, so its limit is small on purpose: it is resident in every
-;; prompt until the first steps are done.
+;; Limits are configured via *BLOCK-LIMITS* and *UNLISTED-BLOCK-LIMIT* in settings.lsp.
 
 (defparameter +block-label-aliases+ '((:soul . :persona))
-  "Labels the tools and commands accept as another name for a block. SOUL.md
-is the persona block, and an operator may call it either; a limit looked up
-under the alias would be the unlisted one, not the persona's.")
+  "Alias-to-canonical block label map (e.g. :SOUL -> :PERSONA) used for limit lookups.")
 
 (declaim (ftype (function (t) keyword) canonical-block-label))
 
@@ -39,8 +24,7 @@ under the alias would be the unlisted one, not the persona's.")
 (declaim (ftype (function (t) (integer 1 *)) default-block-limit))
 
 (defun default-block-limit (label)
-  "Return the configured limit for LABEL, or the unlisted limit for a label
-the configuration does not name. An alias reports its block's limit."
+  "Return the configured character limit for LABEL (resolving aliases), or *UNLISTED-BLOCK-LIMIT*."
   (or (getf *block-limits* (canonical-block-label label)) *unlisted-block-limit*))
 
 ;;;; The scan.
@@ -48,9 +32,7 @@ the configuration does not name. An alias reports its block's limit."
 (declaim (ftype (function (character) boolean) invisible-character-p))
 
 (defun invisible-character-p (character)
-  "Return T for a code point that renders as nothing but reaches the model.
-Zero width spaces, bidi overrides, the word joiner, the byte order mark, and
-the tag characters are the ones that can hide text in a block."
+  "Return T for zero-width, bidi-override, BOM, or tag code points that hide text from operators."
   (let ((code (char-code character)))
     (or (<= #x200B code #x200F)
         (<= #x202A code #x202E)
@@ -71,25 +53,18 @@ the tag characters are the ones that can hide text in a block."
     "you\\s+are\\s+now\\s+(?:a|an|the)\\b"
     "exfiltrate"
     "send\\s+(?:the\\s+)?(?:secret|token|key|password)\\s+to")
-  "Text that asks the model to abandon its instructions or to move a secret.
-The list is intentionally short: every pattern is a sentence the operator can
-read and disagree with, and a false positive is a write that did not happen
-rather than a personality that was rewritten.")
+  "Regex patterns for prompt-injection or secret-exfiltration text rejected on block writes.")
 
 (defparameter +injection-scanners+
   (mapcar (lambda (pattern)
             (cl-ppcre:create-scanner pattern :case-insensitive-mode t))
           +injection-patterns+)
-  "The compiled form of +INJECTION-PATTERNS+. SCAN does not take a
-case-insensitivity argument; CREATE-SCANNER does. Building the scanners once
-also keeps the per-write cost to one match attempt per pattern.")
+  "Pre-compiled case-insensitive scanners for +INJECTION-PATTERNS+.")
 
 (declaim (ftype (function (t string) string) scan-block-text))
 
 (defun scan-block-text (label text)
-  "Return TEXT when it is safe to store, or signal a configuration error.
-LABEL names the block in the report. The caller gets the label and the reason,
-not a generic validation failure."
+  "Return TEXT if free of invisible Unicode and injection patterns, else signal CONFIGURATION-ERROR."
   (loop for character across text
         when (invisible-character-p character)
           do (error 'enchiridion.errors:configuration-error
@@ -105,9 +80,7 @@ not a generic validation failure."
 
 ;;;; The block.
 
-;; label is a keyword, text is the body, limit is the character cap, file is
-;; the Markdown file that backs it or NIL, and writable-p says whether this
-;; agent may change it. The primary agent never gets a writable persona.
+;; Named memory block with character cap, optional backing file, and writability flag.
 (defstruct (block (:constructor %make-block))
   (label :persona :type keyword)
   (text "" :type string)
@@ -116,12 +89,7 @@ not a generic validation failure."
   (writable-p t :type boolean))
 
 (defun make-block (&key label (text "") limit file (writable-p t))
-  "Return a BLOCK named LABEL holding TEXT.
-
-LIMIT defaults from *DEFAULT-BLOCK-LIMITS*. FILE is the Markdown file the
-block reads from and writes to, or NIL for a block that has no file yet. The
-text is scanned here, so no constructor can build a block that was never
-checked."
+  "Construct a BLOCK for LABEL and TEXT, scanning TEXT and defaulting LIMIT from *BLOCK-LIMITS*."
   (let ((label (if (keywordp label)
                    label
                    (intern (string-upcase (string label)) :keyword))))
@@ -138,8 +106,7 @@ checked."
 (declaim (ftype (function (block) (integer 0 *)) block-bytes))
 
 (defun block-bytes (block)
-  "Return the character count of BLOCK. The unit is characters, which is what
-the limits count."
+  "Return the character count of BLOCK."
   (length (block-text block)))
 
 (declaim (ftype (function (block) boolean) block-full-p))
@@ -151,8 +118,7 @@ the limits count."
 (declaim (ftype (function (block) integer) block-slack))
 
 (defun block-slack (block)
-  "Return the characters BLOCK can still take. Negative only when a file was
-loaded over its limit, which set-block-text never allows."
+  "Return remaining character capacity of BLOCK (negative if loaded over limit)."
   (- (block-limit block) (block-bytes block)))
 
 (defun absolute-block-file (path)
@@ -160,9 +126,7 @@ loaded over its limit, which set-block-text never allows."
   (merge-pathnames (pathname path) (uiop:getcwd)))
 
 (defun followed-block-file (path)
-  "Return the file PATH names, with a final symbolic link followed to its target.
-A relative link target resolves against the link's own directory, which is what
-the kernel does when the file is opened through the link."
+  "Resolve a final symlink on PATH relative to the link's directory, or return PATH."
   (let ((target (enchiridion.compat:symlink-target path)))
     (if target
         (merge-pathnames (pathname target)
@@ -172,17 +136,8 @@ the kernel does when the file is opened through the link."
 (declaim (ftype (function (t string) string) write-block-file))
 
 (defun write-block-file (path text)
-  "Replace the block file at PATH with TEXT through one atomic rename and return TEXT.
-
-PATH is taken against the current directory. A final symbolic link is followed,
-so the link survives and its target is the file replaced. The existing
-permission bits are copied to the temporary file before the rename, and an
-existing file is opened for append and closed without writing first, so a
-read-only target refuses before anything is renamed and the old text stays. A
-hard link is not preserved: the rename gives the path a new inode, and the other
-name keeps the old text. The directory has to be writable because the temporary
-file lives in it, and nothing is fsynced, so a process crash leaves one whole
-file or the other and a power loss is not covered."
+  "Atomically replace PATH with TEXT via temp file and rename.
+Follows a final symlink, checks writability on existing targets, and preserves file mode."
   (let* ((path (absolute-block-file path))
          (target (followed-block-file path))
          (mode (enchiridion.compat:file-mode target)))
@@ -206,13 +161,8 @@ file or the other and a power loss is not covered."
 (declaim (ftype (function (block string) string) set-block-text))
 
 (defun set-block-text (block text)
-  "Replace BLOCK's text with TEXT after the scan and the limit check.
-
-An exact duplicate is refused: a write that changes nothing is a turn spent
-for no memory. A write over the limit signals BLOCK-OVERFLOW with the limit as
-CURRENT and the attempted length as WANTED, so the report names the exact
-number of characters to free. A file is replaced before the block changes, and
-WRITE-BLOCK-FILE says what that replacement preserves."
+  "Validate, scan, and replace BLOCK's text (writing its backing file first).
+Refuses frozen blocks, exact duplicates, and writes exceeding the block limit."
   (check-type text string)
   (unless (block-writable-p block)
     (error 'enchiridion.errors:block-frozen :label (block-label block)))
@@ -235,8 +185,7 @@ WRITE-BLOCK-FILE says what that replacement preserves."
 (declaim (ftype (function (list) string) block-summary))
 
 (defun block-summary (blocks)
-  "Return one line per block with its character count and limit. This is the
-capacity line in the prompt, so the agent knows before it writes."
+  "Return one '<label> <used>/<limit>' line per block."
   (with-output-to-string (stream)
     (dolist (block blocks)
       (format stream "~(~A~) ~D/~D~%"
@@ -247,9 +196,7 @@ capacity line in the prompt, so the agent knows before it writes."
 (declaim (ftype (function (list) string) compile-blocks))
 
 (defun compile-blocks (blocks)
-  "Return BLOCKS as prompt text. The output depends on the block list and its
-text only, never on the time or on a hash table order: compiling the same
-blocks twice must yield identical bytes for the prefix cache."
+  "Render BLOCKS deterministically as prompt text for prefix caching."
   (with-output-to-string (stream)
     (format stream "Memory blocks:~%~A" (block-summary blocks))
     (dolist (block blocks)

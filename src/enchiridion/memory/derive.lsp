@@ -1,14 +1,5 @@
-;;;; derive.lsp --- The model-dependent assertion parser seam.
-;;;;
-;;;; The builder calls *ASSERTION-DERIVER*. This file provides one deriver:
-;;;; a cheap-model call that asks for a strict JSON array of assertions and
-;;;; refuses every row without a usable span. It is not wired into a turn or a
-;;;; heartbeat phase; a later phase installs it on the T2 path.
-;;;;
-;;;; The parser is deliberately boring. The interesting properties are the
-;;;; caller's: off the reply path, idempotent, every row carrying a span and the
-;;;; episode's provenance, and a second pass over the same episode inserting
-;;;; nothing.
+;;;; derive.lsp --- Model-dependent assertion deriver and reranker.
+;;;; Implements *ASSERTION-DERIVER* (JSON extraction with span checks) and optional reranking.
 
 (in-package #:enchiridion.memory)
 
@@ -54,10 +45,8 @@ branch covers a caller that hands over jzon's own shape."
          (char= (char trimmed 0) #\[))))
 
 (defun parse-assertion-json (text)
-  "Parse TEXT, a JSON array of assertion objects, and return a list of objects.
-A malformed response returns NIL rather than signalling: one bad model answer
-must not take the builder down. The caller counts the empty result as a
-quarantined candidate if it needs to."
+  "Parse TEXT as a JSON array of assertion objects, returning NIL on malformed
+output instead of signalling."
   (handler-case
       (let ((start (position #\[ text))
             (end (position #\] text :from-end t)))
@@ -127,11 +116,8 @@ record.")
       body))
 
 (defun previous-episode-body (store episode)
-  "Return the body of the turn before EPISODE in its session, or NIL.
-An answer is about the question before it, and a claim like \"the deploy key
-is in vault\" can only be derived from \"in vault under ops\" with that
-question in view. The sleep channel's own turns and memory rows are not part
-of the conversation and are skipped."
+  "Return the body of the preceding non-sleep, non-memory episode in EPISODE's
+session (truncated to +DERIVER-CONTEXT-LIMIT+), or NIL."
   (when store
     (let ((row (first (enchiridion.memory.store:query-rows
                        store
@@ -147,13 +133,9 @@ of the conversation and are skipped."
               body))))))
 
 (defun make-model-assertion-deriver (backend &key model)
-  "Return a deriver that asks BACKEND to turn one episode into assertions.
-The call is off the interactive path. A malformed response yields no
-assertions, not a signal, so one bad answer cannot take the builder down.
-
-The call is billed like any other: its usage goes to STORE's token ledger on
-the :t2 channel, and into *DERIVATION-TOKENS* when a build has bound it, so a
-T2 pass has a cost the gates and the usage report can both see."
+  "Return an assertion deriver calling BACKEND (with optional MODEL).
+Records usage to STORE on :t2 and *DERIVATION-TOKENS*; malformed model output
+returns NIL rather than signalling."
   (lambda (store episode)
     (let* ((body (episode-body episode))
            (context (previous-episode-body store episode))
@@ -189,9 +171,7 @@ T2 pass has a cost the gates and the usage report can both see."
                episode)
               nil))))
 
-;;;; Reranking. One cheap-model call reorders the best few candidates. The
-;;;; call is on the interactive path, so it is off unless the configuration
-;;;; turns it on, and every failure falls back to the score's own order.
+;;;; Optional cheap-model reranking (falls back to score order on error).
 
 (defparameter +rerank-brief+
   "You rank retrieved records for a question. Each record is numbered. Reply
@@ -210,10 +190,8 @@ The model numbers records from 1."
     (nreverse seen)))
 
 (defun make-model-reranker (backend &key model (chars 300))
-  "Return a reranker that asks BACKEND to order records. Each body is cut to
-CHARS characters around the cue, the same window the pack shows. The call bills
-the ledger the retrieval bound, on the :RERANK channel, so one cheap call per
-turn is visible in the usage report and counts toward the day cap."
+  "Return a reranker calling BACKEND over CHARS-sized cue windows of each body.
+Bills token usage to the active retrieval ledger on the :RERANK channel."
   (lambda (cue bodies)
     (let* ((tokens (remove-duplicates (tokenise cue) :test #'string=))
            (listing (with-output-to-string (out)

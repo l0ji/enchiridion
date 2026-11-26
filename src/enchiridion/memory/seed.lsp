@@ -1,25 +1,10 @@
-;;;; seed.lsp --- The operator seed files and the first run.
+;;;; seed.lsp --- Operator seed templates and first-run initialization.
 ;;;;
-;;;; An agent directory is created from these templates the first time
-;;;; enchiridion runs with no agent directory present, and the run then stops.
-;;;; Nothing starts until the operator has had a chance to edit.
-;;;;
-;;;; The rule that outranks everything else in this file: a seed file is
-;;;; created when absent and never overwritten. Rerunning init against a
-;;;; populated directory reports what exists and writes only the gaps, so a
-;;;; half finished setup completes without throwing work away.
-
-;; The package is declared in packages.lsp. One defpackage per subsystem, in one
-;; file, is the rule; a second declaration somewhere else is how an export list
-;; ends up in two places and one of them is stale.
+;;;; Seed files are created only when absent and never overwritten.
 
 (in-package #:enchiridion.memory)
 
-;;;; The templates.
-;;;;
-;;;; They are Lisp string constants rather than separate files in the source
-;;;; tree. One file to keep in sync, and init becomes a single call with no
-;;;; file lookup and no path that can be wrong.
+;;;; Templates.
 
 (defparameter +guide+
   "# Guide
@@ -224,9 +209,7 @@ and `OPERATOR.md` override this section.
 
 Bearing: Emulate the operator's demonstrated style and work habits closely. They are the default while your memory and experience are thin.
 "
-  "The harness-maintained bearing and the learned preferences it records.
-The bearing changes with accumulated memory and corroborated experience, not
-with elapsed time.")
+  "Harness-maintained bearing and learned preferences.")
 
 (defparameter +bootstrap+
   "# Bootstrap
@@ -389,13 +372,11 @@ calls one with no arguments.\"
     ("skills/example-welcome.lsp"  :kind :lisp     :contents +example-skill+ :description "example skill")
     ("tools/example-echo.lsp"      :kind :lisp     :contents +example-tool+ :description "example tool")
     ("state.json"                 :kind :json     :contents +initial-state+ :description "runtime state"))
-  "Every file init writes: its name, its kind, its contents, and the one line
-the first launch prints beside it.")
+  "Files written by init: name, kind, template contents, and status description.")
 
 (defparameter *seed-subdirectories* '("skills" "tools")
   "Directories init creates before it writes anything into them.")
 
-;; string, not (seed-entry (name)): a type specifier cannot be a function call.
 (declaim (ftype (function (string) (or null (cons string list))) seed-entry))
 
 (defun seed-entry (name)
@@ -409,17 +390,7 @@ the first launch prints beside it.")
 (declaim (ftype (function (list (or string keyword)) t) contents-of))
 
 (defun contents-of (row key)
-  "Return the value of KEY in ROW, dereferencing it when it is a symbol that
-names a variable.
-
-The template table is quoted so that its rows are data, which means +GUIDE+
-arrives here as the symbol and not as the text. Writing the symbol would put
-ENCHIRIDION.MEMORY::+GUIDE+ into the operator's SOUL.md.
-
-boundp, not symbolp: :kind holds the keyword :MARKDOWN, and a keyword is a
-symbol that names no variable. Dereferencing it asks for the value of a
-variable that does not exist, so the one row that is not text was the row that
-could not be read."
+  "Return the value of KEY in ROW, dereferencing bound non-keyword symbols (e.g. +GUIDE+)."
   (let ((value (getf (cdr row) key)))
     (if (and (symbolp value) (boundp value))
         (symbol-value value)
@@ -428,8 +399,7 @@ could not be read."
 (declaim (ftype (function (string) (or null string)) seed-template))
 
 (defun seed-template (name)
-  "Return the contents of the seed file NAME, or NIL when there is no such
-template."
+  "Return the contents of seed file NAME, or NIL."
   (let ((row (seed-entry name)))
     (and row (contents-of row :contents))))
 
@@ -443,21 +413,14 @@ template."
 (declaim (ftype (function (string) (or null (member :markdown :lisp :json))) seed-kind))
 
 (defun seed-kind (name)
-  "Return :MARKDOWN, :LISP, or :JSON for NAME, according to which template it
-is."
+  "Return :MARKDOWN, :LISP, or :JSON for NAME, or NIL."
   (let ((row (seed-entry name)))
     (and row (getf (cdr row) :kind))))
 
 ;;;; Writing.
 
 (defun write-if-absent (path contents)
-  "Write CONTENTS to PATH when nothing is there yet. Return :created, :kept, or
-:failed, with the condition as the second value when it failed. Never
-overwrites. That single refusal is what lets a rerun of init complete a half
-finished setup instead of discarding it.
-
-The condition comes back rather than being logged and dropped: a failed write
-that says only 'could not write' is a failure the operator cannot act on."
+  "Write CONTENTS to PATH only if absent. Return :CREATED, :KEPT, or (values :FAILED condition)."
   (cond
     ((probe-file path) (values :kept nil))
     (t
@@ -473,13 +436,7 @@ that says only 'could not write' is a failure the operator cannot act on."
            (values :created nil))
        (error (condition) (values :failed condition))))))
 
-;; defstruct slots take :type and :read-only, and a defstruct takes no
-;; :documentation option at all: a trailing :documentation is read as a slot
-;; named DOCUMENTATION. The meaning is carried here instead.
-;;
-;; created is what this run wrote, existing is what it found already there,
-;; problems is an alist of name to condition for what it could not write, and
-;; existed-p says whether the directory was already populated.
+;; Result of init-agent: created/existing file lists, (name . condition) problems, and existed-p.
 (defstruct (init-result (:constructor %make-init-result))
   (:directory "" :type string)
   (:created '() :type list)
@@ -488,8 +445,7 @@ that says only 'could not write' is a failure the operator cannot act on."
   (:existed-p nil :type boolean))
 
 (defun init-problems (result)
-  "Return the alist of seed file name to the condition that stopped it being
-written. A silent failure list is a failure nobody can act on."
+  "Return the alist of (name . condition) for seed files that failed to write."
   (init-result-problems result))
 
 (declaim (ftype function init-created init-existing init-status-line))
@@ -513,29 +469,15 @@ written. A silent failure list is a failure nobody can act on."
               (init-result-directory result))))
 
 (defun agent-seeded-p (directory)
-  "Return T when DIRECTORY holds at least one seed file. SOME returns the
-probe-file pathname rather than T, and a pathname in a slot typed boolean is a
-type error, so the answer is coerced."
+  "Return T when DIRECTORY contains at least one seed file."
   (not (null (some (lambda (name) (probe-file (merge-pathnames name directory)))
                    (seed-file-names)))))
 
 (declaim (ftype (function (t) t) ensure-agent-repository))
 
 (defun ensure-agent-repository (directory)
-  "Make DIRECTORY a git repository when it is not one, and commit what is
-there. Return the commit hash, or NIL.
-
-The repository is nested: the agent's history is its own, so `enchiridion
-undo` rolls a change back inside the agent directory and never inside the
-harness. A host with no Git identity, and a build sandbox with no identity,
-both leave the files alone: they are written either way, and the commit is what
-turns them into a journey the operator can read. Main refuses to start when
-the Git executable is missing.
-
-This lives with INIT-AGENT and not with the first launch, because
-`enchiridion init` and the first launch are the same thing on demand, and a
-directory created by one of them must not be a repository while the other one
-is not."
+  "Initialize a nested git repository in DIRECTORY if needed and commit existing files.
+Return the commit hash or NIL."
   (handler-case
       (if (enchiridion.git:repository-p directory)
           (enchiridion.git:git-commit-all directory "Record the agent directory")
@@ -545,16 +487,8 @@ is not."
     (error () nil)))
 
 (defun init-agent (directory)
-  "Create DIRECTORY and write every seed file that is not already there. Never
-overwrite anything. Return an init-result holding what was written and what
-was left alone.
-
-A directory that cannot be made is a result with a problem, not a signal. The
-caller prints the problems and exits; the operator gets the path and the OS
-error instead of a backtrace from inside ASDF's source registry.
-
-The repository is created here, once, after the files are on disk: a commit of
-an empty directory would be a history with nothing in it."
+  "Create DIRECTORY and write missing seed files without overwriting.
+Initializes the nested git repository on success and returns an INIT-RESULT."
   (handler-case
       (progn
         (ensure-directories-exist (merge-pathnames "x" directory))
@@ -563,10 +497,6 @@ an empty directory would be a history with nothing in it."
         (let ((populated (agent-seeded-p directory)))
           (let ((created '()) (existing '()) (problems '()))
             (dolist (entry *seed-templates*)
-              ;; The row is a name followed by a plist, so :contents has to be
-              ;; looked up rather than destructured: there are more than four
-              ;; elements in the row.
-              ;; let*, not let: PATH uses NAME, and let binds in parallel.
               (let* ((name (car entry))
                      (contents (contents-of entry :contents))
                      (path (merge-pathnames name directory)))

@@ -1,16 +1,7 @@
-;;;; state.lsp --- state.json, the generation counter, and the bootstrap record.
+;;;; state.lsp --- state.json persistence, generation counter, and bootstrap record.
 ;;;;
-;;;; The agent directory holds one small JSON file. It records the plugin
-;;;; generation the loader has reached and how far the first-steps bootstrap
-;;;; has got. Everything else derives from it, so it has exactly one reader and
-;;;; one writer, and the reader never signals: a missing, empty, or corrupt
-;;;; file is a fresh agent, not a crash.
-;;;;
-;;;; The in-memory shape is the shape com.inuoe.jzon produces and accepts: an
-;;;; EQUAL hash table keyed by strings, arrays as vectors, and false as NIL.
-;;;; Keeping the native shape means STRINGIFY can write a state directly.
-;;;; Handing it a plist instead writes a JSON array of alternating elements,
-;;;; and an empty list is the boolean false, not an empty array.
+;;;; Uses jzon's native representation: EQUAL hash tables with string keys,
+;;;; vectors for JSON arrays, and NIL for false.
 
 (in-package #:enchiridion.memory)
 
@@ -34,15 +25,10 @@
   "Return the BOOTSTRAP.done.md path inside DIRECTORY."
   (merge-pathnames "BOOTSTRAP.done.md" (uiop:ensure-directory-pathname directory)))
 
-;;;; The state object.
-;;;;
-;;;; default-bootstrap-record comes first because default-state calls it and a
-;;;; call to a function that is neither defined nor declared yet is exactly the
-;;;; warning this build refuses.
+;;;; State object.
 
 (defparameter +state-schema+ 1
-  "The state schema this code writes. A file names its schema so a newer
-version's fields can be kept rather than silently dropped by an older one.")
+  "Current state.json schema version; unknown fields from newer versions are preserved.")
 
 (declaim (ftype (function () hash-table) default-bootstrap-record))
 
@@ -57,10 +43,7 @@ version's fields can be kept rather than silently dropped by an older one.")
 (declaim (ftype (function () hash-table) default-state))
 
 (defun default-state ()
-  "Return a fresh state: schema 1, generation 0, bootstrap untouched.
-
-The template init writes and this function must agree, because the file is
-read back into this shape on the first call."
+  "Return a fresh state hash table (schema 1, generation 0, empty bootstrap)."
   (let ((state (make-hash-table :test #'equal)))
     (setf (gethash "schema" state) +state-schema+
           (gethash "generation" state) 0
@@ -70,12 +53,8 @@ read back into this shape on the first call."
 (declaim (ftype (function (hash-table) hash-table) normalize-bootstrap))
 
 (defun normalize-bootstrap (candidate)
-  "Return CANDIDATE as a complete bootstrap record.
-
-An absent field takes its default. A field of the wrong type takes its default
-too: a state.json a human edited by hand should cost the agent a fresh start,
-not a type error three functions later. Step numbers are kept as a sorted,
-duplicate-free vector because that is what STRINGIFY writes as a JSON array."
+  "Normalize CANDIDATE into a complete bootstrap record, preserving unknown keys
+and sorting/deduplicating done steps into a vector."
   (let ((record (default-bootstrap-record)))
     ;; Preserve keys written by newer versions
     (maphash (lambda (key value)
@@ -101,8 +80,8 @@ duplicate-free vector because that is what STRINGIFY writes as a JSON array."
 (declaim (ftype (function (t) hash-table) normalize-state))
 
 (defun normalize-state (candidate)
-  "Return CANDIDATE as a complete state, filling anything absent or malformed
-from DEFAULT-STATE. A JSON document that is not an object is not a state."
+  "Normalize CANDIDATE into a complete state hash table, preserving unknown keys
+and newer schema numbers."
   (if (not (hash-table-p candidate))
       (default-state)
       (let ((state (default-state)))
@@ -111,9 +90,6 @@ from DEFAULT-STATE. A JSON document that is not an object is not a state."
                                    :test #'string=)
                      (setf (gethash key state) value)))
                  candidate)
-        ;; A schema or generation that is not a non-negative integer is a hand
-        ;; edit, and the fresh value is the safe reading. A later schema number
-        ;; is kept: an older process must not downgrade a newer file.
         (let ((schema (gethash "schema" candidate)))
           (when (and (integerp schema) (not (minusp schema)))
             (setf (gethash "schema" state) schema)))
@@ -128,8 +104,7 @@ from DEFAULT-STATE. A JSON document that is not an object is not a state."
 (declaim (ftype (function (hash-table) hash-table) bootstrap-record))
 
 (defun bootstrap-record (state)
-  "Return the bootstrap sub-object of STATE, adding a fresh one when the key is
-absent or does not hold an object."
+  "Return the bootstrap sub-object of STATE, initializing one if absent or invalid."
   (let ((record (gethash "bootstrap" state)))
     (if (hash-table-p record)
         record
@@ -138,20 +113,12 @@ absent or does not hold an object."
           fresh))))
 
 ;;;; Reading and writing.
-;;;;
-;;;; The reader is the tolerant one and the writer is the atomic one. Both
-;;;; matter at the same moment: a supervisor killed mid-write must not leave a
-;;;; half file that the next start cannot read.
 
 (declaim (ftype (function (t) hash-table) read-state))
 
 (defun read-state (directory)
-  "Return the state stored in DIRECTORY, or DEFAULT-STATE.
-
-Never signals. A missing file, an empty file, and a file that is not the state
-JSON all mean the same thing to every caller: a fresh agent. The handler is
-around the whole body, because PROBE-FILE and the read can fail too, not only
-the parse."
+  "Read state.json from DIRECTORY, returning DEFAULT-STATE on missing, invalid, or
+unreadable files without signaling."
   (handler-case
       (let ((path (state-file directory)))
         (if (probe-file path)
@@ -179,16 +146,9 @@ the parse."
 (declaim (ftype (function (t hash-table) hash-table) write-state))
 
 (defun write-state (directory state)
-  "Write STATE to DIRECTORY/state.json and return STATE.
-
-The bytes go to a uniquely named state.json.new.* first and the rename happens
-last, so a crash leaves the old state or the new one, and two writers cannot
-share one temporary. A failed write removes its temporary. The overwriting
-rename is UIOP's."
+  "Atomically write STATE to DIRECTORY/state.json via a uniquely named temp file and rename.
+Returns STATE."
   (let* ((path (state-file directory))
-         ;; Two writers with one fixed temporary name would write the same
-         ;; file at once and publish a mix of both. The suffix is unique per
-         ;; write, so each rename publishes one whole state.
          (temporary (merge-pathnames
                      (state-temporary-name)
                      (uiop:ensure-directory-pathname directory)))
@@ -212,8 +172,7 @@ rename is UIOP's."
 (declaim (ftype (function (t) hash-table) ensure-state))
 
 (defun ensure-state (state-or-directory)
-  "Return STATE-OR-DIRECTORY as a state hash table. A state comes back
-unchanged, and a directory is read from its state.json."
+  "Return STATE-OR-DIRECTORY as a state hash table, reading state.json if given a directory."
   (if (hash-table-p state-or-directory)
       state-or-directory
       (read-state state-or-directory)))
@@ -230,10 +189,7 @@ unchanged, and a directory is read from its state.json."
 
 (defun set-state-generation (state-or-directory generation)
   "Set the generation counter to GENERATION and return it.
-
-Given a state hash table the change is made in memory and the caller writes it
-with WRITE-STATE. Given a directory the state is read, changed, and written
-back, which is what a loader that only knows the agent directory wants."
+Mutates a hash table in place; reads and writes state.json when given a directory."
   (if (hash-table-p state-or-directory)
       (setf (gethash "generation" state-or-directory) generation)
       (let ((state (read-state state-or-directory)))
@@ -241,12 +197,7 @@ back, which is what a loader that only knows the agent directory wants."
         (write-state state-or-directory state)
         generation)))
 
-;;;; The bootstrap steps.
-;;;;
-;;;; BOOTSTRAP.md is an ordered list in Markdown. The parser is deliberately
-;;;; the plainest thing that matches the template: optional indent, digits, a
-;;;; dot, then the text of the line. Continuation lines that wrap a step are
-;;;; part of the file's prose, not of the step's name.
+;;;; Bootstrap steps.
 
 (defparameter +bootstrap-step-scanner+
   (cl-ppcre:create-scanner "^[ \t]*(\\d+)\\.\\s*(.*)$")
@@ -265,9 +216,8 @@ back, which is what a loader that only knows the agent directory wants."
 (declaim (ftype (function (t) list) bootstrap-steps))
 
 (defun bootstrap-steps (directory)
-  "Return the first steps in DIRECTORY/BOOTSTRAP.md as a list of (NUMBER . TEXT),
-in the order the file gives them. The list is empty when the file is absent,
-which is what makes an absent file mean a finished bootstrap."
+  "Return numbered steps in DIRECTORY/BOOTSTRAP.md as (NUMBER . TEXT) pairs in file order,
+or NIL if absent."
   (let ((path (bootstrap-file directory)))
     (when (probe-file path)
       (loop for line in (uiop:read-file-lines path :external-format :utf-8)
@@ -278,11 +228,7 @@ which is what makes an absent file mean a finished bootstrap."
 (declaim (ftype (function (hash-table) list) bootstrap-done-list))
 
 (defun bootstrap-done-list (record)
-  "Return the step numbers in RECORD as a sorted list.
-
-STATE writes a sorted, duplicate-free vector. The sort and the duplicate
-removal are repeated here so that a hand-edited file cannot make completeness
-depend on the order the file happened to list."
+  "Return completed step numbers in RECORD as a sorted, deduplicated list."
   (let ((done (gethash "done" record)))
     (if (vectorp done)
         (the list (sort (remove-duplicates
@@ -307,22 +253,13 @@ in file order."
 (declaim (ftype (function (t) boolean) bootstrap-complete-p))
 
 (defun bootstrap-complete-p (directory)
-  "Return T when every step in DIRECTORY is done.
-
-An absent BOOTSTRAP.md has no steps, so it is complete: that is both the
-handover that renamed the file and a directory that never had one."
+  "Return T when all steps in DIRECTORY/BOOTSTRAP.md are done (or the file is absent)."
   (null (bootstrap-remaining directory)))
 
 (declaim (ftype (function (t) list) bootstrap-status))
 
 (defun bootstrap-status (directory)
-  "Return the bootstrap state as a plist:
-
-  (:step N :done (N...) :total M :complete BOOL :remaining ((N . TEXT)...))
-
-:STEP is the number of steps done, which is the count the prompt line and the
-status command both want. :REMAINING holds the steps still to do, in file
-order, so a caller can name the next one without parsing the file again."
+  "Return bootstrap state as (:step N :done (N...) :total M :complete BOOL :remaining ((N . TEXT)...))."
   (let* ((state (read-state directory))
          (record (bootstrap-record state))
          (done (bootstrap-done-list record))
@@ -337,22 +274,14 @@ order, so a caller can name the next one without parsing the file again."
 (declaim (ftype (function (t) boolean) bootstrap-refuse-writes-p))
 
 (defun bootstrap-refuse-writes-p (directory)
-  "Return T while the agent may not write the seed-backed blocks.
-
-True exactly while BOOTSTRAP.md is present and its steps are not all done. The
-operator's guidance cannot be edited away in the first minutes of the agent's
-life; after handover the file is gone and the answer is NIL."
+  "Return T while BOOTSTRAP.md exists and has incomplete steps (blocks agent writes to seed-backed files)."
   (and (not (null (probe-file (bootstrap-file directory))))
        (not (bootstrap-complete-p directory))))
 
 (declaim (ftype (function (t) string) bootstrap-commit-report))
 
 (defun bootstrap-commit-report (directory)
-  "Commit DIRECTORY through ENCHIRIDION.GIT and return one line about it.
-
-This is the only part of the handover that can fail without losing work: the
-archive has already happened, and a git that is missing, broken, or simply not
-there yet must not be the reason a completed bootstrap is reported as lost."
+  "Commit DIRECTORY after handover and return a one-line status string; never signals."
   (handler-case
       (let ((revision (enchiridion.git:git-commit-all directory "Bootstrap handover complete.")))
         (cond
@@ -364,12 +293,8 @@ there yet must not be the reason a completed bootstrap is reported as lost."
 (declaim (ftype (function (t) string) bootstrap-handover))
 
 (defun bootstrap-handover (directory)
-  "Archive BOOTSTRAP.md, mark the bootstrap complete, write the state, commit,
-and return a report string.
-
-A missing BOOTSTRAP.md is not a failure: it still marks the state complete, so
-a handover interrupted after the rename finishes on the next call. The rename
-comes first and the commit last, so no git failure can lose the archive."
+  "Archive BOOTSTRAP.md to BOOTSTRAP.done.md, mark bootstrap complete in state.json,
+commit, and return a report string. Archive runs before commit so git failures cannot lose it."
   (let* ((source (bootstrap-file directory))
          (target (bootstrap-done-file directory))
          (archived-p (not (null (probe-file source)))))
@@ -388,11 +313,7 @@ comes first and the commit last, so no git failure can lose the archive."
          (ftype (function (t integer) list) mark-bootstrap-step))
 
 (defun mark-bootstrap-step (directory step)
-  "Mark STEP done in DIRECTORY and return the new bootstrap status.
-
-The list stays sorted and duplicate free, so marking the same step twice is the
-same as marking it once. When the last step lands, the handover runs from here:
-the agent should not have to know that a separate call finishes the job."
+  "Mark STEP done in DIRECTORY, trigger handover if all steps are complete, and return the status."
   (mark-bootstrap-steps directory (list step)))
 
 (defun mark-bootstrap-steps (directory steps)
@@ -411,12 +332,8 @@ the agent should not have to know that a separate call finishes the job."
 (declaim (ftype (function (t) list) reset-bootstrap))
 
 (defun reset-bootstrap (directory)
-  "Undo a handover: restore BOOTSTRAP.md, clear the bootstrap record, write the
-state, and return the new status.
-
-BOOTSTRAP.done.md is renamed back only when BOOTSTRAP.md is absent. When both
-exist an operator has edited the live file already, and the archive must not
-overwrite that."
+  "Restore BOOTSTRAP.done.md (only if BOOTSTRAP.md is absent), clear the bootstrap record,
+and return the new status."
   (let ((source (bootstrap-file directory))
         (target (bootstrap-done-file directory)))
     (when (and (probe-file target) (not (probe-file source)))
@@ -429,11 +346,7 @@ overwrite that."
 (declaim (ftype (function (string) string) bootstrap-step-summary))
 
 (defun bootstrap-step-summary (text)
-  "Return TEXT as one line of at most sixty characters.
-
-The prompt line and the status command both print this, and a wrapped step from
-the template would otherwise push the line past the column the terminal
-reports."
+  "Flatten TEXT to a single line truncated to at most 60 characters."
   (let ((flat (substitute #\Space #\Newline text)))
     (if (<= (length flat) 60)
         flat
@@ -442,8 +355,7 @@ reports."
 (declaim (ftype (function (t) string) bootstrap-status-line))
 
 (defun bootstrap-status-line (directory)
-  "Return the bootstrap state as one line, for the prompt and for
-`enchiridion bootstrap status`."
+  "Format the bootstrap state as a single status line."
   (let* ((status (bootstrap-status directory))
          (total (getf status :total))
          (remaining (getf status :remaining)))

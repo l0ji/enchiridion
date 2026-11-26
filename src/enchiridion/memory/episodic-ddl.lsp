@@ -1,17 +1,6 @@
-;;;; episodic-ddl.lsp --- The episodic memory schema, in dependency order.
-;;;;
-;;;; This file holds data only: the CREATE statements, the drop order, and the
-;;;; view list. It loads before STORE so that OPEN-STORE can create the whole
-;;;; schema in one transaction without the store knowing what the memory tables are.
-;;;;
-;;;; The tables split into four scopes. The episodic log is immutable. Global
-;;;; telemetry is append-only or recomputable and is updated by T0 and T1.
-;;;; Semantic artifacts are generation-scoped, so a candidate can be built and
-;;;; gated without changing the live layer. Control tables hold generations,
-;;;; gates, and the operator proposals.
-;;;;
-;;;; Every table is CREATE TABLE IF NOT EXISTS. No existing store table is
-;;;; altered, so an old memory.db gains the new tables on its next open.
+;;;; episodic-ddl.lsp --- Episodic memory schema, drop order, and views.
+;;;; Data only; loaded before STORE so OPEN-STORE creates all tables in one
+;;;; transaction. All statements use IF NOT EXISTS for idempotent migrations.
 
 (in-package #:enchiridion.memory)
 
@@ -27,18 +16,13 @@ DROP-STORE drops these before the tables they read.")
     "schemas" "canary_proposals" "episodes_fts" "episode_vectors" "episodes" "cue_index" "activation" "links"
     "retrievals" "calibration" "canary" "gate_log" "change_proposals"
     "projections" "t2_preflight_retry" "memory_state" "generations")
-  "What DROP-STORE removes, child table before parent table.
-
-The order matters because foreign keys are on. A virtual table is dropped
-before the content table it reads, and a child row is dropped before the row it
-references.")
+  "Tables dropped by DROP-STORE in dependency order (virtual tables before
+content tables, children before parents, because foreign keys are enabled).")
 
 (defparameter +episodic-schema+
   (list
    ;; ---- 1. The immutable episodic log -------------------------------
-   ;; FINAL_P marks the assistant episode a turn returned: 1 final, 0 for a
-   ;; round that asked for tools, NULL for a legacy or imported row whose final
-   ;; answer the utility pairing rule must infer from the turn's boundaries.
+   ;; FINAL_P: 1 final assistant answer, 0 tool-request round, NULL legacy/imported.
    "CREATE TABLE IF NOT EXISTS episodes (
       id            INTEGER PRIMARY KEY AUTOINCREMENT,
       session       TEXT    NOT NULL,
@@ -68,8 +52,7 @@ references.")
    "CREATE INDEX IF NOT EXISTS episodes_session ON episodes(session, id)"
    "CREATE INDEX IF NOT EXISTS episodes_ts ON episodes(ts)"
    "CREATE INDEX IF NOT EXISTS episodes_context ON episodes(context_key)"
-   ;; The adaptation bearing counts roles and channels at each maintenance
-   ;; pass. The index keeps those counts from scanning the whole log.
+   ;; Supports role/channel counts in maintenance without full table scans.
    "CREATE INDEX IF NOT EXISTS episodes_adaptation
       ON episodes(role, channel, session)"
    "CREATE UNIQUE INDEX IF NOT EXISTS episodes_source_turn
@@ -107,14 +90,8 @@ references.")
       distinctness REAL   NOT NULL DEFAULT 0.0,
       PRIMARY KEY (kind, id))"
 
-   ;; Every episode gets its activation row when it is written, whoever
-   ;; writes it. Without one the candidate query found no row, every episode
-   ;; was scored as created now with one encoding, and the base-level term was
-   ;; the same for every candidate, so recency and frequency did nothing. The
-   ;; write time is the episode's own TS. An explicit save is the owner saying
-   ;; the text matters, so it starts at the importance a depth-2 encoding gets;
-   ;; a turn starts at the depth-0 value. WRITE-EPISODE overwrites both with
-   ;; what its encoding filter computed.
+   ;; Auto-create an activation row per episode (role 'memory' starts at imp 7,
+   ;; turns at 3); WRITE-EPISODE overwrites imp/distinctness with its computed values.
    "CREATE TRIGGER IF NOT EXISTS episodes_activation AFTER INSERT ON episodes BEGIN
       INSERT OR IGNORE INTO activation
         (kind, id, n_enc, last_enc, n_ret, last_ret, created_ts,
@@ -122,17 +99,12 @@ references.")
         VALUES ('episode', new.id, 1, new.ts, 0, NULL, new.ts, 0.0, NULL,
                 CASE new.role WHEN 'memory' THEN 7 ELSE 3 END, 0.0);
     END"
-   ;; A deleted episode takes its activation with it, so a forgotten session
-   ;; leaves no score row that a later id could inherit.
+   ;; Cascade episode deletion to activation rows.
    "CREATE TRIGGER IF NOT EXISTS episodes_activation_ad AFTER DELETE ON episodes BEGIN
       DELETE FROM activation WHERE kind = 'episode' AND id = old.id;
     END"
-   ;; One column of dense cache per episode, model and size, written by
-   ;; EMBED-PENDING when an embedder is configured. VEC is the unit-length
-   ;; vector as packed little-endian float32, so a dot product is the cosine.
-   ;; The model and size are part of the key, so changing either invalidates
-   ;; what retrieval cannot use and keeps what it could use again. A deleted
-   ;; episode takes its vectors with it.
+   ;; Dense vector cache per (episode, model, dims). VEC holds unit-length packed
+   ;; little-endian float32 (dot product = cosine); cascades on episode deletion.
    "CREATE TABLE IF NOT EXISTS episode_vectors (
       id     INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
       model  TEXT    NOT NULL,
@@ -140,8 +112,7 @@ references.")
       vec    BLOB    NOT NULL,
       PRIMARY KEY (id, model, dims))"
 
-   ;; The rows a store written before the trigger never got. Running it again
-   ;; changes nothing.
+   ;; Idempotent backfill of activation rows for episodes written before the trigger.
    "INSERT OR IGNORE INTO activation
       (kind, id, n_enc, last_enc, n_ret, last_ret, created_ts,
        supp, supp_ts, imp, distinctness)
@@ -297,9 +268,8 @@ references.")
       ON assertions(generation_id, valid_from, valid_to)"
    "CREATE INDEX IF NOT EXISTS assertions_run ON assertions(run_id)"
 
-   ;; An assertion is found by its own claim as well as through the episode
-   ;; it came from: without this a claim cannot be reached by a word its
-   ;; source episode lacks, and the semantic layer can add no recall.
+   ;; FTS5 index over assertion claim text (subject || relation || object) so
+   ;; claims match terms absent from their source episode.
    "CREATE VIRTUAL TABLE IF NOT EXISTS assertions_fts
       USING fts5(claim, tokenize='porter unicode61')"
    "CREATE TRIGGER IF NOT EXISTS assertions_ai AFTER INSERT ON assertions BEGIN
@@ -475,12 +445,9 @@ references.")
       SELECT l.* FROM links l
         WHERE l.generation_id = 0
            OR l.generation_id = (SELECT live_generation_id FROM memory_state)")
-  "Every episodic table, index, trigger, and view, one statement per element.
-
-The order is dependency order: a content table exists before the FTS table that
-reads it, a parent exists before the child that references it, and a view is
-created after the tables it reads. Every statement is IF NOT EXISTS, so opening
-a store twice changes nothing.")
+  "Episodic tables, indexes, triggers, and views in dependency order (content
+tables before FTS, parents before children, tables before views). Every
+statement is IF NOT EXISTS and idempotent.")
 
 (defparameter +ext-schema+
   (list
@@ -512,9 +479,8 @@ a store twice changes nothing.")
       generation_id INTEGER NOT NULL DEFAULT 0,
       task_hash     TEXT    NOT NULL DEFAULT '',
       config_hash   TEXT    NOT NULL DEFAULT '')")
-  "The extension's original three tables. Kept as a named sublist so callers
-that ask for the extension alone still get what they ask for. The full schema
-above already contains them.")
+  "Named sublist of the extension's three tables (cue_index, canary, gate_log),
+already included in +EPISODIC-SCHEMA+.")
 
 (defparameter *ext-tables*
   '("cue_index" "canary" "gate_log")

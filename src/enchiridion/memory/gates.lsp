@@ -24,12 +24,8 @@ of at least WINS heads in N fair coin flips, as an exact rational."
          (expt 2 n))))
 
 (defun paired-outcomes (store generation-id &key (task-hashes :all))
-  "Return GENERATION-ID's outcome pairs as a list of (RETENTION . CANDIDATE),
-one per task both arms scored, from the latest row of each.
-
-The rows are the ones RUN-ARM wrote under the candidate's id and each task's
-hash, so a pair is the same question asked of the two arms. TASK-HASHES is
-:ALL or a list of tasks to keep. An empty list matches nothing."
+  "Return GENERATION-ID's latest (RETENTION . CANDIDATE) outcome pairs per task.
+TASK-HASHES is :ALL or a list of task hashes to include; NIL matches nothing."
   (when (null task-hashes)
     (return-from paired-outcomes nil))
   (let ((by-task (make-hash-table :test #'equal)))
@@ -59,18 +55,10 @@ hash, so a pair is the same question asked of the two arms. TASK-HASHES is
                                               (min-n *memory-gate-min-n*)
                                               (alpha *memory-gate-alpha*)
                                               (task-hashes :all))
-  "Return two values: T when GENERATION-ID beats retention-only, and a report.
-
-Compare candidate and retention-only on paired tasks at
-matched budget, a mean delta of at least MARGIN, at least MIN-N non-tied
-pairs, and a one-sided sign test below ALPHA.  The pairs are read from the
-gate log, which COMPARE-ARMS writes: the step that decides is not the step
-that measures.  Too little evidence is a failure, which is the correct
-default: an unmeasured candidate is not promoted."
+  "Return (values PASS-P REPORT) when GENERATION-ID beats retention-only on
+paired tasks: >= MIN-N non-tied pairs, mean delta >= MARGIN, sign-test p < ALPHA."
   (let* ((pairs (paired-outcomes store generation-id :task-hashes task-hashes))
-         ;; Exact arithmetic, and the configured margin read as the decimal
-         ;; it was written as: a mean of exactly 0.05 meets a margin of 0.05,
-         ;; which a single-float 0.05 compared with a double would not.
+         ;; Use exact rationals so decimal margins (e.g., 0.05) match without float drift.
          (deltas (mapcar (lambda (pair) (- (rational (cdr pair)) (rational (car pair))))
                          pairs))
          (non-tied (count-if-not #'zerop deltas))
@@ -83,14 +71,9 @@ default: an unmeasured candidate is not promoted."
 
 (defun tail-gate (store generation-id task-hashes &key (margin *memory-tail-margin*)
                                                        (min-n *tail-min-n*))
-  "Return two values: T when GENERATION-ID's recall on TASK-HASHES, the tasks
-with rare answers, is no more than MARGIN below retention-only's, and a report.
-Fewer than MIN-N scored tail tasks is a failure: a tail nobody measured is not
-a tail that survived.
-
-Tail recall counts an outcome as one
-when the answer reached the pack at all, whatever its position: the utility
-outcomes are graded, and a rare answer moved down the pack is still recalled."
+  "Return (values PASS-P REPORT) when GENERATION-ID's recall on TASK-HASHES is
+within MARGIN of retention-only with at least MIN-N scored pairs (any positive
+score counts as recall)."
   (flet ((recall (outcome) (if (plusp outcome) 1 0)))
     (let* ((pairs (paired-outcomes store generation-id :task-hashes task-hashes))
            (n (length pairs))
@@ -100,10 +83,8 @@ outcomes are graded, and a rare answer moved down the pack is still recalled."
               (list :n n :retention (float retention) :candidate (float candidate))))))
 
 (defun provenance-gate (store generation-id)
-  "Return two values: T when every assertion GENERATION-ID holds names a span
-of an episode still in the log, and a report.  A semantic item with no
-surviving source cannot be checked against what was said, so it cannot be
-promoted."
+  "Return (values PASS-P REPORT) when every assertion in GENERATION-ID has a
+valid non-empty span within an existing episode body."
   (let ((bad (or (enchiridion.memory.store:field
                   (first (enchiridion.memory.store:query-rows
                           store
@@ -129,19 +110,8 @@ itself, so the rows it copied from its parent are not counted."
       0))
 
 (defun volume-gate (store generation-id &key (per-episode *memory-writes-per-episode*))
-  "Return T when GENERATION-ID's build wrote at most PER-EPISODE assertions for
-each episode it derived itself.
-
-The cap exists because interference is constantly present: what a system
-writes between encoding a record and retrieving it determines whether the
-record survives, with no deletion policy in play.  High-volume passive
-learning therefore degrades older records by competition alone.
-
-It counts claims, the build's own assertion rows, and not conflict rows or
-closed intervals: those are bookkeeping about claims, and on the trial log one
-list-valued relation alone opened 1,806 conflict rows, which would have
-quarantined a candidate writing 4.2 claims an episode.  The allowance is per
-episode derived, because a measured deriver writes about five an episode."
+  "Return T when GENERATION-ID wrote at most PER-EPISODE own assertions per
+episode derived (excluding copied parent rows, conflicts, and closed intervals)."
   (let ((row (first (enchiridion.memory.store:query-rows
                      store "SELECT episodes_derived FROM generations WHERE id = ?"
                      (list generation-id)))))
@@ -172,19 +142,9 @@ gate can pair the two arms task by task."
 
 (defun run-arm (store arm tasks scorer &key (push nil) (generation :live)
                                             (generation-id 0))
-  "Run TASKS under one ARM and return a result plist.
-
-SCORER is a function of (STORE TASK PUSHED ROWS) returning a number.  ROWS are
-what RETRIEVE-ROWS-FOR-TURN ranks for the cue when GENERATION is the semantic
-layer read -- :LIVE, a generation id, or NIL for the log alone -- and PUSHED is
-the push pack when PUSH is true.  It is the caller's job to make the scorer
-measure OUTCOME rather than action difference.  That distinction is the
-correction the extension's first draft got wrong: a paired audit found 24 of
-24 audits changing the action while the selected branch never changed, so a
-change signal does not track whether the memory did the work.
-
-Records one gate_log row per task, under GENERATION-ID and the task's hash, so
-the gate has evidence rather than memory.  A scorer that signals scores 0."
+  "Run TASKS under ARM, recording one gate_log outcome row per task under
+GENERATION-ID and task hash. SCORER takes (STORE TASK PUSHED ROWS) and
+returns a number (errors score 0); GENERATION is :LIVE, an id, or NIL."
   (let ((outcomes '()))
     (dolist (task tasks)
       (let* ((cue (getf task :cue))
@@ -205,14 +165,8 @@ the gate has evidence rather than memory.  A scorer that signals scores 0."
           :outcomes (nreverse outcomes))))
 
 (defun compare-arms (store generation-id tasks scorer &key (margin *memory-gate-margin*))
-  "Run the retention-only arm and GENERATION-ID's candidate arm over TASKS and
-return the comparison.
-
-The retention-only arm reads the log alone; the candidate arm reads the log
-with the candidate's semantic layer.  Both record their rows under
-GENERATION-ID, so the gate compares this candidate and no other.  This is the
-utility gate's evidence-producing step, deliberately separate from the gate
-that reads it: the step that decides must not be the step that measures."
+  "Run retention-only (log alone) and candidate (GENERATION-ID) arms over TASKS,
+recording both under GENERATION-ID, and return the comparison plist."
   (let ((ret (run-arm store "retention" tasks scorer
                       :generation nil :generation-id generation-id))
         (con (run-arm store "candidate" tasks scorer
@@ -223,12 +177,8 @@ that reads it: the step that decides must not be the step that measures."
           :margin margin)))
 
 (defun push-ab (store tasks scorer &key (margin 0.0))
-  "Run the push-disabled and push-enabled arms and return the comparison.
-
-Measures OUTCOME, at matched difficulty and matched budget, over the live
-layer.  The prediction it tests is P13 of model-unified.md: a push channel's
-outcome effect is positive.  The failure condition is that the effect is
-indistinguishable from zero, in which case the channel is retired."
+  "Run push-disabled and push-enabled arms over TASKS on the live layer and
+return the outcome comparison plist."
   (let ((off (run-arm store "push-off" tasks scorer :push nil))
         (on (run-arm store "push-on" tasks scorer :push t)))
     (list :off off :on on
@@ -241,28 +191,15 @@ indistinguishable from zero, in which case the channel is retired."
 ;;;; ------------------------------------------------------------------
 
 (defparameter +tool-result-roles+ '("tool" "function" "tool_result")
-  "The episode roles that mark a tool result.
-
-A turn's final answer is the last assistant round after the last of these, so a
-preamble that asked for a tool is not mistaken for the reply the operator read.
-The live kernel writes TOOL; the other two are names imported logs use.")
+  "Episode roles marking tool results; answers must follow the last tool result in a turn.")
 
 (defparameter +tail-max-tasks+ 400
-  "The most rare answers one tail sample scores.
-
-The rarity fraction scales with the log, and an imported log's rarest tenth can
-be thousands of answers. The sample is bounded so a preflight scores a fixed
-number of retrieval packs rather than a share of the whole log.")
+  "Maximum number of rare answers scored in one tail sample.")
 
 (defun pair-scope-sql ()
-  "Return the common table expression that pairs a question with its final
-answer in one scan.
-
-A turn starts at a user episode and ends before the next one. Inside it, an
-explicit FINAL_P marker wins: 1 names the reply a live turn returned, and 0
-names an interim round. An interrupted live turn with no final marker has no
-answer. For legacy or imported turns, the answer is the last assistant round
-after the turn's last tool result."
+  "Return the CTE pairing each user turn with its final answer in one scan.
+Explicit FINAL_P=1 wins (FINAL_P=0 marks an interim round); legacy turns
+fall back to the last assistant episode after the turn's last tool result."
   (format nil "WITH scoped AS (
      SELECT e.id, e.session, e.role, e.final_p,
             MAX(CASE WHEN e.role = 'user' THEN e.id END)
@@ -299,16 +236,8 @@ after the turn's last tool result."
           :expect-episode (enchiridion.memory.store:field row "answer_id"))))
 
 (defun utility-tasks (store &key (limit *utility-max-tasks*))
-  "Return up to LIMIT tasks derived from the log, newest first.
-
-A task is a question the operator asked and the reply that answered it. A live
-turn marks the reply with FINAL_P; a legacy or imported turn has no marker, and
-its answer is the last assistant round after the turn's last tool result and
-before the next question. A round that asked for a tool is never taken for the
-reply, and a turn that stopped on a tool result has no task.
-
-Every exchange in the log is one, so the set grows with use and needs nobody to
-write it. The sleep channel's own turns are not exchanges and are left out."
+  "Return up to LIMIT question/answer utility tasks from the log, newest first,
+excluding sleep-channel and memory-role episodes."
   (mapcar #'pair-row-task
           (enchiridion.memory.store:query-rows
            store
@@ -334,14 +263,9 @@ from it: either way the answer reached the pack."
 
 (defun pack-position (store rows cue episode-id &key (budget *gate-pack-chars*)
                                                       skip-episode)
-  "Return where EPISODE-ID's answer sits in the pack ROWS render at BUDGET
-characters, counting from 0, or NIL when it did not fit. The pack is built the
-way a turn builds it, through SELECT-PACK-ROWS and RENDER-PACK, so the gate
-measures what a model would be shown and not the ranking behind it.
-
-SKIP-EPISODE, the turn the cue was taken from, still takes its room in the
-pack but is not counted as a place: it is the question repeated, it leads both
-arms' packs, and counting it made every other row cost a whole rank."
+  "Return the 0-based position of EPISODE-ID's answer in the pack rendered at
+BUDGET chars via SELECT-PACK-ROWS and RENDER-PACK, or NIL if omitted.
+SKIP-EPISODE still consumes budget but is excluded from rank counting."
   (let ((included (remove-if (lambda (row)
                                (let ((item (getf row :item)))
                                  (and skip-episode
@@ -352,14 +276,8 @@ arms' packs, and counting it made every other row cost a whole rank."
     (position-if (lambda (row) (answer-hit-p (list row) episode-id)) included)))
 
 (defun answer-scorer (store task pushed rows)
-  "Score TASK by where its answer reached the gate's pack: 1 first, 1/2
-second, 1/N at position N, and 0 when it did not fit in *GATE-PACK-CHARS*.
-The turn the cue came from is not counted as a place.
-
-A graded score and not hit or miss, because a log already brings back most
-answers to its own questions: scored as hits, nearly every pair ties and the
-sign test has nothing to count. The small pack is the matched budget, and it
-is what lets a short claim beat a long answer that no longer fits."
+  "Score TASK by reciprocal rank (1/(pos+1)) of its answer in *GATE-PACK-CHARS*,
+or 0.0 if omitted; the cue episode is excluded from rank counting."
   (declare (ignore pushed))
   (let ((position (pack-position store rows (task-cue-text (getf task :cue))
                                  (getf task :expect-episode)
@@ -393,12 +311,8 @@ reached yet is neither rare nor common."
     ids))
 
 (defun tail-tasks (store tasks &key (fraction *tail-rarity-fraction*))
-  "Return the TASKS whose answer is among the rarest FRACTION of the answers
-TASKS name. A task whose answer maintenance has not derived is not ranked.
-
-This filters a bounded task list. TAIL-SAMPLE reads the whole log's eligible
-answers instead, because the rare records are wherever the log put them and a
-tail drawn from the newest utility tasks can miss them."
+  "Return the subset of TASKS whose derived answer is in the rarest FRACTION
+by rarity_raw (unlike TAIL-SAMPLE, restricted to TASKS)."
   (let ((ids (remove-duplicates
               (remove nil (mapcar (lambda (task) (getf task :expect-episode)) tasks))))
         (rare (make-hash-table)))
@@ -507,15 +421,8 @@ up to and including GENERATION-ID."
 
 (defun cost-gate (store generation-id &key (per-episode *memory-writes-per-episode*)
                                            (tokens-per-episode *t2-max-tokens-per-episode*))
-  "Return two values: T when GENERATION-ID wrote at most PER-EPISODE rows for
-each episode it derived, and the generations since the last promotion cost at
-most TOKENS-PER-EPISODE for each episode they derived; and a report.
-
-The cost is per episode and not one number per promotion, because a first
-build derives the whole log: a fixed 600,000 quarantined the first build of
-any log over about 400 episodes after its tokens were already spent. What
-bounds the money is the rolling day cap on T2 spend; this gate bounds how
-much each episode's semantics may cost, so a wasteful deriver still fails."
+  "Return (values PASS-P REPORT) when VOLUME-GATE passes and cumulative tokens
+since the live generation are at most TOKENS-PER-EPISODE per derived episode."
   (let ((tokens (promotion-tokens store generation-id))
         (episodes (promotion-episodes store generation-id)))
     (values (and (volume-gate store generation-id :per-episode per-episode)
@@ -596,13 +503,9 @@ tasks' hashes, so each gate reads only its own pairs."
 
 (defun gate-candidate (store generation-id &key (canaries *memory-canaries*)
                                                (scorer #'answer-scorer) (tail :current))
-  "Run GENERATION-ID through the promotion gates in order and return a report.
-
-The order is provenance, canary, utility, tail, then
-volume and cost.  Every gate writes a generation_checks row, and the first
-that fails quarantines the candidate with its name as the reason and leaves
-the live layer as it was.  A candidate that passes all five is promoted in
-one transaction."
+  "Run GENERATION-ID through promotion gates in order: provenance, canary,
+utility, tail, cost. Logs each check; first failure quarantines the candidate,
+and passing all five promotes it (unless frozen, which marks it held)."
   (let ((row (generation-row store generation-id)))
     (unless (and row (string= (enchiridion.memory.store:field row "status") "candidate"))
       (return-from gate-candidate
@@ -625,9 +528,7 @@ one transaction."
                         (utility-gate store generation-id :task-hashes utility-hashes)))
       (gate "tail" (lambda () (tail-gate store generation-id tail-hashes)))
       (gate "cost" (lambda () (cost-gate store generation-id)))
-      ;; Every gate passed. A freeze still holds the candidate back, and a held
-      ;; candidate is not a quarantined one: it is what lowers the quarantine
-      ;; rate and lifts that freeze.
+      ;; A held candidate passed all gates and lowers the quarantine rate.
       (let ((freeze (promotion-freeze store)))
         (if freeze
             (progn
@@ -685,12 +586,8 @@ post-check rows are what the freeze and promotion precision read."
       0))
 
 (defun promotion-precision (store &key (window *precision-window*))
-  "Return a plist of the last WINDOW promotions since the operator's reset:
-:CHECKED, those that have had their post-promotion check, :PASSED, those
-whose first canary and utility runs after promotion both passed, and
-:PRECISION, PASSED over CHECKED or NIL when none is checked.
-Precision is the share that pass the next canary and
-utility run, so a promotion's first post-check is the one that counts."
+  "Return (:CHECKED :PASSED :PRECISION) over the last WINDOW promotions since
+the precision reset, counting each promotion's first post-canary and post-utility checks."
   (let ((checked 0) (passed 0))
     (dolist (row (enchiridion.memory.store:query-rows
                   store
@@ -829,12 +726,9 @@ episode it ended at, and return NOW."
       0))
 
 (defun t2-due-p (store &key (now (get-universal-time)) (canaries *memory-canaries*))
-  "Return T when a T2 pass should run on this tick.
-A building candidate always continues, because a pass spans as many ticks as
-its episodes need. Otherwise it runs daily or after
-*T2-EPISODE-THRESHOLD* new episodes, whichever comes first. While the
-quarantine rate is over its ceiling the interval is weekly and the threshold
-is off, or a busy log would make weekly mean nothing."
+  "Return T when a T2 pass should run: always if a candidate is building, else
+on interval or *T2-EPISODE-THRESHOLD* new episodes (threshold disabled while
+quarantine-frozen), unless throttled by a recent missing-instrument preflight."
   (or (and (current-building-generation store) t)
       (let ((last (last-t2-ts store)))
         (and (or (null last)
@@ -882,18 +776,9 @@ RECOVERED says the candidate was built by an earlier pass and never gated."
                                (scorer #'answer-scorer)
                                (limit *memory-t2-episodes-per-tick*)
                                now)
-  "Run one tick of a T2 pass and return a report plist whose :OUTCOME is one
-of :ROLLED-BACK, :INSTRUMENT-MISSING, :MAINTENANCE-PENDING, :BUILDING,
-:PROMOTED, :QUARANTINED, :HELD, or :SKIPPED. The caller has already asked T2-REFUSAL.
-
-A pass that starts after a promotion first re-checks the live generation:
-A failed post-promotion check rolls back and
-freezes the next pass, so a rollback ends this pass with nothing built. A new
-candidate is started only when the preflight finds every instrument, so no
-tokens go to a candidate nobody could promote. A candidate an earlier pass built
-and never gated is gated before a new build starts, so a crash between building
-and gating does not waste its derivations. LAST_T2_TS is written when a pass
-ends, not while a candidate is building or waiting for rarity."
+  "Run one tick of a T2 pass and return a status plist. Order: post-check an
+unchecked live generation (rolling back on failure), run preflight and gate
+any stranded candidate before starting a new build, and mark LAST_T2_TS only when a pass ends."
   (let* ((live (live-generation-id store))
          (building (current-building-generation store))
          (unchecked (and (null building) (live-unchecked-p store live)))

@@ -1,55 +1,34 @@
-;;;; adaptation.lsp --- The bearing that fades, and the preferences it may learn.
+;;;; adaptation.lsp --- Maturity bearing and evidence-backed preference learning.
 ;;;;
-;;;; A young agent borrows its operator's style and work habits. That is the
-;;;; opening posture, not a permanent rule: as substantive memory and
-;;;; corroborated experience accumulate, the bearing moves toward the agent's
-;;;; own defaults. Elapsed time is not a term. The agent is not told that it is
-;;;; being measured, and no tick announces a change.
-;;;;
-;;;; ADAPT.md is the visible form. It is a normal file in the agent directory,
-;;;; so a diff and a revert are the ordinary Git ones. The harness owns the
-;;;; bearing line; the maintenance pass may add one preference entry per pass,
-;;;; and only with evidence it can name.
-;;;;
-;;;; This file is prompt guidance. It cannot grant a tool, lift a refusal,
-;;;; change a permission, raise a budget, or finish the bootstrap. Those
-;;;; bounds are enforced in code and are listed in the operator documentation.
+;;;; Maintains ADAPT.md: the harness updates the Bearing line from memory and
+;;;; corroborated experience counts, and validates at most one preference proposal
+;;;; per maintenance pass. ADAPT.md is prompt guidance only; enforcement bounds
+;;;; stay in code.
 
 (in-package #:enchiridion.kernel)
 
-;;;; What a pass needs and what it may do.
+;;;; Configuration and bounds.
 
 (defparameter +adaptation-file-name+ "ADAPT.md"
   "The Markdown file the bearing and the learned entries live in.")
 
 (defparameter +adaptation-proposal-name+ "tmp/adaptation.json"
-  "Where a maintenance pass leaves one proposal. The directory is ignored by
-the agent repository, so a proposal is never a commit.")
+  "Path for a maintenance pass proposal JSON (git-ignored under tmp/).")
 
 (defparameter +adaptation-entry-limit+ 240
-  "The most characters one learned entry may hold. A pass that wants to write
-an essay is a pass that is rewriting the identity files instead.")
+  "Maximum character length of one learned preference entry.")
 
 (defparameter +adaptation-min-inferred-evidence+ 3
-  "How many separate operator turns an inferred preference needs.
-One turn is an incident; several turns are a pattern.")
+  "Minimum distinct operator turns required for an inferred preference.")
 
 (defparameter *adaptation-operator-channels* '("cli")
-  "Channels whose user turns can be cited as operator evidence. The CLI is the
-operator's direct surface. HTTP and Fluxer messages arrive with role user but
-are not operator identity by themselves, so they do not authorize a preference
-unless an embedding binds their channel here.")
+  "Channels whose user turns qualify as operator evidence (defaults to CLI only).")
 
 (defparameter +adaptation-memory-full+ 120
-  "Substantive turns that count as a full memory for the bearing. Sleep output
-and tool rows are excluded, so a chatty harness cannot mature an agent by
-talking to itself. Saved memories are excluded too: every saved memory carries
-the same owner provenance regardless of who saved it.")
+  "Substantive user/assistant turns for full memory maturity (excludes sleep, tools, saved memories).")
 
 (defparameter +adaptation-experience-full+ 6
-  "Corroborated sessions that count as full experience for the bearing.
-A session is corroborated when it holds at least two tool results and an
-assistant reply, which is the smallest shape of acting and then answering.")
+  "Corroborated sessions (>=2 tool results + assistant reply) for full experience maturity.")
 
 (defparameter +adaptation-evidence-window+ 24
   "How many recent turns the maintenance prompt shows as possible evidence.")
@@ -62,16 +41,12 @@ assistant reply, which is the smallest shape of acting and then answering.")
 
 (defparameter +adaptation-categories+
   '("style" "workflow" "format" "communication" "priority")
-  "The kinds of preference an adaptation may record. A category outside this
-list is refused, so a proposal cannot rename itself a permission or a tool
-policy and still apply.")
+  "Allowed preference categories; proposals outside this list are refused.")
 
 (defparameter +adaptation-forbidden-terms+
   '("permission" "refusal" "refuse" "tool access" "bootstrap" "sandbox"
     "authority" "token budget")
-  "Words that name an enforced bound. The list is a guard, not a proof: the
-operator still reads the diff, and the code that enforces the bound never reads
-ADAPT.md.")
+  "Substrings rejected in preference text because they reference code-enforced bounds.")
 
 (defparameter +adaptation-bearings+
   '((4/5 . "Use your own defaults. Your memory and corroborated experience are broad enough that the operator's style is context, not a model. Explicit operator instructions still override this line.")
@@ -79,14 +54,11 @@ ADAPT.md.")
     (2/5 . "Blend the operator's demonstrated style and work habits with what your own experience has confirmed.")
     (1/5 . "Lean on the operator's demonstrated style and work habits; your own experience is still thin.")
     (0 . "Emulate the operator's demonstrated style and work habits closely. They are the default while your memory and experience are thin."))
-  "The bearing line at each maturity band, strongest emulation first in the
-list because the loop returns the first threshold the score reaches. The text
-is deliberately about behavior and never about the measurement.")
+  "Maturity threshold alist (highest first) mapping score to bearing text.")
 
 (defparameter +adaptation-note+
   "Guidance only. Tool access, permissions, refusals, budgets, and the bootstrap are enforced in code and do not change here. Explicit operator instructions and OPERATOR.md override this section."
-  "The sentence that keeps the block honest. It is part of the prompt and of
-ADAPT.md, so neither the model nor the operator has to infer the distinction.")
+  "Header disclaimer written into ADAPT.md.")
 
 ;;;; Paths and the file view.
 
@@ -117,14 +89,10 @@ ADAPT.md, so neither the model nor the operator has to infer the distinction.")
   (enchiridion.memory:write-block-file (adaptation-path directory) text)
   text)
 
-;;;; Maturity. The two terms are deliberately different: memory is what the
-;;;; agent has kept, experience is what it has done and had answered.
+;;;; Maturity scoring.
 
 (defun adaptation-memory-count (store)
-  "Return the substantive user and assistant turns in STORE, capped at the full
-mark. Sleep output and tool rows do not count, so consolidation cannot age an
-agent. Saved memories do not count either: their owner provenance is written by
-SAVE-MEMORY for every caller, so it says nothing about the source."
+  "Count non-empty non-sleep user/assistant episodes in STORE, capped at +ADAPTATION-MEMORY-FULL+."
   (if store
       (handler-case
           (let ((row (first (enchiridion.memory.store:query-rows
@@ -141,10 +109,7 @@ SAVE-MEMORY for every caller, so it says nothing about the source."
     0))
 
 (defun adaptation-experience-count (store)
-  "Return corroborated sessions in STORE, capped at the full mark.
-A session is corroborated when it holds at least two tool results and an
-assistant reply. One tool call is a try; a second in the same conversation is
-the experience the answer was formed against."
+  "Count non-sleep sessions with >=2 tool rows and an assistant reply, capped at +ADAPTATION-EXPERIENCE-FULL+."
   (if store
       (handler-case
           (let ((row (first (enchiridion.memory.store:query-rows
@@ -167,9 +132,7 @@ the experience the answer was formed against."
 
 (declaim (ftype (function (t) rational) adaptation-maturity))
 (defun adaptation-maturity (store)
-  "Return 0 to 1, the smaller of the memory and experience terms.
-The smaller term means neither a large transcript nor a busy tool history is
-enough on its own. A store with no rows is 0, which is the early bearing."
+  "Return maturity in [0, 1] as min(memory-ratio, experience-ratio)."
   (let ((memory (/ (adaptation-memory-count store)
                    (max 1 +adaptation-memory-full+)))
         (experience (/ (adaptation-experience-count store)
@@ -184,14 +147,10 @@ enough on its own. A store with no rows is 0, which is the early bearing."
               return text)
       (cdar (last +adaptation-bearings+))))
 
-;;;; The file's small grammar: one header, one bearing line, and one bullet
-;;;; per learned entry. That is enough for a diff and too little for a policy
-;;;; language.
+;;;; ADAPT.md formatting.
 
 (defun adaptation-bearing-marker (text)
-  "Return the start of a Bearing: line in TEXT, or NIL.
-Only a marker at the beginning of a line counts, so a sentence that mentions
-the word does not become the bearing."
+  "Return the index of a line-leading \"Bearing: \" marker in TEXT, or NIL."
   (let ((marker (search "Bearing: " text)))
     (when marker
       (when (or (zerop marker)
@@ -199,9 +158,7 @@ the word does not become the bearing."
         marker))))
 
 (defun adaptation-replace-bearing (text bearing)
-  "Return TEXT with its Bearing: line replaced by BEARING.
-A file without the marker gets one appended, so a hand-edited file keeps
-everything else."
+  "Replace the Bearing: line in TEXT, or append one if absent."
   (let* ((line (format nil "Bearing: ~A" bearing))
          (start (adaptation-bearing-marker text)))
     (cond
@@ -239,9 +196,7 @@ everything else."
 ;;;; Evidence and the one proposal.
 
 (defun adaptation-evidence-row (store id)
-  "Return the row for turn ID, or NIL.
-The query names the columns rather than using RECENT-TURNS, because evidence
-may be older than the recent window and is looked up by exact id."
+  "Fetch turn row ID from STORE by exact id, or NIL."
   (when store
     (handler-case
         (first (enchiridion.memory.store:query-rows
@@ -257,8 +212,7 @@ may be older than the recent window and is looked up by exact id."
                :test #'string=)))
 
 (defun adaptation-valid-evidence-p (store id)
-  "Return T when ID is a user turn from an operator channel.
-The role alone is not identity: an HTTP or Fluxer message also arrives as user."
+  "Return T when turn ID is a user turn from an allowed operator channel."
   (let ((row (adaptation-evidence-row store id)))
     (and row
          (string= "user" (enchiridion.memory.store:field row "role"))
@@ -297,11 +251,7 @@ The role alone is not identity: an HTTP or Fluxer message also arrives as user."
                return (format nil "the text names an enforced bound (~A)" term))))))
 
 (defun adaptation-validate-proposal (store proposal)
-  "Return two values: the normalized entry, or NIL and the reason.
-The checks are structural. They can prove that a named turn says the quoted
-words and that an inferred preference has three separate operator turns. They
-cannot prove that the model inferred the right preference, which is why the
-operator gets a diff and a revert."
+  "Structurally validate PROPOSAL against STORE; return (VALUES entry nil) or (VALUES nil reason)."
   (let* ((kind (string-downcase (string (getf proposal :kind))))
          (category (string-downcase (string (getf proposal :category))))
          (text (and (stringp (getf proposal :text))
@@ -372,8 +322,7 @@ operator gets a diff and a revert."
       (values nil (enchiridion.errors:condition-report-line condition)))))
 
 (defun adaptation-read-proposal (directory)
-  "Return the proposal in DIRECTORY, or two values NIL and the reason.
-A missing file is a no-op, not an error."
+  "Read and parse the proposal JSON in DIRECTORY; missing file returns (VALUES nil nil)."
   (let ((path (adaptation-proposal-path directory)))
     (if (probe-file path)
         (handler-case
@@ -462,10 +411,8 @@ A missing file is a no-op, not an error."
 
 (declaim (ftype (function (t t list) list) adaptation-apply-proposal))
 (defun adaptation-apply-proposal (store directory proposal)
-  "Validate and apply one proposal, and return a plist describing the result.
-The file is written before the row, so a database failure can put the old text
-back. A commit failure is silent, because a host without a Git identity must
-not lose the change."
+  "Validate, append to ADAPT.md, record in STORE, and commit PROPOSAL.
+Rolls back ADAPT.md if the database insert fails; commit errors are ignored."
   (multiple-value-bind (entry reason) (adaptation-validate-proposal store proposal)
     (if (null entry)
         (list :status :refused :reason reason)
@@ -486,8 +433,7 @@ not lose the change."
                           :text (getf entry :text)
                           :evidence (getf entry :evidence)))
                 (error (condition)
-                  ;; The file moved and the row did not. Put the file back:
-                  ;; a change no row can explain is worse than no change.
+                  ;; Roll back ADAPT.md if recording the row failed.
                   (ignore-errors (adaptation-write-file directory before))
                   (list :status :refused
                         :reason (enchiridion.errors:condition-report-line condition)))))
@@ -507,9 +453,7 @@ not lose the change."
   (problem nil))
 
 (defun adaptation-begin (agent store)
-  "Prepare ADAPT.md for one maintenance pass and return an ADAPTATION-PASS.
-The bearing is updated before the turn, so the pass reads the posture it is
-about to act under, and the ordinary turn commit records the change."
+  "Update ADAPT.md bearing before a maintenance pass and return an ADAPTATION-PASS."
   (let* ((directory (and agent (agent-directory agent)))
          (before (and directory (adaptation-read-file directory)))
          (memory (adaptation-memory-count store))
@@ -553,9 +497,7 @@ about to act under, and the ordinary turn commit records the change."
         (error () nil)))))
 
 (defun adaptation-direct-change-p (state)
-  "Return T when ADAPT.md changed without the harness. The model writing the
-file directly is reverted, because the evidence checks live on the proposal
-path and a direct write has not passed them."
+  "Return T if ADAPT.md was modified outside the harness during STATE's pass."
   (let ((directory (adaptation-pass-directory state)))
     (and directory
          (not (string= (or (adaptation-read-file directory) "")
@@ -563,9 +505,8 @@ path and a direct write has not passed them."
 
 (declaim (ftype (function (t t &key (:success-p t)) list) adaptation-finish))
 (defun adaptation-finish (state store &key (success-p t))
-  "Close one maintenance pass and return a plist for the internal report.
-The status is never printed. It exists for tests and for an operator who asks
-the code directly; a heartbeat says only that a maintenance pass ran."
+  "Finalize a maintenance pass and return a status plist.
+Reverts direct ADAPT.md edits; allows at most one change (bearing or proposal) per pass."
   (let ((directory (and state (adaptation-pass-directory state))))
     (cond
       ((null directory)
@@ -576,16 +517,13 @@ the code directly; a heartbeat says only that a maintenance pass ran."
        (list :status :failed
              :problem (adaptation-pass-problem state)))
       ((adaptation-direct-change-p state)
-       ;; A direct write skipped the evidence checks, so it is put back even
-       ;; when the bearing moved in the same pass. The turn may already have
-       ;; committed it, so the restore is committed too.
+       ;; Revert direct edits (and commit the revert if the turn already committed).
        (adaptation-restore state)
        (adaptation-commit directory "Revert a direct adaptation write")
        (ignore-errors (delete-file (adaptation-proposal-path directory)))
        (list :status :direct-reverted))
       ((adaptation-pass-changed-p state)
-       ;; The bearing moved, so it is the one change this pass gets. A
-       ;; proposal waits for a pass that did not already change the file.
+       ;; Bearing change uses this pass's single-change budget; defer any proposal.
        (ignore-errors
          (adaptation-record-bearing store
                                     (adaptation-pass-bearing state)
@@ -608,13 +546,10 @@ the code directly; a heartbeat says only that a maintenance pass ran."
               (ignore-errors (delete-file (adaptation-proposal-path directory)))
               result))))))))
 
-;;;; The maintenance prompt. This is the only model call the feature uses, and
-;;;; it is the pass that already ran.
+;;;; Maintenance prompt and revert.
 
 (defun adaptation-evidence-text (store)
-  "Return the recent turns as evidence lines, oldest first, bounded by count
-and characters. Tool rows are omitted: a tool result is not an operator
-correction and does not belong in a correction's citation."
+  "Format recent operator user turns as evidence lines, oldest first, within budget."
   (when store
     (let ((rows (handler-case
                     (enchiridion.memory.store:recent-turns
@@ -652,9 +587,8 @@ The shape is {\"kind\":\"explicit\"|\"inferred\",\"category\":\"...\",\"text\":\
           (adaptation-evidence-text store)))
 
 (defun revert-adaptation (store directory id)
-  "Put back the text before adaptation ID and mark the row reverted.
-The latest change can be reverted; an older one cannot, because a later change
-sits on top of it. Return a plist with :REVERTED-P and a reason."
+  "Restore ADAPT.md to before_text for ID and mark it reverted.
+Only the latest un-reverted adaptation (matching current file text) can be reverted."
   (let ((target (adaptation-row store id)))
     (cond
       ((null target) (list :reverted-p nil :reason "no such adaptation"))

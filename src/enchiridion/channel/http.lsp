@@ -1,74 +1,30 @@
-;;;; http.lsp --- The webhook: three routes, one token, and a body limit.
+;;;; http.lsp --- Hunchentoot webhook channel (/message, /health, /usage).
 ;;;;
-;;;; The webhook is a channel like any other, with one difference: a turn is
-;;;; request and response, so the reply is the response body instead of a
-;;;; message sent somewhere else. The channel therefore implements no
-;;;; CHANNEL-SEND. The protocol default refuses it by name, which is the right
-;;;; answer for a surface that has nothing to send to.
-;;;;
-;;;; It binds to loopback by default. A bind that listens to anything else
-;;;; needs a token, and the refusal happens before a socket is opened rather
-;;;; than at the first request: a server that comes up unauthenticated and
-;;;; then argues about it was already reachable, and the window is the part
-;;;; that matters.
-;;;;
-;;;; hunchentoot and not clack. The core clack system ships no handler, so
-;;;; clackup needs clack-handler-hunchentoot, which is this same server plus a
-;;;; layer nothing here uses; and clack:stop destroys its wrapper thread
-;;;; without stopping the acceptor. hunchentoot starts and stops explicitly,
-;;;; gives a thread per connection under a bounded taskmaster, and reads a
-;;;; chunked body without help.
-;;;;
-;;;; Nothing in this file knows what a supervisor, a store or an agent is.
-;;;; The three things a route needs arrive as functions: TURN runs one turn,
-;;;; HEALTH reports the process, and USAGE reads the ledger. That is what
-;;;; keeps the channel above the kernel instead of beside it.
+;;;; Replies travel in the HTTP response body, so CHANNEL-SEND is unimplemented.
+;;;; Non-loopback binds require a bearer token before opening a socket.
+;;;; Route handlers receive TURN, HEALTH, and USAGE callbacks to stay decoupled
+;;;; from the kernel.
 
 (in-package #:enchiridion.channel.http)
 
 ;;;; Limits.
 
 (defparameter +http-body-limit+ 65536
-  "How many bytes of request body the webhook will read by default.
-
-The limit is checked against the declared length before one byte is read,
-because hunchentoot's own reader allocates what the header claims and the
-header is written by the caller. A body that arrives chunked has no declared
-length and is counted as it is read instead.")
+  "Default max request body size in bytes (checked against Content-Length before
+reading, and counted during chunked reads).")
 
 (defparameter +http-usage-limit+ 50
-  "How many ledger rows GET /usage returns by default. The CLI prints the same
-fifty rows, so the two surfaces answer the same question the same way.")
+  "Default row count returned by GET /usage.")
 
 (defparameter +http-max-usage-limit+ 1000
-  "The largest ?limit= GET /usage will honour. A caller may ask for fewer rows
-than the default, not for the whole table in one response.")
+  "Maximum ?limit= value accepted by GET /usage.")
 
 (defparameter *http-drain-seconds* 6
-  "How long CHANNEL-STOP waits for a turn already in flight, in seconds.
-
-hunchentoot:stop closes the listener and returns without killing a handler
-thread, so a turn that started before the stop still finishes and still writes
-its ledger row. The supervisor closes the store immediately after this returns,
-which is why the wait counts turns and not only connections: a turn lost here is
-a token row that never reaches the ledger. A turn that outlasts even this is
-reported, and the operator can read why the shutdown was slow.
-
-Six and not thirty because the drain has to fit the twenty second shutdown
-budget: the supervisor gives each channel eight of those seconds, and this
-deadline covers the acceptor's stop as well as the wait after it.
-STOP-HTTP-ACCEPTOR takes :SECONDS too, so a caller with less to spend can pass
-its own.")
+  "Default seconds CHANNEL-STOP budgets for stopping the acceptor and draining
+in-flight turns before the supervisor closes the store.")
 
 (defparameter +http-read-timeout+ 5
-  "How long a connection may take to send its request line, headers and body.
-
-A client that declares a body and then sends nothing holds a handler thread for
-this long. Eight of those exhaust the taskmaster before authentication had a
-chance to refuse them, so the timeout is short: a real caller on a real network
-sends a webhook request in milliseconds, and one that needs longer than five
-seconds is one that is not sending. hunchentoot requires the read and write
-timeouts to be equal, so the same number is used for both.")
+  "Socket read/write timeout in seconds (hunchentoot requires both to match).")
 
 ;;;; The one condition this file signals.
 
@@ -86,18 +42,11 @@ timeouts to be equal, so the same number is used for both.")
                      (http-error-status condition)
                      (http-error-message condition))))
   (:documentation
-   "A request the webhook refuses, with the status it refuses it with.
-
-The status and the message travel together because the alternative is a
-handler that returns a string and a code from two places, and the two drift
-the first time a route is added."))
+   "Refused webhook request carrying HTTP status, safe client message, and optional headers."))
 
 (defmacro http-fail (status message &key allow retry-after)
-  "Signal an HTTP-ERROR carrying STATUS and MESSAGE.
-
-A macro and not a function, so the compiler sees the ERROR: a function that
-signals looks to the type checker like a function that returns NIL, and every
-declared return type around it becomes a lie the gate rejects."
+  "Signal HTTP-ERROR with STATUS and MESSAGE. Macro so the compiler sees the
+non-local exit for type checking."
   `(error 'http-error :status ,status :message ,message
                       :allow ,allow :retry-after ,retry-after))
 
@@ -106,9 +55,7 @@ declared return type around it becomes a lie the gate rejects."
 (declaim (ftype (function (&rest t) hash-table) json-object))
 
 (defun json-object (&rest pairs)
-  "Return PAIRS as the JSON object shape JZON writes.
-A hash table and not a plist: JZON writes a plist as a JSON array, and every
-body this file returns is an object."
+  "Return PAIRS as a string-keyed hash table (JZON serializes plists as arrays)."
   (let ((table (make-hash-table :test #'equal)))
     (loop for (key value) on pairs by #'cddr
           do (setf (gethash (string-downcase (string key)) table) value))
@@ -121,18 +68,13 @@ body this file returns is an object."
   (com.inuoe.jzon:stringify value))
 
 (defparameter +json-null+ 'null
-  "The symbol JZON writes as JSON null.
-JZON writes NIL as false, so null needs a value of its own. It is CL:NULL,
-inherited into JZON's package, where the parser also returns it for a null it
-reads.")
+  "Symbol JZON serializes as JSON null (NIL serializes as false).")
 
 (declaim (ftype (function (t) t) json-value))
 
 (defun json-value (value)
-  "Return VALUE as the shape JZON writes as a JSON object.
-A plist is written as an array, so a plist becomes a table; a hash table, a
-vector and every scalar pass through. :NULL becomes JSON null, because NIL is
-already false and a reader could not tell it from a real value."
+  "Convert VALUE for JZON: plists to hash tables, :NULL to +JSON-NULL+,
+keywords to lowercase strings."
   (cond
     ((hash-table-p value) value)
     ((eq value :null) +json-null+)
@@ -153,12 +95,8 @@ already false and a reader could not tell it from a real value."
 
 ;;;; The service.
 
-;; turn answers one message and returns (:ok-p :reply :error :reason :usage).
-;; health reports the process, usage reads the ledger, token is the shared
-;; secret or NIL, and the rest is where to listen and how much to read.
-;; in-flight counts the turns a stop has to wait for, which hunchentoot's own
-;; requests-in-progress does not: a turn that has finished reading its body and
-;; is waiting on a model is a request hunchentoot considers answered.
+;; IN-FLIGHT tracks active turns separately from hunchentoot's
+;; requests-in-progress so shutdown waits for model calls to finish.
 (defstruct (http-service (:constructor %make-http-service))
   (turn nil :type t)
   (health nil :type t)
@@ -177,13 +115,8 @@ already false and a reader could not tell it from a real value."
 
 (defun make-http-service (&key turn health usage token (bind "127.0.0.1") (port 8787)
                                (body-limit +http-body-limit+))
-  "Return an HTTP service. Nothing binds a port until a channel starts it.
-
-The bind and the token are trimmed here, in one place, because both are read
-from a configuration file a person edited: a token with a trailing space is a
-token no header will ever match, and an empty bind would be handed to
-hunchentoot as a hostname. An empty token becomes no token, which the policy
-refuses on a reachable bind and allows on loopback."
+  "Construct an HTTP-SERVICE without binding a port. Trims BIND and TOKEN;
+empty BIND defaults to 127.0.0.1 and empty TOKEN becomes NIL."
   (check-type bind string)
   (check-type port (integer 0 65535))
   (check-type body-limit (integer 1 *))
@@ -219,13 +152,8 @@ refuses on a reachable bind and allows on loopback."
 (declaim (ftype (function (string string) boolean) constant-time-string=))
 
 (defun constant-time-string= (left right)
-  "Compare LEFT and RIGHT without an early exit.
-
-A comparison that stops at the first difference tells the caller how many
-characters of a token were right, one request at a time. This folds every
-character in and adds the length difference, so the only thing it leaks is the
-length, which the caller chose. Strings, not bytes: the header is text by the
-time it arrives."
+  "Compare LEFT and RIGHT without early exit on character mismatch (length
+difference is folded into the accumulator)."
   (declare (type string left right))
   (let ((difference (logxor (length left) (length right)))
         (limit (min (length left) (length right))))
@@ -238,8 +166,7 @@ time it arrives."
 (declaim (ftype (function (t) (or null string)) bearer-token))
 
 (defun bearer-token (authorization)
-  "Return the token of an Authorization header, or NIL.
-One spelling, Bearer, so there is one code path to read and one to test."
+  "Extract the Bearer token from AUTHORIZATION, or NIL."
   (when (and (stringp authorization)
              (> (length authorization) 7)
              (string-equal "bearer " authorization :end2 7))
@@ -249,12 +176,9 @@ One spelling, Bearer, so there is one code path to read and one to test."
 (declaim (ftype (function (http-service t) boolean) authorized-p))
 
 (defun authorized-p (service authorization)
-  "Return T when AUTHORIZATION carries the service's token.
-
-A service with no token answers T: that is the loopback case, and the policy
-check is what keeps a reachable bind from being the no-token case. A missing
-header is compared as an empty string rather than short-circuited, so a request
-with no token and a request with the wrong one take the same path."
+  "Return T when AUTHORIZATION matches SERVICE's token (or when SERVICE has no
+token, allowed only on loopback). Compares missing headers as empty strings in
+constant time."
   (let ((expected (http-service-token service)))
     (if (or (null expected) (zerop (length expected)))
         t
@@ -265,23 +189,9 @@ with no token and a request with the wrong one take the same path."
 (declaim (ftype (function (t) boolean) loopback-bind-p))
 
 (defun loopback-bind-p (bind)
-  "Return T when BIND names only the loopback interface, or names nothing.
-
-The empty string is loopback because MAKE-HTTP-SERVICE replaces it with
-127.0.0.1 before an acceptor is made. NIL is NOT loopback: hunchentoot reads a
-NIL address as the wildcard and binds every interface, so classifying NIL as
-the safe default would make one spelling silently open the port to the network
-while the policy said it was local.
-
-0.0.0.0, ::, a hostname other than localhost, and every other address are not
-loopback either: a name that resolves to the loopback today can resolve
-elsewhere tomorrow, and a name server inside a startup security check is a
-network call inside a security check.
-
-The digit test is bounded to ASCII on purpose. DIGIT-CHAR-P accepts every
-Unicode decimal digit, so a spelling such as 127.0.0.<arabic-indic one> would
-be called loopback by a looser check; it does not resolve today, but the check
-must not be the reason that stays true."
+  "Return T when BIND is loopback (empty string, localhost, ::1,
+::ffff:127.0.0.1, or ASCII-only 127.x.x.x). NIL is not loopback because
+hunchentoot treats NIL as wildcard; hostnames are not resolved."
   (if (not (stringp bind))
       nil
       (let ((text (string-trim '(#\Space #\Tab) bind)))
@@ -316,9 +226,6 @@ must not be the reason that stays true."
 
 ;;;; The request.
 
-;; hunchentoot's request, plus the one fact that outlives the handler: a body
-;; nobody read. A flag on the value the routes see would be gone by the time the
-;; answer is written, because every refusal that leaves a body unread throws.
 (defclass http-request-object (hunchentoot:request)
   ((body-abandoned-p :accessor http-request-object-body-abandoned-p
                      :initarg :body-abandoned-p
@@ -327,11 +234,8 @@ must not be the reason that stays true."
                      :documentation
                      "T when the body was not read, so the connection must close."))
   (:documentation
-   "The acceptor's request class: hunchentoot's request and BODY-ABANDONED-P.
-
-The body slot is sealed when the request is made and opened only by the bounded
-read, so no answer allocates a declared length no route asked for. That includes
-the 503 hunchentoot sends when every handler thread is busy."))
+   "Hunchentoot request subclass tracking unread bodies via BODY-ABANDONED-P.
+Seals RAW-POST-DATA on init so hunchentoot never allocates an unvalidated Content-Length."))
 
 (defmethod initialize-instance :after ((request http-request-object) &rest initargs)
   "Seal the body until a route opens it."
@@ -339,9 +243,7 @@ the 503 hunchentoot sends when every handler thread is busy."))
   (when (slot-exists-p request 'hunchentoot::raw-post-data)
     (setf (slot-value request 'hunchentoot::raw-post-data) t)))
 
-;; The request is a value, not a hunchentoot object, so a route can be tested
-;; without a socket. REQUEST-FROM-HUNCHENTOOT is the only function here that
-;; knows the server.
+;; Plain request value so routes can be tested without a socket.
 (defstruct (http-request (:constructor %make-http-request))
   (method "GET" :type string)
   (path "/" :type string)
@@ -359,8 +261,7 @@ the 503 hunchentoot sends when every handler thread is busy."))
 
 (defun make-http-request (&key (method "GET") (path "/") (query "") authorization
                                content-type content-length (body ""))
-  "Return a request value. Tests build this; the server side builds it in
-REQUEST-FROM-HUNCHENTOOT."
+  "Construct an HTTP-REQUEST value (used by tests and REQUEST-FROM-HUNCHENTOOT)."
   (check-type method string)
   (check-type path string)
   (check-type body string)
@@ -371,11 +272,7 @@ REQUEST-FROM-HUNCHENTOOT."
 (declaim (ftype (function (t) (or null integer)) declared-length))
 
 (defun declared-length (header)
-  "Return HEADER as a byte count, or NIL when it is absent or not positive.
-
-Zero frames nothing to read, and a negative count is not a length. Hunchentoot
-bounds the stream it hands back with the header whatever this returns, so what
-is decided here is only what counts as a body."
+  "Parse HEADER as a positive byte count, or NIL."
   (when (and (stringp header) (plusp (length header)))
     (let ((value (parse-integer header :junk-allowed t)))
       (and value (plusp value) value))))
@@ -383,29 +280,21 @@ is decided here is only what counts as a body."
 (declaim (ftype (function (t) boolean) json-content-type-p))
 
 (defun json-content-type-p (value)
-  "Return T when VALUE is a JSON content type.
-A missing header is not JSON: a caller that sends a body has to say what it
-is, and guessing is how a form post becomes a parse error three functions
-later."
+  "Return T when VALUE is a string containing application/json."
   (and (stringp value)
        (not (null (search "application/json" (string-downcase value))))))
 
 (declaim (ftype (function (t) boolean) chunked-body-p))
 
 (defun chunked-body-p (transfer-encoding)
-  "Return T when TRANSFER-ENCODING names chunked as a transfer coding.
-A substring check, as in JSON-CONTENT-TYPE-P, because every spelling that names
-chunked has to reach the code that counts the bytes."
+  "Return T when TRANSFER-ENCODING contains chunked."
   (and (stringp transfer-encoding)
        (not (null (search "chunked" (string-downcase transfer-encoding))))))
 
 (declaim (ftype (function (t t) boolean) body-declared-p))
 
 (defun body-declared-p (content-length transfer-encoding)
-  "Return T when these headers frame a body.
-Either header frames one on its own. A request that frames none has nothing to
-read, and asking hunchentoot for the stream waits out the read timeout for bytes
-that will not come."
+  "Return T when CONTENT-LENGTH or TRANSFER-ENCODING frames a body."
   (or (and (integerp content-length) (plusp content-length))
       (chunked-body-p transfer-encoding)))
 
@@ -414,23 +303,10 @@ that will not come."
                 read-request-body))
 
 (defun read-request-body (service raw length chunked-p &optional (declared-p (not (null length))))
-  "Read the body of RAW, refusing more than the service's limit.
-
-The declared length is checked first, because hunchentoot allocates what the
-header claims. The bytes are then counted as they arrive, which is what bounds
-a chunked body that declares nothing. READ-BYTE and not READ-SEQUENCE: the
-byte loop consumes a chunked body's terminating chunk and read-sequence leaves
-it, which hunchentoot then reports as a 500.
-
-A body framed both ways is refused before either is read. DECLARED-P is whether
-a Content-Length header was there at all, not whether its length is positive: a
-header of zero beside a chunked encoding is still two framings, and hunchentoot
-bounds the chunked stream by the zero and leaves every chunk on the connection.
-
-The second value is T when nothing of this body is left to read: a declared
-length read in full, a chunked body that reached its terminator, or a form body
-hunchentoot had already read. Bytes left on a kept alive connection are read by
-the next request as its own request line, so the caller closes it instead."
+  "Read RAW's body up to SERVICE's byte limit, returning (VALUES text clean-p).
+Rejects dual Content-Length + Transfer-Encoding framing (even Content-Length: 0).
+Uses READ-BYTE so chunked terminators are consumed; CLEAN-P is NIL if unread
+bytes may remain on the connection."
   (when (and declared-p chunked-p)
     (http-fail 400 "The body declares both a length and a chunked encoding."))
   (when (and length (> length (http-service-body-limit service)))
@@ -455,10 +331,7 @@ the next request as its own request line, so the caller closes it instead."
 (declaim (ftype (function (t boolean) boolean) note-body-abandoned))
 
 (defun note-body-abandoned (request abandoned-p)
-  "Record on REQUEST whether its body was left unread, and return ABANDONED-P.
-
-The type test covers an acceptor built with hunchentoot's own request class: it
-is still answered, it cannot ask for the close."
+  "Set BODY-ABANDONED-P on REQUEST (when an HTTP-REQUEST-OBJECT) and return ABANDONED-P."
   (when (typep request 'http-request-object)
     (setf (http-request-object-body-abandoned-p request) abandoned-p))
   abandoned-p)
@@ -473,9 +346,7 @@ is still answered, it cannot ask for the close."
 (declaim (ftype (function (t) null) open-request-body))
 
 (defun open-request-body (request)
-  "Undo the construction seal so READ-REQUEST-BODY can take the stream.
-Called immediately before the bounded read and nowhere else, so every other path
-leaves the declared length unallocated."
+  "Clear the construction seal on RAW-POST-DATA immediately before bounded body reading."
   (when (and (typep request 'http-request-object)
              (slot-exists-p request 'hunchentoot::raw-post-data))
     (setf (slot-value request 'hunchentoot::raw-post-data) nil))
@@ -484,17 +355,8 @@ leaves the declared length unallocated."
 (declaim (ftype (function (t) null) seal-request-body))
 
 (defun seal-request-body (request)
-  "Stop hunchentoot from reading REQUEST's unread body into memory on the way out.
-
-Every answer passes through HUNCHENTOOT:START-OUTPUT, which calls RAW-POST-DATA
-:FORCE-BINARY T to clear the request stream; with an empty slot that call
-allocates the declared Content-Length, so a refused body would be charged its
-declared size while the refusal was written. T is hunchentoot's marker for a body
-already consumed and it answers NIL for it. The connection closes after this
-answer, so no bytes are left for the next request.
-
-SLOT-EXISTS-P because the slot belongs to the library: a rename must leave the
-answer writable rather than signal from the unwind form that writes it."
+  "Mark RAW-POST-DATA as T so HUNCHENTOOT:START-OUTPUT does not allocate and
+drain an unread body while writing a refusal. Guarded by SLOT-EXISTS-P."
   (when (and (typep request 'http-request-object)
              (slot-exists-p request 'hunchentoot::raw-post-data))
     (setf (slot-value request 'hunchentoot::raw-post-data) t))
@@ -510,11 +372,8 @@ answer writable rather than signal from the unwind form that writes it."
 (declaim (ftype (function (http-service t) http-request) request-from-hunchentoot))
 
 (defun request-from-hunchentoot (service raw)
-  "Return RAW, a hunchentoot request, as an HTTP-REQUEST with its body read.
-
-Only a POST whose headers frame a body is read. A request that framed one anyway
-is marked on RAW, and the acceptor closes that connection when the answer is
-written."
+  "Convert RAW into an HTTP-REQUEST, reading the body only for framed POST
+requests and marking abandoned bodies on RAW."
   (let* ((method (string-upcase (string (hunchentoot:request-method* raw))))
          (length-header (hunchentoot:header-in* :content-length raw))
          (length (declared-length length-header))
@@ -542,9 +401,7 @@ written."
 (declaim (ftype (function (t) t) channel-object))
 
 (defun channel-object (row)
-  "Return ROW, a channel row, as something JSON writes.
-The status file already produces these as hash tables; a plist is accepted so
-a test or a future caller does not have to build the other shape."
+  "Normalize channel status ROW (hash table or plist) for JSON output."
   (if (hash-table-p row)
       row
       (json-object "name" (or (getf row :name) "")
@@ -578,10 +435,8 @@ a test or a future caller does not have to build the other shape."
 (declaim (ftype (function (http-request) (integer 1 *)) usage-limit))
 
 (defun usage-limit (request)
-  "Return the ?limit= of REQUEST, or the default, clamped to the maximum.
-A limit that is not a positive number is the default rather than an error: the
-parameter is a convenience, and refusing the whole report over it would make
-the report harder to get than the rows are worth."
+  "Return ?limit= from REQUEST, clamped to [1, +HTTP-MAX-USAGE-LIMIT+],
+defaulting to +HTTP-USAGE-LIMIT+."
   (let ((value (and (query-value (http-request-query request) "limit")
                     (parse-integer (query-value (http-request-query request) "limit")
                                    :junk-allowed t))))
@@ -594,17 +449,8 @@ the report harder to get than the rows are worth."
 (declaim (ftype (function (http-service) (values integer string)) health-response))
 
 (defun health-response (service)
-  "Return the status and body for GET /health.
-
-The report comes from the live process, not from the status file: a file read
-by a process that has stopped reports the last thing it said, and an uptime
-derived from a dead process grows forever.
-
-OK and the status code are the same answer: a channel the supervisor wants on
-that is failed or stopped, or an enabled heartbeat whose thread is gone, makes a
-live process unready even though it still answers this route. An orchestrator
-reads the code; an operator reads the fields. Persistence and provider refreshes
-are reported beside readiness, not folded into it."
+  "Return (VALUES status body) for GET /health from the live supervisor
+callback (200 when ready, 503 otherwise)."
   (let ((report (and (http-service-health service)
                      (funcall (http-service-health service)))))
     (if report
@@ -629,9 +475,7 @@ are reported beside readiness, not folded into it."
                 usage-response))
 
 (defun usage-response (service request)
-  "Return the status and body for GET /usage.
-A service with no store answers 503 and says so rather than reporting an empty
-ledger, which would read as a day with no spend."
+  "Return (VALUES status body) for GET /usage, or 503 when no store is open or readable."
   (let ((report (and (http-service-usage service)
                      (funcall (http-service-usage service) (usage-limit request)))))
     (cond
@@ -649,9 +493,7 @@ ledger, which would read as a day with no spend."
 (declaim (ftype (function (t) hash-table) usage-summary-object))
 
 (defun usage-summary-object (usage)
-  "Return USAGE, the plist a turn reports, as the JSON object a reply carries.
-The turn's own rows are summed, not the completion's: a turn that called a
-tool makes several model calls, and the completion is only the last one."
+  "Format turn USAGE plist (summed across all model rounds) as a JSON object."
   (json-object "model" (or (getf usage :model) "")
                "input" (or (getf usage :input) 0)
                "output" (or (getf usage :output) 0)
@@ -675,12 +517,8 @@ tool makes several model calls, and the completion is only the last one."
 (declaim (ftype (function (http-service t t) t) run-turn))
 
 (defun run-turn (service turn message)
-  "Run TURN on MESSAGE, counted as in flight, and return what it reports.
-
-A turn that signals is a failed turn, not a failure of the webhook: the status is
-the only part of an answer a caller can act on, and 502 says the far side broke.
-The stderr line keeps the condition visible to an operator who never reads the
-answer."
+  "Run TURN on MESSAGE while tracked as in-flight; logs and converts signalled
+errors into a failed-turn plist."
   (enter-turn service)
   (unwind-protect
        (handler-case (funcall turn message)
@@ -729,11 +567,8 @@ answer."
                 handle-http-request))
 
 (defun handle-http-request (service request)
-  "Return the status and the JSON body for an authenticated REQUEST.
-
-Three routes and no more. A known path with the wrong method is 405 with the
-method it takes; anything else is 404. The answer is a value rather than a
-write so the whole routing table is testable without a socket."
+  "Route an authenticated REQUEST to /message, /health, or /usage, returning
+(VALUES status body) or signalling 405/404."
   (let ((method (http-request-method request))
         (path (http-request-path request)))
     (cond
@@ -755,9 +590,7 @@ write so the whole routing table is testable without a socket."
                 dispatch-http-request))
 
 (defun dispatch-http-request (service request)
-  "Authenticate REQUEST, then route it, and return the status and body.
-A refusal and a wrong token are both 401: a 403 that means the token was right
-and the caller was wrong is an oracle for guessing tokens."
+  "Authenticate REQUEST (401 on missing or invalid token) and dispatch via HANDLE-HTTP-REQUEST."
   (if (authorized-p service (http-request-authorization request))
       (handle-http-request service request)
       (http-fail 401 "A bearer token is required.")))
@@ -768,18 +601,13 @@ and the caller was wrong is an oracle for guessing tokens."
   ((service :accessor http-acceptor-service :initarg :service :initform nil :type t
             :documentation "The service this acceptor answers for."))
   (:documentation
-   "A hunchentoot acceptor that routes to HANDLE-HTTP-REQUEST and always
-answers JSON. It exists so the dispatch method has somewhere to live: a plain
-acceptor would fall through to hunchentoot's own handler and answer an HTML
-page."))
+   "Hunchentoot acceptor dispatching all requests as JSON via HANDLE-HTTP-REQUEST."))
 
 (declaim (ftype (function (integer string &key (:allow t) (:retry-after t)) t)
                 abort-with))
 
 (defun abort-with (status body &key allow retry-after)
-  "Write STATUS, BODY and the optional headers, and end the handler.
-Returning a string from a dispatch method sends nothing: ABORT-REQUEST-HANDLER
-is the throw that delivers the body."
+  "Set STATUS, JSON Content-Type, optional headers, and deliver BODY via ABORT-REQUEST-HANDLER."
   (setf (hunchentoot:return-code*) status
         (hunchentoot:content-type*) "application/json; charset=utf-8")
   (when allow
@@ -789,26 +617,9 @@ is the throw that delivers the body."
   (hunchentoot:abort-request-handler body))
 
 (defmethod hunchentoot:acceptor-dispatch-request ((acceptor http-acceptor) request)
-  "Answer one request as JSON and never let a condition escape.
-
-The token is checked from the header before the body is read. That order is the
-difference between an anonymous caller being refused and an anonymous caller
-holding a handler thread for the read timeout: a client that announces a body
-and then sends nothing costs nothing until the body is wanted, and the
-taskmaster is small.
-
-An uncaught condition is rendered by hunchentoot as its own HTML error page,
-with the server version and a backtrace on stderr: an API that answers HTML
-when it fails is an API whose caller cannot tell a bug from a shutdown.
-
-A body that is framed and not read takes its connection with it: hunchentoot
-reads the next request from the same connection, so bytes nobody read would be
-read as a request the caller never sent. The header is written here and the loop
-is stopped in an :AFTER method on PROCESS-REQUEST, because hunchentoot decides
-keep-alive while writing the answer.
-
-The same cleanup seals the body slot: START-OUTPUT calls RAW-POST-DATA before it
-writes, and an empty slot makes that call allocate the declared length."
+  "Dispatch one request as JSON, catching all errors so hunchentoot never emits HTML.
+Checks auth before reading the body, and seals RAW-POST-DATA plus sets
+Connection: close whenever a framed body is left unread."
   (let ((service (http-acceptor-service acceptor)))
     ;; Close if framing cannot be read
     (when (handler-case (request-body-unread-p request)
@@ -837,13 +648,8 @@ writes, and an empty slot makes that call allocate the declared length."
         (setf (hunchentoot:header-out :connection) "close")))))
 
 (defmethod hunchentoot:process-request :after ((request http-request-object))
-  "Stop the request loop on a connection whose body was left unread.
-
-START-OUTPUT runs before this method and clears *FINISH-PROCESSING-SOCKET* when
-the answer may keep the connection alive, so this is the last place the flag
-counts. The variable is hunchentoot's own and unexported: nothing it exports
-closes a connection from inside a handler. BOUNDP because it is only bound while
-a connection is processing requests."
+  "Force connection close after START-OUTPUT when the request body was abandoned
+by setting hunchentoot's unexported *FINISH-PROCESSING-SOCKET*."
   (when (and (http-request-object-body-abandoned-p request)
              (boundp 'hunchentoot::*finish-processing-socket*))
     (setf hunchentoot::*finish-processing-socket* t)))
@@ -862,12 +668,9 @@ a connection is processing requests."
               :initform (bordeaux-threads:make-lock "enchiridion http stop")
               :type t
               :documentation
-              "Serialises the stop, so a caller waiting for the drain cannot
-return from under the one draining."))
+              "Serializes CHANNEL-STOP and start-loop cleanup so drains complete before returning."))
   (:documentation
-   "The webhook as a channel. CHANNEL-START blocks until CHANNEL-STOP, the way
-every channel does, because the supervisor calls CHANNEL-START in a restart
-loop and a start that returned at once would bind the port again every second."))
+   "Webhook channel. CHANNEL-START blocks until CHANNEL-STOP for the supervisor restart loop."))
 
 (declaim (ftype (function (&key (:name string) (:service t))
                            (values http-channel &rest t))
@@ -880,9 +683,7 @@ loop and a start that returned at once would bind the port again every second.")
 (declaim (ftype (function (function real) boolean) wait-until))
 
 (defun wait-until (done-p deadline)
-  "Poll DONE-P until it returns true or DEADLINE passes. Return its last value.
-A poll rather than a condition variable, because both things a stop waits for
-are counted by libraries that do not signal when they change."
+  "Poll DONE-P every 50ms until true or DEADLINE passes; return its last value."
   (loop while (and (not (funcall done-p))
                    (< (get-internal-real-time) deadline))
         do (sleep 0.05))
@@ -891,21 +692,15 @@ are counted by libraries that do not signal when they change."
 (declaim (ftype (function (http-service) integer) turns-running))
 
 (defun turns-running (service)
-  "Return how many turns SERVICE has in flight, read under the lock they are
-counted with."
+  "Return the number of in-flight turns on SERVICE under its lock."
   (bordeaux-threads:with-lock-held ((http-service-in-flight-lock service))
     (http-service-in-flight service)))
 
 (declaim (ftype (function (t real) boolean) stop-acceptor-within))
 
 (defun stop-acceptor-within (acceptor deadline)
-  "Stop ACCEPTOR on a helper thread, waiting until DEADLINE. Return T when it
-stopped.
-
-hunchentoot's stop joins the accepting thread, which waits for a free handler
-while the taskmaster is saturated, so the call can outlast any wait put around
-it. A thread lets one deadline cover the stop and the drain after it. A stop that
-signalled leaves the acceptor listening, and the caller keeps its handle."
+  "Stop ACCEPTOR on a helper thread bounded by DEADLINE; return T on success.
+Avoids hanging when hunchentoot:stop waits for a saturated taskmaster."
   (let ((stopper (bordeaux-threads:make-thread
                   (lambda ()
                     (handler-case
@@ -934,10 +729,8 @@ signalled leaves the acceptor listening, and the caller keeps its handle."
 (declaim (ftype (function (t t real real) null) drain-requests))
 
 (defun drain-requests (service acceptor deadline seconds)
-  "Wait until ACCEPTOR and SERVICE are quiet, or DEADLINE passes.
-
-A turn still running when the drain ends is reported, because the supervisor
-closes the store immediately after and the row it would write is gone."
+  "Wait until ACCEPTOR and SERVICE have no active requests or turns, logging if
+a turn outlasts DEADLINE."
   (unless (wait-until (lambda () (request-quiet-p service acceptor)) deadline)
     (when (and service (plusp (turns-running service)))
       (format *error-output*
@@ -951,24 +744,8 @@ closes the store immediately after and the row it would write is gone."
                 stop-http-acceptor))
 
 (defun stop-http-acceptor (channel &key (seconds *http-drain-seconds*))
-  "Stop CHANNEL's acceptor and wait at most SECONDS for the work in flight.
-
-Two things are waited for. hunchentoot's own count of requests in progress
-covers a connection still inside the handler; the service's turn count covers
-the longer and more expensive case, a turn that has read its body and is
-waiting on a model. The supervisor closes the store as soon as this returns, so
-a turn still running would write its ledger row into a closed store.
-
-SECONDS bounds the whole stop, the acceptor's stop as well as the drain after it,
-so a caller with a shutdown window can spend part of it here.
-
-The stop lock makes the two callers that always arrive, CHANNEL-STOP and the
-start loop's cleanup, take turns: the second waits for the drain rather than
-returning, which the supervisor would read as permission to close the store.
-
-An acceptor that does not stop in budget stays on the channel, so a later stop,
-or the retry a restart makes before listening again, can try once more. Clearing
-the slot would lose the only handle on a listener that may still be bound."
+  "Stop CHANNEL's acceptor and drain in-flight requests and turns within SECONDS.
+Serialized by STOP-LOCK; retains the acceptor slot if stopping times out."
   (bordeaux-threads:with-lock-held ((http-channel-stop-lock channel))
     (let ((acceptor (http-channel-acceptor channel)))
       (when acceptor
@@ -981,12 +758,9 @@ the slot would lose the only handle on a listener that may still be bound."
   nil)
 
 (defmethod enchiridion.channel:channel-start ((channel http-channel) &key config)
-  "Validate the bind policy, start the acceptor, and block until stopped.
-
-HUCHENTOOT:*LOG-LISP-ERRORS-P* is bound to NIL around the start because every
-handler thread inherits this thread's bindings: without it each failure prints
-a backtrace on top of the one line this file writes, and the log becomes
-unreadable exactly when it is needed."
+  "Validate bind policy, start the acceptor, and block until stopped.
+Binds HUNCHENTOOT:*LOG-LISP-ERRORS-P* to NIL so handler threads inherit it and
+avoid duplicate backtraces."
   (declare (ignore config))
   (let ((service (http-channel-service channel)))
     (unless service
@@ -1017,8 +791,6 @@ unreadable exactly when it is needed."
                             :persistent-connections-p t)))
       (setf (enchiridion.channel:channel-live-p channel) t
             (enchiridion.channel:channel-state channel) :live)
-      ;; The one line an operator needs to know a listener exists; everything
-      ;; before this in startup can take minutes.
       (format *error-output* "~&enchiridion: webhook listening on ~A:~D.~%"
               (http-service-bind service)
               (or (hunchentoot:acceptor-port (http-channel-acceptor channel))
@@ -1029,8 +801,7 @@ unreadable exactly when it is needed."
                             (not (http-channel-stopped-p channel)))
                  do (sleep 0.2))
         (stop-http-acceptor channel)
-        ;; A stop between START and the line that wrote :live would leave the
-        ;; channel live with nothing behind it, and /health reads that state
+        ;; Ensure state is cleared if stopped before :live was set.
         (setf (enchiridion.channel:channel-live-p channel) nil
               (enchiridion.channel:channel-state channel) :stopped)))
     channel))
@@ -1057,8 +828,7 @@ unreadable exactly when it is needed."
 
 (defun start-http (&key turn health usage token (bind "127.0.0.1") (port 8787)
                         (body-limit +http-body-limit+) (name "http"))
-  "Build a channel over these options, start it, and return it.
-This blocks until STOP-HTTP, exactly as CHANNEL-START does."
+  "Create and start an HTTP-CHANNEL with these options; blocks until STOP-HTTP."
   (let ((channel (make-http-channel
                   :name name
                   :service (make-http-service :turn turn :health health :usage usage

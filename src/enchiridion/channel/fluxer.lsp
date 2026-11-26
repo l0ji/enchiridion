@@ -1,37 +1,11 @@
-;;;; fluxer.lsp --- The Fluxer direct-message channel.
+;;;; fluxer.lsp --- Fluxer direct-message channel (gateway websocket inbound, REST outbound).
 ;;;;
-;;;; The gateway is the inbound half and REST is the outbound half: events
-;;;; arrive on a websocket, replies leave as one POST per message. Both halves
-;;;; live in one file because they share one token and one allowlist, and a
-;;;; channel whose authorisation is read in two files is a channel whose two
-;;;; files drift apart.
-;;;;
-;;;; Three rules are load bearing and each one has a test that pins it. The
-;;;; allowlist denies by default, so an empty list admits nobody. Only direct
-;;;; messages are answered, so a guild event, a group channel, a bot, and the
-;;;; agent's own echo never reach a turn. The reply is scrubbed before it
-;;;; becomes a REST body, because this is the one path that ends at a person.
-;;;;
-;;;; Everything that can spin is bounded. Reconnects are counted and backed
-;;;; off. The heartbeat waits in slices and stops on the same flag a close
-;;;; sets. The worker is the only thread that runs a turn, so the library's
-;;;; read thread never holds a turn while the socket backs up behind it. The
-;;;; reaction thread is a third thread with a bounded, coalescing queue, so a
-;;;; cosmetic marker never sits in front of a socket or a turn.
-;;;;
-;;;; The protocol is facts and pure functions at the top of the file. The
-;;;; socket, the threads, and the HTTP calls below them use those facts, so
-;;;; every one of them is testable without a network and the tests need no
-;;;; server. Nothing here reaches the kernel: a turn arrives as an injected
-;;;; function, which is what lets the whole channel be tested with a closure.
+;;;; Enforces deny-by-default allowlisting, DM-only filtering, and secret scrubbing on outbound
+;;;; replies. Uses bounded reconnects, a single turn worker thread, and a coalescing reaction worker.
 
 (in-package #:enchiridion.channel.fluxer)
 
-;;;; The protocol facts.
-;;;;
-;;;; Taken from the Fluxer REST and gateway documentation and from a live
-;;;; gateway, so they are recorded rather than derived. None of them is
-;;;; written twice: the tests read the same numbers the code does.
+;;;; Protocol constants.
 
 (defparameter +rest-base+ "https://api.fluxer.app/v1"
   "The REST base every Fluxer call is made under.")
@@ -40,26 +14,17 @@
   "The discovery path, under +REST-BASE+, that answers with the websocket url.")
 
 (defparameter +gateway-query+ "?v=1&encoding=json"
-  "What the advertised gateway url is missing. Ask for version 1 and JSON
-frames explicitly, because the url /gateway/bot answers carries no query
-string of its own.")
+  "Query string appended to /gateway/bot URLs to request v1 JSON frames.")
 
 (defparameter +default-heartbeat-interval+ 41250
-  "The heartbeat interval in milliseconds to assume before Hello arrives. It is
-the number the live gateway sent, and it is only a fallback: Hello decides.")
+  "Fallback heartbeat interval in milliseconds before Hello arrives.")
 
 (defparameter +heartbeat-ack-timeout-seconds+ 45
-  "How long a heartbeat may stay unacknowledged before the socket is treated as
-closed.
-
-The gateway closes 4009 after 45 seconds without an acknowledgement, so a socket
-that stopped acknowledging is already dropped. A half open transport never says
-so: writes still succeed and nothing arrives, which is why the check is here and
-not a close code.")
+  "Seconds an unacknowledged heartbeat may remain open before closing the socket.
+Gateway closes with 4009 after 45s; this detects half-open transports.")
 
 (defparameter +identify-wait-seconds+ 10
-  "How long to wait for Hello after the handshake. A gateway that accepts the
-socket and then says nothing is not a gateway to sit and wait on.")
+  "Seconds to wait for Hello after the websocket handshake.")
 
 (defparameter +message-limit+ 2000
   "The outbound message limit, in UTF-16 code units.")
@@ -74,71 +39,50 @@ socket and then says nothing is not a gateway to sit and wait on.")
   "The longest configurable custom status cooldown, in seconds.")
 
 (defparameter +presence-online+ "online"
-  "The base presence every custom status update carries.
-
-The gateway requires d.status even when only custom_status changes, so the
-channel names the one state it wants rather than leaving the field to default.")
+  "Base presence state; gateway requires d.status even when only custom_status changes.")
 
 (defparameter +http-timeout-seconds+ 15
-  "Seconds to wait for one REST call. A send that has not answered by then is a
-send the operator has already given up on.")
+  "Timeout in seconds for a single REST request.")
 
 (defparameter +max-reconnect-attempts+ 5
-  "How many reconnects in a row to try before the channel gives up and returns
-to its supervisor. A counted loop is what stops a dead gateway from becoming a
-busy loop, and the supervisor restarts the channel a second later anyway.")
+  "Consecutive reconnect attempts before returning :FAILED to the supervisor.")
 
 (defparameter +reconnect-base-seconds+ 1
   "The first reconnect wait, in seconds. Each later wait doubles it.")
 
 (defparameter +reconnect-max-seconds+ 60
-  "The longest reconnect wait, in seconds, so a gateway that is down is not
-hammered once a minute forever.")
+  "Maximum reconnect backoff wait, in seconds.")
 
 (defparameter +reconnect-stable-seconds+ 30
-  "How long one connection must last before it earns a fresh reconnect budget.
-
-A gateway that completes the handshake and closes again reaches READY too, so a
-reset on READY alone would retry it once a second for the life of the process.
-Thirty seconds is most of one heartbeat interval, long enough that a connection
-which lasted it has shown the transport works.")
+  "Minimum connection duration in seconds before resetting the reconnect budget.
+Prevents rapid retry loops when a gateway reaches READY and immediately closes.")
 
 (defparameter +resume-window-seconds+ 60
-  "How long the gateway keeps a session after a transport ends, in seconds. A
-reconnect inside the window resumes; a later one identifies again.")
+  "Seconds the gateway retains a session after disconnect for op 6 Resume.")
 
 (defparameter +rate-limit-attempts+ 3
-  "How many times one message is retried after a 429. The route bucket is 20
-requests in 10 seconds per user per channel, so a batched reply can cross it.")
+  "Retries after HTTP 429 (route bucket is 20 requests/10s per user per channel).")
 
 (defparameter +max-pending-messages+ 32
-  "How many inkbound messages may wait for the worker. A turn can take minutes,
-and an unbounded queue in front of it is an unbounded amount of memory.")
+  "Maximum inbound messages queued for the turn worker.")
 
 (defparameter +worker-wait-seconds+ 0.2
-  "How long the worker waits for work before looking at the stop flag again.
-The wait is signalled as well as timed, so this is the worst case for a lost
-wake-up and never the case for a message.")
+  "Semaphore wait timeout in seconds before re-checking the stop flag.")
 
 (defparameter +stop-join-seconds+ 5
-  "How long a stop waits for the worker. A turn already in flight is given
-this long and is then destroyed: a stop that waits for a model call is a stop
-that never finishes.")
+  "Seconds to wait for an in-flight turn on stop before destroying the worker thread.")
 
 (defparameter +op-dispatch+ 0
   "The dispatch opcode. Every event arrives as one of these.")
 
 (defparameter +op-heartbeat+ 1
-  "The heartbeat opcode. The payload is the last processed dispatch sequence,
-or null before the first one, and the gateway answers with op 11.")
+  "Heartbeat opcode; payload is last processed sequence (or null), answered with op 11.")
 
 (defparameter +op-identify+ 2
   "The identify opcode. It authenticates a fresh session on an open socket.")
 
 (defparameter +op-presence+ 3
-  "The presence opcode. It sets the displayed status and custom status. The
-gateway sends no acknowledgement for it, so a frame that left the socket is all
-this channel can know.")
+  "Presence opcode for status/custom_status updates (unacknowledged by gateway).")
 
 (defparameter +op-resume+ 6
   "The resume opcode. It reattaches to a session the gateway still holds.")
@@ -147,25 +91,20 @@ this channel can know.")
   "The reconnect opcode. The gateway is asking for a new socket.")
 
 (defparameter +op-invalid-session+ 9
-  "The invalid session opcode. The socket stays open and unauthenticated, so
-the answer is another Identify on the same socket, never a Resume.")
+  "Invalid session opcode; socket stays open and requires a fresh Identify, not Resume.")
 
 (defparameter +op-hello+ 10
-  "The hello opcode. It carries the heartbeat interval and is the first frame
-after the handshake.")
+  "Hello opcode; first frame after handshake, carrying heartbeat_interval.")
 
 (defparameter +op-heartbeat-ack+ 11
-  "The heartbeat acknowledgement opcode. The gateway closes 4009 when 45
-seconds pass without one.")
+  "Heartbeat ACK opcode; gateway closes 4009 if 45s pass without one.")
 
 (defparameter +direct-message-channel-type+ 1
-  "The channel_type a one-on-one direct message carries. Every other number is
-a group channel or a guild channel, and this channel answers neither.")
+  "channel_type for 1:1 DMs; all other types (group/guild) are ignored.")
 
 (defparameter +fatal-close-codes+ '(4002 4004 4012)
-  "The close codes that say trying again cannot work: 4002 an Identify the
-gateway could not decode, 4004 a token it refused, 4012 an API version it does
-not speak. The other codes in the range are worth a reconnect.")
+  "Gateway close codes that must not be retried: 4002 (decode error), 4004 (auth failed),
+4012 (invalid API version).")
 
 (defparameter +close-code-notes+
   '((1000 . "normal closure")
@@ -185,32 +124,23 @@ not speak. The other codes in the range are worth a reconnect.")
     (4012 . "invalid API version")
     (4013 . "invalid intents")
     (4014 . "disallowed intents"))
-  "A short note per close code, so a log line names what happened instead of
-printing a number the operator has to look up.")
+  "Human-readable log descriptions for gateway close codes.")
 
 (defparameter +token-env-default+ "FLUXER_BOT_TOKEN"
   "The environment variable name used when the configuration names none.")
 
-;; jzon writes NIL as false and spells JSON null as an unexported symbol, and
-;; the heartbeat payload is null before the first dispatch. This is the one
-;; place this file names a dependency's internals, and the test that reads the
-;; frame's text is what keeps the name honest. The alternative, building the
-;; frame with a format string, puts the JSON escaping of every other frame in
-;; this file's hands for the sake of one word.
+;; jzon encodes NIL as false and uses this unexported symbol for JSON null,
+;; required by heartbeat frames before the first dispatch.
 (defconstant +json-null+ 'com.inuoe.jzon::null
-  "The value STRINGIFY writes as JSON null rather than as false.")
+  "Value serialized as JSON null rather than false.")
 
 ;;;; Reading a frame.
 
 (declaim (ftype (function (string) t) parse-frame))
 
 (defun parse-frame (text)
-  "Return TEXT, one gateway frame, as a plist with keyword keys, or NIL.
-
-NIL is the answer for anything that is not a JSON object with a numeric op:
-the gateway sends text frames only, but a proxy in front of it answers HTML,
-and a frame this channel cannot read is a frame to drop rather than a
-condition thrown on the library's read thread."
+  "Parse gateway frame TEXT into a keyword plist, or NIL for non-JSON / missing numeric :op.
+Never signals on the read thread."
   (handler-case
       (let ((frame (enchiridion.llm:parse-json text)))
         (when (and (consp frame) (integerp (getf frame :op)))
@@ -226,10 +156,7 @@ condition thrown on the library's read thread."
 (declaim (ftype (function (t) t) frame-seq))
 
 (defun frame-seq (frame)
-  "Return the dispatch sequence number of FRAME, or NIL.
-
-A replayed dispatch keeps its old number, which makes this the one place a
-redelivery is visible. Ready is 1 and the count starts at 0."
+  "Return the dispatch sequence number of FRAME, or NIL. Replays retain their original number."
   (getf frame :s))
 
 (declaim (ftype (function (t) t) frame-data))
@@ -241,8 +168,7 @@ redelivery is visible. Ready is 1 and the count starts at 0."
 (declaim (ftype (function (t) (or null integer)) hello-interval))
 
 (defun hello-interval (frame)
-  "Return the heartbeat interval in milliseconds FRAME, an op 10 Hello, names,
-or NIL when it names none."
+  "Return the heartbeat interval in milliseconds from an op 10 Hello FRAME, or NIL."
   (let ((data (frame-data frame)))
     (when (consp data)
       (let ((interval (getf data :heartbeat_interval)))
@@ -251,19 +177,9 @@ or NIL when it names none."
 (declaim (ftype (function (t &optional t t) (or null integer)) frame-close-code))
 
 (defun frame-close-code (data &optional start end)
-  "Return the close code in DATA, one whole websocket frame, or NIL.
-
-DATA is a frame as it came off the socket: a flags byte with the opcode in its
-low nibble, a length byte with the mask bit above it, an extended length when
-the payload is long, a masking key when the sender masked it, and then the
-payload. A close frame with fewer than two payload bytes carries no code, a
-frame that is not a close frame has none, and a masked code is unmasked here.
-
-This exists because the library loses the code. Its close callback answers the
-peer's close frame and the transport then ends, so the :close event that fires
-afterwards has NIL where the code was. While the frame is still bytes it is the
-only place left to read it, and the code is what tells a refused token from a
-network blip."
+  "Extract the 16-bit close code from raw websocket frame bytes DATA, or NIL.
+Unmasks masked close frames (opcode 8). Needed because websocket-driver drops the
+close code before firing its :close event."
   (let ((start (or start 0))
         (end (or end (length data))))
     (when (>= (- end start) 2)
@@ -296,13 +212,8 @@ network blip."
 (declaim (ftype (function (t) t) json-shape))
 
 (defun json-shape (value)
-  "Return VALUE in the shape STRINGIFY writes as JSON.
-
-A plist becomes an object and a list becomes an array. A plist handed straight
-to STRINGIFY writes as an array of alternating elements, so an Identify frame
-would go on the wire as [\"op\",2,...] and the gateway would answer with a
-decode error. Keys are the downcased keyword names, which is what a JSON object
-conventionally looks like; the reading side upcases whatever it gets."
+  "Convert VALUE for STRINGIFY: keyword plists become hash tables with downcased keys,
+and non-keyword lists become vectors (otherwise plists serialize as JSON arrays)."
   (cond
     ((and (consp value) (keywordp (first value)))
      (let ((table (make-hash-table :test #'equal)))
@@ -323,12 +234,7 @@ conventionally looks like; the reading side upcases whatever it gets."
 (declaim (ftype (function (t) (or null string)) non-blank-string))
 
 (defun non-blank-string (value)
-  "Return VALUE as a string without surrounding whitespace, or NIL.
-
-NIL is the answer for a non string, for the empty string, and for a string that
-holds nothing but whitespace. A value that came from a shell or a file is
-allowed to have a newline on it, and a name that is only whitespace is not a
-name."
+  "Return VALUE trimmed of whitespace if it is a non-empty string, else NIL."
   (let ((trimmed (and (stringp value)
                       (string-trim '(#\Space #\Tab #\Newline #\Return) value))))
     (and trimmed (plusp (length trimmed)) trimmed)))
@@ -336,12 +242,8 @@ name."
 (declaim (ftype (function (t) (or null string)) gateway-url))
 
 (defun gateway-url (advertised)
-  "Return ADVERTISED, the url GET /gateway/bot answers, or NIL.
-
-The scheme is left exactly as advertised, because a self-hosted deployment may
-advertise ws:// and rewriting it to wss:// would break the one deployment that
-is not the public one. The version and the encoding are asked for explicitly,
-because the advertised url carries no query string of its own."
+  "Append v=1&encoding=json to ADVERTISED /gateway/bot URL, or return NIL.
+Preserves the advertised scheme (ws:// or wss://) for self-hosted deployments."
   (let ((url (non-blank-string advertised)))
     (when url
       (concatenate 'string url (if (find #\? url) "&v=1&encoding=json"
@@ -350,12 +252,8 @@ because the advertised url carries no query string of its own."
 (declaim (ftype (function (string) list) identify-frame))
 
 (defun identify-frame (token)
-  "Return the op 2 Identify frame for TOKEN.
-
-There is no intents field and no shard field, and sending neither is correct:
-direct messages are account scoped, so they arrive without asking for a
-gateway intent, and this client is one shard. The properties object is not
-optional: an Identify without it closes the socket with 4002."
+  "Return an op 2 Identify frame for TOKEN.
+Omits intents/shard (DMs are account-scoped); :properties is required or gateway closes 4002."
   (list :op +op-identify+
         :d (list :token token
                  :properties (list :os "linux"
@@ -365,23 +263,15 @@ optional: an Identify without it closes the socket with 4002."
 (declaim (ftype (function (t) list) heartbeat-frame))
 
 (defun heartbeat-frame (sequence)
-  "Return the op 1 heartbeat frame for SEQUENCE, or for NIL before the first
-dispatch.
-
-SEQUENCE is the last PROCESSED dispatch sequence and not the last seen one.
-NIL goes on the wire as null and not as false: the gateway reads one as no
-sequence yet and the other as a sequence that is not a number."
+  "Return an op 1 Heartbeat frame for last processed SEQUENCE, encoding NIL as JSON null
+rather than false."
   (list :op +op-heartbeat+
         :d (if (integerp sequence) sequence +json-null+)))
 
 (declaim (ftype (function (string string t) list) resume-frame))
 
 (defun resume-frame (token session-id sequence)
-  "Return the op 6 resume frame for TOKEN, SESSION-ID, and SEQUENCE.
-
-A resume is only worth sending inside the 60 seconds the gateway keeps a
-session, and only with a session id it gave us. It replays whatever was
-missed, which the sequence filter then drops where it was already answered."
+  "Return an op 6 Resume frame for TOKEN, SESSION-ID, and SEQUENCE (valid within 60s)."
   (list :op +op-resume+
         :d (list :token token
                  :session_id session-id
@@ -390,21 +280,11 @@ missed, which the sequence filter then drops where it was already answered."
 (declaim (ftype (function (string) list) message-body))
 
 (defun message-body (text)
-  "Return the REST body that posts TEXT as one message.
-
-One field, because that is what the endpoint takes, and the test pins that
-there is no second one: an unknown field is ignored by one gateway version and
-refused by the next."
+  "Return the single-field REST body (:content TEXT) for posting a message."
   (list :content text))
 
-;;;; The agent's custom status.
-;;;;
-;;;; A status is public the moment it leaves this process, so the adapter and
-;;;; not the agent owns the last word: the text is one line of bounded length,
-;;;; it carries no secret the scrubber would redact, and it is the agent's
-;;;; deliberate proposal rather than anything read out of its reasoning. The
-;;;; channel also owns the lifetime and the spacing between changes, because a
-;;;; model that can publish on every turn is a model that can flood a profile.
+;;;; Custom status validation and frames.
+;;;; Enforces single-line, bounded, secret-free proposals with channel-owned TTL and cooldown.
 
 (declaim (ftype (function (character) boolean) control-character-p))
 
@@ -417,13 +297,8 @@ refused by the next."
                 validate-custom-status))
 
 (defun validate-custom-status (proposal)
-  "Return PROPOSAL as custom status text and NIL, or NIL and the refusal.
-
-The text is trimmed, must be non-empty and at most
-+CUSTOM-STATUS-MAX-CHARACTERS+ characters, must not contain a line break or any
-other control character, and must survive the scrubber unchanged. A value the
-scrubber would redact is refused rather than published redacted: the marker is
-noise on a profile and the text that produced it was never meant to be public."
+  "Validate PROPOSAL as custom status text; return (values TEXT NIL) or (values NIL REASON).
+Requires trimmed non-empty text <= +CUSTOM-STATUS-MAX-CHARACTERS+, no control chars, and no scrubber redactions."
   (unless (stringp proposal)
     (return-from validate-custom-status
       (values nil "a custom status is a string.")))
@@ -445,13 +320,8 @@ noise on a profile and the text that produced it was never meant to be public."
 (declaim (ftype (function ((or null string)) list) presence-frame))
 
 (defun presence-frame (text)
-  "Return the op 3 frame that sets TEXT, or clears the custom status when TEXT
-is NIL.
-
-The documented clear is a null custom_status and not an empty text, because a
-text must be 1 to 128 characters. d.status is required even when only the
-custom status changes, and this channel does not play with idle or do not
-disturb."
+  "Return an op 3 presence frame setting custom_status to TEXT, or JSON null to clear.
+Always includes d.status = \"online\" as required by the gateway."
   (list :op +op-presence+
         :d (list :status +presence-online+
                  :custom_status (if text
@@ -463,13 +333,8 @@ disturb."
 (declaim (ftype (function (t t) boolean) allowed-p))
 
 (defun allowed-p (allowlist id)
-  "Return T when ID, a sender's user id, is on ALLOWLIST.
-
-Deny by default, in four ways at once: a NIL or empty allowlist admits nobody,
-a missing or non string id is refused, a non string entry cannot make itself
-match, and a non list allowlist is no allowlist. The comparison is against the
-user id and never against a username, because a username is a string its owner
-can change and an allowlist keyed on one is an allowlist a stranger can join."
+  "Return T iff non-empty string user ID is a member of string list ALLOWLIST.
+Deny-by-default: NIL/empty/non-list allowlists and non-string entries match nothing. Keyed on user ID, never username."
   (and (stringp id)
        (plusp (length id))
        (consp allowlist)
@@ -487,11 +352,7 @@ can change and an allowlist keyed on one is an allowlist a stranger can join."
 (declaim (ftype (function (t t) string) text-field))
 
 (defun text-field (data key)
-  "Return KEY of DATA as a string, or the empty string.
-
-Every slot of the one message shape is typed STRING, so a field the gateway
-sent as a number, or did not send at all, becomes the empty string here
-instead of a type error three calls later."
+  "Return string value of KEY in DATA, or \"\" if missing or non-string."
   (let ((value (and (consp data) (getf data key))))
     (if (stringp value) value "")))
 
@@ -505,26 +366,21 @@ instead of a type error three calls later."
 (declaim (ftype (function (t) boolean) guild-event-p))
 
 (defun guild-event-p (data)
-  "Return T when DATA carries a guild id, so it did not come from a direct
-message whatever its channel type says."
+  "Return T when DATA carries a non-NIL :guild_id."
   (let ((guild (and (consp data) (getf data :guild_id))))
     (and guild (not (null guild)))))
 
 (declaim (ftype (function (t) boolean) bot-author-p))
 
 (defun bot-author-p (data)
-  "Return T when the author of DATA is a bot. Two bots answering each other is
-a loop that costs tokens and never ends."
+  "Return T when DATA's author has a truthy :bot flag (prevents bot-to-bot loops)."
   (let ((author (and (consp data) (getf data :author))))
     (and (consp author) (not (null (getf author :bot))))))
 
 (declaim (ftype (function (t t) boolean) own-author-p))
 
 (defun own-author-p (data self-id)
-  "Return T when DATA was sent by SELF-ID, the agent's own user id.
-
-SELF-ID is NIL before Ready says who the agent is, and nothing is the agent's
-own before then."
+  "Return T when DATA's author matches SELF-ID (NIL before READY)."
   (let ((author (author-id data)))
     (and (non-blank-string self-id)
          (non-blank-string author)
@@ -533,11 +389,7 @@ own before then."
 (declaim (ftype (function (t t) boolean) inkbound-p))
 
 (defun inkbound-p (data self-id)
-  "Return T when DATA is a direct message from someone other than the agent.
-
-The four rules are separate functions because each one is a sentence the
-operator can read, and this is the sentence they make together. This is the
-whole authorisation story for a channel that only answers direct messages."
+  "Return T when DATA is a 1:1 DM (no guild_id) from a non-bot user other than SELF-ID."
   (and (direct-message-p data)
        (not (guild-event-p data))
        (not (bot-author-p data))
@@ -546,8 +398,7 @@ whole authorisation story for a channel that only answers direct messages."
 (declaim (ftype (function (t) boolean) message-create-p))
 
 (defun message-create-p (frame)
-  "Return T when FRAME is a MESSAGE_CREATE dispatch. Every other event is
-dropped: MESSAGE_CREATE is the only one a direct message channel has."
+  "Return T when FRAME is a MESSAGE_CREATE dispatch."
   (and (eql +op-dispatch+ (frame-op frame))
        (let ((type (getf frame :t)))
          (and (stringp type) (string= "MESSAGE_CREATE" type)))))
@@ -555,8 +406,7 @@ dropped: MESSAGE_CREATE is the only one a direct message channel has."
 (declaim (ftype (function (t) boolean) ready-p))
 
 (defun ready-p (frame)
-  "Return T when FRAME is the READY dispatch, which says who the agent is and
-which session this socket belongs to."
+  "Return T when FRAME is a READY dispatch."
   (and (eql +op-dispatch+ (frame-op frame))
        (let ((type (getf frame :t)))
          (and (stringp type) (string= "READY" type)))))
@@ -564,12 +414,8 @@ which session this socket belongs to."
 (declaim (ftype (function (t) list) message-fields))
 
 (defun message-fields (data)
-  "Return DATA, a MESSAGE_CREATE payload, as the plist NORMALIZE takes.
-
-TARGET is the event's channel id, which is where a reply goes: a direct
-message's channel is the conversation, so there is nothing else to look up.
-The timestamp is left to NORMALIZE, because the gateway's is an ISO 8601
-string and the message shape carries a number."
+  "Convert MESSAGE_CREATE payload DATA to the plist expected by NORMALIZE.
+Uses channel_id as :target and omits timestamp so NORMALIZE supplies a numeric one."
   (list :channel :fluxer
         :id (text-field data :id)
         :author (or (author-id data) "")
@@ -579,21 +425,14 @@ string and the message shape carries a number."
 (declaim (ftype (function (t) t) message-create->msg))
 
 (defun message-create->msg (data)
-  "Return DATA, a MESSAGE_CREATE payload, as the one message shape every
-channel normalizes into. The id is the gateway's own message id, so a
-transcript line and the message it names are the same object."
+  "Normalize MESSAGE_CREATE payload DATA into a channel message using the gateway message id."
   (enchiridion.channel:normalize (message-fields data)))
 
 (declaim (ftype (function (t t) t) advance-sequence))
 
 (defun advance-sequence (last incoming)
-  "Return the new last-processed sequence and whether INCOMING is new work.
-
-A dispatch is dropped when its sequence is not greater than the last one
-processed, because a replay keeps its old number and a resume replays what was
-already answered. A frame with no sequence number is accepted and leaves the
-count alone: it carries no evidence that it is a replay, and the sequence is
-the only place a replay is visible."
+  "Return (values NEW-LAST FRESH-P) for INCOMING dispatch sequence against LAST.
+Drops replays (INCOMING <= LAST); accepts frames with non-integer sequences without advancing LAST."
   (cond
     ((not (integerp incoming)) (values last t))
     ((and (integerp last) (<= incoming last)) (values last nil))
@@ -855,12 +694,7 @@ the only place a replay is visible."
 (declaim (ftype (function (t (integer 2 *)) list) outbound-chunks))
 
 (defun outbound-chunks (text limit)
-  "Return TEXT scrubbed, as the pieces a reply is sent in, or NIL.
-
-This is the last place a reply is ours before it becomes a REST body, so it is
-where the scrubber runs. A reply that is empty after scrubbing is not sent: the
-operator reads an empty message as being ignored, and the gateway refuses it
-anyway."
+  "Scrub secrets from TEXT and chunk to LIMIT UTF-16 code units, or return NIL if empty."
   (let ((clean (enchiridion.llm.secrets:scrub text)))
     (if (stringp clean)
         (chunk-text clean limit)
@@ -871,24 +705,15 @@ anyway."
 (declaim (ftype (function (integer) real) next-backoff))
 
 (defun next-backoff (attempt)
-  "Return how many seconds to wait before reconnect attempt number ATTEMPT.
-
-The wait doubles from +RECONNECT-BASE-SECONDS+ and stops at
-+RECONNECT-MAX-SECONDS+, so a gateway that is down is retried without a busy
-loop and a gateway that is up is rejoined quickly."
+  "Return exponential backoff in seconds for ATTEMPT, capped at +RECONNECT-MAX-SECONDS+."
   (min +reconnect-max-seconds+
        (* +reconnect-base-seconds+ (expt 2 (max 0 (1- attempt))))))
 
 (declaim (ftype (function (integer integer) integer) next-attempt))
 
 (defun next-attempt (attempt connection-seconds)
-  "Return the reconnect attempt number after a connection that lasted
-CONNECTION-SECONDS, where ATTEMPT is the number that connection was tried on.
-
-A connection that lasted +RECONNECT-STABLE-SECONDS+ proved the transport works,
-so the count starts again at one. Anything shorter is one more attempt on the
-same budget, which stops a gateway that accepts a socket and closes it at once
-from being retried once a second forever."
+  "Return the next reconnect attempt count after a connection lasting CONNECTION-SECONDS.
+Resets to 1 if >= +RECONNECT-STABLE-SECONDS+; otherwise increments ATTEMPT."
   (if (>= connection-seconds +reconnect-stable-seconds+)
       1
       (1+ attempt)))
@@ -896,11 +721,7 @@ from being retried once a second forever."
 (declaim (ftype (function (t) (or null real)) retry-after-seconds))
 
 (defun retry-after-seconds (body)
-  "Return the wait a 429 body asks for, in seconds, or NIL.
-
-The gateway puts retry_after in the body and not in a header, and it is a
-fractional number of seconds. A body that is not JSON, or JSON without the
-field, is NIL: the caller then waits its own backoff instead of guessing."
+  "Parse numeric retry_after seconds from a 429 JSON BODY, or return NIL."
   (handler-case
       (let ((data (enchiridion.llm:parse-json body)))
         (when (consp data)
@@ -912,9 +733,7 @@ field, is NIL: the caller then waits its own backoff instead of guessing."
 (declaim (ftype (function (t t) boolean) resume-window-open-p))
 
 (defun resume-window-open-p (ended now)
-  "Return T when a session that ended at ENDED can still be resumed at NOW.
-Both are universal times, and the gateway keeps a session for
-+RESUME-WINDOW-SECONDS+ after a transport ends."
+  "Return T when universal time NOW is within +RESUME-WINDOW-SECONDS+ of ENDED."
   (and (integerp ended)
        (integerp now)
        (<= (- now ended) +resume-window-seconds+)))
@@ -931,13 +750,7 @@ Both are universal times, and the gateway keeps a session for
 (declaim (ftype (function (string) (or null string)) environment-token))
 
 (defun environment-token (name)
-  "Return the environment variable NAME as a token, registering it first, or
-NIL.
-
-The loader registers what it reads and then unsets the variable, so this is the
-fallback for a process that exported it after the loader ran. It registers with
-the scrubber before it returns, because a token the scrubber has never seen is
-a token that can reach a transcript."
+  "Read token from environment variable NAME and register it with the secret scrubber before returning, or NIL."
   (let ((token (non-blank-string (enchiridion.compat:environment-value name))))
     (when token
       (enchiridion.llm.secrets:register-secret name token :env)
@@ -946,17 +759,8 @@ a token that can reach a transcript."
 (declaim (ftype (function (&key (:name t)) (or null string)) resolve-token))
 
 (defun resolve-token (&key name)
-  "Return the Fluxer bot token, or NIL.
-
-NAME defaults to the name the :FLUXER configuration carries in :TOKEN-ENV. The
-loaded secret is asked first, because the loader registers the token and unsets
-the environment variable, and a token that is still in the environment is a
-token a child process would inherit.
-
-A value that is missing, empty, or only whitespace is no token at all. The
-caller says so in one line before any socket opens rather than signalling: a
-mis-set variable is a fact the operator can see in the log, and a channel that
-signals it takes a supervisor down over a typo."
+  "Resolve the Fluxer bot token from secrets store first, then environment variable NAME (default :TOKEN-ENV).
+Returns NIL if missing or blank without signalling."
   (let ((name (or (non-blank-string name) (configured-token-env))))
     (or (non-blank-string (enchiridion.llm.secrets:secret-value name))
         (environment-token name))))
@@ -965,45 +769,33 @@ signals it takes a supervisor down over a typo."
 
 (defclass fluxer-socket (websocket-driver.ws.client:client)
   ((close-code :accessor fluxer-socket-close-code :initform nil :type t
-               :documentation "The code the peer closed with, captured while
-the close frame was still bytes rather than after the library dropped it.")
+               :documentation "Close code captured from raw close frame bytes before websocket-driver drops it.")
    (closed-p :accessor fluxer-socket-closed-p :initform nil :type boolean
-             :documentation "True once the close event has been noted. The
-library can fire :close twice for one close, so this is what makes the handler
-idempotent.")
+             :documentation "True once :close has been handled (guards against duplicate :close events).")
    (hello :accessor fluxer-socket-hello
           :initform (bordeaux-threads:make-semaphore :name "fluxer hello")
           :type t
-          :documentation "Signalled when Hello arrives, so the thread that
-waits for it is not a poll loop.")
+          :documentation "Semaphore signalled when Hello arrives or the socket closes.")
    (done :accessor fluxer-socket-done
          :initform (bordeaux-threads:make-semaphore :name "fluxer done")
          :type t
-         :documentation "Signalled when the socket is finished, so the
-heartbeat loop wakes on a close instead of on its next slice.")
+         :documentation "Semaphore signalled when the socket closes to wake the heartbeat loop.")
    (heartbeat-interval :accessor fluxer-socket-heartbeat-interval :initform nil
                        :type t
-                       :documentation "The interval Hello named, in
-milliseconds.")
+                       :documentation "Heartbeat interval from Hello, in milliseconds.")
    (last-ack :accessor fluxer-socket-last-ack :initform nil :type t
-             :documentation "A universal time, for the last heartbeat the
-gateway acknowledged.")
+             :documentation "Universal time of the last heartbeat ACK.")
    (state-lock :accessor fluxer-socket-state-lock
                :initform (bordeaux-threads:make-lock "fluxer socket")
                :type t
-               :documentation "Guards the two facts the read thread writes and
-another thread reads."))
+               :documentation "Guards mutable socket state shared between the read and session threads."))
   (:documentation
-   "The gateway socket, with the facts this channel needs and one method the
-library leaves out. The subclass exists for the close code: the library's close
-callback consumes the code and the :close event that follows carries NIL, so
-the frame has to be read while it is still a frame."))
+   "Gateway websocket client subclass that captures the close code from raw frame bytes
+before websocket-driver discards it."))
 
 (defmethod websocket-driver.ws.base:parse :around ((socket fluxer-socket)
                                                    data &key start end)
-  "Note the close code in DATA before the library discards it.
-
-The next method runs either way: this one only looks at the frame first."
+  "Record the close code from raw frame bytes DATA before delegating to websocket-driver."
   (let ((code (frame-close-code data start end)))
     (when code
       (bordeaux-threads:with-lock-held ((fluxer-socket-state-lock socket))
@@ -1014,136 +806,98 @@ The next method runs either way: this one only looks at the frame first."
 
 (defclass fluxer-channel (enchiridion.channel:channel)
   ((turn :accessor fluxer-channel-turn :initarg :turn :initform nil :type t
-         :documentation "The function one inkbound message is handed to. It is
-injected and never reached through the kernel, which is what lets the whole
-channel be tested with a closure.")
+         :documentation "Injected turn handler (lambda (msg) ...) returning a result plist.")
    (config :accessor fluxer-channel-config :initarg :config :initform nil
            :type t
-           :documentation "The :FLUXER options, or a whole configuration that
-carries them. NIL means the active configuration.")
+           :documentation "Explicit :FLUXER options or full config; NIL uses the active config.")
    (token :accessor fluxer-channel-token :initform nil :type t
-          :documentation "The bot token, resolved once at start. It is never
-printed and never logged.")
+          :documentation "Bot token resolved at start; never logged.")
    (socket :accessor fluxer-channel-socket :initform nil :type t
            :documentation "The live gateway socket, or NIL.")
    (send-lock :accessor fluxer-channel-send-lock
               :initform (bordeaux-threads:make-lock "fluxer send")
               :type t
-              :documentation "Serialises websocket writes. The library's send
-is not locked, and two interleaved frames on one socket are one corrupt frame
-that closes 4002.")
+              :documentation "Serializes websocket writes; websocket-driver send is unlocked and interleaving causes 4002.")
    (pending :accessor fluxer-channel-pending :initform nil :type list
-            :documentation "Inkbound payloads waiting for the worker, oldest
-first.")
+            :documentation "FIFO queue of inbound MESSAGE_CREATE payloads for the turn worker.")
    (pending-lock :accessor fluxer-channel-pending-lock
                  :initform (bordeaux-threads:make-lock "fluxer pending")
                  :type t
-                 :documentation "Guards the queue, which the read thread
-writes and the worker drains.")
+                 :documentation "Guards PENDING, ACTIVE-REACTION, and STOPPING-P handoff.")
    (pending-ready :accessor fluxer-channel-pending-ready
                   :initform (bordeaux-threads:make-semaphore
                              :name "fluxer pending")
                   :type t
-                  :documentation "Counts the payloads waiting, so the worker
-sleeps rather than polls.")
+                  :documentation "Semaphore counting queued inbound payloads.")
    (worker :accessor fluxer-channel-worker :initform nil :type t
            :documentation "The one thread that runs turns.")
    (stopping-p :accessor fluxer-channel-stopping-p :initform nil :type boolean
-               :documentation "True once a stop has been asked for. Every loop
-in this file reads it.")
+               :documentation "True once channel shutdown has been requested.")
    (sequence :accessor fluxer-channel-sequence :initform nil :type t
-             :documentation "The last processed dispatch sequence, or NIL
-before the first dispatch. A heartbeat reports it.")
+             :documentation "Last processed dispatch sequence, or NIL before the first dispatch.")
    (self-id :accessor fluxer-channel-self-id :initform nil :type t
-            :documentation "The agent's own user id, from READY. What the echo
-guard compares against.")
+            :documentation "Bot user ID from READY, used by the echo guard.")
    (session-id :accessor fluxer-channel-session-id :initform nil :type t
-               :documentation "The session id READY named, for a resume.")
+               :documentation "Session ID from READY, used for op 6 Resume.")
    (session-ended :accessor fluxer-channel-session-ended :initform nil :type t
-                  :documentation "When the last transport ended, as a
-universal time. The resume window is counted from it.")
+                  :documentation "Universal time when the last transport ended, for the resume window.")
    (attempt :accessor fluxer-channel-attempt :initform 0 :type integer
-            :documentation "Reconnects since the last connection that stayed
-up. NEXT-ATTEMPT decides which connections earn a fresh budget.")
+            :documentation "Consecutive reconnect attempts since the last stable connection.")
    (status-text :accessor fluxer-channel-status-text :initform nil :type t
-                :documentation "The live custom status text, or NIL. It is
-never read from a reply or from reasoning: only an explicit proposal sets it.")
+                :documentation "Active custom status text from an explicit proposal, or NIL.")
    (status-expires :accessor fluxer-channel-status-expires :initform nil :type t
-                   :documentation "When the live custom status stops being
-current, as a universal time, or NIL.")
+                   :documentation "Universal time when the active custom status expires, or NIL.")
    (status-changed :accessor fluxer-channel-status-changed :initform nil :type t
-                   :documentation "When the last accepted status change was
-proposed, as a universal time. The cooldown is counted from it.")
+                   :documentation "Universal time of the last accepted status change, for cooldown.")
    (status-lock :accessor fluxer-channel-status-lock
                 :initform (bordeaux-threads:make-lock "fluxer status")
                 :type t
-                :documentation "Guards the status state. The worker proposes,
-the read thread reapplies on READY, and the heartbeat thread expires it.")
+                :documentation "Guards custom status state across worker, read thread (READY), and heartbeat expiry.")
    (dropped :accessor fluxer-channel-dropped :initform 0 :type integer
             :documentation "How many messages a full queue has dropped.")
    (reaction-pending :accessor fluxer-channel-reaction-pending
                      :initform (make-hash-table :test #'equal) :type hash-table
-                     :documentation "The newest reaction state waiting for each
-message, keyed by \"channel/message\". A newer state for a message already here
-replaces it.")
+                     :documentation "Coalescing map of \"channel/message\" -> newest pending reaction state.")
    (reaction-order :accessor fluxer-channel-reaction-order :initform nil :type list
-                   :documentation "The keys in REACTION-PENDING, oldest first.
-The queue is bounded by +MAX-PENDING-REACTIONS+.")
+                   :documentation "FIFO keys in REACTION-PENDING, bounded by +MAX-PENDING-REACTIONS+.")
    (reaction-lock :accessor fluxer-channel-reaction-lock
                   :initform (bordeaux-threads:make-lock "fluxer reactions")
                   :type t
-                  :documentation "Guards the reaction queue, which the socket's
-read thread and the turn worker write and the reaction thread drains.")
+                  :documentation "Guards REACTION-PENDING and REACTION-ORDER.")
    (reaction-ready :accessor fluxer-channel-reaction-ready
                    :initform (bordeaux-threads:make-semaphore
                               :name "fluxer reactions")
                    :type t
-                   :documentation "Counts the messages waiting, so the reaction
-thread sleeps rather than polls.")
+                   :documentation "Semaphore counting queued reaction updates.")
    (reaction-worker :accessor fluxer-channel-reaction-worker :initform nil :type t
                     :documentation "The one thread that sends reactions, or NIL.")
    (reaction-stopping-p :accessor fluxer-channel-reaction-stopping-p
                         :initform nil :type boolean
-                        :documentation "True once the reaction thread has been
-asked to drain and finish. Separate from STOPPING-P, because the reaction thread
-outlives the socket and the worker by one drain.")
+                        :documentation "True once reaction worker drain/shutdown has been requested (separate from STOPPING-P).")
    (reaction-deadline :accessor fluxer-channel-reaction-deadline :initform nil
                       :type t
-                      :documentation "When a stop's drain gives up, as a real
-time from REAL-SECONDS, or NIL outside a stop.")
+                      :documentation "REAL-SECONDS deadline for draining reactions during stop, or NIL.")
    (reaction-applied :accessor fluxer-channel-reaction-applied
                      :initform (make-hash-table :test #'equal) :type hash-table
-                     :documentation "The marker the bot last put on each
-message, so a state that was coalesced away never causes a delete.")
+                     :documentation "Map of \"channel/message\" -> last applied emoji to skip redundant DELETEs.")
    (reaction-applied-order :accessor fluxer-channel-reaction-applied-order
                            :initform nil :type list
-                           :documentation "The keys in REACTION-APPLIED, oldest
-first, so the table can evict at +REACTION-TRACKED-LIMIT+.")
+                           :documentation "FIFO keys in REACTION-APPLIED, bounded by +REACTION-TRACKED-LIMIT+.")
    (active-reaction :accessor fluxer-channel-active-reaction :initform nil
                     :type t
-                    :documentation "The message key the turn worker is inside,
-so a stop that has to destroy the thread can mark it failed."))
+                    :documentation "Message key currently being processed by the turn worker, for failure marking on destroy."))
   (:documentation
-   "The Fluxer direct-message channel. One worker thread runs every turn, so a
-slow turn queues instead of starving the socket, and the library's read thread
-only ever parses a frame and hands it on."))
+   "Fluxer DM channel. Decouples websocket reading from turn execution via a single
+worker thread and manages cosmetic reactions on a separate coalescing worker."))
 
 (declaim (ftype (function (&key (:turn t) (:config t))
                            (values fluxer-channel &rest t))
                 make-fluxer-channel))
 
 (defun make-fluxer-channel (&key turn config)
-  "Return a stopped Fluxer channel that calls TURN for every inkbound message.
-
-TURN is (lambda (msg) ...) and returns a plist (:ok-p BOOL :reply STRING :error
-STRING :usage PLIST-OR-NIL :status PROPOSAL). STATUS is the agent's deliberate
-custom status proposal, a string or :CLEAR, and is ignored unless the :FLUXER
-options set :CUSTOM-STATUS. It travels beside the reply, not inside it: the
-channel validates, rate limits, and expires it, and a refusal never costs the
-reply. It is the only way this channel reaches an agent: the channel never
-calls the kernel, so a test hands it a closure and a supervisor hands it the
-agent's turn. CONFIG is the :FLUXER options, or a whole configuration that
-carries them; NIL means whatever is active."
+  "Return a stopped Fluxer channel invoking TURN (lambda (msg) -> (:ok-p :reply :error :usage :status))
+for each inbound DM. Optional :STATUS proposals (string or :CLEAR) are validated and rate-limited
+when :CUSTOM-STATUS is enabled. CONFIG overrides the active configuration when non-NIL."
   (make-instance 'fluxer-channel :name "fluxer" :turn turn :config config))
 
 ;;;; What the configuration says.
@@ -1151,16 +905,8 @@ carries them; NIL means whatever is active."
 (declaim (ftype (function (fluxer-channel) list) channel-options))
 
 (defun channel-options (channel)
-  "Return the :FLUXER options CHANNEL was made with.
-
-The channel's own CONFIG wins when it has one: a section plist is merged over
-the active configuration key by key, and a whole configuration is asked for
-its :CHANNELS section. NIL means the active configuration, which is what a
-supervisor passes.
-
-The merge matters: a section that names only :ENABLED must keep the operator's
-allowlist rather than replacing it with nothing, because a channel that
-silently denies everybody looks exactly like a channel with no traffic."
+  "Return effective :FLUXER options for CHANNEL.
+Merges a section plist over the active config key-by-key so partial overrides preserve :ALLOWED-USERS."
   (let ((config (fluxer-channel-config channel)))
     (cond
       ((null config) (enchiridion:channel-config :fluxer))
@@ -1173,42 +919,30 @@ silently denies everybody looks exactly like a channel with no traffic."
 (declaim (ftype (function (fluxer-channel) list) channel-allowlist))
 
 (defun channel-allowlist (channel)
-  "Return the user ids the :FLUXER options allow. NIL means nobody.
-
-Anything that is not a list of ids is no allowlist: a single id written as a
-string, or a symbol where a string was meant, denies everybody rather than
-admitting somebody the operator did not name."
+  "Return the :ALLOWED-USERS list for CHANNEL, or NIL (deny all) if missing or not a list."
   (let ((allowlist (getf (channel-options channel) :allowed-users)))
     (if (listp allowlist) allowlist nil)))
 
 (declaim (ftype (function (fluxer-channel) string) channel-token-env))
 
 (defun channel-token-env (channel)
-  "Return the environment variable name the :FLUXER options name for the
-token, or the default when they name none."
+  "Return the configured :TOKEN-ENV name for CHANNEL, or +TOKEN-ENV-DEFAULT+."
   (or (non-blank-string (getf (channel-options channel) :token-env))
       +token-env-default+))
 
 (declaim (ftype (function (fluxer-channel) boolean) channel-custom-status-p))
 
 (defun channel-custom-status-p (channel)
-  "Return T when the :FLUXER options opt in to an agent-authored custom status.
-
-The default is off. A public status is a new way for the agent to be seen, and
-an operator who did not ask for one should never discover it is on."
+  "Return T when :CUSTOM-STATUS is explicitly enabled for CHANNEL (default NIL)."
   (not (null (getf (channel-options channel) :custom-status))))
 
 (declaim (ftype (function (fluxer-channel) (or null string))
                 custom-status-operator))
 
 (defun custom-status-operator (channel)
-  "Return the user id whose turns may set CHANNEL's public status, or NIL.
-
-An explicit :CUSTOM-STATUS-USER wins, but only when that id is one the
-allowlist admits. Without one, a single allowed user is the operator, because
-that is the one person the channel was set up to talk to. Several allowed users
-and no explicit id is ambiguous, so nobody may steer the public status: being
-allowed to send the agent a direct message is not permission to speak for it."
+  "Return the user ID permitted to update CHANNEL's custom status, or NIL.
+Uses :CUSTOM-STATUS-USER if allowlisted; otherwise the sole allowlisted user if there is exactly one.
+Multiple allowlisted users without an explicit :CUSTOM-STATUS-USER permits nobody."
   (let ((configured (non-blank-string
                      (getf (channel-options channel) :custom-status-user)))
         (allowed (channel-allowlist channel)))
@@ -1237,11 +971,7 @@ allowed to send the agent a direct message is not permission to speak for it."
                 status-seconds))
 
 (defun status-seconds (channel key minimum maximum)
-  "Return KEY from CHANNEL's options as seconds, or the shipped value.
-
-A value that is not an integer, or that falls outside MINIMUM..MAXIMUM, is the
-shipped default. The bounds are what keep one typo from pinning a status for a
-day or letting the cooldown disappear without the operator saying so."
+  "Return integer option KEY within [MINIMUM, MAXIMUM] for CHANNEL, or the shipped default."
   (let ((value (getf (channel-options channel) key)))
     (if (and (integerp value) (<= minimum value maximum))
         value
@@ -1265,17 +995,12 @@ day or letting the cooldown disappear without the operator saying so."
 ;;;; Saying what happened.
 
 (defparameter *log-lock* (bordeaux-threads:make-lock "fluxer log")
-  "Serialises the one line this channel writes at a time. Three threads write
-here, and two lines interleaved on one stream are two lines nobody can read.")
+  "Serializes log lines across the read, turn, and reaction threads.")
 
 (declaim (ftype (function (t integer) string) short-text))
 
 (defun short-text (text limit)
-  "Return TEXT as one line of at most LIMIT characters, for a log line.
-
-A frame that is not JSON, and a service's error body, can both be any length.
-A log line longer than a screen buries the line that matters, so it is cut
-here rather than left to the terminal to wrap."
+  "Return the first line of TEXT truncated to LIMIT characters with \"...\"."
   (let* ((line (if (stringp text) text (format nil "~S" text)))
          (end (or (position #\Newline line) (length line))))
     (if (< end limit)
@@ -1287,16 +1012,9 @@ here rather than left to the terminal to wrap."
 (declaim (ftype (function (string &rest t) null) note))
 
 (defun note (control &rest arguments)
-  "Write one scrubbed line about this channel to the error stream and return
-NIL.
-
-Scrubbed, because the things worth logging here are the things that came from
-the other end of a socket: a gateway's reason string and a condition a turn
-signalled are both text this process did not write."
+  "Write one flattened, secret-scrubbed log line to *ERROR-OUTPUT* and return NIL."
   (let* ((text (apply #'format nil control arguments))
-         ;; One line, whatever arrived: a gateway's reason string and a
-         ;; service's error body both reach this function, and a newline in
-         ;; either one would let the far end write a second log line.
+         ;; Flatten whitespace so untrusted remote strings cannot inject extra log lines.
          (flat (substitute #\Space #\Newline
                            (substitute #\Space #\Return
                                        (substitute #\Space #\Tab text))))
@@ -1329,21 +1047,14 @@ signalled are both text this process did not write."
 (declaim (ftype (function () real) real-seconds))
 
 (defun real-seconds ()
-  "Return a monotonic clock in seconds, for the heartbeat and the backoff.
-
-GET-UNIVERSAL-TIME has one second resolution, which is too coarse to send a
-heartbeat on time or to measure a backoff that starts at one second."
+  "Return monotonic clock time in seconds (sub-second resolution for heartbeats/backoff)."
   (/ (get-internal-real-time) internal-time-units-per-second))
 
 (declaim (ftype (function (t t integer) boolean) heartbeat-ack-overdue-p))
 
 (defun heartbeat-ack-overdue-p (sent acked now)
-  "Return T when the heartbeat sent at SENT was still unacknowledged at NOW.
-
-SENT and NOW are universal times, and ACKED is the last acknowledgement the
-gateway sent, or NIL when it has sent none; an ACKED older than SENT answers for
-an earlier beat. The gateway answers every beat it receives, so a window with no
-answer means the frames are not arriving."
+  "Return T when heartbeat sent at universal time SENT is unacknowledged past +HEARTBEAT-ACK-TIMEOUT-SECONDS+
+at NOW (ACKED is NIL or earlier than SENT)."
   (and (integerp sent)
        (integerp now)
        (> (- now sent) +heartbeat-ack-timeout-seconds+)
@@ -1353,13 +1064,8 @@ answer means the frames are not arriving."
 (declaim (ftype (function (integer integer &optional t) real) heartbeat-delay))
 
 (defun heartbeat-delay (beat interval &optional jitter)
-  "Return the seconds to wait before heartbeat number BEAT, where INTERVAL is
-the gateway's interval in milliseconds and BEAT counts the beats sent.
-
-The first heartbeat waits a random part of one interval, so a fleet of clients
-that reconnected together does not arrive together; every later heartbeat waits
-one whole interval. JITTER replaces the random choice, so a test names the
-number instead of accepting whatever the dice said."
+  "Return seconds to wait before heartbeat BEAT given INTERVAL ms.
+Beat 0 waits a random jitter fraction of INTERVAL (or explicit JITTER); later beats wait one full INTERVAL."
   (let ((interval (max 1 interval)))
     (if (plusp beat)
         (/ interval 1000)
@@ -1368,12 +1074,8 @@ number instead of accepting whatever the dice said."
 (declaim (ftype (function (t real) boolean) join-thread-bounded))
 
 (defun join-thread-bounded (thread seconds)
-  "Wait up to SECONDS for THREAD to finish, then destroy it.
-
-Return T when the thread had to be destroyed and NIL when it ended on its own.
-A plain join on a worker that is inside a model call is a stop that never
-finishes, and the deadline is what makes a stop a stop. The answer matters to
-the caller because a destroyed turn reached no terminal state."
+  "Wait up to SECONDS for THREAD to exit, destroying it if still alive.
+Returns T if destroyed, NIL if it exited cleanly."
   (let ((destroyed nil))
     (when (and thread (bordeaux-threads:thread-alive-p thread))
       (let ((deadline (+ (real-seconds) seconds)))
@@ -1390,11 +1092,7 @@ the caller because a destroyed turn reached no terminal state."
 (declaim (ftype (function (t) null) close-socket))
 
 (defun close-socket (socket)
-  "Close SOCKET and return NIL. An already closed socket is left alone.
-
-CLOSE-CONNECTION emits :close, and the handler below is idempotent, so a close
-from here and a close from the read thread settle to one state and one log
-line."
+  "Close SOCKET if non-NIL, ignoring errors. Idempotent with the :close handler."
   (when socket
     (ignore-errors (websocket-driver:close-connection socket)))
   nil)
@@ -1402,12 +1100,7 @@ line."
 (declaim (ftype (function (fluxer-socket t) null) note-socket-closed))
 
 (defun note-socket-closed (socket code)
-  "Note that SOCKET is finished, once, and wake everyone waiting on it.
-
-The library can fire :close twice for one close, so a second call does nothing:
-the code is kept, and the semaphores keep one wake-up per socket. Hello is
-signalled too, because a socket that closed will never send one and the thread
-waiting for it would otherwise wait out its whole timeout."
+  "Idempotently mark SOCKET closed, preserve its close CODE, and signal both DONE and HELLO semaphores."
   (bordeaux-threads:with-lock-held ((fluxer-socket-state-lock socket))
     (unless (fluxer-socket-closed-p socket)
       (setf (fluxer-socket-closed-p socket) t)
@@ -1420,8 +1113,7 @@ waiting for it would otherwise wait out its whole timeout."
 (declaim (ftype (function (fluxer-socket integer) boolean) wait-for-hello))
 
 (defun wait-for-hello (socket seconds)
-  "Wait up to SECONDS for the gateway's Hello. Return T when it arrived, or
-when the socket closed, which the caller tells apart with CLOSED-P."
+  "Wait up to SECONDS for Hello or socket close; callers disambiguate via CLOSED-P."
   (and (bordeaux-threads:wait-on-semaphore (fluxer-socket-hello socket)
                                            :timeout seconds)
        t))
@@ -1437,31 +1129,19 @@ when the socket closed, which the caller tells apart with CLOSED-P."
 (declaim (ftype (function (fluxer-channel fluxer-socket t) string) send-frame))
 
 (defun send-frame (channel socket frame)
-  "Write FRAME, a plist, to SOCKET as one JSON text frame and return the text.
-
-The lock is not decoration. The library's send is unlocked, so a heartbeat from
-this thread racing a reply from the worker interleaves two frames on one socket,
-and the gateway reads that as one corrupt frame and closes 4002."
+  "Serialize plist FRAME to JSON and write it to SOCKET under SEND-LOCK to prevent interleaved frames (4002)."
   (let ((text (json-text frame)))
     (bordeaux-threads:with-lock-held ((fluxer-channel-send-lock channel))
       (websocket-driver:send socket text))
     text))
 
-;;;; The custom status, from proposal to frame.
-;;;;
-;;;; The state is three facts and a lock. A proposal is either applied or
-;;;; refused, and the reason is part of the answer so a caller can log one line
-;;;; and a test can name the rule. Nothing here signals: a refused status must
-;;;; never cost the reply that was proposed beside it.
+;;;; Custom status state machine (never signals; failures must not affect replies).
 
 (declaim (ftype (function (fluxer-channel &optional integer) boolean)
                 custom-status-live-p))
 
 (defun custom-status-live-p (channel &optional (now (get-universal-time)))
-  "Return T when CHANNEL holds a custom status that has not expired at NOW.
-
-The caller holds the status lock, or accepts a snapshot. Expiry is strict: a
-status that ends at NOW is over, not one second more."
+  "Return T when CHANNEL has a non-empty custom status with strict expiry NOW < EXPIRES."
   (let ((text (fluxer-channel-status-text channel))
         (expires (fluxer-channel-status-expires channel)))
     (and (stringp text)
@@ -1473,11 +1153,7 @@ status that ends at NOW is over, not one second more."
                 send-presence))
 
 (defun send-presence (channel text)
-  "Send one op 3 frame setting TEXT, or clearing when TEXT is NIL.
-
-Return the frame text, or NIL when the channel has no socket to write to. A
-status proposed between connections is kept and reapplied on the next READY,
-so a missing socket is not a lost status."
+  "Send an op 3 presence frame for TEXT (or NIL to clear); returns frame text or NIL if disconnected."
   (let ((socket (fluxer-channel-socket channel)))
     (when socket
       (send-frame channel socket (presence-frame text)))))
@@ -1486,20 +1162,14 @@ so a missing socket is not a lost status."
                 apply-status-proposal))
 
 (defun apply-status-proposal (channel proposal now)
-  "Apply PROPOSAL, a validated text or :CLEAR, at NOW under the status lock.
-Return the decision plist.
-
-The lock is held across the write so two proposals cannot invert their frames
-on the wire. The frame write itself is short; a socket that blocks is the same
-socket the heartbeat is already writing to."
+  "Apply validated status PROPOSAL (text or :CLEAR) at NOW under STATUS-LOCK; return decision plist.
+Holds STATUS-LOCK across the socket write to preserve wire ordering and prevent racing with expiry."
   (let ((outcome nil) (reason nil) (frame-p nil) (frame-text nil))
     (bordeaux-threads:with-lock-held ((fluxer-channel-status-lock channel))
       (let ((cooldown (channel-custom-status-cooldown channel))
             (live (custom-status-live-p channel now))
             (changed (fluxer-channel-status-changed channel)))
-        ;; An expired status is already over. Forget it before the decision so
-        ;; a clear after the deadline is a no-op and a new text does not
-        ;; deduplicate against one nobody is showing.
+        ;; Drop expired status before deciding so clears are no-ops and new text does not deduplicate against it.
         (when (and (fluxer-channel-status-text channel) (not live))
           (setf (fluxer-channel-status-text channel) nil
                 (fluxer-channel-status-expires channel) nil))
@@ -1536,9 +1206,6 @@ socket the heartbeat is already writing to."
                  outcome :applied
                  frame-p t
                  frame-text proposal))))
-      ;; The lock covers the write as well as the decision, so two proposals
-      ;; cannot invert their frames and an expiry cannot clear one that this
-      ;; frame is about to republish.
       (when frame-p
         (handler-case
             (let ((sent (send-presence channel frame-text)))
@@ -1568,23 +1235,9 @@ socket the heartbeat is already writing to."
 
 (defun propose-custom-status (channel proposal &key (now (get-universal-time))
                                                 author)
-  "Propose PROPOSAL as the agent's temporary public custom status.
-
-PROPOSAL is a string to set, :CLEAR to remove it, or NIL for no proposal.
-AUTHOR names the sender whose turn made the proposal. When it is supplied, only
-the operator may set or clear the status, so one allowlisted friend cannot
-speak for the agent. An in-process caller omits AUTHOR and is the operator.
-
-Return a decision plist (:outcome OUTCOME :reason TEXT-OR-NIL :sent BOOL).
-OUTCOME is :disabled, :unchanged, :refused, :applied, or :cleared. A frame
-error leaves the outcome and reports the error in :reason: the status is
-recorded and a later READY can apply it.
-
-The proposal is the agent's own deliberate text. This function never reads a
-reply, a transcript, or reasoning, so nothing private becomes public by
-accident. Validation, the cooldown, deduplication, and expiry all live here
-rather than in the agent, because the channel is the last place before a frame
-leaves the process."
+  "Propose PROPOSAL (string, :CLEAR, or NIL) as CHANNEL's custom status, enforcing opt-in,
+operator authorization (when AUTHOR is given), validation, cooldown, and deduplication.
+Returns (:outcome KEYWORD :reason STRING-OR-NIL :sent BOOL)."
   (cond
     ((null proposal)
      (list :outcome :unchanged :reason nil :sent nil))
@@ -1611,13 +1264,8 @@ leaves the process."
                 expire-custom-status))
 
 (defun expire-custom-status (channel &key (now (get-universal-time)))
-  "Clear CHANNEL's custom status when it has expired at NOW, and return the
-decision.
-
-The clear goes out on the socket this connection recorded. A status that
-expires while the channel is disconnected is simply forgotten: a new session
-starts with no custom status, and REAPPLY-CUSTOM-STATUS does not send one that
-is already over."
+  "Clear CHANNEL's custom status if expired at NOW, sending an op 3 clear if connected.
+Returns (:outcome (:expired|:unchanged) :reason STRING-OR-NIL :sent BOOL)."
   (let ((expired nil) (sent nil) (reason nil))
     (bordeaux-threads:with-lock-held ((fluxer-channel-status-lock channel))
       (when (and (stringp (fluxer-channel-status-text channel))
@@ -1647,12 +1295,8 @@ is already over."
                 reapply-custom-status))
 
 (defun reapply-custom-status (channel &key (now (get-universal-time)))
-  "Reapply a still-current custom status on a new session.
-
-A READY follows an Identify, so the session that just began does not carry the
-old presence. A status whose lifetime is over is forgotten here instead of
-being published again, and an unchanged status is not resent: a reconnect is
-not a new proposal and must not restart the cooldown."
+  "Reapply a still-live custom status on a fresh READY session without resetting cooldown;
+drops statuses that expired while disconnected or if :CUSTOM-STATUS was disabled."
   (let ((outcome nil) (sent nil) (reason nil) (expired nil) (disabled nil))
     (bordeaux-threads:with-lock-held ((fluxer-channel-status-lock channel))
       (let ((text (fluxer-channel-status-text channel)))
@@ -1665,8 +1309,7 @@ not a new proposal and must not restart the cooldown."
            (setf outcome :disabled))
           ((null text) (setf outcome :unchanged))
           ((custom-status-live-p channel now)
-           ;; The lock covers the write so an expiry cannot clear the status
-           ;; between this decision and the frame that republishes it.
+           ;; Hold STATUS-LOCK across the write so expiry cannot race republish.
            (handler-case
                (if (send-presence channel text)
                    (setf outcome :reapplied sent t)
@@ -1710,13 +1353,8 @@ not a new proposal and must not restart the cooldown."
 (declaim (ftype (function (fluxer-channel) null) note-fresh-session))
 
 (defun note-fresh-session (channel)
-  "Forget the session the last transport carried, and its cursor. Return NIL.
-
-A dispatch sequence belongs to one session, and a new session numbers its
-dispatches from one again. A cursor kept across an Identify comes from a
-numbering that has ended, so the monotonic filter would drop every dispatch of
-the new session as a replay: the channel stays connected, heartbeats, and never
-answers another message. This is the one place that forgets."
+  "Clear session ID and dispatch sequence cursor. Must run on fresh Identify so the monotonic
+sequence filter does not drop new-session dispatches (which restart at 1) as replays."
   (setf (fluxer-channel-sequence channel) nil
         (fluxer-channel-session-id channel) nil)
   nil)
@@ -1724,10 +1362,7 @@ answers another message. This is the one place that forgets."
 (declaim (ftype (function (fluxer-channel fluxer-socket) string) send-identify))
 
 (defun send-identify (channel socket)
-  "Send op 2 Identify, the frame that authenticates a fresh session.
-
-The old session's id and cursor go first: identifying abandons them, and
-resuming a session this channel has left is answered with op 9."
+  "Reset session state and send op 2 Identify on SOCKET."
   (note-fresh-session channel)
   (send-frame channel socket (identify-frame (fluxer-channel-token channel))))
 
@@ -1745,12 +1380,7 @@ resuming a session this channel has left is answered with op 9."
 (declaim (ftype (function (string) list) bot-headers))
 
 (defun bot-headers (token)
-  "Return the headers every authenticated Fluxer call carries.
-
-The scheme is Bot and not Bearer: a Fluxer token is
-<applicationId>.<secret> and the service wants the first word to say so. The
-token appears here and nowhere else, and never in a query string, which is the
-one place a url ends up in a log."
+  "Return REST headers with Bot authorization scheme (never placed in URLs)."
   (list (cons :authorization (format nil "Bot ~A" token))
         (cons :content-type "application/json")
         (cons :user-agent "enchiridion/0.1.0")))
@@ -1758,10 +1388,7 @@ one place a url ends up in a log."
 (declaim (ftype (function (string) (or null string)) discover-gateway))
 
 (defun discover-gateway (token)
-  "Ask GET /gateway/bot where the websocket is and return its url, or NIL.
-
-A failure is one line and NIL rather than a condition: the caller is a
-reconnect loop that has a backoff for exactly this."
+  "Fetch websocket URL via GET /gateway/bot; logs and returns NIL on error."
   (handler-case
       (let* ((body (enchiridion.llm::bounded-http-request
                      (enchiridion.llm:make-http-request
@@ -1801,13 +1428,8 @@ reconnect loop that has a backoff for exactly this."
              (sleep (max 0 (min 0.05 (- end (real-seconds))))))))
 
 (defun post-message (token channel-id text &optional (attempt 0))
-  "POST TEXT to CHANNEL-ID as one message and return the new message id, or NIL.
-
-A 429 is repeated after the wait its own body asks for, up to
-+RATE-LIMIT-ATTEMPTS+ times, because the route bucket is 20 requests in 10
-seconds per user per channel and a long reply is several requests. Everything
-else in the 4xx range is reported once: a wrong channel id does not become
-right by being repeated."
+  "POST TEXT to CHANNEL-ID and return the new message ID, or NIL.
+Retries HTTP 429 up to +RATE-LIMIT-ATTEMPTS+ times using retry_after; signals TRANSPORT-ERROR otherwise."
   (let ((url (concatenate 'string +rest-base+ "/channels/" channel-id
                           "/messages"))
         (body (json-text (message-body text))))
@@ -1817,8 +1439,7 @@ right by being repeated."
                        :url url :headers (bot-headers token) :body body
                        :timeout +http-timeout-seconds+)
                       :body-limit 65536)))
-          ;; An unreadable reply is not a failed send: the message was
-          ;; accepted, and retrying it would post it twice.
+          ;; Ignore parse errors on 2xx: the message was accepted and retrying would duplicate it.
           (message-id (ignore-errors (enchiridion.llm:parse-json reply))))
       (dexador.error:http-request-failed (failure)
         (let ((status (dexador.error:response-status failure))
@@ -1838,10 +1459,7 @@ right by being repeated."
 (declaim (ftype (function (fluxer-channel string string) list) send-reply))
 
 (defun send-reply (channel target text)
-  "Scrub TEXT, cut it into messages, POST each to TARGET, and return their ids.
-
-An empty list means the scrubber left nothing to send, which is a success: the
-reply was empty, so there was nothing to say."
+  "Scrub, chunk, and POST TEXT to TARGET within +REPLY-DEADLINE-SECONDS+; return accepted message IDs."
   (let ((ids '())
         (*send-channel* channel)
         (*send-deadline* (+ (real-seconds) +reply-deadline-seconds+)))
@@ -1855,24 +1473,9 @@ reply was empty, so there was nothing to say."
           (when id (push id ids)))))
     (nreverse ids)))
 
-;;;; The reaction lifecycle.
-;;;;
-;;;; A direct message carries a marker while it is not answered: an hourglass
-;;;; while it waits for the worker, a wrench while its turn runs, and a warning
-;;;; when the turn fails, a reply cannot be delivered whole, or the message is
-;;;; evicted from the full queue. A delivered reply removes the marker.
-;;;;
-;;;; The calls are cosmetic and the paths that ask for them are not: the
-;;;; gateway's read thread and the turn worker only enqueue and return. One
-;;;; more thread owns the queue and every REST call. The queue is keyed by
-;;;; message and coalesces, so a state that arrives before the previous one was
-;;;; applied replaces it, and a reply delivered inside one round trip never
-;;;; flickers.
-;;;;
-;;;; The queue is bounded, because a channel that accepts messages faster than
-;;;; the reaction bucket carries them must not turn that into memory. The
-;;;; applied table is bounded too; it only remembers enough messages to skip a
-;;;; delete for a reaction that was never added.
+;;;; Reaction lifecycle: ⏳ queued -> 🔧 processing -> cleared on delivery (or ⚠️ on failure/eviction).
+;;;; Cosmetic REST calls run on a dedicated worker with a bounded, per-message coalescing queue
+;;;; and a bounded applied-marker table to skip redundant DELETEs.
 
 (defparameter +queued-reaction+ "⏳"
   "The marker on a direct message that is waiting for the worker.")
@@ -1881,53 +1484,30 @@ reply was empty, so there was nothing to say."
   "The marker on a direct message whose turn is running.")
 
 (defparameter +failed-reaction+ "⚠️"
-  "The marker left on a direct message whose turn or reply failed, and on one
-evicted from the full queue.")
+  "Marker left on a DM whose turn/reply failed or was evicted from the queue.")
 
 (defparameter +reaction-states+ '(:queued :processing :failed :delivered)
-  "The states a message is moved through. DELIVERED adds no marker: it clears
-the one that is there.")
+  "Valid reaction states (:DELIVERED clears the active marker).")
 
 (defparameter +max-pending-reactions+ 128
-  "How many distinct messages may wait for the reaction worker. Coalescing
-means one entry per message and not one per change, and the turn queue in front
-of the worker holds only 32, so this is headroom rather than a limit a healthy
-channel reaches.")
+  "Maximum distinct messages queued for the reaction worker (coalesced per message).")
 
 (defparameter +reaction-tracked-limit+ 512
-  "How many messages the applied table remembers. Entries for delivered
-messages are removed as they clear, and a failed marker stays because no later
-state revisits it. The bound is what keeps a long session's failures from
-growing the table without end; evicting one costs no request.")
+  "Maximum entries in the applied-reaction table (FIFO-evicted to bound memory).")
 
 (defparameter +reaction-drain-seconds+ 1
-  "How long a stop spends sending the markers it just set.
-
-The markers a stop creates are the ones a person is most likely to be staring
-at, so they get a drain of their own, and the abandoned turn's warning is
-enqueued first. One second is what a cosmetic marker is worth: the count line
-says how many waiting messages were left. The join that follows gives up at
-+REACTION-STOP-SECONDS+ either way, so a channel stop stays inside the
-supervisor's eight second share next to the turn worker's five.")
+  "Seconds spent draining final reaction updates (e.g., failure markers) during stop.")
 
 (defparameter +reaction-stop-seconds+ 1
-  "How long a stop waits for the reaction thread after its drain. A reaction
-that has not finished a call by then is destroyed, because a shutdown is worth
-more than a marker.")
+  "Seconds to wait for the reaction thread to exit after drain before destroying it.")
 
 (defparameter +reaction-timeout-seconds+ 5
-  "Seconds to wait for one reaction call. A marker is cosmetic and never worth
-the fifteen a reply gets, so a service that has stopped answering costs five
-seconds per call and one line rather than a channel's whole budget.")
+  "HTTP timeout in seconds for a single cosmetic reaction request.")
 
 (declaim (ftype (function (t) (or null string)) message-reaction-key))
 
 (defun message-reaction-key (data)
-  "Return the key that names DATA's message, or NIL.
-
-The key is the channel id and the message id, because a reaction route names
-both and a message id alone is unique only within its channel. A payload
-without either id has no message to react to."
+  "Return \"channel_id/message_id\" key for DATA, or NIL if either ID is missing."
   (let ((channel (text-field data :channel_id))
         (message (text-field data :id)))
     (when (and (plusp (length channel)) (plusp (length message)))
@@ -1952,9 +1532,7 @@ without either id has no message to react to."
 
 (defparameter +path-unreserved+
   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
-  "The characters RFC 3986 leaves alone in a path segment. Everything else is
-percent encoded, which is what an emoji needs: the route takes the emoji
-itself, and the emoji itself is four UTF-8 octets and not four characters.")
+  "RFC 3986 unreserved characters; all other UTF-8 octets (including emoji) are percent-encoded.")
 
 (declaim (ftype (function (string) string) percent-encode-segment))
 
@@ -1973,11 +1551,7 @@ itself, and the emoji itself is four UTF-8 octets and not four characters.")
 (declaim (ftype (function (string string) string) reaction-url))
 
 (defun reaction-url (key emoji)
-  "Return the route that adds or removes EMOJI on the message KEY names.
-
-Both ends are the same route: PUT adds the bot's own reaction, DELETE removes
-it. @ME is literal and is what says which reaction, because the authorization
-header already says which bot."
+  "Return the PUT/DELETE reaction endpoint URL for KEY and EMOJI (using literal @me)."
   (multiple-value-bind (channel message) (reaction-parts key)
     (format nil "~A/channels/~A/messages/~A/reactions/~A/@me"
             +rest-base+
@@ -2046,14 +1620,8 @@ Return T when the wait ran out and NIL when a stop cut it short."
                 reaction-call))
 
 (defun reaction-call (channel key emoji add-p &optional (attempt 0))
-  "Add EMOJI to KEY when ADD-P, or remove it, and return T on success.
-
-A 404 is a success: the message or the reaction is already gone, which is the
-state the caller wanted. A 429 is retried the way a reply is retried, up to
-+RATE-LIMIT-ATTEMPTS+ times, because every marker on every message shares one
-bucket of 30 requests per 10 seconds per channel. Anything else is one line and
-NIL: a marker that cannot be put is not a reason to stop a channel that is
-answering messages."
+  "PUT (when ADD-P) or DELETE EMOJI on KEY; return T on success.
+Treats 404 as success, retries 429 up to +RATE-LIMIT-ATTEMPTS+ times, and logs/returns NIL on other errors."
   (let ((token (non-blank-string (fluxer-channel-token channel))))
     (if (null token)
         (progn
@@ -2095,13 +1663,8 @@ answering messages."
                 apply-reaction-state))
 
 (defun apply-reaction-state (channel key state)
-  "Bring the bot's marker on KEY to STATE and return what is now applied.
-
-The applied table is what makes the cost proportional to the changes: a
-message coalesced from waiting straight to delivered never had the hourglass
-put, so there is nothing to delete. A call that fails leaves the table saying
-what is actually there, not what was wanted. A DELETE that fails stops the
-transition, because putting the new marker would leave the old one beside it."
+  "Transition KEY to STATE using the applied-marker table to skip redundant DELETEs.
+If removing the prior marker fails, aborts before adding the new one to avoid leaving two markers."
   (let* ((applied (applied-reaction channel key))
          (want (reaction-emoji state)))
     (cond
@@ -2115,8 +1678,6 @@ transition, because putting the new marker would leave the old one beside it."
        (let ((removed (or (null applied)
                           (reaction-call channel key applied nil))))
          (if (not removed)
-             ;; The old marker is still on the message, which is what the
-             ;; table says. A new one now would leave both.
              applied
              (progn
                (when applied (forget-reaction channel key))
@@ -2129,13 +1690,8 @@ transition, because putting the new marker would leave the old one beside it."
 (declaim (ftype (function (t t keyword) null) enqueue-reaction))
 
 (defun enqueue-reaction (channel key state)
-  "Ask the reaction worker to bring KEY to STATE and return NIL.
-
-Only a lock and a bounded append happen here. The gateway's read thread and
-the turn worker both call this, and neither may wait on a service that is
-decorative. A state for a message still waiting replaces the waiting one, so
-the worker only ever applies the newest one; a delivered state that replaces a
-waiting processing state costs no request at all."
+  "Non-blocking enqueue of STATE for KEY on the reaction worker.
+Coalesces by replacing any queued state for KEY; drops with a log line if full."
   (when (and (reaction-key-p key)
              (member state +reaction-states+))
     (let ((queued nil)
@@ -2176,12 +1732,7 @@ waiting processing state costs no request at all."
 (declaim (ftype (function (t) null) fail-pending-reactions))
 
 (defun fail-pending-reactions (channel)
-  "Turn every waiting or running marker into the warning one and return NIL.
-
-A message that has not reached a terminal state when the channel stops will
-never be answered, and an hourglass or a wrench left on it is a promise the
-process can no longer keep. A delivered state is left alone: its reply did
-reach the gateway, so the stop still clears its marker."
+  "Rewrite all queued :QUEUED/:PROCESSING reaction states to :FAILED (leaving :DELIVERED intact)."
   (bordeaux-threads:with-lock-held ((fluxer-channel-reaction-lock channel))
     (let ((states (fluxer-channel-reaction-pending channel))
           (keys '()))
@@ -2207,12 +1758,7 @@ reach the gateway, so the stop still clears its marker."
 (declaim (ftype (function (t) null) run-reaction-worker))
 
 (defun run-reaction-worker (channel)
-  "Apply queued reaction states until CHANNEL stops. Return NIL.
-
-The thread waits on a semaphore rather than polling, and the same semaphore
-wakes it at a stop. A stop keeps draining until the queue is empty or its
-deadline passes, so the warning markers a stop creates are sent when the
-service still answers."
+  "Drain queued reaction states until stopped and either empty or past +REACTION-DRAIN-SECONDS+."
   (loop
     (let ((entry (dequeue-reaction channel)))
       (cond
@@ -2247,13 +1793,7 @@ service still answers."
 (declaim (ftype (function (t) null) stop-reaction-worker))
 
 (defun stop-reaction-worker (channel)
-  "Mark what is waiting as failed, drain for a bounded time, and join the
-reaction thread. Return NIL.
-
-The thread is joined after the drain with +REACTION-STOP-SECONDS+, not the
-turn worker's five: a reaction is never worth making a shutdown wait on a
-service that may be gone. The applied table is left as it is: a restart resets
-it, and until then it is the only record of which markers the bot put down."
+  "Mark pending reactions failed, drain up to +REACTION-DRAIN-SECONDS+, and bounded-join the reaction thread."
   (let ((worker (fluxer-channel-reaction-worker channel)))
     (when worker
       (fail-pending-reactions channel)
@@ -2262,9 +1802,7 @@ it, and until then it is the only record of which markers the bot put down."
             (+ (real-seconds) +reaction-drain-seconds+))
       (bordeaux-threads:signal-semaphore (fluxer-channel-reaction-ready channel))
       (join-thread-bounded worker +reaction-stop-seconds+)
-      ;; The thread is joined or destroyed, so these reads are not racing a
-      ;; writer. Taking the lock here would deadlock if the thread died while
-      ;; it held it, which is the one thing a bounded join cannot rule out.
+      ;; Thread is stopped; avoid taking REACTION-LOCK in case it was destroyed while holding it.
       (let ((left (length (fluxer-channel-reaction-order channel))))
         (setf (fluxer-channel-reaction-pending channel) (make-hash-table :test #'equal)
               (fluxer-channel-reaction-order channel) nil)
@@ -2278,17 +1816,9 @@ it, and until then it is the only record of which markers the bot put down."
 (declaim (ftype (function (fluxer-channel t) null) enqueue-inkbound))
 
 (defun enqueue-inkbound (channel data)
-  "Hand DATA to the worker and return NIL.
-
-The queue is bounded. A turn can take minutes, and the gateway does not stop
-sending while it runs, so a full queue drops the oldest waiting message and
-counts it rather than growing without a limit. The drop is one log line, which
-is loud enough to act on and quiet enough not to stop the channel, and the
-message it dropped is marked failed because no turn will ever answer it.
-
-The stop flag is read under the same lock that writes the queue. A message
-that arrives after a stop began is therefore never left waiting for a worker
-that has gone: it is refused, and marked failed for the same reason."
+  "Enqueue inbound payload DATA for the turn worker under PENDING-LOCK.
+Evicts the oldest queued message (marking it :FAILED) when at +MAX-PENDING-MESSAGES+,
+and refuses new messages (marking them :FAILED) once STOPPING-P is set."
   (let ((dropped nil)
         (refused nil))
     (bordeaux-threads:with-lock-held ((fluxer-channel-pending-lock channel))
@@ -2316,12 +1846,7 @@ that has gone: it is refused, and marked failed for the same reason."
 (declaim (ftype (function (fluxer-channel) t) claim-inkbound))
 
 (defun claim-inkbound (channel)
-  "Return the oldest waiting payload for the worker, or NIL.
-
-NIL means the queue was empty, or the channel is stopping. The stop flag and
-the queue are read under one lock, so a stop cannot begin between the check and
-the pop: a message is either claimed by a running worker or left for
-STOP-WORKER to mark failed, never both."
+  "Pop the oldest queued payload under PENDING-LOCK, or return NIL if empty or stopping."
   (bordeaux-threads:with-lock-held ((fluxer-channel-pending-lock channel))
     (unless (fluxer-channel-stopping-p channel)
       (pop (fluxer-channel-pending channel)))))
@@ -2331,11 +1856,7 @@ STOP-WORKER to mark failed, never both."
 (declaim (ftype (function (t (or null string)) null) note-active-reaction))
 
 (defun note-active-reaction (channel key)
-  "Record the message the worker is inside, or clear it with NIL.
-
-A stop that has to destroy the worker reads this to mark the abandoned message
-failed. The pending lock is the one both sides already take, and neither side
-holds it across a call that waits."
+  "Record or clear the active message key under PENDING-LOCK so stop can mark an abandoned turn failed."
   (bordeaux-threads:with-lock-held ((fluxer-channel-pending-lock channel))
     (setf (fluxer-channel-active-reaction channel) key))
   nil)
@@ -2343,17 +1864,8 @@ holds it across a call that waits."
 (declaim (ftype (function (fluxer-channel t) null) handle-inkbound))
 
 (defun handle-inkbound (channel data)
-  "Run one turn for DATA and send its reply. Return NIL.
-
-The turn is an injected function, and a turn that signals, or one that answers
-without :OK-P, is one log line and no reply. A worker that dies on the first
-bad turn is a channel that stops answering, and the gateway does not care whose
-fault it was.
-
-The reaction is part of the same lifecycle. DELIVERED is enqueued only when
-SEND-REPLY returns, which is the one answer that says every piece reached the
-gateway; a reply whose second piece fails leaves FAILED, because a person who
-got half an answer has not got the answer."
+  "Execute one turn for DATA and send its reply, catching errors so the worker stays alive.
+Marks :DELIVERED only after all reply chunks succeed; otherwise marks :FAILED."
   (let* ((message (message-create->msg data))
          (key (message-reaction-key data))
          (turn (fluxer-channel-turn channel))
@@ -2405,8 +1917,7 @@ got half an answer has not got the answer."
              (t
               (enqueue-reaction channel key :failed)))
            (setf completed t))
-      ;; A destroyed thread that runs this cleanup did not reach a terminal
-      ;; state, so the marker stays set for STOP-WORKER to find and mark failed.
+      ;; Leave active-reaction set if destroyed mid-turn so STOP-WORKER marks it failed.
       (when completed
         (note-active-reaction channel nil))))
   nil)
@@ -2414,15 +1925,8 @@ got half an answer has not got the answer."
 (declaim (ftype (function (fluxer-channel) null) run-worker))
 
 (defun run-worker (channel)
-  "Run every inkbound message through the turn, one at a time, until stopped.
-
-One worker thread, so two turns never run at once and messages are answered in
-the order they arrived. The wait is signalled as well as timed, so a lost
-wake-up costs +WORKER-WAIT-SECONDS+ and never a message.
-
-The stop flag is checked again by CLAIM-INKBOUND, under the queue lock, when a
-wake-up is turned into work. A stop that lands after the wait but before the
-pop therefore ends the loop instead of starting one more turn."
+  "Process queued inbound messages sequentially until STOPPING-P is set.
+Re-checks STOPPING-P under PENDING-LOCK via CLAIM-INKBOUND before starting each turn."
   (loop
     (when (fluxer-channel-stopping-p channel)
       (return))
@@ -2437,13 +1941,8 @@ pop therefore ends the loop instead of starting one more turn."
 (declaim (ftype (function (fluxer-channel) null) stop-worker))
 
 (defun stop-worker (channel)
-  "Ask the worker to finish, wake it, and join it for a bounded time. Return
-NIL.
-
-A turn that had to be destroyed, and every message still waiting behind it,
-will never be answered, so each is marked failed on the message itself. The
-markers are only enqueued here: the reaction thread is stopped after this, and
-that order is what lets it send them."
+  "Set STOPPING-P, wake and bounded-join the turn worker, and mark any destroyed or queued
+messages :FAILED. Must run before STOP-REACTION-WORKER so failure markers can be drained."
   (bordeaux-threads:with-lock-held ((fluxer-channel-pending-lock channel))
     (setf (fluxer-channel-stopping-p channel) t))
   (bordeaux-threads:signal-semaphore (fluxer-channel-pending-ready channel))
@@ -2467,18 +1966,12 @@ that order is what lets it send them."
       (note "~D waiting message~:P dropped at the stop." (length waiting))))
   nil)
 
-;;;; The read thread's handlers.
-;;;;
-;;;; Everything below runs on the library's read thread. It parses, it notes,
-;;;; and it hands a payload to the worker. It never runs a turn and it never
-;;;; waits: a read thread inside a model call is a socket whose heartbeats
-;;;; stop, and the gateway closes that with 4009.
+;;;; Read-thread frame handlers (must stay non-blocking so heartbeats never stall).
 
 (declaim (ftype (function (t) (or null string)) message-text))
 
 (defun message-text (message)
-  "Return MESSAGE as text, or NIL. A binary frame is not something this
-protocol uses: every gateway frame is JSON."
+  "Return MESSAGE if it is a text string, else NIL (binary frames are ignored)."
   (and (stringp message) message))
 
 (declaim (ftype (function (fluxer-socket t) null) note-hello))
@@ -2502,13 +1995,7 @@ protocol uses: every gateway frame is JSON."
                 note-invalid-session))
 
 (defun note-invalid-session (channel socket)
-  "Identify again on the same socket after op 9.
-
-The socket stays open and unauthenticated after an invalid session, so closing
-it and reconnecting would throw away a working transport. SEND-IDENTIFY drops
-the session id and the cursor: a resume after an invalid session is answered
-with op 9 again, and op 9 is never sent with d true, so an Identify is the only
-frame that can work."
+  "Re-identify on the same open socket after op 9 (session is unresumable)."
   (unless (fluxer-channel-stopping-p channel)
     (send-identify channel socket))
   nil)
@@ -2516,10 +2003,7 @@ frame that can work."
 (declaim (ftype (function (fluxer-socket) null) note-reconnect-requested))
 
 (defun note-reconnect-requested (socket)
-  "Note that the gateway asked for a reconnect, and close the socket.
-
-The close ends the read thread's loop, and the reconnect loop decides from the
-session's age whether the next socket resumes or identifies."
+  "Log op 7 reconnect request and close SOCKET so the reconnect loop resumes or re-identifies."
   (note "the gateway asked for a reconnect.")
   (close-socket socket)
   nil)
@@ -2529,12 +2013,7 @@ session's age whether the next socket resumes or identifies."
 (declaim (ftype (function (t) (or null string)) ready-user-id))
 
 (defun ready-user-id (data)
-  "Return the agent's own user id in DATA, a READY payload, or NIL.
-
-The id is the one under :USER, which is the shape a READY event carries. A
-flattened :USER_ID is accepted as well, because the alternative to a tolerant
-read here is an unarmed echo guard, and an unarmed echo guard is the agent
-answering itself in a loop that costs tokens and never ends."
+  "Extract the bot's user ID from READY payload DATA (:user/:id or :user_id), or NIL."
   (or (let ((user (and (consp data) (getf data :user))))
         (and (consp user) (non-blank-string (getf user :id))))
       (non-blank-string (and (consp data) (getf data :user_id)))))
@@ -2542,12 +2021,8 @@ answering itself in a loop that costs tokens and never ends."
 (declaim (ftype (function (fluxer-channel t) null) note-ready))
 
 (defun note-ready (channel frame)
-  "Record who the agent is and which session this socket is, from READY.
-
-The reconnect budget is not reset here. A gateway that completes the handshake
-and closes again reaches READY as well, so a reset here would retry it once a
-second for the life of the process; only the reconnect loop can measure a
-connection that stayed up. See NEXT-ATTEMPT."
+  "Record self ID and session ID from READY and reapply any live custom status.
+Does not reset reconnect attempts (handled by NEXT-ATTEMPT after +RECONNECT-STABLE-SECONDS+)."
   (let ((data (frame-data frame)))
     (when (consp data)
       (setf (fluxer-channel-self-id channel) (ready-user-id data))
@@ -2555,21 +2030,13 @@ connection that stayed up. See NEXT-ATTEMPT."
             (non-blank-string (getf data :session_id))))
     (note "connected as ~A." (or (fluxer-channel-self-id channel)
                                  "an unknown user"))
-    ;; READY follows an Identify, so this session began without the presence
-    ;; the last one had. A status that is still current goes out again; one
-    ;; that has expired is forgotten rather than republished.
     (reapply-custom-status channel))
   nil)
 
 (declaim (ftype (function (list t) t) check-sender))
 
 (defun check-sender (allowlist id)
-  "Signal UNAUTHORIZED when ID is not on ALLOWLIST, and return ID when it is.
-
-The condition is the policy in one object: a caller in this process can catch
-it and ask, rather than read a NIL and guess which rule said no. The report
-reads \"~A is not allowed to talk to this agent\", so the sender's id is what
-the condition carries."
+  "Return ID if allowlisted, otherwise signal ENCHIRIDION.ERRORS:UNAUTHORIZED."
   (unless (allowed-p allowlist id)
     (error 'enchiridion.errors:unauthorized :channel (or id "an unknown sender")))
   id)
@@ -2577,17 +2044,8 @@ the condition carries."
 (declaim (ftype (function (fluxer-channel t) null) offer-message))
 
 (defun offer-message (channel data)
-  "Allow or drop DATA, a MESSAGE_CREATE payload, and return NIL.
-
-Three refusals, each with its own line and none of them an error out of this
-thread: a message that is not a direct message from a person, and a direct
-message from someone the allowlist does not name. A refusal is never answered,
-because an answer is a reply to whoever asked.
-
-The waiting marker is queued before the message reaches the worker, so the
-worker's processing marker cannot overtake it: the two states are read in the
-order they were enqueued, and a marker that arrived late would move a message
-back to waiting while its turn ran."
+  "Filter and allowlist-check MESSAGE_CREATE DATA, logging refusals without replying.
+Enqueues :QUEUED before handing DATA to the worker so :PROCESSING cannot overtake it."
   (cond
     ((not (inkbound-p data (fluxer-channel-self-id channel)))
      (note "dropped a message that is not a direct message from a person."))
@@ -2606,13 +2064,8 @@ back to waiting while its turn ran."
 (declaim (ftype (function (fluxer-channel t) null) note-session-start))
 
 (defun note-session-start (channel frame)
-  "Forget the old cursor when READY names a session the channel has not been in.
-
-A READY whose session id differs from the one in hand is a new numbering that
-starts at one. Dropping the cursor here recovers a stale one even on a path that
-never sent an Identify, and the READY then passes the filter and records the new
-session. A resume answers with the session id already in hand, so a resumed
-session keeps its cursor and keeps dropping what it has answered."
+  "Reset the sequence cursor if READY carries a new session_id (numbering restarts at 1);
+resumed sessions keep their existing cursor."
   (let* ((data (frame-data frame))
          (session (non-blank-string (and (consp data) (getf data :session_id)))))
     (when (and session
@@ -2624,15 +2077,8 @@ session keeps its cursor and keeps dropping what it has answered."
 (declaim (ftype (function (fluxer-channel t) null) handle-dispatch))
 
 (defun handle-dispatch (channel frame)
-  "Advance the sequence and hand an inkbound direct message to the worker.
-
-The sequence advances for every dispatch, including the ones dropped, because
-it is what a heartbeat reports and what a resume replays from. A replayed
-dispatch keeps its old number, so a redelivery is dropped here rather than
-answered twice.
-
-READY is read before the filter: it is the one frame that says the numbering
-restarted, and a cursor from the old numbering would drop it."
+  "Advance the monotonic dispatch sequence and route READY or MESSAGE_CREATE frames.
+Checks READY session change before filtering so a stale cursor cannot drop a new session's READY."
   (when (ready-p frame)
     (note-session-start channel frame))
   (multiple-value-bind (sequence fresh-p)
@@ -2647,27 +2093,15 @@ restarted, and a cursor from the old numbering would drop it."
 (declaim (ftype (function (fluxer-channel t) boolean) current-socket-p))
 
 (defun current-socket-p (channel socket)
-  "Return T when SOCKET is the socket CHANNEL is working on.
-
-The library closes a socket from another thread by destroying its read thread,
-and a frame that thread had already read can still arrive afterwards. It carries
-the sequence of a session that is over, so letting it through would move the
-cursor the live session reads from and turn real dispatches into replays. NIL,
-the state before the first socket is recorded, accepts a frame: that is a new
-connection's Hello arriving before the channel records the socket."
+  "Return T when SOCKET is CHANNEL's active socket (or none is recorded yet).
+Ignores late frames from destroyed prior sockets so they cannot corrupt the live sequence cursor."
   (let ((current (fluxer-channel-socket channel)))
     (or (null current) (eq current socket))))
 
 (declaim (ftype (function (fluxer-channel fluxer-socket t) null) handle-text))
 
 (defun handle-text (channel socket message)
-  "Handle one inbound websocket message and return NIL.
-
-This runs on the library's read thread, so it does three cheap things and no
-more: parse the frame, note what the channel needs, and hand anything that
-needs a turn to the worker. The error handler is what keeps a bad frame from
-ending the read loop, because the library's loop would treat a signal as the
-end of the connection."
+  "Parse and dispatch one inbound JSON text frame on the read thread, catching all errors."
   (handler-case
       (let ((text (message-text message)))
         (when (and text (current-socket-p channel socket))
@@ -2693,11 +2127,7 @@ end of the connection."
 (declaim (ftype (function (fluxer-channel) boolean) resume-open-p))
 
 (defun resume-open-p (channel)
-  "Return T when the session this channel had can still be resumed.
-
-The gateway keeps a session for +RESUME-WINDOW-SECONDS+ after a transport end,
-so a reconnect inside the window resumes and is sent what it missed. After it,
-a fresh Identify is the only frame that works."
+  "Return T when CHANNEL has a session ID within +RESUME-WINDOW-SECONDS+ of disconnect."
   (and (non-blank-string (fluxer-channel-session-id channel))
        (resume-window-open-p (fluxer-channel-session-ended channel)
                              (get-universal-time))))
@@ -2706,10 +2136,7 @@ a fresh Identify is the only frame that works."
                 open-socket))
 
 (defun open-socket (channel url)
-  "Connect to URL and return the socket, or NIL after one line.
-
-The handlers go on before the connection starts, because the close can fire
-inside START-CONNECTION and a listener attached afterwards would miss it."
+  "Create fluxer-socket, attach handlers before START-CONNECTION, and return it (or NIL on error)."
   (handler-case
       (let ((socket (make-instance 'fluxer-socket :url url)))
         (websocket-driver:on :message socket
@@ -2732,17 +2159,9 @@ inside START-CONNECTION and a listener attached afterwards would miss it."
 (declaim (ftype (function (fluxer-channel fluxer-socket) null) run-heartbeats))
 
 (defun run-heartbeats (channel socket)
-  "Send heartbeats until the socket closes or CHANNEL is stopped. Return NIL.
-
-Every beat is due one interval after the last one was written, measured from
-the clock rather than accumulated, so a slow send cannot make the beats drift
-late. The wait is sliced at one second, which is what makes a stop or a close
-take effect at once instead of one interval later.
-
-A half open transport looks like a quiet one: writes still succeed and no frame
-arrives again. This is the only place that can tell them apart, so a beat left
-unanswered for +HEARTBEAT-ACK-TIMEOUT-SECONDS+ closes the socket here and lets
-the reconnect loop do the rest."
+  "Send heartbeats on SOCKET until closed or stopped, slicing waits at 1s for responsiveness
+and custom-status expiry. Closes SOCKET if an ACK is overdue past +HEARTBEAT-ACK-TIMEOUT-SECONDS+
+to detect half-open transports."
   (let* ((beat 0)
          (interval (or (fluxer-socket-heartbeat-interval socket)
                        +default-heartbeat-interval+))
@@ -2752,8 +2171,6 @@ the reconnect loop do the rest."
       (when (or (fluxer-channel-stopping-p channel)
                 (fluxer-socket-closed-p socket))
         (return))
-      ;; The heartbeat is already awake at least once a second, so the status
-      ;; deadline rides on it instead of starting a timer of its own.
       (when (fluxer-channel-status-text channel)
         (expire-custom-status channel))
       (when (heartbeat-ack-overdue-p sent (fluxer-socket-last-ack socket)
@@ -2777,11 +2194,7 @@ the reconnect loop do the rest."
 (declaim (ftype (function (fluxer-channel fluxer-socket) null) run-session))
 
 (defun run-session (channel socket)
-  "Authenticate SOCKET and run it until it closes or CHANNEL is stopped.
-
-A session young enough to resume is resumed, because a resume replays what the
-disconnect lost; anything else identifies. Both are followed by heartbeats,
-since the interval is Hello's and Hello has already arrived."
+  "Send Resume (if within window) or Identify, then run the heartbeat loop."
   (if (resume-open-p channel)
       (send-resume channel socket)
       (send-identify channel socket))
@@ -2791,8 +2204,7 @@ since the interval is Hello's and Hello has already arrived."
 (declaim (ftype (function (fluxer-socket) null) note-pre-hello-close))
 
 (defun note-pre-hello-close (socket)
-  "Note that the gateway closed before Hello, which is where a refused token
-shows up first."
+  "Log a gateway close that occurred before Hello."
   (note "the gateway closed before Hello: ~A."
         (close-code-note (fluxer-socket-close-code socket)))
   nil)
@@ -2800,11 +2212,7 @@ shows up first."
 (declaim (ftype (function (fluxer-channel) t) connect-once))
 
 (defun connect-once (channel)
-  "Connect, run the session, and return the close code or NIL.
-
-NIL means no connection was opened at all, which is a discovery or handshake
-failure. Anything else is the code the socket ended with, or :CLOSED when it
-ended without one."
+  "Run one gateway connection attempt; return close code, :CLOSED, or NIL on discovery/connect failure."
   (let ((socket nil))
     (unwind-protect
          (progn
@@ -2836,10 +2244,7 @@ ended without one."
 (declaim (ftype (function (fluxer-channel integer) null) sleep-backoff))
 
 (defun sleep-backoff (channel attempt)
-  "Wait NEXT-BACKOFF seconds for ATTEMPT, or until CHANNEL is stopped.
-
-The wait is sliced, so a stop during a sixty second backoff takes effect in
-half a second rather than in a minute."
+  "Sleep NEXT-BACKOFF seconds in stop-aware slices."
   (let ((deadline (+ (real-seconds) (next-backoff attempt))))
     (loop while (and (not (fluxer-channel-stopping-p channel))
                      (< (real-seconds) deadline))
@@ -2851,30 +2256,17 @@ half a second rather than in a minute."
 (declaim (ftype (function (fluxer-channel) null) shutdown))
 
 (defun shutdown (channel)
-  "Close the socket, stop the turn worker, and drain the reaction thread. Return
-NIL.
-
-Safe to run twice and safe on a channel that never started: a stop and an
-unwinding start both run it. The turn worker stops first because it is what
-turns a waiting message into a failed one, and the reaction thread has to still
-be there to send those markers."
+  "Idempotently close the socket, stop the turn worker, and drain the reaction worker.
+Stops the turn worker before the reaction worker so failure markers can still be sent."
   (close-socket (fluxer-channel-socket channel))
   (stop-worker channel)
   (stop-reaction-worker channel)
   nil)
 
 (defmethod enchiridion.channel:channel-start ((channel fluxer-channel) &key config)
-  "Start CHANNEL and block until it is stopped.
-
-The method does not return while the channel is live. The supervisor calls it
-again when it returns, so a return is the restart signal and the reconnect
-budget is what makes returning rare: five backed-off attempts, then one line
-and a :FAILED state for the supervisor to try again in a second.
-
-A missing token and a missing turn function are both refused here, in one line,
-before any socket opens. Neither signals: they are configuration facts the
-operator can see in the log, and a channel that signals them takes a supervisor
-down over a mis-set variable."
+  "Start CHANNEL and block until stopped or reconnect budget (+MAX-RECONNECT-ATTEMPTS+) is exhausted.
+Logs and marks :FAILED without signalling if token or turn function is missing.
+Fatal close codes stop retrying immediately."
   (when config
     (setf (fluxer-channel-config channel) config))
   (let ((token (resolve-token :name (channel-token-env channel))))
@@ -2895,13 +2287,11 @@ down over a mis-set variable."
         (fluxer-channel-dropped channel) 0
         (fluxer-channel-pending channel) nil
         (fluxer-channel-active-reaction channel) nil
-        ;; A socket left over from a stop is not the one the next connection
-        ;; will read, and CURRENT-SOCKET-P would take its frames for another's
+        ;; Clear any stale socket so CURRENT-SOCKET-P does not misclassify frames.
         (fluxer-channel-socket channel) nil
         (enchiridion.channel:channel-live-p channel) t
         (enchiridion.channel:channel-state channel) :live)
-  ;; The reaction thread starts first, so no accepted message can outrun the
-  ;; thread that will carry its markers.
+  ;; Start reaction worker before turn worker so queued messages have a reaction consumer.
   (start-reaction-worker channel)
   (setf (fluxer-channel-worker channel)
         (bordeaux-threads:make-thread
@@ -2945,10 +2335,7 @@ down over a mis-set variable."
   channel)
 
 (defmethod enchiridion.channel:channel-stop ((channel fluxer-channel))
-  "Stop CHANNEL: close the socket, wake the worker, and join what is left.
-
-Safe to call twice, and safe on a channel that never started, because a
-supervisor stops every channel it holds."
+  "Idempotently stop CHANNEL and set its state to :STOPPED."
   (shutdown channel)
   (setf (enchiridion.channel:channel-live-p channel) nil
         (enchiridion.channel:channel-state channel) :stopped)
@@ -2956,11 +2343,7 @@ supervisor stops every channel it holds."
 
 (defmethod enchiridion.channel:channel-send ((channel fluxer-channel) target text
                                              &key reply-to)
-  "Send TEXT to TARGET, the channel id of a direct message conversation.
-
-REPLY-TO is accepted and not sent: a direct message has one conversation, so a
-reply reference buys nothing the target does not already say. The return value
-is the list of message ids the gateway accepted."
+  "Send TEXT to DM channel TARGET, returning accepted message IDs (REPLY-TO is ignored)."
   (declare (ignore reply-to))
   (unless (fluxer-channel-token channel)
     (error 'enchiridion.errors:configuration-error
@@ -2986,10 +2369,7 @@ is the list of message ids the gateway accepted."
                 start-fluxer))
 
 (defun start-fluxer (&key turn config)
-  "Create a Fluxer channel, start it, and return it.
-
-This is the one shot entry for a caller that is not a supervisor, and it blocks
-for as long as the channel runs, exactly as START-CLI does."
+  "Create, start, and block on a Fluxer channel; return it when stopped."
   (let ((channel (make-fluxer-channel :turn turn :config config)))
     (enchiridion.channel:channel-start channel)
     channel))

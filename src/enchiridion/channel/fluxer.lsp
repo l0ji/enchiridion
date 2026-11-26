@@ -277,11 +277,15 @@ rather than false."
                  :session_id session-id
                  :seq (if (integerp sequence) sequence +json-null+))))
 
-(declaim (ftype (function (string) list) message-body))
+(declaim (ftype (function (string (or null string)) list) message-body))
 
-(defun message-body (text)
-  "Return the single-field REST body (:content TEXT) for posting a message."
-  (list :content text))
+(defun message-body (text reply-to)
+  "Return the REST body for TEXT, with a non-pinging reply reference when set."
+  (if reply-to
+      (list :content text
+            :message_reference (list :message_id reply-to)
+            :allowed_mentions (list :replied_user nil))
+      (list :content text)))
 
 ;;;; Custom status validation and frames.
 ;;;; Enforces single-line, bounded, secret-free proposals with channel-owned TTL and cooldown.
@@ -1410,7 +1414,14 @@ sequence filter does not drop new-session dispatches (which restart at 1) as rep
   "Return the message id in DATA, a message object, or NIL."
   (and (consp data) (non-blank-string (getf data :id))))
 
-(declaim (ftype (function (string string string &optional integer)
+(declaim (ftype (function (t) (or null string)) reply-anchor))
+
+(defun reply-anchor (data)
+  "Return the gateway ID for a default or reply message."
+  (when (member (getf data :type 0) '(0 19))
+    (message-id data)))
+
+(declaim (ftype (function (string string string (or null string))
                           (or null string))
                 post-message))
 
@@ -1427,51 +1438,59 @@ sequence filter does not drop new-session dispatches (which restart at 1) as rep
                (error 'enchiridion.errors:transport-error :detail "reply stopped or timed out"))
              (sleep (max 0 (min 0.05 (- end (real-seconds))))))))
 
-(defun post-message (token channel-id text &optional (attempt 0))
-  "POST TEXT to CHANNEL-ID and return the new message ID, or NIL.
-Retries HTTP 429 up to +RATE-LIMIT-ATTEMPTS+ times using retry_after; signals TRANSPORT-ERROR otherwise."
-  (let ((url (concatenate 'string +rest-base+ "/channels/" channel-id
-                          "/messages"))
-        (body (json-text (message-body text))))
-    (handler-case
-        (let ((reply (enchiridion.llm::bounded-http-request
-                      (enchiridion.llm:make-http-request
-                       :url url :headers (bot-headers token) :body body
-                       :timeout +http-timeout-seconds+)
-                      :body-limit 65536)))
-          ;; Ignore parse errors on 2xx: the message was accepted and retrying would duplicate it.
-          (message-id (ignore-errors (enchiridion.llm:parse-json reply))))
-      (dexador.error:http-request-failed (failure)
-        (let ((status (dexador.error:response-status failure))
-              (payload (dexador.error:response-body failure)))
-          (if (and (eql status 429) (< attempt +rate-limit-attempts+))
-              (progn
-                (wait-to-retry (or (retry-after-seconds payload)
-                                   (next-backoff (1+ attempt))))
-                (post-message token channel-id text (1+ attempt)))
-              (error 'enchiridion.errors:transport-error
-                     :status status
-                     :detail (format nil "~D after ~D attempt~:P: ~A"
-                                     status
-                                     (1+ attempt)
-                                     (error-note payload)))))))))
+(defun post-message (token channel-id text reply-to)
+  "Post TEXT to CHANNEL-ID, dropping the reference if its message is gone."
+  (let ((url (concatenate 'string +rest-base+ "/channels/" channel-id "/messages"))
+        (headers (bot-headers token))
+        (rate-limits 0))
+    (loop for attempt from 1 do
+      (when (and *send-channel* (fluxer-channel-stopping-p *send-channel*))
+        (error 'enchiridion.errors:transport-error :detail "reply stopped"))
+      (handler-case
+          (let ((reply (enchiridion.llm::bounded-http-request
+                        (enchiridion.llm:make-http-request
+                         :url url :headers headers
+                         :body (json-text (message-body text reply-to))
+                         :timeout +http-timeout-seconds+)
+                        :body-limit 65536)))
+            ;; A 2xx accepted the message even if its response cannot be parsed
+            (return (message-id (ignore-errors (enchiridion.llm:parse-json reply)))))
+        (dexador.error:http-request-failed (failure)
+          (let ((status (dexador.error:response-status failure))
+                (payload (dexador.error:response-body failure)))
+            (cond
+              ((and (eql status 429) (< rate-limits +rate-limit-attempts+))
+               (incf rate-limits)
+               (wait-to-retry (or (retry-after-seconds payload)
+                                  (next-backoff rate-limits))))
+              ((and reply-to (eql status 404)
+                    (equal "UNKNOWN_MESSAGE"
+                           (ignore-errors
+                             (getf (enchiridion.llm:parse-json payload) :code))))
+               (note "reply target ~A was not found; sending without the reference."
+                     reply-to)
+               (setf reply-to nil))
+              (t
+               (error 'enchiridion.errors:transport-error
+                      :status status
+                      :detail (format nil "~D after ~D attempt~:P: ~A"
+                                      status attempt (error-note payload)))))))))))
 
-(declaim (ftype (function (fluxer-channel string string) list) send-reply))
+(declaim (ftype (function (fluxer-channel string string &key (:reply-to (or null string)))
+                          list)
+                send-reply))
 
-(defun send-reply (channel target text)
-  "Scrub, chunk, and POST TEXT to TARGET within +REPLY-DEADLINE-SECONDS+; return accepted message IDs."
-  (let ((ids '())
-        (*send-channel* channel)
+(defun send-reply (channel target text &key reply-to)
+  "Send scrubbed TEXT in chunks, referencing REPLY-TO on the first chunk only."
+  (let ((*send-channel* channel)
         (*send-deadline* (+ (real-seconds) +reply-deadline-seconds+)))
     (enchiridion.compat:with-deadline
         (+reply-deadline-seconds+
          :on-timeout (error 'enchiridion.errors:transport-error :detail "reply timed out"))
-      (dolist (piece (outbound-chunks text +message-limit+))
-        (when (fluxer-channel-stopping-p channel)
-          (error 'enchiridion.errors:transport-error :detail "reply stopped"))
-        (let ((id (post-message (fluxer-channel-token channel) target piece)))
-          (when id (push id ids)))))
-    (nreverse ids)))
+      (loop for piece in (outbound-chunks text +message-limit+)
+            for anchor = (non-blank-string reply-to) then nil
+            for id = (post-message (fluxer-channel-token channel) target piece anchor)
+            when id collect id))))
 
 ;;;; Reaction lifecycle: ⏳ queued -> 🔧 processing -> cleared on delivery (or ⚠️ on failure/eviction).
 ;;;; Cosmetic REST calls run on a dedicated worker with a bounded, per-message coalescing queue
@@ -1896,7 +1915,8 @@ Marks :DELIVERED only after all reply chunks succeed; otherwise marks :FAILED."
                            (progn
                              (send-reply channel
                                          (enchiridion.channel:msg-target message)
-                                         (getf result :reply))
+                                         (getf result :reply)
+                                         :reply-to (reply-anchor data))
                              (when (getf result :status)
                                (ignore-errors
                                  (propose-custom-status
@@ -2343,13 +2363,12 @@ Fatal close codes stop retrying immediately."
 
 (defmethod enchiridion.channel:channel-send ((channel fluxer-channel) target text
                                              &key reply-to)
-  "Send TEXT to DM channel TARGET, returning accepted message IDs (REPLY-TO is ignored)."
-  (declare (ignore reply-to))
+  "Send TEXT to DM channel TARGET and return the accepted message IDs."
   (unless (fluxer-channel-token channel)
     (error 'enchiridion.errors:configuration-error
            :key "fluxer"
            :detail "the channel is not started, so there is no token to send with."))
-  (send-reply channel target text))
+  (send-reply channel target text :reply-to reply-to))
 
 (defmethod enchiridion.channel:channel-status ((channel fluxer-channel))
   "Return CHANNEL's state."

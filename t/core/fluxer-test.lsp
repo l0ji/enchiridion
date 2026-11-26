@@ -153,12 +153,19 @@ message: the frame tests do that once, at the edge.")
                  (enchiridion.channel.fluxer::resume-frame "t" "s" nil))))))
 
 (deftest the-message-body-carries-one-field ()
-  (let ((body (enchiridion.channel.fluxer::message-body "hello")))
+  (let ((body (enchiridion.channel.fluxer::message-body "hello" nil)))
     (ok (eql 2 (length body)))
     (ok (string= "hello" (getf body :content)))
     (testing "and it is an object on the wire, not an array"
       (ok (string= "{\"content\":\"hello\"}"
                    (enchiridion.channel.fluxer::json-text body))))))
+
+(deftest only-a-default-or-reply-message-can-be-a-reply-anchor ()
+  (dolist (type '(0 19))
+    (ok (equal "m-1"
+               (enchiridion.channel.fluxer::reply-anchor (list :type type :id "m-1")))))
+  (ng (enchiridion.channel.fluxer::reply-anchor '(:type 3 :id "m-1")))
+  (ng (enchiridion.channel.fluxer::reply-anchor '(:type 0))))
 
 (deftest a-plist-becomes-an-object-and-a-list-becomes-an-array ()
   (let ((text (enchiridion.channel.fluxer::json-text (list :a 1 :b "two"))))
@@ -1008,8 +1015,15 @@ message: the frame tests do that once, at the edge.")
              (dispatch 2 +direct-message+)
              (dispatch 1 +direct-message+)
              (ok (equal '("hello") seen))
-             (ok (equal '(("https://api.fluxer.app/v1/channels/d-1/messages"
-                           :post "{\"content\":\"answer\"}")) sent))
+             (ok (= 1 (length sent)))
+             (destructuring-bind (url method body) (first sent)
+               (let ((data (enchiridion.llm:parse-json body)))
+                 (ok (equal "https://api.fluxer.app/v1/channels/d-1/messages" url))
+                 (ok (eq :post method))
+                 (ok (equal "answer" (getf data :content)))
+                 (ok (equal '(:message_id "m-1") (getf data :message_reference)))
+                 (ok (equal '(:replied_user nil) (getf data :allowed_mentions)))
+                 (ok (search "\"replied_user\":false" body))))
              (ok (= 2 (enchiridion.channel.fluxer::fluxer-channel-sequence channel)))
              (ok (null (enchiridion.channel.fluxer::fluxer-channel-pending channel)))))
       (enchiridion.channel.fluxer::stop-worker channel))))
@@ -1055,6 +1069,71 @@ message: the frame tests do that once, at the edge.")
               "late")))
       (ok (signals (enchiridion.channel.fluxer::send-reply channel "target" "reply")
                    'enchiridion.errors:transport-error)))))
+
+(deftest channel-reply-retries-its-reference-until-the-message-is-gone ()
+  (let* ((sent '())
+         (channel (enchiridion.channel.fluxer:make-fluxer-channel))
+         (enchiridion.llm::*http-request-function*
+           (lambda (url &rest options)
+             (declare (ignore url))
+             (push (enchiridion.llm:parse-json (getf options :content)) sent)
+             (case (length sent)
+               (1 (error 'dexador.error:http-request-failed :status 429
+                         :body "{\"retry_after\":0}" :headers nil :uri nil :method :post))
+               (2 (error 'dexador.error:http-request-failed :status 404
+                         :body "{\"code\":\"UNKNOWN_MESSAGE\"}"
+                         :headers nil :uri nil :method :post))
+               (otherwise "{\"id\":\"reply\"}")))))
+    (setf (enchiridion.channel.fluxer::fluxer-channel-token channel) "fake")
+    (ok (equal '("reply")
+               (enchiridion.channel:deliver channel "d-1" "answer" :reply-to "m-1")))
+    (destructuring-bind (original rate-retry fallback) (reverse sent)
+      (ok (equal '(:message_id "m-1") (getf original :message_reference)))
+      (ok (equal original rate-retry))
+      (ok (equal '(:content "answer") fallback)))))
+
+(deftest a-reply-keeps-its-retry-budget-when-it-loses-its-reference ()
+  (let ((channel (enchiridion.channel.fluxer:make-fluxer-channel)))
+    (setf (enchiridion.channel.fluxer::fluxer-channel-token channel) "fake")
+    (dolist (failures '((404 404) (429 429 429 404 429)))
+      (let* ((remaining failures)
+             (references '())
+             (enchiridion.llm::*http-request-function*
+               (lambda (url &rest options)
+                 (declare (ignore url))
+                 (push (getf (enchiridion.llm:parse-json (getf options :content))
+                             :message_reference)
+                       references)
+                 (let ((status (pop remaining)))
+                   (if status
+                       (error 'dexador.error:http-request-failed
+                              :status status
+                              :body (if (= status 404)
+                                        "{\"code\":\"UNKNOWN_MESSAGE\"}"
+                                        "{\"retry_after\":0}")
+                              :headers nil :uri nil :method :post)
+                       "{\"id\":\"unexpected-extra-post\"}")))))
+        (ok (signals (enchiridion.channel:deliver channel "d-1" "answer" :reply-to "m-1")
+                     'enchiridion.errors:transport-error))
+        (ok (equal references
+                   (cons nil (make-list (1- (length failures))
+                                        :initial-element '(:message_id "m-1")))))))))
+
+(deftest unrelated-send-errors-do-not-drop-the-reference-and-retry ()
+  (let ((channel (enchiridion.channel.fluxer:make-fluxer-channel)))
+    (setf (enchiridion.channel.fluxer::fluxer-channel-token channel) "fake")
+    (dolist (failure '((404 . "{\"code\":\"UNKNOWN_CHANNEL\"}")
+                       (500 . "{\"message\":\"unavailable\"}")))
+      (let* ((posts 0)
+             (enchiridion.llm::*http-request-function*
+               (lambda (url &rest options)
+                 (declare (ignore url options))
+                 (incf posts)
+                 (error 'dexador.error:http-request-failed :status (car failure)
+                        :body (cdr failure) :headers nil :uri nil :method :post))))
+        (ok (signals (enchiridion.channel:deliver channel "d-1" "answer" :reply-to "m-1")
+                     'enchiridion.errors:transport-error))
+        (ok (= 1 posts))))))
 
 ;;;; The reaction lifecycle.
 ;;;;
@@ -1419,12 +1498,15 @@ message: the frame tests do that once, at the edge.")
          (enchiridion.llm::*http-request-function*
            (lambda (url &rest options)
              (declare (ignore url))
-             (push (getf (enchiridion.llm:parse-json (getf options :content)) :content) sent)
+             (push (enchiridion.llm:parse-json (getf options :content)) sent)
              "{\"id\":\"reply\"}")))
     (setf (enchiridion.channel.fluxer::fluxer-channel-token channel) "fake")
     (enchiridion.channel.fluxer::handle-inkbound channel +direct-message+)
     (let ((expected (format nil "```lisp~%~A~%```" line)))
-      (ok (equal sent (list expected expected))))))
+      (destructuring-bind (first second) (reverse sent)
+        (ok (equal expected (getf first :content)))
+        (ok (equal '(:message_id "m-1") (getf first :message_reference)))
+        (ok (equal (list :content expected) second))))))
 
 (deftest a-reply-that-fails-mid-chunk-is-not-delivered ()
   (let* ((posts 0)

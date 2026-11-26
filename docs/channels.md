@@ -123,6 +123,9 @@ dropped.
   (capacity 32) so turns never block the heartbeat. The bot reacts with ⏳ while
   queued, 🔧 while running, removes the reaction on delivery, and marks ⚠️ on
   failure or queue eviction.
+- **Reply links:** The first chunk of a reply links to the original DM without
+  notifying its author as a mention. If the original message is gone, the bot
+  sends the reply without the link.
 - **Chunking:** Long replies split cleanly at paragraph/line breaks to stay
   within 2,000 UTF-16 code units, repeating fenced code block markers across
   chunks.

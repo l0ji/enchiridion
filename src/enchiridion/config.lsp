@@ -141,6 +141,7 @@ Signals an error if KEY is not defined in DEFAULT-CONFIG."
     (:http (:enabled nil) (:bind "127.0.0.1") (:port 8787) (:token nil)
            (:token-env "ENCHIRIDION_HTTP_TOKEN") (:max-body-bytes 65536))
     (:fluxer (:enabled nil) (:allowed-users nil) (:token-env "FLUXER_BOT_TOKEN")
+             (:typing-wait-seconds 8)
              (:custom-status nil) (:custom-status-user nil)
              (:custom-status-ttl-seconds 300)
              (:custom-status-cooldown-seconds 60))

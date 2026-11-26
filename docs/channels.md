@@ -124,8 +124,11 @@ dropped.
   queued, 🔧 while running, removes the reaction on delivery, and marks ⚠️ on
   failure or queue eviction.
 - **Follow-ups:** New messages from the same sender in the same DM can join a
-  turn while the agent works. A message after the answer is ready starts its own
+  turn while the agent works. A message after the reply is released starts its own
   turn. Replies to several messages link to the first one.
+- **Typing:** If the sender is typing when an answer is ready, the bot waits up
+  to eight seconds for another message to join that answer. Typing updates do
+  not extend the wait. Set `:typing-wait-seconds` to `0` to disable it.
 - **Silence:** The agent can choose not to reply to a DM. It still records the
   incoming message and clears the processing reaction. An empty model response
   without that decision counts as a failed turn.

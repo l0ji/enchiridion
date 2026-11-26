@@ -79,6 +79,7 @@ field by field.
 | `:fluxer` | `:enabled` | `nil` | Enable Fluxer gateway under `serve` |
 | `:fluxer` | `:allowed-users` | `nil` | List of allowed string user IDs (empty admits nobody) |
 | `:fluxer` | `:token-env` | `"FLUXER_BOT_TOKEN"` | Env var for bot token |
+| `:fluxer` | `:typing-wait-seconds` | `8` | Maximum wait for a typing sender before sending a ready reply (`0` disables, max `30`) |
 | `:fluxer` | `:custom-status` | `nil` | Allow agent to propose a temporary profile status |
 | `:fluxer` | `:custom-status-user` | sole allowed user | User ID whose turns may set status (required if >1 allowed user) |
 | `:fluxer` | `:custom-status-ttl-seconds` | `300` | Status lifetime before clearing |

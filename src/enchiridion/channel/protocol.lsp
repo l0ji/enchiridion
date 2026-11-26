@@ -82,7 +82,8 @@ Call while holding the queue lock; leave an oversized match and later matches qu
                     (decf count)
                     (decf chars size)))
                  (t (push message waiting)))
-            finally (return (values (nreverse claimed) (nreverse waiting)))))))
+            finally (return (values (nreverse claimed) (nreverse waiting)
+                                    (and (plusp count) (plusp chars))))))))
 
 ;;;; The digest.
 

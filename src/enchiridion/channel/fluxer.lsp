@@ -66,6 +66,8 @@ Prevents rapid retry loops when a gateway reaches READY and immediately closes."
 (defparameter +max-pending-messages+ 32
   "Maximum inbound messages queued for the turn worker.")
 
+(defparameter +typing-fresh-seconds+ 8)
+
 (defparameter +worker-wait-seconds+ 0.2
   "Semaphore wait timeout in seconds before re-checking the stop flag.")
 
@@ -826,10 +828,13 @@ before websocket-driver discards it."))
               :documentation "Serializes websocket writes; websocket-driver send is unlocked and interleaving causes 4002.")
    (pending :accessor fluxer-channel-pending :initform nil :type list
             :documentation "FIFO queue of inbound MESSAGE_CREATE payloads for the turn worker.")
+   (typing :accessor fluxer-channel-typing :initform nil :type list
+           :documentation "Recent typing times by DM route.")
+   (active-route :accessor fluxer-channel-active-route :initform nil :type list)
    (pending-lock :accessor fluxer-channel-pending-lock
                  :initform (bordeaux-threads:make-lock "fluxer pending")
                  :type t
-                 :documentation "Guards PENDING, ACTIVE-REACTION, and STOPPING-P handoff.")
+                 :documentation "Guards the inbox, active route, typing times, and the stop handoff.")
    (pending-ready :accessor fluxer-channel-pending-ready
                   :initform (bordeaux-threads:make-condition-variable
                              :name "fluxer pending")
@@ -1834,6 +1839,19 @@ Coalesces by replacing any queued state for KEY; drops with a log line if full."
 
 ;;;; The queue between the read thread and the worker.
 
+(defun dm-route (target author)
+  (when (and (non-blank-string target) (non-blank-string author))
+    (list target author)))
+
+(defun inbound-route (data)
+  (dm-route (text-field data :channel_id) (author-id data)))
+
+(defun clear-typing (channel route)
+  "Remove ROUTE's typing time with the inbox lock held."
+  (when route
+    (setf (fluxer-channel-typing channel)
+          (delete route (fluxer-channel-typing channel) :key #'car :test #'equal))))
+
 (declaim (ftype (function (fluxer-channel t) null) enqueue-inkbound))
 
 (defun enqueue-inkbound (channel data)
@@ -1848,6 +1866,7 @@ Coalesces by replacing any queued state for KEY; drops with a log line if full."
                       +max-pending-messages+)
               (setf dropped (pop (fluxer-channel-pending channel)))
               (incf (fluxer-channel-dropped channel)))
+            (clear-typing channel (inbound-route data))
             (setf (fluxer-channel-pending channel)
                   (nconc (fluxer-channel-pending channel) (list data)))
             (bordeaux-threads:condition-notify (fluxer-channel-pending-ready channel)))))
@@ -1878,37 +1897,62 @@ Coalesces by replacing any queued state for KEY; drops with a log line if full."
 
 ;;;; The worker: the one thread that runs a turn.
 
-(defun claim-followups (channel select)
-  "Claim matching payloads for the active turn and register their reaction keys."
-  (bordeaux-threads:with-lock-held ((fluxer-channel-pending-lock channel))
-    (unless (fluxer-channel-stopping-p channel)
-      (multiple-value-bind (claimed waiting)
-          (funcall select (fluxer-channel-pending channel))
-        (when claimed
-          (setf (fluxer-channel-pending channel) waiting)
-          (dolist (data claimed)
-            (let ((key (message-reaction-key data)))
-              (when key (push key (fluxer-channel-active-reactions channel)))))
-          claimed)))))
+(defun typing-fresh-p (channel route now)
+  (let ((entry (assoc route (fluxer-channel-typing channel) :test #'equal)))
+    (and entry (< (- now (cdr entry)) +typing-fresh-seconds+))))
 
-(defun make-turn-steer (channel message)
+(defun claim-followups (channel select route grace
+                        &key (clock #'real-seconds) (wait #'bordeaux-threads:condition-wait))
+  "Claim matching payloads. Wait for fresh typing at most GRACE seconds."
+  (let ((lock (fluxer-channel-pending-lock channel))
+        (deadline (when (plusp grace) (+ (funcall clock) grace)))
+        (waited nil))
+    (bordeaux-threads:with-lock-held (lock)
+      (loop
+        (when (or (fluxer-channel-stopping-p channel)
+                  (and waited (>= (funcall clock) deadline)))
+          (return (values nil waited)))
+        (multiple-value-bind (claimed waiting room-p)
+            (funcall select (fluxer-channel-pending channel))
+          (when claimed
+            (setf (fluxer-channel-pending channel) waiting)
+            (dolist (data claimed)
+              (let ((key (message-reaction-key data)))
+                (when key (push key (fluxer-channel-active-reactions channel)))))
+            (return (values claimed waited)))
+          (let ((now (funcall clock)))
+            (unless (and deadline room-p (< now deadline)
+                         (typing-fresh-p channel route now))
+              (return (values nil waited)))
+            (setf waited t)
+            (funcall wait (fluxer-channel-pending-ready channel)
+                     lock :timeout (- deadline now))))))))
+
+(defun make-turn-steer (channel route)
   "Return the follow-up callback for an authenticated DM route."
-  (let ((target (enchiridion.channel:msg-target message))
-        (author (enchiridion.channel:msg-author message)))
-    (when (and (non-blank-string target) (non-blank-string author))
-      (labels ((text (data) (text-field data :content))
-               (matches (data)
-                 (and (equal target (text-field data :channel_id))
-                      (equal author (author-id data))
-                      (non-blank-string (text data)))))
-        (let ((select (enchiridion.channel:make-followup-selector #'matches #'text)))
-          (lambda (phase)
-            (declare (ignore phase))
-            (mapcar #'text (claim-followups channel select))))))))
+  (when route
+    (labels ((text (data) (text-field data :content))
+             (matches (data)
+               (and (equal route (inbound-route data))
+                    (non-blank-string (text data)))))
+      (let ((select (enchiridion.channel:make-followup-selector #'matches #'text))
+            (grace (status-seconds channel :typing-wait-seconds 0 30))
+            (held-p nil))
+        (lambda (phase)
+          (multiple-value-bind (claimed waited)
+              (claim-followups channel select route
+                               (if (and (eq phase :before-final) (not held-p)) grace 0))
+            (when waited (setf held-p t))
+            (mapcar #'text claimed)))))))
 
-(defun set-active-reactions (channel keys)
+(defun set-active-reactions (channel keys &optional route)
   (bordeaux-threads:with-lock-held ((fluxer-channel-pending-lock channel))
-    (setf (fluxer-channel-active-reactions channel) keys)))
+    (let ((active (fluxer-channel-active-route channel)))
+      (unless (or route (member active (fluxer-channel-pending channel)
+                                :key #'inbound-route :test #'equal))
+        (clear-typing channel active)))
+    (setf (fluxer-channel-active-reactions channel) keys
+          (fluxer-channel-active-route channel) route)))
 
 (declaim (ftype (function (fluxer-channel t) null) handle-inkbound))
 
@@ -1917,11 +1961,12 @@ Coalesces by replacing any queued state for KEY; drops with a log line if full."
 Marks :DELIVERED only after all reply chunks succeed; otherwise marks :FAILED."
   (let* ((message (message-create->msg data))
          (key (message-reaction-key data))
+         (route (inbound-route data))
          (turn (fluxer-channel-turn channel))
          (completed nil))
     (unwind-protect
          (progn
-           (set-active-reactions channel (when key (list key)))
+           (set-active-reactions channel (when key (list key)) route)
            (enqueue-reaction channel key :processing)
            (cond
              ((not (functionp turn))
@@ -1930,7 +1975,7 @@ Marks :DELIVERED only after all reply chunks succeed; otherwise marks :FAILED."
               (enqueue-reaction channel key :failed))
              ((handler-case
                   (let ((result (if (fluxer-channel-followups-p channel)
-                                     (funcall turn message (make-turn-steer channel message))
+                                     (funcall turn message (make-turn-steer channel route))
                                      (funcall turn message))))
                     (cond
                       ((not (listp result))
@@ -2011,7 +2056,9 @@ messages :FAILED. Must run before STOP-REACTION-WORKER so failure markers can be
       (setf active (fluxer-channel-active-reactions channel)
             (fluxer-channel-active-reactions channel) nil
             waiting (fluxer-channel-pending channel)
-            (fluxer-channel-pending channel) nil))
+            (fluxer-channel-pending channel) nil
+            (fluxer-channel-active-route channel) nil
+            (fluxer-channel-typing channel) nil))
     (when abandoned
       (dolist (key active)
         (enqueue-reaction channel key :failed)))
@@ -2129,10 +2176,26 @@ resumed sessions keep their existing cursor."
       (note-fresh-session channel)))
   nil)
 
+(defun note-typing (channel data)
+  "Record typing only for the sender of an active or queued DM."
+  (let ((route (and (consp data) (not (guild-event-p data))
+                    (dm-route (text-field data :channel_id) (text-field data :user_id)))))
+    (when route
+      (bordeaux-threads:with-lock-held ((fluxer-channel-pending-lock channel))
+        (when (and (not (fluxer-channel-stopping-p channel))
+                   (or (equal route (fluxer-channel-active-route channel))
+                       (member route (fluxer-channel-pending channel)
+                               :key #'inbound-route :test #'equal)))
+          (clear-typing channel route)
+          (when (> (length (fluxer-channel-typing channel)) +max-pending-messages+)
+            (setf (fluxer-channel-typing channel) (butlast (fluxer-channel-typing channel))))
+          (push (cons route (real-seconds)) (fluxer-channel-typing channel))
+          (bordeaux-threads:condition-notify (fluxer-channel-pending-ready channel)))))))
+
 (declaim (ftype (function (fluxer-channel t) null) handle-dispatch))
 
 (defun handle-dispatch (channel frame)
-  "Advance the monotonic dispatch sequence and route READY or MESSAGE_CREATE frames.
+  "Advance the dispatch sequence and route ready, message, and typing events.
 Checks READY session change before filtering so a stale cursor cannot drop a new session's READY."
   (when (ready-p frame)
     (note-session-start channel frame))
@@ -2142,7 +2205,8 @@ Checks READY session change before filtering so a stale cursor cannot drop a new
     (when fresh-p
       (cond
         ((ready-p frame) (note-ready channel frame))
-        ((message-create-p frame) (offer-message channel (frame-data frame))))))
+        ((message-create-p frame) (offer-message channel (frame-data frame)))
+        ((equal "TYPING_START" (getf frame :t)) (note-typing channel (frame-data frame))))))
   nil)
 
 (declaim (ftype (function (fluxer-channel t) boolean) current-socket-p))
@@ -2342,6 +2406,8 @@ Fatal close codes stop retrying immediately."
         (fluxer-channel-dropped channel) 0
         (fluxer-channel-pending channel) nil
         (fluxer-channel-active-reactions channel) nil
+        (fluxer-channel-active-route channel) nil
+        (fluxer-channel-typing channel) nil
         ;; Clear any stale socket so CURRENT-SOCKET-P does not misclassify frames.
         (fluxer-channel-socket channel) nil
         (enchiridion.channel:channel-live-p channel) t

@@ -1,24 +1,25 @@
 # Documentation
 
-Start with [Getting started](getting-started.md) for a local conversation or
-[Deployment](deployment.md) for a Linux server.
+Start with [Getting started](getting-started.md) to run enchiridion locally, or
+[Deployment](deployment.md) for a Linux server with Docker Compose.
 
-## Setup and use
+For the full list of CLI and REPL commands, run `enchiridion help` (or
+`enchiridion help <command>` for subcommands and usage).
 
-| Page | Contents |
+## Guides
+
+| Page | Covers |
 | --- | --- |
-| [Configuration](configuration.md) | Provider, models, channels and background work |
-| [Settings reference](config-reference.md) | All settings, including advanced tuning |
-| [Commands](commands.md) | CLI and REPL commands |
-| [Channels](channels.md) | HTTP requests and Fluxer setup |
-| [Memory](memory.md) | Personality files, history and tasks |
+| [Getting started](getting-started.md) | First run, identity files, `chat`, `ask`, and `serve` |
+| [Configuration](configuration.md) | `config.lsp`, `.env`, LLM providers (OpenAI, Anthropic, local, Bedrock, Vertex), channels, and budgets |
+| [Channels](channels.md) | Terminal REPL, HTTP webhook API, and Fluxer direct messages |
+| [Memory](memory.md) | Identity files, bootstrap, git history, episodic retrieval, T2 claims, and `ADAPT.md` |
+| [Tools and plugins](tools-and-plugins.md) | Built-in tools, writing `.lsp` plugins and `.md` skills, verification, and hot-reload |
+| [Deployment](deployment.md) | Docker Compose, Tailscale Serve, backups, supervisor/schedule, and secret isolation |
 
 ## Reference
 
-| Page | Contents |
+| Page | Covers |
 | --- | --- |
-| [LLM providers](llm.md) | Custom endpoints, cloud auth and request options |
-| [Tools](tools.md) | Built-in tools and argument schemas |
-| [Plugins and skills](plugins.md) | Agent files, manifests, verification and reloads |
-| [Episodic memory](episodic-memory.md) | Retrieval and promotion checks |
-| [Development](development.md) | Build, tests and code conventions |
+| [Settings reference](config-reference.md) | Every `config.lsp` key and environment variable |
+| [Development](development.md) | Repo layout, Nix commands, Lisp conventions, and tests |

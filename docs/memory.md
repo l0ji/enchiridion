@@ -1,193 +1,143 @@
 # Memory
 
-The agent's identity is three Markdown files in its agent directory. You edit
-them before the first conversation; after the bootstrap, the sleep agent
-maintains them during `serve`.
+Enchiridion splits memory into three layers so the system prompt stays frozen
+(preserving prompt caching) while the agent can still recall past conversations:
 
-## The files
+1. **Identity blocks** (`SOUL.md`, `OPERATOR.md`, `WORLD.md`, plus
+   harness-managed `ADAPT.md`) — compiled once at startup into the system
+   prompt.
+2. **Episodic log** (`memory.db`) — every turn, tool result, and saved memory
+   goes into one SQLite log. Before each turn, full-text search (BM25) packs
+   relevant excerpts into the user message—never into the system prompt.
+3. **T2 derived claims** (optional/background) — a background pass can distill
+   short claims from episodes and test them through automated gates before
+   promoting them into retrieval.
 
-| File | Contents |
-| --- | --- |
-| `SOUL.md` | Who the agent is, how it speaks, what it refuses, what it is trying to improve |
-| `OPERATOR.md` | Who you are, what a good answer looks like, when the agent may act alone or interrupt |
-| `WORLD.md` | Real paths, commands, ports and conventions on this machine |
-| `ADAPT.md` | The bearing and the evidence-cited preferences the harness learns |
+## Identity files
 
-`ADAPT.md` is not an identity file you are expected to edit. It is
-harness-maintained prompt guidance, included in every prompt, and normally
-changed during a maintenance pass. The revert helper is the other writer.
+The agent directory (`agents/default/` under `ENCHIRIDION_HOME`, or the current
+directory) is a git repository containing:
 
-The directory is `agents/default/` under `ENCHIRIDION_HOME`, or under the working
-directory when the variable is unset. `init` writes the files and never
-overwrites one that exists, so a rerun fills the gaps of a partial setup.
-
-```sh
-nix run .#enchiridion -- init
-nix run .#enchiridion -- persona          # print SOUL.md
-nix run .#enchiridion -- operator edit    # print the path of OPERATOR.md
-nix run .#enchiridion -- world            # print WORLD.md
-nix run .#enchiridion -- blocks           # characters used of each limit
-```
-
-The default limits are 6000 characters for `SOUL.md`, 1600 for `OPERATOR.md`,
-3000 for `WORLD.md` and 1200 for `ADAPT.md`; `:block-limits` changes them, and
-the [settings reference](config-reference.md#memory) lists the keys. `blocks`
-shows the count; `blockops` and the adaptation writer enforce the limit and
-refuse invisible Unicode and a short list of prompt-injection patterns. The same scan
-runs at startup, so a hand-edited file that trips it stops the agent with
-`Configuration is wrong at BLOCK.`
-
-`GUIDE.md` in the agent directory has writing advice for the three files.
-
-## The bootstrap
-
-`BOOTSTRAP.md` lists the first steps, and the agent records each one as it goes.
-
-```sh
-nix run .#enchiridion -- bootstrap status
-nix run .#enchiridion -- bootstrap run
-nix run .#enchiridion -- bootstrap step 3
-```
-
-The operator may edit `SOUL.md`, `OPERATOR.md`, and `WORLD.md` at any time.
-Until handover, the block and file tools refuse agent writes to those files.
-The agent saves drafts under `proposed/` and can finish consecutive steps in
-one turn. The built-in shell is unavailable until handover. These tool restrictions
-are not an OS sandbox. Untouched older stock checklists update on the next turn;
-custom checklists and recorded progress are preserved.
-
-The last step renames the file to `BOOTSTRAP.done.md` and commits the directory.
-`bootstrap reset` restores it when the live file is absent and clears the record.
-The bootstrap record lives in `state.json`, so deleting that file resets it.
-
-## Adaptation
-
-A young agent borrows its operator's style and work habits. As substantive
-memory and corroborated experience accumulate, the bearing moves toward the
-agent's own defaults. Elapsed time is not a term, and no tick announces the
-change.
-
-The two terms are counts the store already has:
-
-| Term | Counts | Full at |
+| File | Default limit | Purpose |
 | --- | --- | --- |
-| Substantive memory | Non-sleep user and assistant turns | 120 |
-| Corroborated experience | Sessions with at least two tool results and an assistant reply | 6 |
+| `SOUL.md` | 6,000 chars | Who the agent is, how it speaks, what it refuses |
+| `OPERATOR.md` | 1,600 chars | Who you are, how you like answers, when it may act alone |
+| `WORLD.md` | 3,000 chars | Paths, commands, ports, and conventions on this machine |
+| `ADAPT.md` | 1,200 chars | Harness-maintained style and workflow guidance (managed by the harness) |
 
-Sleep output and tool rows do not enter the memory term, so consolidation
-cannot age an agent by talking to itself. Saved memories do not enter it
-either: the store writes owner provenance for every saved memory, so that field
-does not identify the source. `ADAPT.md` has five bearing bands and changes
-only when a maintenance pass runs and a band is crossed.
+`GUIDE.md` in the agent directory has writing tips. Check sizes with
+`enchiridion blocks`, or print/locate files with `persona`, `operator`, and
+`world`. Limits are configurable via `:memory :block-limits` in [Settings
+reference](config-reference.md#storage-and-prompt-blocks).
 
-The maintenance pass may add at most one learned entry, and a bearing change
-counts as that pass's one change. The default is no change. An explicit CLI
-operator correction may be applied immediately with the turn id and a short
-quote. An inferred preference needs at least three separate CLI operator turns.
-Only CLI user turns count as operator evidence by default; an embedding can
-bind `enchiridion.kernel:*adaptation-operator-channels*`. HTTP and Fluxer
-messages carry the user role, but they are not operator identity by themselves,
-even when the channel authenticated the sender. They still contribute to
-substantive memory and to tool experience. The harness checks the cited turn
-ids, their role, their channel, the quote and the category before it writes the
-entry.
+Because the prompt is compiled at startup, edits to identity files take effect
+on the next `chat`, `ask`, or `serve`. Block writes and startup both scan for
+invisible Unicode and basic prompt-injection patterns (a bad hand-edit refuses
+startup with `Configuration is wrong at BLOCK.`).
 
-`ADAPT.md` is guidance. These bounds are enforced outside the prompt and an
-adaptation cannot change them:
+### Bootstrap
 
-| Bound | Enforced by |
-| --- | --- |
-| Identity-file writes before handover | `blockops`, `file`, and the bootstrap state |
-| Block size and injection scan | `scan-block-text`, `set-block-text`, `adaptation-write-file` |
-| Tool names, arguments and availability | the tool registry and its schemas |
-| OS identity, sandbox and file access | the broker and the deployment |
-| Token caps and task claims | the budget code and the task queue |
-| Writes to `ADAPT.md` | the builtin `write-file` and `edit-file` refuse it |
+On a fresh agent, `BOOTSTRAP.md` holds a first-run checklist. Until bootstrap
+completes:
 
-The builtin `write-file` and `edit-file` tools refuse the agent's `ADAPT.md` at
-every bootstrap state, including through a symlink. The builtin `shell` is not
-an OS sandbox and can still write the file as the agent user; a direct write
-during a maintenance pass is reverted, but a shell write between passes is only
-prompt text until the next pass and the operator's Git review. The same is true
-of the identity files after handover.
+- The agent's file and block tools cannot modify `SOUL.md`, `OPERATOR.md`, or
+  `WORLD.md` (drafts go under `proposed/`), and the built-in `shell` tool is
+  disabled.
+- You can still edit the identity files yourself at any time.
+- Finishing the last step renames `BOOTSTRAP.md` to `BOOTSTRAP.done.md` and
+  commits the repo.
 
-A proposal that names an enforced bound, such as tool access, a permission, a
-refusal, a budget or the bootstrap, is refused. The category must be `style`,
-`workflow`, `format`, `communication` or `priority`. The guard is a filter, not
-a proof: `ADAPT.md` never grants authority, and the code that enforces a bound
-never reads it.
+Inspect or advance it with `enchiridion bootstrap status|run|step N|reset`
+(progress is stored in `state.json`).
 
-Every bearing change and learned entry records its evidence in the store's
-`adaptations` table. A bearing row names both counts; an entry row names its
-turn ids. The pass is silent: `health` and the tick report say that a
-maintenance pass ran, not that the bearing moved or that an entry was learned.
-`ADAPT.md` is in the agent directory, so `git -C agents/default log` shows
-every change and `nix run .#enchiridion -- undo N` reverts one. The latest
-change can also be reverted with `enchiridion.kernel:revert-adaptation` from a
-Lisp session.
+### Git history and undo
 
-## History
-
-The agent directory is its own Git repository. The kernel commits after each
-successful turn that changed the tree, with the message `Agent turn N via CHANNEL`.
-The counter also includes turns that changed nothing, so Git history can skip numbers.
+The kernel commits `agents/default/` after every turn that changes files (`Agent
+turn N via CHANNEL`), ignoring `state.json`, `memory.db`, `private/`, `tmp/`,
+and `*.fasl`.
 
 ```sh
-git -C agents/default log --oneline
-nix run .#enchiridion -- journey
-nix run .#enchiridion -- undo 1
+enchiridion journey       # recent commits
+enchiridion undo 1        # revert the latest commit
 ```
 
-`undo N` counts from the newest commit. The repository ignores `state.json`,
-`memory.db`, `private/`, `tmp/` and `*.fasl`; the Markdown files, skills and
-tools are the history.
+## Episodic retrieval and compaction
 
-## Inspecting memory
+- **Compaction:** The session summary block (not one of the Markdown files) is
+  rewritten every few turns from the previous summary + last 4 turns, and
+  rebuilt from the last 24 raw turns every 8 passes.
+- **Retrieval:** On each turn, SQLite FTS scores candidate episodes with BM25
+  and packs up to 12 excerpts (400-char windows, 4,450-char total budget via
+  `:pack-chars`) into the user message under a data-only header with `[ref
+  episode-ID]` tags. The agent can fetch full bodies with the `search` tool.
+- **Inspecting and searching:** `enchiridion memory "query"` searches saved
+  memories and turns directly in SQLite (no LLM call). `enchiridion memory
+  status` shows counts and switches.
+- **Off by default:** `:rerank` (cheap-model reranking) and `:embed` (dense
+  vectors) are off by default; `:push` is unfinished and should stay `nil`.
 
-| Command | Shows |
-| --- | --- |
-| `memory "open ports"` | Full-text search over saved memories and turns |
-| `memory status` | Log counts, live generation, retrieval switches |
-| `sessions` | Stored sessions with turn counts |
-| `usage` | Tokens by model, channel and day, including cache reads and writes |
-| `tasks` | The task queue |
+> [!note]
+> Retrieved turns, tool outputs, and claims are **untrusted input**—a relevance
+> score does not imply truth or authority, and the data-only header is not an
+> isolation boundary. Secret scrubbing strips known credentials, not arbitrary
+> private facts.
 
-A search prints the memories section, then the turns. It reads SQLite's index
-directly, so it costs no model call. The store is `memory.db` in the agent
-directory, and `:db` sets another path. `memory status` reports zero generations
-until T2 builds one; [Episodic memory](episodic-memory.md) covers that.
+## T2 derived claims (advanced)
 
-## Backup
+During `serve` ticks, T2 can derive structured claims from episodes into a
+candidate **generation** (versioned snapshot) and run five gates before
+promoting it:
 
-Stop the process before a copy, so the database is not mid-write. The state is
-the agent directory plus the database, which is inside it unless `:db` says
-otherwise.
+1. **Provenance** — every claim cites an exact span in an existing episode.
+2. **Canary** — retrieval checks across four families (`retrieval`, `update`,
+   `safety`, `tail`) all pass.
+3. **Utility** — statistically significant improvement on paired Q&A tasks
+   (`:gate-margin`, `:gate-min-n`, `:gate-alpha`).
+4. **Tail** — recall on rare answers does not drop beyond `:tail-margin`.
+5. **Cost** — claims and tokens per derived episode stay within caps.
+
+A failing candidate is quarantined without touching the live generation. On a
+fresh log, T2 skips until enough Q&A pairs exist (`enchiridion memory preflight`
+reports any missing prerequisites). Manage generations with `enchiridion memory
+candidates|gates|build|promote|regate|rollback`.
+
+### Canaries
+
+T2 ships with built-in smoke canaries (`:canaries :built-in`). The agent can
+also propose workspace canaries via the `canary` tool; review and approve them
+with:
+
+```sh
+enchiridion memory canaries
+enchiridion memory canaries approve <id>
+enchiridion memory canaries discard <id>
+enchiridion memory canaries revoke <id>
+```
+
+Approved canaries are stored under `canary-approvals/` (on the Docker state
+volume, or beside your config locally).
+
+## Adaptation (`ADAPT.md`)
+
+As substantive conversations and tool-using sessions accumulate (120 non-sleep
+turns, 6 tool-using sessions), maintenance passes silently shift `ADAPT.md` from
+borrowing your style toward the agent's own defaults, and may record at most one
+evidence-cited preference per pass (`style`, `workflow`, `format`,
+`communication`, or `priority`) from CLI operator turns.
+
+`ADAPT.md` is prompt guidance only—it never grants permissions or overrides
+code-enforced bounds (tool schemas, bootstrap locks, budgets, or OS user
+isolation). `write-file` and `edit-file` refuse to modify `ADAPT.md`; changes
+are committed to git and can be reverted with `enchiridion undo`.
+
+## Backups
+
+Stop enchiridion before copying so SQLite is not mid-write, then archive
+`agents/default/` (plus your `:db` file if you moved it outside the agent
+directory):
 
 ```sh
 tar czf enchiridion-agent.tgz -C agents default
 ```
 
-If `:db` names a path elsewhere, copy that file too. Restore the archive into the
-same place while the process is stopped. A container deployment backs up the
-state volume instead; see [Deployment](deployment.md#state-and-backups).
-
-## Prompt and compaction
-
-The prompt is compiled when the agent starts, so a change to an identity file
-reaches the agent on the next `chat`, `ask` or `serve`, not mid-session.
-
-The session block is the agent's summary of the conversation, and it is not one
-of the three files. Compaction rewrites it every few turns from the previous
-summary and the last four turns; every eighth pass rebuilds it from the last 24
-raw turns. An empty answer, or one over 400 characters, changes nothing.
-[Deployment](deployment.md#supervisor-and-schedule) covers when a tick runs it.
-
-## Troubleshooting
-
-| Symptom | Cause | Fix |
-| --- | --- | --- |
-| `Block PERSONA is at 6000 characters and needs 6070, so 70 must go.` | A write over the limit | Shorten by that many characters |
-| `Block PERSONA is the operator's until bootstrap hands over.` | The first steps are unfinished | Finish or reset the bootstrap |
-| `A memory needs text.` | The agent tried to save an empty memory | Ask for a body with content |
-| `The query has no searchable terms.` | The query was only punctuation | Search for words |
-| A block edit is missing from a running session | The prompt was compiled at start | Start a new process |
+For Docker volume backups, see [Deployment](deployment.md#state-and-backups).

@@ -1,13 +1,10 @@
 # Getting started
 
-This page creates an agent and holds the first conversation.
+This guide covers creating a local agent and running your first conversation.
+Requirements: Linux or macOS with Nix and an API key for at least one LLM
+provider.
 
-## Requirements
-
-- Linux or macOS with Nix
-- An API key for one provider
-
-## Create the agent
+## 1. Set up config and secrets
 
 ```sh
 git clone https://tangled.org/hexmani.ac/enchiridion
@@ -17,60 +14,63 @@ cp .env.example .env
 chmod 600 .env
 ```
 
-Open `.env`, uncomment one provider line, and replace `add-key` with your key.
+Open `.env`, uncomment one provider key (`OPENAI_API_KEY`, `OPENCODE_API_KEY`,
+or `ANTHROPIC_API_KEY`), and paste your key.
 
-| Provider | Line to uncomment |
-| --- | --- |
-| OpenAI | `OPENAI_API_KEY=add-key` |
-| OpenCode Go | `OPENCODE_API_KEY=add-key` |
-| Anthropic | `ANTHROPIC_API_KEY=add-key` |
+You do not need to edit `config.lsp` for a first run. With `(:provider nil)`,
+enchiridion selects the provider from your key and uses its default model. If
+you have multiple provider keys set (including in your shell environment), set
+`:provider` explicitly in `config.lsp`. See [Configuration](configuration.md)
+for details.
 
-You can leave `config.lsp` alone for the first run. The key selects the provider,
-and the provider supplies a default model. If your shell exports another
-provider key, set `:provider` explicitly. See [Configuration](configuration.md)
-for provider, model and channel settings.
-
-## Create the agent
+## 2. Initialize the agent
 
 ```sh
 nix run .#enchiridion -- init
 ```
 
-This creates `agents/default/`. Edit these files before starting a conversation:
+This creates `agents/default/` (an isolated git repository) with starter files.
+Edit these three before your first conversation:
 
-| File | What to put in it |
-| --- | --- |
-| `SOUL.md` | The agent's personality and instructions |
-| `OPERATOR.md` | Your name, preferences and expectations |
-| `WORLD.md` | The machine and services it can use |
+- `SOUL.md` — the agent's personality, voice, and rules
+- `OPERATOR.md` — who you are, how you prefer answers, and when it may act alone
+- `WORLD.md` — the machine, paths, and services it can use
 
-Leave `BOOTSTRAP.md` for the agent to work through on its first turns.
-Set `ENCHIRIDION_HOME` to an absolute directory before running `init` if you want
-state somewhere other than this checkout. Use the same value on later runs.
+Keep `BOOTSTRAP.md` unmodified; the agent works through it during its first
+turns. If you want state stored outside the repository, set `ENCHIRIDION_HOME`
+to an absolute path before running `init` and keep it set on later runs.
 
-## Talk to it
+## 3. Talk to it
 
 ```sh
 nix run .#enchiridion -- chat
 nix run .#enchiridion -- ask "What can you do?"
 ```
 
-`chat` opens the REPL. Type `/help` for commands or `/quit` to leave.
-`ask` sends one question and exits.
+- `chat` starts the interactive REPL (`enchiridion> `). Commands start with a
+  slash (`/help`, `/stop`, `/quit`, `/who`); anything else is sent as a message.
+  `Ctrl-C` cancels the current line or turn without exiting.
+- `ask` runs a single turn, prints the reply to stdout (and progress to stderr),
+  and exits.
+
+Run `enchiridion help` for all CLI commands, or `enchiridion help <command>` for
+subcommands and usage. Commands exit `0` on success, `1` on runtime, turn, or
+build failure, `2` on invalid usage or configuration, and `130` on interrupt.
 
 > [!warning]
-> In a normal checkout the agent runs as your user. Its file and shell tools can
-> read your files, including `.env`. Use the container deployment for a separate
-> agent user.
+> In a local checkout, the agent runs as your UNIX user. Its file and shell
+> tools can read anything you can, including `.env`. Use the [Docker
+> deployment](deployment.md) when you need user separation.
 
-## Keep it running
+## 4. Keep it running
 
 ```sh
 nix run .#enchiridion -- serve
 ```
 
-`serve` starts the supervisor and runs background work every 15 minutes by default.
-It also starts the enabled [channels](channels.md). In a terminal you can chat;
-on a server, configure HTTP or Fluxer. `Ctrl-C` stops it.
+`serve` runs the supervisor, starts enabled [channels](channels.md), and runs
+background memory and task ticks every 15 minutes by default. Press `Ctrl-C` to
+stop it.
 
-For server setup, health checks and backups, use [Deployment](deployment.md).
+For server setup, TLS access, health checks, and backups, see
+[Deployment](deployment.md).

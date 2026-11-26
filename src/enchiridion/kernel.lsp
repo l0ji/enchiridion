@@ -143,7 +143,18 @@ reply. Prior replies and learned preferences are defaults, not a script. Match
 the detail and formality to what the person is doing now. In casual chat, skip
 headings, recaps, and canned reassurance. Don't mimic typos or slang.")
 
-(defun turn-prompt-text (agent tools channel)
+(defparameter +no-reply-text+ "[enchiridion:no-reply]"
+  "The model's exact text for an intentional silent turn.")
+
+(defparameter +no-reply-note+
+  (format nil "You need not answer every chat message. Before using tools, you
+can stay silent by returning only ~A. Use it when a message needs no answer, or
+when a serious disclosure or uncertainty leaves you with nothing useful to add.
+A brief, genuine acknowledgment is fine. Don't use silence for a direct request,
+to hide work or a failure, or when someone may be in immediate danger."
+          +no-reply-text+))
+
+(defun turn-prompt-text (agent tools channel allow-silence-p)
   (let* ((text (prompt-text (agent-snapshot agent)))
          (directory (agent-directory agent))
          (status (and directory (not (eq channel :sleep))
@@ -153,6 +164,8 @@ headings, recaps, and canned reassurance. Don't mimic typos or slang.")
       (write-string text stream)
       (unless (eq channel :sleep)
         (format stream "~%~%~A" +live-style-note+))
+      (when allow-silence-p
+        (format stream "~%~%~A" +no-reply-note+))
       (when tools
         (format stream "~%~%Tool budget: ~D rounds per turn. A round may contain multiple tool calls."
                 (agent-tool-rounds agent)))
@@ -315,10 +328,12 @@ Events: :REQUEST, :RESPONSE, :TOOL-START, :TOOL-END, :ROUND-LIMIT.")
   "I reached the tool round limit for this turn before I could finish. Ask me to continue and I will pick up from here."
   "The reply a capped turn falls back to when the model said nothing at all.")
 
+(defun trim-reply-text (text)
+  (string-trim '(#\Space #\Tab #\Newline #\Return) text))
+
 (defun blank-text-p (text)
   "Return T when TEXT is NIL or only whitespace."
-  (or (null text)
-      (zerop (length (string-trim '(#\Space #\Tab #\Newline #\Return) text)))))
+  (or (null text) (zerop (length (trim-reply-text text)))))
 
 (defun wrap-up-completion (completion fallback-text)
   "Finalize COMPLETION for a capped turn: drop any remaining tool calls and
@@ -538,11 +553,12 @@ Silently ignores non-repositories, missing git identity, and clean trees."
            (format nil "Agent turn ~D via ~A" (agent-turn agent) channel))
         (error () nil)))))
 
-(declaim (ftype (function (agent string t t t keyword t t) (values t t))
+(declaim (ftype (function (agent string t t t keyword t t t)
+                          (values t t boolean))
                 run-turn-locked))
 
 (defun run-turn-locked (agent text model session store channel cancel-p
-                        pre-request)
+                        pre-request allow-silence-p)
   "Execute one turn on AGENT with its lock already held.
 PRE-REQUEST, if set, is called with the 0-based round index before each model
 call and may signal to enforce a soft budget cap."
@@ -587,7 +603,8 @@ call and may signal to enforce a soft budget cap."
            (messages (append
                       (list (enchiridion.llm:system-message
                              (enchiridion.llm.secrets:scrub
-                              (turn-prompt-text agent tools channel))))
+                              (turn-prompt-text agent tools channel
+                                                allow-silence-p))))
                       (mapcar (lambda (entry)
                                 (let ((body (enchiridion.llm.secrets:scrub
                                              (cdr entry))))
@@ -604,7 +621,8 @@ call and may signal to enforce a soft budget cap."
            (wrapped-up nil)
            (last-words nil)
            (completion nil)
-           (tool-message nil))
+           (tool-message nil)
+           (silent-p nil))
       (persist-turn store session "user" text :channel channel)
       (loop
         (when (and cancel-p (funcall cancel-p))
@@ -612,8 +630,15 @@ call and may signal to enforce a soft budget cap."
         (when pre-request
           (funcall pre-request rounds))
         (note-progress :request :round rounds)
-        (setf completion (complete-with-tools backend messages model tools)
-              tool-message (enchiridion.llm:take-completion-tool-message completion))
+        (setf completion (complete-with-tools backend messages model tools))
+        (when (and allow-silence-p
+                   (string= +no-reply-text+
+                            (trim-reply-text (enchiridion.llm:completion-text completion))))
+          (setf silent-p (and (zerop rounds) (not wrapped-up)
+                              (null (enchiridion.llm:completion-tool-calls completion)))
+                completion (enchiridion.llm:copy-completion completion)
+                (enchiridion.llm:completion-text completion) ""))
+        (setf tool-message (enchiridion.llm:take-completion-tool-message completion))
         (note-progress :response
                        :round rounds
                        :reasoning (enchiridion.llm:completion-reasoning-text completion)
@@ -639,7 +664,8 @@ call and may signal to enforce a soft budget cap."
           (unless (blank-text-p text)
             (setf last-words text))
           (when (or wrapped-up (null calls))
-            (return (values (setf completion final) *turn-proposal*)))
+            (setf completion final)
+            (return))
           ;; At the round cap, drop pending tool calls and force one wrap-up reply.
           (if (>= rounds (agent-tool-rounds agent))
               (progn
@@ -672,19 +698,20 @@ call and may signal to enforce a soft budget cap."
                                          (enchiridion.llm:tool-call-id call)))))))))))
       (incf (agent-turn agent))
       (commit-agent-turn agent channel)
-      (values completion *turn-proposal*))))
+      (values completion *turn-proposal* silent-p))))
 
 (defun run-turn (agent text &key model session store (channel :cli) (cancel-p nil)
-                             (pre-request nil) (block-p t))
+                             (pre-request nil) (block-p t) (allow-silence-p nil))
   "Run one turn for AGENT with TEXT, executing tool calls up to the round cap.
 Serializes turns via AGENT's lock (waiting if BLOCK-P, else signalling TURN-BUSY).
-CANCEL-P and PRE-REQUEST run before each round to cancel or enforce soft caps."
+CANCEL-P and PRE-REQUEST run before each round to cancel or enforce soft caps.
+When ALLOW-SILENCE-P is set, a silent turn returns T as the third value."
   (let ((lock (agent-lock agent)))
     (when lock
       (unless (bordeaux-threads:acquire-lock lock block-p)
         (error 'enchiridion.errors:turn-busy :agent (agent-name agent))))
     (unwind-protect
          (run-turn-locked agent text model session store channel cancel-p
-                          pre-request)
+                          pre-request allow-silence-p)
       (when lock
         (bordeaux-threads:release-lock lock)))))

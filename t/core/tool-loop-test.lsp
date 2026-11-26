@@ -74,6 +74,28 @@
            (ok (= 1 (enchiridion.kernel:agent-turn agent)))))
     (enchiridion.tools:clear-registry)))
 
+(deftest a-no-reply-marker-is-not-a-successful-silent-turn-after-tools ()
+  (let ((enchiridion.tools::*registry* (make-hash-table :test #'equal))
+        (runs 0))
+    (enchiridion.tools:define-tool "fixture"
+      :description "Return fixture text."
+      :schema (:object)
+      :handler (lambda (arguments) (declare (ignore arguments)) (incf runs) "done"))
+    (let* ((marker "[enchiridion:no-reply]")
+           (backend (make-scripted-backend
+                     :replies (list (completion marker :tool-calls
+                                                (list (call "c1" "fixture" "{}")))
+                                    (completion marker))))
+           (agent (test-agent backend)))
+      (multiple-value-bind (result proposal silent-p)
+          (enchiridion.kernel:run-turn agent "go" :allow-silence-p t)
+        (declare (ignore proposal))
+        (ng silent-p)
+        (ok (= 1 runs))
+        (ok (string= "" (enchiridion.llm:completion-text result)))
+        (let ((assistant (third (first (scripted-backend-transcripts backend)))))
+          (ok (string= "" (enchiridion.llm:message-content assistant))))))))
+
 (deftest a-presence-call-proposes-beside-the-reply ()
   (enchiridion.tools:clear-registry)
   (unwind-protect

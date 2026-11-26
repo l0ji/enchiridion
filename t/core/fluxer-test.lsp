@@ -1387,6 +1387,31 @@ message: the frame tests do that once, at the edge.")
                        (enchiridion.channel.fluxer::fluxer-channel-reaction-pending
                         channel)))))))
 
+(deftest intentional-silence-clears-the-reaction-without-posting ()
+  (let* ((posts 0)
+         (*error-output* (make-string-output-stream))
+         (enchiridion.llm::*http-request-function*
+           (lambda (url &rest options)
+             (declare (ignore url options))
+             (incf posts)
+             "{\"id\":\"unexpected-message\"}")))
+    (dolist (silent-p '(t nil))
+      (let ((channel (enchiridion.channel.fluxer:make-fluxer-channel
+                      :turn (lambda (message)
+                              (declare (ignore message))
+                              (list :ok-p t :silent-p silent-p :reply "")))))
+        (setf (enchiridion.channel.fluxer::fluxer-channel-token channel) "fake")
+        (enchiridion.channel.fluxer::handle-inkbound
+         channel (list* :content "private disclosure" +direct-message+))
+        (ok (eq (if silent-p :delivered :failed)
+                (gethash "d-1/m-1"
+                         (enchiridion.channel.fluxer::fluxer-channel-reaction-pending channel))))))
+    (ok (zerop posts))
+    (let ((log (get-output-stream-string *error-output*)))
+      (ok (search "chose not to reply to message m-1" log))
+      (ok (search "returned no reply for message m-1" log))
+      (ng (search "private disclosure" log)))))
+
 (deftest a-failed-turn-marks-the-message-failed ()
   (dolist (turn (list (lambda (message)
                         (declare (ignore message))

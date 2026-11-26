@@ -899,7 +899,7 @@ worker thread and manages cosmetic reactions on a separate coalescing worker."))
                 make-fluxer-channel))
 
 (defun make-fluxer-channel (&key turn config)
-  "Return a stopped Fluxer channel invoking TURN (lambda (msg) -> (:ok-p :reply :error :usage :status))
+  "Return a stopped Fluxer channel invoking TURN (lambda (msg) -> (:ok-p :reply :silent-p :error :usage :status))
 for each inbound DM. Optional :STATUS proposals (string or :CLEAR) are validated and rate-limited
 when :CUSTOM-STATUS is enabled. CONFIG overrides the active configuration when non-NIL."
   (make-instance 'fluxer-channel :name "fluxer" :turn turn :config config))
@@ -1909,6 +1909,14 @@ Marks :DELIVERED only after all reply chunks succeed; otherwise marks :FAILED."
                        (note "the turn failed for ~A: ~A"
                              (enchiridion.channel:message-digest message)
                              (or (getf result :error) "no reason given"))
+                       nil)
+                      ((getf result :silent-p)
+                       (note "chose not to reply to message ~A."
+                             (enchiridion.channel:msg-id message))
+                       t)
+                      ((not (non-blank-string (getf result :reply)))
+                       (note "the turn returned no reply for message ~A."
+                             (enchiridion.channel:msg-id message))
                        nil)
                       (t
                        (handler-case

@@ -917,7 +917,8 @@ else only the finished steps are written, one plain line each. The event
         (format nil "~A ~A" condition detail)
         (princ-to-string condition))))
 
-(declaim (ftype (function (t &key (:block-p t)) function) make-channel-turn))
+(declaim (ftype (function (t &key (:block-p t) (:allow-silence-p t)) function)
+                make-channel-turn))
 
 
 (defun broker-reload (context supervisor)
@@ -990,9 +991,9 @@ over the webhook is not filed as a turn typed at the terminal."
   "Return the plist a channel reports when a turn did not run."
   (list :ok-p nil :reply "" :error message :reason reason :usage nil))
 
-(defun make-channel-turn (context &key (block-p nil))
+(defun make-channel-turn (context &key (block-p nil) (allow-silence-p nil))
   "Return a turn handler for a channel, returning a result plist
-(:ok-p :reply :error :reason :status :usage).
+(:ok-p :reply :silent-p :error :reason :status :usage).
 When BLOCK-P is NIL (default), return :busy if another turn is in flight;
 when T, wait for the agent lock."
   (lambda (message)
@@ -1012,14 +1013,16 @@ when T, wait for the agent lock."
             ;; this turn. It travels beside the reply so a channel that does
             ;; not show presence ignores it, and a refused proposal costs the
             ;; reply nothing.
-            (multiple-value-bind (completion proposal)
+            (multiple-value-bind (completion proposal silent-p)
                 (enchiridion.kernel:run-turn
                  agent text
                  :session (context-session context)
                  :store (context-store context)
                  :channel channel
-                 :block-p block-p)
+                 :block-p block-p
+                 :allow-silence-p allow-silence-p)
               (list :ok-p t
+                    :silent-p silent-p
                     :reply (enchiridion.llm.secrets:scrub
                             (enchiridion.llm:completion-text completion))
                     :error ""
@@ -1223,7 +1226,7 @@ the network channels."
        "fluxer" fluxer-p
        (lambda ()
          (enchiridion.channel.fluxer:make-fluxer-channel
-          :turn (make-channel-turn context :block-p t)
+          :turn (make-channel-turn context :block-p t :allow-silence-p t)
           :config config))))
     (values (nreverse channels) (nreverse factories))))
 

@@ -123,6 +123,9 @@ dropped.
   (capacity 32) so turns never block the heartbeat. The bot reacts with ⏳ while
   queued, 🔧 while running, removes the reaction on delivery, and marks ⚠️ on
   failure or queue eviction.
+- **Silence:** The agent can choose not to reply to a DM. It still records the
+  incoming message and clears the processing reaction. An empty model response
+  without that decision counts as a failed turn.
 - **Reply links:** The first chunk of a reply links to the original DM without
   notifying its author as a mention. If the original message is gone, the bot
   sends the reply without the link.

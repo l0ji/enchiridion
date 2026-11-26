@@ -12,14 +12,15 @@
 (in-package #:enchiridion-kernel-test)
 
 (defstruct (fake-backend (:constructor make-fake-backend))
-  (transcript '() :type list))
+  (transcript '() :type list)
+  (text "fake reply" :type string))
 
 (defmethod enchiridion.llm:complete ((backend fake-backend) messages
                                      &key model tools budget)
   (declare (ignore model tools budget))
   (setf (fake-backend-transcript backend) messages)
   (enchiridion.llm::%make-completion
-   :text "fake reply"
+   :text (fake-backend-text backend)
    :model "fake-model"
    :input-tokens 7
    :output-tokens 3))
@@ -35,6 +36,46 @@
 (defun make-test-block (text &key (label :persona) (limit 100) (writable-p t))
   (enchiridion.memory:make-block :label label :text text
                                  :limit limit :writable-p writable-p))
+
+(deftest a-silent-turn-keeps-the-input-and-usage-but-writes-no-assistant-message ()
+  (let* ((directory (merge-pathnames (format nil "enchiridion-silent-~D/"
+                                            (random most-positive-fixnum))
+                                     (uiop:temporary-directory)))
+         (store (enchiridion.memory.store:open-store
+                 :path (merge-pathnames "memory.db" directory)))
+         (backend (make-fake-backend :text (format nil " ~A~%" "[enchiridion:no-reply]")))
+         (agent (enchiridion.kernel:make-agent :backend backend :tools-p nil)))
+    (unwind-protect
+         (multiple-value-bind (completion proposal silent-p)
+             (enchiridion.kernel:run-turn agent "Thanks, that's all."
+                                          :channel :fluxer :store store :allow-silence-p t)
+           (ng proposal)
+           (ok silent-p)
+           (ok (equal "" (enchiridion.llm:completion-text completion)))
+           (ok (= 1 (length (enchiridion.memory.store:usage-rows store))))
+           (ok (equal '(("user" . "Thanks, that's all."))
+                      (enchiridion.memory:conversation-window store)))
+           (ok (search "[enchiridion:no-reply]"
+                       (enchiridion.llm:message-content (first (fake-backend-transcript backend))))))
+      (enchiridion.memory.store:close-store store)
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(deftest only-an-exact-no-reply-decision-on-an-enabled-turn-is-silent ()
+  (let* ((backend (make-fake-backend :text "[enchiridion:no-reply]"))
+         (agent (enchiridion.kernel:make-agent :backend backend :tools-p nil)))
+    (testing "a direct caller still gets text and no silence instruction"
+      (ok (equal "[enchiridion:no-reply]"
+                 (enchiridion.llm:completion-text (enchiridion.kernel:run-turn agent "Quote it."))))
+      (ng (search "[enchiridion:no-reply]"
+                  (enchiridion.llm:message-content (first (fake-backend-transcript backend))))))
+    (testing "blank output and prose containing the marker are not no-reply decisions"
+      (dolist (reply '("" "The literal marker is [enchiridion:no-reply]."))
+        (setf (fake-backend-text backend) reply)
+        (multiple-value-bind (completion proposal silent-p)
+            (enchiridion.kernel:run-turn agent "Another message" :allow-silence-p t)
+          (declare (ignore proposal))
+          (ng silent-p)
+          (ok (equal reply (enchiridion.llm:completion-text completion))))))))
 
 (deftest live-style-guidance-keeps-the-current-user-message-in-place ()
   (let* ((backend (make-fake-backend))

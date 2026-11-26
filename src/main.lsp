@@ -996,7 +996,7 @@ over the webhook is not filed as a turn typed at the terminal."
 (:ok-p :reply :silent-p :error :reason :status :usage).
 When BLOCK-P is NIL (default), return :busy if another turn is in flight;
 when T, wait for the agent lock."
-  (lambda (message)
+  (lambda (message &optional steer)
     (handler-case
         (let ((text (enchiridion.channel:msg-text message))
               (channel (enchiridion.channel:msg-channel message)))
@@ -1020,7 +1020,8 @@ when T, wait for the agent lock."
                  :store (context-store context)
                  :channel channel
                  :block-p block-p
-                 :allow-silence-p allow-silence-p)
+                 :allow-silence-p allow-silence-p
+                 :steer steer)
               (list :ok-p t
                     :silent-p silent-p
                     :reply (enchiridion.llm.secrets:scrub
@@ -1227,6 +1228,7 @@ the network channels."
        (lambda ()
          (enchiridion.channel.fluxer:make-fluxer-channel
           :turn (make-channel-turn context :block-p t :allow-silence-p t)
+          :followups-p t
           :config config))))
     (values (nreverse channels) (nreverse factories))))
 

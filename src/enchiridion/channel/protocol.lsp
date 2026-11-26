@@ -56,6 +56,34 @@ GET-UNIVERSAL-TIME when absent/zero."
      :ts (if (and (integerp ts) (plusp ts)) ts (get-universal-time))
      :reply-to (or (getf plist :reply-to) ""))))
 
+;;;; In-flight follow-ups.
+
+(declaim (ftype (function (function function &key
+                           (:count (integer 0 *)) (:chars (integer 0 *)))
+                          function)
+                make-followup-selector))
+
+(defun make-followup-selector (same-route-p message-text &key (count 4) (chars 16000))
+  "Return a selector for one turn, with a shared COUNT and CHARS budget.
+Given a pending list, return the claimed messages and the remaining list in order.
+Call while holding the queue lock; leave an oversized match and later matches queued."
+  (lambda (pending)
+    (let ((claimed '()) (waiting '()))
+      (loop for tail on pending
+            for message = (first tail)
+            do (cond
+                 ((zerop count)
+                  (return (values (nreverse claimed) (nreconc waiting tail))))
+                 ((funcall same-route-p message)
+                  (let ((size (length (funcall message-text message))))
+                    (when (> size chars)
+                      (return (values (nreverse claimed) (nreconc waiting tail))))
+                    (push message claimed)
+                    (decf count)
+                    (decf chars size)))
+                 (t (push message waiting)))
+            finally (return (values (nreverse claimed) (nreverse waiting)))))))
+
 ;;;; The digest.
 
 (defparameter +message-digest-length+ 60

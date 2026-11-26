@@ -123,6 +123,9 @@ dropped.
   (capacity 32) so turns never block the heartbeat. The bot reacts with ⏳ while
   queued, 🔧 while running, removes the reaction on delivery, and marks ⚠️ on
   failure or queue eviction.
+- **Follow-ups:** New messages from the same sender in the same DM can join a
+  turn while the agent works. A message after the answer is ready starts its own
+  turn. Replies to several messages link to the first one.
 - **Silence:** The agent can choose not to reply to a DM. It still records the
   incoming message and clears the processing reaction. An empty model response
   without that decision counts as a failed turn.

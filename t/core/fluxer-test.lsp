@@ -1387,6 +1387,39 @@ message: the frame tests do that once, at the edge.")
                        (enchiridion.channel.fluxer::fluxer-channel-reaction-pending
                         channel)))))))
 
+(deftest follow-ups-fold-only-the-same-sender-and-dm-before-publication ()
+  (let ((channel nil) (posted '()) (folded nil))
+    (setf channel
+          (enchiridion.channel.fluxer:make-fluxer-channel
+           :config '(:allowed-users ("u-1" "u-2")) :followups-p t
+           :turn (lambda (message steer)
+                   (declare (ignore message))
+                   (dolist (data (list (list* :id "m-other-dm" :channel_id "d-2" +direct-message+)
+                                       (list* :id "m-other-user" :author '(:id "u-2") +direct-message+)
+                                       (list* :id "m-attachment" :content "" +direct-message+)
+                                       (list* :id "m-folded" :content "a follow-up" +direct-message+)))
+                     (enchiridion.channel.fluxer::offer-message channel data))
+                   (setf folded (funcall steer :before-final))
+                   (enchiridion.channel.fluxer::offer-message
+                    channel (list* :id "m-later" :content "next turn" +direct-message+))
+                   (list :ok-p t :reply "one reply"))))
+    (let ((enchiridion.llm::*http-request-function*
+            (lambda (url &rest options)
+              (declare (ignore url))
+              (push (enchiridion.llm:parse-json (getf options :content)) posted)
+              "{\"id\":\"reply\"}")))
+      (setf (enchiridion.channel.fluxer::fluxer-channel-token channel) "fake")
+      (enchiridion.channel.fluxer::handle-inkbound channel +direct-message+))
+    (ok (equal '("a follow-up") folded))
+    (ok (= 1 (length posted)))
+    (ok (equal '(:message_id "m-1") (getf (first posted) :message_reference)))
+    (let ((reactions (enchiridion.channel.fluxer::fluxer-channel-reaction-pending channel))
+          (pending (enchiridion.channel.fluxer::fluxer-channel-pending channel)))
+      (ok (eq :delivered (gethash "d-1/m-1" reactions)))
+      (ok (eq :delivered (gethash "d-1/m-folded" reactions)))
+      (ok (equal '("m-other-dm" "m-other-user" "m-attachment" "m-later")
+                 (mapcar (lambda (data) (getf data :id)) pending))))))
+
 (deftest intentional-silence-clears-the-reaction-without-posting ()
   (let* ((posts 0)
          (*error-output* (make-string-output-stream))
@@ -1622,13 +1655,13 @@ message: the frame tests do that once, at the edge.")
            ;; Wait for the worker to be inside the turn, so the stop has a turn
            ;; to abandon rather than a message to dequeue and mark normally.
            (loop repeat 200
-                 until (string= "d-1/m-1"
+                 until (member "d-1/m-1"
                                 (bordeaux-threads:with-lock-held
                                     ((enchiridion.channel.fluxer::fluxer-channel-pending-lock
                                       channel))
-                                  (or (enchiridion.channel.fluxer::fluxer-channel-active-reaction
-                                       channel)
-                                      "")))
+                                  (enchiridion.channel.fluxer::fluxer-channel-active-reactions
+                                   channel))
+                                :test #'equal)
                  do (sleep 0.01))
            ;; A second message waits behind the abandoned turn and must be
            ;; marked failed by the drain, not left for a worker that is gone.

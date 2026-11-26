@@ -74,6 +74,76 @@
            (ok (= 1 (enchiridion.kernel:agent-turn agent)))))
     (enchiridion.tools:clear-registry)))
 
+(deftest follow-ups-use-an-unsent-draft-without-recording-it-as-a-reply ()
+  (let* ((directory (merge-pathnames (format nil "enchiridion-followup-~D/"
+                                            (random most-positive-fixnum))
+                                     (uiop:temporary-directory)))
+         (store (enchiridion.memory.store:open-store
+                 :path (merge-pathnames "memory.db" directory)))
+         (backend (make-scripted-backend
+                   :replies (list (completion "draft") (completion "answer together"))))
+         (agent (test-agent backend :tools-p nil))
+         (before-request '("second"))
+         (before-final '("" "  " "third")))
+    (unwind-protect
+         (let ((result (enchiridion.kernel:run-turn
+                        agent "first" :store store
+                        :steer (lambda (phase)
+                                 (ecase phase
+                                   (:before-request (shiftf before-request nil))
+                                   (:before-final (shiftf before-final nil)))))))
+           (ok (equal "answer together" (enchiridion.llm:completion-text result)))
+           (destructuring-bind (revised initial) (scripted-backend-transcripts backend)
+             (ok (equal '("first" "second")
+                        (mapcar #'enchiridion.llm:message-content (rest initial))))
+             (ok (equal (list "first" "second" (format nil "Unsent draft:~%draft") "third")
+                        (mapcar #'enchiridion.llm:message-content (rest revised)))))
+           (ok (equal '(("user" . "first") ("user" . "second") ("user" . "third")
+                        ("assistant" . "answer together"))
+                      (enchiridion.memory:conversation-window store)))
+           (ok (= 2 (length (enchiridion.kernel:spend agent)))))
+      (enchiridion.memory.store:close-store store)
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))))
+
+(deftest a-follow-up-can-stop-a-planned-tool-before-it-runs ()
+  (let ((enchiridion.tools::*registry* (make-hash-table :test #'equal))
+        (runs 0))
+    (enchiridion.tools:define-tool "fixture"
+      :description "Return fixture text."
+      :schema (:object)
+      :handler (lambda (arguments) (declare (ignore arguments)) (incf runs) "done"))
+    (let* ((plan (completion "I'll do it." :tool-calls (list (call "c1" "fixture" "{}"))))
+           (backend (make-scripted-backend :replies (list plan (completion "I won't run it."))))
+           (agent (test-agent backend))
+           (result (enchiridion.kernel:run-turn
+                    agent "Run it."
+                    :steer (lambda (phase)
+                             (when (eq phase :before-tools) '("Wait, don't run it."))))))
+      (ok (zerop runs))
+      (ok (equal "I won't run it." (enchiridion.llm:completion-text result)))
+      (ok (equal '("Run it." "Wait, don't run it.")
+                 (mapcar #'enchiridion.llm:message-content
+                         (rest (first (scripted-backend-transcripts backend)))))))))
+
+(deftest a-follow-up-can-supersede-an-unpublished-status-proposal ()
+  (let ((enchiridion.tools::*registry* (make-hash-table :test #'equal)))
+    (enchiridion.tools.builtin:register-presence-tools)
+    (let* ((backend (make-scripted-backend
+                     :replies (list (completion "" :tool-calls
+                                                (list (call "c1" "presence"
+                                                            "{\"text\":\"away\"}")))
+                                    (completion "Heading out.")
+                                    (completion "I'll be here."))))
+           (agent (test-agent backend))
+           (pending '("Actually, don't set a status.")))
+      (multiple-value-bind (reply proposal)
+          (enchiridion.kernel:run-turn agent "Set your status to away."
+                                       :steer (lambda (phase)
+                                                (when (eq phase :before-final)
+                                                  (shiftf pending nil))))
+        (ok (equal "I'll be here." (enchiridion.llm:completion-text reply)))
+        (ng proposal)))))
+
 (deftest a-no-reply-marker-is-not-a-successful-silent-turn-after-tools ()
   (let ((enchiridion.tools::*registry* (make-hash-table :test #'equal))
         (runs 0))

@@ -811,6 +811,8 @@ before websocket-driver discards it."))
 (defclass fluxer-channel (enchiridion.channel:channel)
   ((turn :accessor fluxer-channel-turn :initarg :turn :initform nil :type t
          :documentation "Injected turn handler (lambda (msg) ...) returning a result plist.")
+   (followups-p :reader fluxer-channel-followups-p :initarg :followups-p :initform nil
+                :type boolean)
    (config :accessor fluxer-channel-config :initarg :config :initform nil
            :type t
            :documentation "Explicit :FLUXER options or full config; NIL uses the active config.")
@@ -829,10 +831,10 @@ before websocket-driver discards it."))
                  :type t
                  :documentation "Guards PENDING, ACTIVE-REACTION, and STOPPING-P handoff.")
    (pending-ready :accessor fluxer-channel-pending-ready
-                  :initform (bordeaux-threads:make-semaphore
+                  :initform (bordeaux-threads:make-condition-variable
                              :name "fluxer pending")
                   :type t
-                  :documentation "Semaphore counting queued inbound payloads.")
+                  :documentation "Notifies the worker when work arrives or the channel stops.")
    (worker :accessor fluxer-channel-worker :initform nil :type t
            :documentation "The one thread that runs turns.")
    (stopping-p :accessor fluxer-channel-stopping-p :initform nil :type boolean
@@ -887,22 +889,22 @@ before websocket-driver discards it."))
    (reaction-applied-order :accessor fluxer-channel-reaction-applied-order
                            :initform nil :type list
                            :documentation "FIFO keys in REACTION-APPLIED, bounded by +REACTION-TRACKED-LIMIT+.")
-   (active-reaction :accessor fluxer-channel-active-reaction :initform nil
-                    :type t
-                    :documentation "Message key currently being processed by the turn worker, for failure marking on destroy."))
+   (active-reactions :accessor fluxer-channel-active-reactions :initform nil
+                     :type list
+                     :documentation "Reaction keys for messages claimed by the current turn."))
   (:documentation
    "Fluxer DM channel. Decouples websocket reading from turn execution via a single
 worker thread and manages cosmetic reactions on a separate coalescing worker."))
 
-(declaim (ftype (function (&key (:turn t) (:config t))
+(declaim (ftype (function (&key (:turn t) (:config t) (:followups-p boolean))
                            (values fluxer-channel &rest t))
                 make-fluxer-channel))
 
-(defun make-fluxer-channel (&key turn config)
-  "Return a stopped Fluxer channel invoking TURN (lambda (msg) -> (:ok-p :reply :silent-p :error :usage :status))
-for each inbound DM. Optional :STATUS proposals (string or :CLEAR) are validated and rate-limited
-when :CUSTOM-STATUS is enabled. CONFIG overrides the active configuration when non-NIL."
-  (make-instance 'fluxer-channel :name "fluxer" :turn turn :config config))
+(defun make-fluxer-channel (&key turn config (followups-p nil))
+  "Return a stopped Fluxer channel invoking TURN for each DM.
+With FOLLOWUPS-P, pass TURN a second argument, its follow-up callback."
+  (make-instance 'fluxer-channel :name "fluxer" :turn turn :config config
+                 :followups-p followups-p))
 
 ;;;; What the configuration says.
 
@@ -1835,9 +1837,7 @@ Coalesces by replacing any queued state for KEY; drops with a log line if full."
 (declaim (ftype (function (fluxer-channel t) null) enqueue-inkbound))
 
 (defun enqueue-inkbound (channel data)
-  "Enqueue inbound payload DATA for the turn worker under PENDING-LOCK.
-Evicts the oldest queued message (marking it :FAILED) when at +MAX-PENDING-MESSAGES+,
-and refuses new messages (marking them :FAILED) once STOPPING-P is set."
+  "Queue DATA, evicting the oldest waiting message if full."
   (let ((dropped nil)
         (refused nil))
     (bordeaux-threads:with-lock-held ((fluxer-channel-pending-lock channel))
@@ -1849,7 +1849,8 @@ and refuses new messages (marking them :FAILED) once STOPPING-P is set."
               (setf dropped (pop (fluxer-channel-pending channel)))
               (incf (fluxer-channel-dropped channel)))
             (setf (fluxer-channel-pending channel)
-                  (nconc (fluxer-channel-pending channel) (list data))))))
+                  (nconc (fluxer-channel-pending channel) (list data)))
+            (bordeaux-threads:condition-notify (fluxer-channel-pending-ready channel)))))
     (cond
       (refused
        (note "the channel is stopping, so a message was not queued.")
@@ -1857,28 +1858,57 @@ and refuses new messages (marking them :FAILED) once STOPPING-P is set."
       (dropped
        (note "the queue is full, so the oldest waiting message was dropped (~D so far)."
              (fluxer-channel-dropped channel))
-       (enqueue-reaction channel (message-reaction-key dropped) :failed)))
-    (unless refused
-      (bordeaux-threads:signal-semaphore (fluxer-channel-pending-ready channel))))
+       (enqueue-reaction channel (message-reaction-key dropped) :failed))))
   nil)
 
-(declaim (ftype (function (fluxer-channel) t) claim-inkbound))
+(declaim (ftype (function (fluxer-channel &key (:wait-p boolean)) t) claim-inkbound))
 
-(defun claim-inkbound (channel)
-  "Pop the oldest queued payload under PENDING-LOCK, or return NIL if empty or stopping."
-  (bordeaux-threads:with-lock-held ((fluxer-channel-pending-lock channel))
-    (unless (fluxer-channel-stopping-p channel)
-      (pop (fluxer-channel-pending channel)))))
+(defun claim-inkbound (channel &key (wait-p nil))
+  "Pop the oldest waiting payload, optionally waiting until work or shutdown."
+  (let ((lock (fluxer-channel-pending-lock channel)))
+    (bordeaux-threads:with-lock-held (lock)
+      (loop
+        (when (fluxer-channel-stopping-p channel)
+          (return nil))
+        (when (fluxer-channel-pending channel)
+          (return (pop (fluxer-channel-pending channel))))
+        (unless wait-p
+          (return nil))
+        (bordeaux-threads:condition-wait (fluxer-channel-pending-ready channel) lock)))))
 
 ;;;; The worker: the one thread that runs a turn.
 
-(declaim (ftype (function (t (or null string)) null) note-active-reaction))
-
-(defun note-active-reaction (channel key)
-  "Record or clear the active message key under PENDING-LOCK so stop can mark an abandoned turn failed."
+(defun claim-followups (channel select)
+  "Claim matching payloads for the active turn and register their reaction keys."
   (bordeaux-threads:with-lock-held ((fluxer-channel-pending-lock channel))
-    (setf (fluxer-channel-active-reaction channel) key))
-  nil)
+    (unless (fluxer-channel-stopping-p channel)
+      (multiple-value-bind (claimed waiting)
+          (funcall select (fluxer-channel-pending channel))
+        (when claimed
+          (setf (fluxer-channel-pending channel) waiting)
+          (dolist (data claimed)
+            (let ((key (message-reaction-key data)))
+              (when key (push key (fluxer-channel-active-reactions channel)))))
+          claimed)))))
+
+(defun make-turn-steer (channel message)
+  "Return the follow-up callback for an authenticated DM route."
+  (let ((target (enchiridion.channel:msg-target message))
+        (author (enchiridion.channel:msg-author message)))
+    (when (and (non-blank-string target) (non-blank-string author))
+      (labels ((text (data) (text-field data :content))
+               (matches (data)
+                 (and (equal target (text-field data :channel_id))
+                      (equal author (author-id data))
+                      (non-blank-string (text data)))))
+        (let ((select (enchiridion.channel:make-followup-selector #'matches #'text)))
+          (lambda (phase)
+            (declare (ignore phase))
+            (mapcar #'text (claim-followups channel select))))))))
+
+(defun set-active-reactions (channel keys)
+  (bordeaux-threads:with-lock-held ((fluxer-channel-pending-lock channel))
+    (setf (fluxer-channel-active-reactions channel) keys)))
 
 (declaim (ftype (function (fluxer-channel t) null) handle-inkbound))
 
@@ -1891,7 +1921,7 @@ Marks :DELIVERED only after all reply chunks succeed; otherwise marks :FAILED."
          (completed nil))
     (unwind-protect
          (progn
-           (note-active-reaction channel key)
+           (set-active-reactions channel (when key (list key)))
            (enqueue-reaction channel key :processing)
            (cond
              ((not (functionp turn))
@@ -1899,7 +1929,9 @@ Marks :DELIVERED only after all reply chunks succeed; otherwise marks :FAILED."
                     (enchiridion.channel:message-digest message))
               (enqueue-reaction channel key :failed))
              ((handler-case
-                  (let ((result (funcall turn message)))
+                  (let ((result (if (fluxer-channel-followups-p channel)
+                                     (funcall turn message (make-turn-steer channel message))
+                                     (funcall turn message))))
                     (cond
                       ((not (listp result))
                        (note "the turn answered ~S, which is not a result plist."
@@ -1941,29 +1973,23 @@ Marks :DELIVERED only after all reply chunks succeed; otherwise marks :FAILED."
                         (enchiridion.channel:message-digest message)
                         condition)
                   nil))
-              (enqueue-reaction channel key :delivered))
+              (dolist (claimed (fluxer-channel-active-reactions channel))
+                (enqueue-reaction channel claimed :delivered)))
              (t
-              (enqueue-reaction channel key :failed)))
+              (dolist (claimed (fluxer-channel-active-reactions channel))
+                (enqueue-reaction channel claimed :failed))))
            (setf completed t))
-      ;; Leave active-reaction set if destroyed mid-turn so STOP-WORKER marks it failed.
+      ;; Leave active reactions if destroyed mid-turn so STOP-WORKER marks it failed.
       (when completed
-        (note-active-reaction channel nil))))
+        (set-active-reactions channel nil))))
   nil)
 
 (declaim (ftype (function (fluxer-channel) null) run-worker))
 
 (defun run-worker (channel)
-  "Process queued inbound messages sequentially until STOPPING-P is set.
-Re-checks STOPPING-P under PENDING-LOCK via CLAIM-INKBOUND before starting each turn."
-  (loop
-    (when (fluxer-channel-stopping-p channel)
-      (return))
-    (when (bordeaux-threads:wait-on-semaphore
-           (fluxer-channel-pending-ready channel)
-           :timeout +worker-wait-seconds+)
-      (let ((data (claim-inkbound channel)))
-        (when data
-          (handle-inkbound channel data)))))
+  "Process queued messages sequentially until the channel stops."
+  (loop for data = (claim-inkbound channel :wait-p t)
+        while data do (handle-inkbound channel data))
   nil)
 
 (declaim (ftype (function (fluxer-channel) null) stop-worker))
@@ -1972,8 +1998,8 @@ Re-checks STOPPING-P under PENDING-LOCK via CLAIM-INKBOUND before starting each 
   "Set STOPPING-P, wake and bounded-join the turn worker, and mark any destroyed or queued
 messages :FAILED. Must run before STOP-REACTION-WORKER so failure markers can be drained."
   (bordeaux-threads:with-lock-held ((fluxer-channel-pending-lock channel))
-    (setf (fluxer-channel-stopping-p channel) t))
-  (bordeaux-threads:signal-semaphore (fluxer-channel-pending-ready channel))
+    (setf (fluxer-channel-stopping-p channel) t)
+    (bordeaux-threads:condition-notify (fluxer-channel-pending-ready channel)))
   (let ((worker (fluxer-channel-worker channel))
         (abandoned nil)
         (active nil)
@@ -1982,12 +2008,13 @@ messages :FAILED. Must run before STOP-REACTION-WORKER so failure markers can be
       (setf abandoned (join-thread-bounded worker +stop-join-seconds+)
             (fluxer-channel-worker channel) nil))
     (bordeaux-threads:with-lock-held ((fluxer-channel-pending-lock channel))
-      (setf active (fluxer-channel-active-reaction channel)
-            (fluxer-channel-active-reaction channel) nil
+      (setf active (fluxer-channel-active-reactions channel)
+            (fluxer-channel-active-reactions channel) nil
             waiting (fluxer-channel-pending channel)
             (fluxer-channel-pending channel) nil))
-    (when (and abandoned active)
-      (enqueue-reaction channel active :failed))
+    (when abandoned
+      (dolist (key active)
+        (enqueue-reaction channel key :failed)))
     (dolist (data waiting)
       (enqueue-reaction channel (message-reaction-key data) :failed))
     (when waiting
@@ -2314,7 +2341,7 @@ Fatal close codes stop retrying immediately."
         (fluxer-channel-attempt channel) 0
         (fluxer-channel-dropped channel) 0
         (fluxer-channel-pending channel) nil
-        (fluxer-channel-active-reaction channel) nil
+        (fluxer-channel-active-reactions channel) nil
         ;; Clear any stale socket so CURRENT-SOCKET-P does not misclassify frames.
         (fluxer-channel-socket channel) nil
         (enchiridion.channel:channel-live-p channel) t

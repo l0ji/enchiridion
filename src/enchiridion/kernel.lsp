@@ -154,7 +154,13 @@ A brief, genuine acknowledgment is fine. Don't use silence for a direct request,
 to hide work or a failure, or when someone may be in immediate danger."
           +no-reply-text+))
 
-(defun turn-prompt-text (agent tools channel allow-silence-p)
+(defparameter +steer-note+
+  "The person can send more messages while you work. An assistant message
+labeled Unsent draft was not shown to them. Use it if useful, but answer the
+latest messages together without referring to that draft as a sent reply.
+A follow-up discards any pending custom status. Propose it again if it still fits.")
+
+(defun turn-prompt-text (agent tools channel allow-silence-p steer)
   (let* ((text (prompt-text (agent-snapshot agent)))
          (directory (agent-directory agent))
          (status (and directory (not (eq channel :sleep))
@@ -166,6 +172,8 @@ to hide work or a failure, or when someone may be in immediate danger."
         (format stream "~%~%~A" +live-style-note+))
       (when allow-silence-p
         (format stream "~%~%~A" +no-reply-note+))
+      (when steer
+        (format stream "~%~%~A" +steer-note+))
       (when tools
         (format stream "~%~%Tool budget: ~D rounds per turn. A round may contain multiple tool calls."
                 (agent-tool-rounds agent)))
@@ -553,12 +561,26 @@ Silently ignores non-repositories, missing git identity, and clean trees."
            (format nil "Agent turn ~D via ~A" (agent-turn agent) channel))
         (error () nil)))))
 
-(declaim (ftype (function (agent string t t t keyword t t t)
+(defun append-followups (steer phase messages store session channel &optional draft)
+  "Append new user messages to MESSAGES, or return NIL if none arrived."
+  (let ((texts (and steer (remove-if #'blank-text-p (funcall steer phase)))))
+    (when texts
+      (setf *turn-proposal* nil)
+      (append messages
+              (unless (blank-text-p draft)
+                (list (enchiridion.llm:assistant-message
+                       (format nil "Unsent draft:~%~A" (enchiridion.llm.secrets:scrub draft)))))
+              (loop for text in texts collect
+                (progn
+                  (persist-turn store session "user" text :channel channel)
+                  (enchiridion.llm:user-message (enchiridion.llm.secrets:scrub text))))))))
+
+(declaim (ftype (function (agent string t t t keyword t t t t)
                           (values t t boolean))
                 run-turn-locked))
 
 (defun run-turn-locked (agent text model session store channel cancel-p
-                        pre-request allow-silence-p)
+                        pre-request allow-silence-p steer)
   "Execute one turn on AGENT with its lock already held.
 PRE-REQUEST, if set, is called with the 0-based round index before each model
 call and may signal to enforce a soft budget cap."
@@ -604,7 +626,7 @@ call and may signal to enforce a soft budget cap."
                       (list (enchiridion.llm:system-message
                              (enchiridion.llm.secrets:scrub
                               (turn-prompt-text agent tools channel
-                                                allow-silence-p))))
+                                                allow-silence-p steer))))
                       (mapcar (lambda (entry)
                                 (let ((body (enchiridion.llm.secrets:scrub
                                              (cdr entry))))
@@ -625,93 +647,105 @@ call and may signal to enforce a soft budget cap."
            (silent-p nil))
       (persist-turn store session "user" text :channel channel)
       (loop
-        (when (and cancel-p (funcall cancel-p))
-          (error 'enchiridion.errors:turn-cancelled :turn rounds))
-        (when pre-request
-          (funcall pre-request rounds))
-        (note-progress :request :round rounds)
-        (setf completion (complete-with-tools backend messages model tools))
-        (when (and allow-silence-p
-                   (string= +no-reply-text+
-                            (trim-reply-text (enchiridion.llm:completion-text completion))))
-          (setf silent-p (and (zerop rounds) (not wrapped-up)
-                              (null (enchiridion.llm:completion-tool-calls completion)))
-                completion (enchiridion.llm:copy-completion completion)
-                (enchiridion.llm:completion-text completion) ""))
-        (setf tool-message (enchiridion.llm:take-completion-tool-message completion))
-        (note-progress :response
-                       :round rounds
-                       :reasoning (enchiridion.llm:completion-reasoning-text completion)
-                       :text (and (enchiridion.llm:completion-tool-calls completion)
-                                  (enchiridion.llm:completion-text completion))
-                       :calls (length (enchiridion.llm:completion-tool-calls completion)))
-        (persist-usage store session (record-spend agent completion :channel channel))
-        ;; Compute the effective final completion before persisting so wrap-up
-        ;; replies are recorded once as final.
-        (let* ((final (if wrapped-up
-                          (wrap-up-completion completion last-words)
-                          completion))
-               (text (enchiridion.llm:completion-text final))
-               (calls (enchiridion.llm:completion-tool-calls final)))
-          (when session
-            (push final (session-turns session))
-            (setf (session-turns session)
-                  (keep-newest (session-turns session) +session-turns-keep+)))
-          (persist-turn store session "assistant" text
-                        :model (enchiridion.llm:completion-model final)
-                        :channel channel
-                        :final-p (if (or wrapped-up (null calls)) t 0))
-          (unless (blank-text-p text)
-            (setf last-words text))
-          (when (or wrapped-up (null calls))
-            (setf completion final)
-            (return))
-          ;; At the round cap, drop pending tool calls and force one wrap-up reply.
-          (if (>= rounds (agent-tool-rounds agent))
-              (progn
-                (note-progress :round-limit :rounds rounds)
-                (setf wrapped-up t
-                      messages (append messages
-                                       (list (enchiridion.llm:user-message
-                                              +tool-round-limit-note+)))))
-              (progn
-                (incf rounds)
-                (setf messages (append messages (list tool-message)))
-                (loop for (call . later) on calls do
-                  (note-progress :tool-start
-                                 :name (enchiridion.llm:tool-call-name call)
-                                 :arguments (enchiridion.llm:tool-call-arguments call))
-                  (multiple-value-bind (result outcome failed) (execute-tool agent call)
-                    (declare (ignore outcome))
-                    (note-progress :tool-end
+        (block round
+          (when (and cancel-p (funcall cancel-p))
+            (error 'enchiridion.errors:turn-cancelled :turn rounds))
+          (when pre-request
+            (funcall pre-request rounds))
+          (setf messages (or (append-followups steer :before-request messages store session channel)
+                             messages))
+          (note-progress :request :round rounds)
+          (setf completion (complete-with-tools backend messages model tools))
+          (when (and allow-silence-p
+                     (string= +no-reply-text+
+                              (trim-reply-text (enchiridion.llm:completion-text completion))))
+            (setf silent-p (and (zerop rounds) (not wrapped-up)
+                                (null (enchiridion.llm:completion-tool-calls completion)))
+                  completion (enchiridion.llm:copy-completion completion)
+                  (enchiridion.llm:completion-text completion) ""))
+          (setf tool-message (enchiridion.llm:take-completion-tool-message completion))
+          (note-progress :response
+                         :round rounds
+                         :reasoning (enchiridion.llm:completion-reasoning-text completion)
+                         :text (and (enchiridion.llm:completion-tool-calls completion)
+                                    (enchiridion.llm:completion-text completion))
+                         :calls (length (enchiridion.llm:completion-tool-calls completion)))
+          (persist-usage store session (record-spend agent completion :channel channel))
+          (let* ((calls (enchiridion.llm:completion-tool-calls completion))
+                 (next (append-followups steer (if (and calls (not wrapped-up))
+                                                   :before-tools :before-final)
+                                         messages store session channel
+                                         (unless calls (enchiridion.llm:completion-text completion)))))
+            (when next
+              (setf messages next silent-p nil)
+              (return-from round)))
+          ;; Compute the effective final completion before persisting so wrap-up
+          ;; replies are recorded once as final.
+          (let* ((final (if wrapped-up
+                            (wrap-up-completion completion last-words)
+                            completion))
+                 (text (enchiridion.llm:completion-text final))
+                 (calls (enchiridion.llm:completion-tool-calls final)))
+            (when session
+              (push final (session-turns session))
+              (setf (session-turns session)
+                    (keep-newest (session-turns session) +session-turns-keep+)))
+            (persist-turn store session "assistant" text
+                          :model (enchiridion.llm:completion-model final)
+                          :channel channel
+                          :final-p (if (or wrapped-up (null calls)) t 0))
+            (unless (blank-text-p text)
+              (setf last-words text))
+            (when (or wrapped-up (null calls))
+              (setf completion final)
+              (return))
+            ;; At the round cap, drop pending tool calls and force one wrap-up reply.
+            (if (>= rounds (agent-tool-rounds agent))
+                (progn
+                  (note-progress :round-limit :rounds rounds)
+                  (setf wrapped-up t
+                        messages (append messages
+                                         (list (enchiridion.llm:user-message
+                                                +tool-round-limit-note+)))))
+                (progn
+                  (incf rounds)
+                  (setf messages (append messages (list tool-message)))
+                  (loop for (call . later) on calls do
+                    (note-progress :tool-start
                                    :name (enchiridion.llm:tool-call-name call)
-                                   :result result
-                                   :failed failed)
-                    (persist-turn store session "tool" result :channel channel)
-                    (setf messages
-                          (append messages
-                                  (list (enchiridion.llm:tool-message
-                                         (if (and bootstrap-active (null later))
-                                             (format nil "~A~%~%Tool rounds remaining: ~D."
-                                                     result (- (agent-tool-rounds agent) rounds))
-                                             result)
-                                         (enchiridion.llm:tool-call-id call)))))))))))
+                                   :arguments (enchiridion.llm:tool-call-arguments call))
+                    (multiple-value-bind (result outcome failed) (execute-tool agent call)
+                      (declare (ignore outcome))
+                      (note-progress :tool-end
+                                     :name (enchiridion.llm:tool-call-name call)
+                                     :result result
+                                     :failed failed)
+                      (persist-turn store session "tool" result :channel channel)
+                      (setf messages
+                            (append messages
+                                    (list (enchiridion.llm:tool-message
+                                           (if (and bootstrap-active (null later))
+                                               (format nil "~A~%~%Tool rounds remaining: ~D."
+                                                       result (- (agent-tool-rounds agent) rounds))
+                                               result)
+                                           (enchiridion.llm:tool-call-id call))))))))))))
       (incf (agent-turn agent))
       (commit-agent-turn agent channel)
       (values completion *turn-proposal* silent-p))))
 
 (defun run-turn (agent text &key model session store (channel :cli) (cancel-p nil)
-                             (pre-request nil) (block-p t) (allow-silence-p nil))
+                             (pre-request nil) (block-p t) (allow-silence-p nil) steer)
   "Run one turn for AGENT with TEXT, executing tool calls up to the round cap.
 Serializes turns via AGENT's lock (waiting if BLOCK-P, else signalling TURN-BUSY).
 CANCEL-P and PRE-REQUEST run before each round to cancel or enforce soft caps.
-When ALLOW-SILENCE-P is set, a silent turn returns T as the third value."
+When ALLOW-SILENCE-P is set, a silent turn returns T as the third value.
+STEER, if set, returns a bounded list of new user texts at each checkpoint."
   (let ((lock (agent-lock agent)))
     (when lock
       (unless (bordeaux-threads:acquire-lock lock block-p)
         (error 'enchiridion.errors:turn-busy :agent (agent-name agent))))
     (unwind-protect
          (run-turn-locked agent text model session store channel cancel-p
-                          pre-request allow-silence-p)
+                          pre-request allow-silence-p steer)
       (when lock
         (bordeaux-threads:release-lock lock)))))

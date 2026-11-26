@@ -64,6 +64,29 @@
     (testing "and so does reply-to"
       (ok (equal "m-6" (enchiridion.channel:msg-reply-to message))))))
 
+;;;; In-flight follow-ups.
+
+(deftest a-followup-selector-claims-only-matching-routes-in-order ()
+  (let ((select (enchiridion.channel:make-followup-selector
+                 (lambda (entry) (eq :a (car entry))) #'cdr :count 2)))
+    (multiple-value-bind (claimed waiting)
+        (funcall select '((:b . "unrelated") (:a . "first") (:c . "other")))
+      (ok (equal '((:a . "first")) claimed))
+      (ok (equal '((:b . "unrelated") (:c . "other")) waiting)))
+    (multiple-value-bind (claimed waiting)
+        (funcall select '((:a . "second") (:a . "third") (:b . "fourth")))
+      (ok (equal '((:a . "second")) claimed))
+      (ok (equal '((:a . "third") (:b . "fourth")) waiting)))))
+
+(deftest a-followup-that-will-not-fit-blocks-later-matches ()
+  (let* ((select (enchiridion.channel:make-followup-selector
+                  (lambda (entry) (eq :a (car entry))) #'cdr :chars 5))
+         (pending '((:a . "1234") (:b . "other") (:a . "too long") (:a . "x"))))
+    (multiple-value-bind (claimed waiting) (funcall select pending)
+      (ok (equal '((:a . "1234")) claimed))
+      (ok (equal '((:b . "other") (:a . "too long") (:a . "x")) waiting))
+      (ng (funcall select waiting)))))
+
 ;;;; The digest.
 
 (deftest message-digest-names-channel-and-author ()

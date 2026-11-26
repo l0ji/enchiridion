@@ -1246,8 +1246,10 @@ RARITY-OF runs one index count per token and LINK-CO-OCCURRENCES one query per
 token, so the tokens are the body's first and the limit keeps a hint a hint.")
 
 (defun hint-tokens (body)
-  "Return the distinct content tokens the lexical hints read from BODY."
-  (let ((tokens (remove-duplicates (tokenise body) :test #'string=)))
+  "Return the distinct searchable content tokens the lexical hints read from BODY.
+FTS-QUERY rejects tokens with no alphanumeric character, such as underscore runs."
+  (let ((tokens (remove-if (lambda (token) (notany #'alphanumericp token))
+                           (remove-duplicates (tokenise body) :test #'string=))))
     (if (> (length tokens) *hint-token-limit*)
         (subseq tokens 0 *hint-token-limit*)
         tokens)))

@@ -502,6 +502,20 @@ CALLS, when given, is a cons whose car counts the requests."
         (ok (equal batched
                    (loop for id from 1 to 6 collect (episode-rarity store id))))))))
 
+(deftest maintenance-skips-punctuation-only-hint-tokens ()
+  (with-store (store)
+    (let ((write (turn-writer store))
+          (enchiridion.memory:*memory-parameters*
+            (list* :spread-weight 1.0 enchiridion.memory:*memory-parameters*)))
+      (funcall write "___")
+      (funcall write "deploy ___ vault")
+      (funcall write "deploy key")
+      (ok (eql 3 (getf (enchiridion.memory:maintenance store) :derived)))
+      (ok (zerop (episode-rarity store 1)))
+      (ok (= 1.0 (episode-rarity store 2)))
+      (ok (= 2 (row-count store "SELECT COUNT(*) AS n FROM links
+                                 WHERE type = 'co_occurs'"))))))
+
 (deftest a-lexical-hint-reads-a-bounded-prefix-of-its-body ()
   ;; RARITY-OF runs one index count per distinct token. An episode can be one
   ;; whole tool result, so an unbounded list cost thousands of queries.

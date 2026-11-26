@@ -201,6 +201,24 @@ here the way the operator would see it."
           (ok (eql 0 status))
           (ok (search (format nil "~A -- " name) text)))))))
 
+(deftest every-command-has-usage-documentation ()
+  (dolist (name (enchiridion.channel.cli:command-names))
+    (testing name
+      (let ((text (with-output-to-string (*standard-output*)
+                    (enchiridion.channel.cli:command-help name))))
+        (ok (search "usage:" text)))))
+  (testing "memory help lists subcommands"
+    (let ((text (with-output-to-string (*standard-output*)
+                  (enchiridion.channel.cli:command-help "memory"))))
+      (ok (search "memory preflight" text))
+      (ok (search "memory canaries" text))))
+  (testing "REPL help resolves REPL-only commands"
+    (multiple-value-bind (text result)
+        (captured-repl (format nil "/help quit~%/quit~%"))
+      (ok (eq :quit result))
+      (ok (search "/quit -- " text))
+      (ok (search "usage:" text)))))
+
 ;;;; The REPL surface.
 
 (deftest repl-only-commands-stay-out-of-the-table ()

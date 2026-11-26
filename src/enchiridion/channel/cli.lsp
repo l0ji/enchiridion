@@ -377,53 +377,202 @@ here: their handlers own that refusal."
                 (command-label (first row)) (arity-text row) count)))))
 
 (defparameter +repl-only-commands+
-  '(("stop" "Ask the turn in flight to stop")
-    ("quit" "Leave the session")
-    ("who" "Show the live channel and the supervisor"))
-  "The rows the REPL has and the shell does not, as (name summary).
-
-They act on the live turn, so they are not table rows: the shell has no turn in
-flight to stop and no session to leave. The REPL prints them with the rest of
-the help, which is why they live here as rows and not only as names.")
+  '(("stop" "Cancel the turn in flight")
+    ("quit" "Leave the REPL")
+    ("who" "Show the active channel and supervisor state"))
+  "Commands available only in the REPL, as (name summary).")
 
 (defparameter +not-in-repl+ '("chat" "serve")
-  "The table rows the REPL help leaves out, because they do not work there.
+  "Shell-only commands omitted from REPL help.")
 
-`chat` starts a nested REPL and `serve` polls a control file forever, so a
-slash line that reached either one would not answer the operator who typed it.
-Both stay shell commands and keep their rows in the table.")
+(defparameter +help-groups+
+  '(("Run" "init" "chat" "ask" "serve")
+    ("Agent and memory" "persona" "operator" "world" "blocks" "bootstrap"
+     "memory" "sessions" "journey" "undo" "tasks")
+    ("Tools, skills, and providers" "skills" "tools" "providers" "secrets"
+     "usage" "budget")
+    ("Supervisor and diagnostics" "health" "reload" "channels" "heartbeat"
+     "doctor" "check" "version" "help"))
+  "Display order and section headings for `help`.")
+
+(defparameter +command-help-details+
+  '(("init"
+     ("init [dir]" "Create the agent directory and seed files (never overwrites existing files)."))
+    ("ask"
+     ("ask <prompt...>" "Run one turn in a short-lived session and print the reply to stdout."))
+    ("check"
+     ("check" "Compile all system files and entry scripts with warnings as errors (requires Nix)."))
+    ("skills"
+     ("skills [list]" "List .lsp skills under skills/ with their triggers (default).")
+     ("skills show <n>" "Print the Nth skill file."))
+    ("tools"
+     ("tools [list]" "List registered tools with schema token estimates (default).")
+     ("tools show <name>" "Print one tool's JSON schema."))
+    ("blocks"
+     ("blocks [show]" "Show memory blocks with character counts and limits (default).")
+     ("blocks edit <n>" "Print the path of the Nth memory block file."))
+    ("persona"
+     ("persona [show]" "Print SOUL.md (default).")
+     ("persona edit" "Print the path to SOUL.md."))
+    ("operator"
+     ("operator [show]" "Print OPERATOR.md (default).")
+     ("operator edit" "Print the path to OPERATOR.md."))
+    ("world"
+     ("world [show]" "Print WORLD.md (default).")
+     ("world edit" "Print the path to WORLD.md."))
+    ("memory"
+     ("memory <query...>" "Full-text search over saved memories and past turns.")
+     ("memory status" "Show episode counts, live generation, and retrieval switches.")
+     ("memory preflight" "Check T2 promotion readiness without building a candidate.")
+     ("memory candidates" "List all generations and their gate verdicts.")
+     ("memory gates <id>" "Show gate check results for generation ID.")
+     ("memory build" "Derive the next batch of episodes for a candidate generation.")
+     ("memory promote <id>" "Run promotion gates on candidate ID.")
+     ("memory regate <id>" "Re-run promotion gates on a quarantined generation.")
+     ("memory rollback <id>" "Roll back a live generation to its parent.")
+     ("memory canaries" "List configured, approved, and shadow canary checks.")
+     ("memory canaries approve|discard|revoke <id>" "Approve, discard, or revoke a canary.")
+     ("memory import <file>" "Import turns from a JSON Lines file."))
+    ("sessions"
+     ("sessions" "List stored sessions with their turn counts."))
+    ("journey"
+     ("journey [list]" "List recent commits in the agent directory (default).")
+     ("journey show <rev>" "Show a commit by 1-based index or git hash.")
+     ("journey edit <rev>" "Print the agent directory and revision to edit by hand.")
+     ("journey rm <rev>" "Revert a commit by 1-based index or git hash."))
+    ("undo"
+     ("undo <n|rev>" "Revert the Nth most recent commit (or git hash) in the agent directory."))
+    ("usage"
+     ("usage" "Show token usage (input, output, cache read/write) by model, channel, and day."))
+    ("budget"
+     ("budget" "Show configured tick and 24-hour background token caps."))
+    ("tasks"
+     ("tasks [list [pending|running|done|failed]]" "List queued background tasks (default).")
+     ("tasks add <text...>" "Queue a new background task.")
+     ("tasks rm <id>" "Remove a task by numeric ID."))
+    ("secrets"
+     ("secrets" "List loaded secret names, sources, and secrets file status (never values)."))
+    ("providers"
+     ("providers [list]" "List known providers, endpoints, and key status (default).")
+     ("providers show <id>" "Show the merged configuration row for provider ID.")
+     ("providers models <id>" "Fetch and list models available to your key for provider ID.")
+     ("providers refresh" "Fetch the latest provider catalog from models.dev."))
+    ("version"
+     ("version" "Show the version, source path, git branch, and HEAD commit."))
+    ("help"
+     ("help [command]" "List all commands, or show usage and subcommands for one."))
+    ("bootstrap"
+     ("bootstrap [status]" "Show current bootstrap progress (default).")
+     ("bootstrap run" "List remaining bootstrap steps.")
+     ("bootstrap step <n>" "Mark step N as complete.")
+     ("bootstrap reset" "Restore BOOTSTRAP.md from BOOTSTRAP.done.md and clear progress."))
+    ("doctor"
+     ("doctor" "Check git, config.lsp, configured provider keys, and the tool broker."))
+    ("health"
+     ("health" "Show the running supervisor's status, channels, and heartbeat."))
+    ("reload"
+     ("reload" "Ask the running supervisor to verify and hot-reload plugins and skills."))
+    ("channels"
+     ("channels [list]" "List supervised channels and their states (default).")
+     ("channels enable <name>" "Start a channel on the running supervisor.")
+     ("channels replace <name>" "Restart a channel in place.")
+     ("channels disable <name>" "Stop a channel on the running supervisor."))
+    ("heartbeat"
+     ("heartbeat [on]" "Enable scheduled background work (default).")
+     ("heartbeat off" "Pause scheduled background work.")
+     ("heartbeat run" "Trigger one background tick now."))
+    ("chat"
+     ("chat [--channel cli|http|fluxer] [--bind ADDR] [--port N] [--token-env VAR]"
+      "Start the interactive REPL with a live supervisor."))
+    ("serve"
+     ("serve [--channel cli|http|fluxer] [--bind ADDR] [--port N] [--token-env VAR]"
+      "Start the supervisor, enabled channels, and background schedule."))
+    ("stop"
+     ("stop" "Cancel the turn currently in flight."))
+    ("quit"
+     ("quit" "Exit the REPL."))
+    ("who"
+     ("who" "Show the attached channel and running supervisor state.")))
+  "Detailed usage lines per command: (name (usage description) ...).")
+
+(declaim (ftype (function (string) string) format-usage-for-surface))
+
+(defun format-usage-for-surface (usage)
+  "Prefix USAGE with a slash in the REPL; keep it bare in the shell."
+  (if *repl-p*
+      (concatenate 'string "/" usage)
+      usage))
+
+(declaim (ftype (function (string string list) null) print-command-detail))
+
+(defun print-command-detail (name summary arity-row)
+  "Print detailed help for one command."
+  (let ((entries (cdr (assoc name +command-help-details+ :test #'string-equal))))
+    (say "~A -- ~A" (command-label name) summary)
+    (when entries
+      (say "  usage:")
+      (dolist (entry entries)
+        (say "    ~A" (format-usage-for-surface (first entry)))
+        (say "      ~A" (second entry))))
+    (when arity-row
+      (say "  arguments: ~A" (arity-text arity-row))))
+  nil)
 
 (declaim (ftype (function (&optional t) integer) command-help))
 
 (defun command-help (&optional name)
-  "Print the command list, or the detail for NAME.
-
-Return 0, or 2 for a name that is not a command. At the REPL the list labels
-every command with the slash the operator types, adds the REPL-only commands,
-and leaves out the shell-only ones; the shell keeps the bare names. The detail
-is the summary and the argument range, which is all a caller needs to form a
-correct call."
+  "Print the command list, or usage details for NAME. Return 0, or 2 if unknown."
   (fresh-line *standard-output*)
   (if name
       (let* ((label (strip-command-slash name))
-             (row (find-command label)))
-        (unless row
-          (say "There is no command called ~A." label)
-          (return-from command-help 2))
-        (when (and *repl-p* (member label +not-in-repl+ :test #'string-equal))
-          (say "~A is a shell-only command, so the REPL does not have it." label)
-          (return-from command-help 2))
-        (say "~A -- ~A" (command-label (first row)) (fifth row))
-        (say "  arguments: ~A" (arity-text row))
-        0)
+             (row (find-command label))
+             (repl-row (and *repl-p*
+                            (assoc label +repl-only-commands+ :test #'string-equal))))
+        (cond
+          (repl-row
+           (print-command-detail (first repl-row) (second repl-row) nil)
+           0)
+          ((null row)
+           (say "There is no command called ~A." label)
+           2)
+          ((and *repl-p* (member label +not-in-repl+ :test #'string-equal))
+           (say "~A is a shell-only command, so the REPL does not have it." label)
+           2)
+          (t
+           (print-command-detail (first row) (fifth row) row)
+           0)))
       (progn
-        (dolist (row *commands*)
-          (unless (and *repl-p*
-                       (member (first row) +not-in-repl+ :test #'string-equal))
-            (say "~A~VT~A" (command-label (first row)) 14 (fifth row))))
+        (unless *repl-p*
+          (say "Usage: enchiridion [flags] <command> [args...]"))
+        (dolist (group +help-groups+)
+          (let ((heading (first group))
+                (names (remove-if (lambda (cmd)
+                                    (and *repl-p*
+                                         (member cmd +not-in-repl+ :test #'string-equal)))
+                                  (rest group))))
+            (when names
+              (say "")
+              (say "~A:" heading)
+              (dolist (cmd names)
+                (let ((row (find-command cmd)))
+                  (when row
+                    (say "  ~A~VT~A" (command-label (first row)) 16 (fifth row))))))))
         (when *repl-p*
+          (say "")
+          (say "REPL:")
           (dolist (row +repl-only-commands+)
-            (say "~A~VT~A" (command-label (first row)) 14 (second row))))
+            (say "  ~A~VT~A" (command-label (first row)) 16 (second row))))
+        (unless *repl-p*
+          (say "")
+          (say "Flags (for chat and serve):")
+          (say "  --channel NAME      Enable cli, http, or fluxer for this run")
+          (say "  --bind ADDRESS      HTTP bind address (requires --channel http)")
+          (say "  --port NUMBER       HTTP port, 1 to 65535 (requires --channel http)")
+          (say "  --token-env NAME    Env var for HTTP bearer token (requires --channel http)")
+          (say "  --verify-plugin DIR Verify plugins and skills in DIR and exit"))
+        (say "")
+        (say "Run `~A <command>` for usage and subcommands."
+             (if *repl-p* "/help" "enchiridion help"))
         0)))
 
 (declaim (ftype (function (t list) integer) run-command))
@@ -1580,73 +1729,71 @@ and archives BOOTSTRAP.md."
 (defun build-command-table ()
   "Return the shared command table.
 
-Each row carries its capability requirements as a plist of :DEFAULT and
-:ACTIONS. :ACTIONS names only the subcommands whose requirements differ from
-the default, so the table stays one source of command names and handlers."
+Each row is (name min-args max-args handler summary requirements)."
   (list
    (list "init" 0 1 #'cmd-init "Create the agent directory and seed files"
          '(:default (:config :directory :git)))
-   (list "ask" 1 nil #'cmd-ask "One turn in a short lived session"
+   (list "ask" 1 nil #'cmd-ask "Run one turn and print the reply"
          '(:default (:config :directory :secrets :store :backend :agent)))
    (list "check" 0 0 #'cmd-check
-         "Compile system files and three entry scripts (requires Nix)"
+         "Compile system files and entry scripts (requires Nix)"
           '(:default ()))
-   (list "skills" 0 2 #'cmd-skills "List or show skills"
+   (list "skills" 0 2 #'cmd-skills "List or show agent skills"
          '(:default (:directory)))
-   (list "tools" 0 2 #'cmd-tools "List or show tools"
+   (list "tools" 0 2 #'cmd-tools "List tools or show a JSON schema"
          '(:default ()))
-   (list "blocks" 0 2 #'cmd-blocks "Blocks with character counts and capacity"
+   (list "blocks" 0 2 #'cmd-blocks "Show memory block sizes and limits"
          '(:default (:config :directory)
            :actions (("edit" . (:directory)))))
-   (list "persona" 0 1 #'cmd-persona "SOUL.md"
+   (list "persona" 0 1 #'cmd-persona "Show or locate SOUL.md"
          '(:default (:directory)))
-   (list "operator" 0 1 #'cmd-operator "OPERATOR.md"
+   (list "operator" 0 1 #'cmd-operator "Show or locate OPERATOR.md"
          '(:default (:directory)))
-   (list "world" 0 1 #'cmd-world "WORLD.md"
+   (list "world" 0 1 #'cmd-world "Show or locate WORLD.md"
          '(:default (:directory)))
-   (list "memory" 1 nil #'cmd-memory "Search sessions, memories and episodes"
+   (list "memory" 1 nil #'cmd-memory "Search memory or manage episodic generations"
          '(:default (:config :store)
            :actions (("preflight" . (:config :directory :secrets :store :backend))
                      ("build" . (:config :directory :secrets :store :backend))
                      ("promote" . (:config :directory :secrets :store :backend))
                      ("regate" . (:config :directory :secrets :store :backend)))))
-   (list "sessions" 0 0 #'cmd-sessions "Stored sessions with turn counts"
+   (list "sessions" 0 0 #'cmd-sessions "List stored sessions with turn counts"
          '(:default (:config :store)))
-   (list "journey" 0 2 #'cmd-journey "Everything the agent has learned or written"
+   (list "journey" 0 2 #'cmd-journey "Inspect or revert agent directory history"
          '(:default (:config :directory :git)))
-   (list "undo" 1 1 #'cmd-undo "Roll back the nth change in the agent directory"
+   (list "undo" 1 1 #'cmd-undo "Revert the Nth change in the agent directory"
          '(:default (:config :directory :git)))
-   (list "usage" 0 0 #'cmd-usage "Token ledger by model, day and channel"
+   (list "usage" 0 0 #'cmd-usage "Show token usage by model, channel, and day"
          '(:default (:config :store)))
-   (list "budget" 0 0 #'cmd-budget "Spend against the caps"
+   (list "budget" 0 0 #'cmd-budget "Show background token caps"
          '(:default (:config)))
-   (list "tasks" 0 nil #'cmd-tasks "The task queue"
+   (list "tasks" 0 nil #'cmd-tasks "List, add, or remove background tasks"
          '(:default (:config :store)))
-   (list "secrets" 0 0 #'cmd-secrets "Names and sources, never values"
+   (list "secrets" 0 0 #'cmd-secrets "List loaded secret names and sources"
          '(:default (:config :secrets)))
-   (list "providers" 0 2 #'cmd-providers "Provider list, one provider, its models, or a catalog refresh"
+   (list "providers" 0 2 #'cmd-providers "List providers, show details, list models, or refresh"
          '(:default (:config)
            :actions (("models" . (:config :secrets)))))
-   (list "version" 0 0 #'cmd-version "Version and build provenance"
+   (list "version" 0 0 #'cmd-version "Show version and git provenance"
          '(:default ()))
-   (list "help" 0 1 #'cmd-help "Command list, or detail for one"
+   (list "help" 0 1 #'cmd-help "Show command list or details for one command"
          '(:default ()))
-   (list "bootstrap" 0 2 #'cmd-bootstrap "Bootstrap state, remaining steps, a step record, or a reset"
+   (list "bootstrap" 0 2 #'cmd-bootstrap "Show, advance, or reset bootstrap steps"
          '(:default (:directory)
            :actions (("step" . (:config :directory :git)))))
-   (list "doctor" 0 0 #'cmd-doctor "Check local dependencies and the broker"
+   (list "doctor" 0 0 #'cmd-doctor "Check local dependencies, config, and broker"
          '(:default ()))
-   (list "health" 0 0 #'cmd-health "Read the running supervisor's status"
+   (list "health" 0 0 #'cmd-health "Show running supervisor status"
          '(:default ()))
-   (list "reload" 0 0 #'cmd-reload "Ask a running supervisor to reload its code"
+   (list "reload" 0 0 #'cmd-reload "Verify and hot-reload plugins and skills"
          '(:default ()))
-   (list "channels" 0 2 #'cmd-channels "List, enable or disable a channel"
+   (list "channels" 0 2 #'cmd-channels "List, enable, replace, or disable channels"
          '(:default ()))
-   (list "heartbeat" 0 1 #'cmd-heartbeat "Turn the heartbeat on, off, or run one"
+   (list "heartbeat" 0 1 #'cmd-heartbeat "Turn scheduled background work on, off, or run now"
          '(:default ()))
-   (list "chat" 0 0 #'cmd-chat "Start the REPL"
+   (list "chat" 0 0 #'cmd-chat "Start the interactive REPL"
          '(:default (:config :directory :secrets :store :backend :agent :supervised)))
-   (list "serve" 0 0 #'cmd-serve "Start the supervisor and its channels"
+   (list "serve" 0 0 #'cmd-serve "Start the supervisor and enabled channels"
          '(:default (:config :directory :secrets :store :backend :agent :supervised)))))
 (defparameter *commands* (build-command-table)
   "The shared command table. One list of rows backs the shell and the REPL, so

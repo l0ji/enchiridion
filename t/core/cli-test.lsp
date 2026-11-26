@@ -441,6 +441,544 @@ here the way the operator would see it."
           (ok (eql 1 status))
           (ok (search "/reload: no supervisor" text)))))))
 
+;;;; The interactive REPL.
+
+#+sbcl
+(defun make-pipe-stream (fd direction)
+  "Return FD as a stream in DIRECTION (:input or :output)."
+  (sb-sys:make-fd-stream fd
+                         :input (eq direction :input)
+                         :output (eq direction :output)
+                         :buffering (if (eq direction :output) :line :full)
+                         :external-format :utf-8
+                         :auto-close t))
+
+#+sbcl
+(defun make-pipe-pair ()
+  "Return a reader and a writer for one pipe."
+  (multiple-value-bind (read-fd write-fd) (sb-posix:pipe)
+    (values (make-pipe-stream read-fd :input)
+            (make-pipe-stream write-fd :output))))
+
+#+sbcl
+(defstruct (repl-fixture (:constructor make-repl-fixture))
+  input input-writer output output-reader thread done result worker error)
+
+#+sbcl
+(defun start-repl-fixture (context &key (stop-seconds 5) (eof-seconds 30))
+  "Run RUN-REPL on a pipe in a thread and return its fixture."
+  (multiple-value-bind (input input-writer) (make-pipe-pair)
+    (multiple-value-bind (output-reader output) (make-pipe-pair)
+      (let* ((done (bordeaux-threads:make-semaphore :count 0))
+             (fixture (make-repl-fixture
+                       :input input
+                       :input-writer input-writer
+                       :output output
+                       :output-reader output-reader
+                       :done done)))
+        (setf (repl-fixture-thread fixture)
+              (bordeaux-threads:make-thread
+               (lambda ()
+                 (let ((enchiridion.channel.cli::+repl-stop-seconds+ stop-seconds)
+                       (enchiridion.channel.cli::+repl-eof-seconds+ eof-seconds))
+                   (unwind-protect
+                        (handler-case
+                            (multiple-value-bind (result worker)
+                                (enchiridion.channel.cli:run-repl
+                                 :context context :input input :output output)
+                              (setf (repl-fixture-result fixture) result
+                                    (repl-fixture-worker fixture) worker))
+                          (error (condition)
+                            (setf (repl-fixture-error fixture)
+                                  (princ-to-string condition))))
+                     (bordeaux-threads:signal-semaphore done))))
+               :name "enchiridion cli test repl"))
+        fixture))))
+
+#+sbcl
+(defun send-repl-line (fixture line)
+  "Write LINE and a newline to the fixture's input."
+  (write-line line (repl-fixture-input-writer fixture))
+  (finish-output (repl-fixture-input-writer fixture))
+  nil)
+
+#+sbcl
+(defun close-quietly (stream)
+  (when stream
+    (ignore-errors (close stream)))
+  nil)
+
+#+sbcl
+(defun close-repl-input (fixture)
+  "Close the input writer, so the REPL sees EOF."
+  (close-quietly (repl-fixture-input-writer fixture))
+  (setf (repl-fixture-input-writer fixture) nil)
+  nil)
+
+#+sbcl
+(defun read-repl-until (fixture pattern &key (timeout 5))
+  "Read output lines through the one containing PATTERN. Return the lines and whether it was found."
+  (let ((lines '()) (found nil))
+    (enchiridion.compat:with-deadline (timeout :on-timeout nil)
+      (loop for line = (read-line (repl-fixture-output-reader fixture) nil :eof)
+            until (eq line :eof)
+            do (push line lines)
+            when (search pattern line)
+              do (setf found t)
+                 (return)))
+    (values (nreverse lines) found)))
+
+#+sbcl
+(defun read-repl-through (fixture pattern &key (timeout 5) (limit 20000))
+  "Read output characters through PATTERN. Return whether it was found and the last window."
+  (let ((window "") (found nil) (count 0) (size (length pattern)))
+    (enchiridion.compat:with-deadline (timeout :on-timeout nil)
+      (loop while (< count limit)
+            for char = (read-char (repl-fixture-output-reader fixture) nil :eof)
+            until (eq char :eof)
+            do (incf count)
+               (setf window (concatenate 'string window (string char)))
+               (when (> (length window) size)
+                 (setf window (subseq window (- (length window) size))))
+            when (search pattern window)
+              do (setf found t)
+                 (return)))
+    (values found window)))
+
+#+sbcl
+(defun await-repl (fixture &key (timeout 5))
+  "Wait for the fixture's RUN-REPL thread to return."
+  (bordeaux-threads:wait-on-semaphore (repl-fixture-done fixture)
+                                      :timeout timeout))
+
+#+sbcl
+(defun stop-repl-fixture (fixture)
+  "End the fixture and close its pipes, even after a failed assertion."
+  (close-repl-input fixture)
+  (when (and (repl-fixture-thread fixture)
+             (bordeaux-threads:thread-alive-p (repl-fixture-thread fixture)))
+    (unless (bordeaux-threads:wait-on-semaphore (repl-fixture-done fixture)
+                                                :timeout 3)
+      (ignore-errors
+        (bordeaux-threads:destroy-thread (repl-fixture-thread fixture)))))
+  (close-quietly (repl-fixture-input fixture))
+  (close-quietly (repl-fixture-output-reader fixture))
+  (close-quietly (repl-fixture-output fixture))
+  nil)
+
+#+sbcl
+(defmacro with-repl-fixture ((fixture context &rest options) &body body)
+  "Run BODY with a live interactive REPL, then stop it."
+  `(let ((,fixture (start-repl-fixture ,context ,@options)))
+     (unwind-protect
+          (progn ,@body)
+       (stop-repl-fixture ,fixture))))
+
+(deftest follow-ups-respect-the-shared-budget ()
+  (let* ((state (enchiridion.channel.cli::make-repl-state))
+         (turn (enchiridion.channel.cli::make-repl-turn)))
+    (setf (enchiridion.channel.cli::repl-state-active state) turn)
+    (dotimes (index 4)
+      (let ((text (format nil "line ~D" index)))
+        (multiple-value-bind (kind line)
+            (enchiridion.channel.cli::admit-interactive-line state text)
+          (ok (eq :follow-up kind))
+          (ok (search "follow-up" line)))))
+    (multiple-value-bind (kind line)
+        (enchiridion.channel.cli::admit-interactive-line state "fifth")
+      (ok (eq :queued kind))
+      (ok (search "queued as the next turn" line)))
+    (ok (equal '("line 0" "line 1" "line 2" "line 3")
+               (enchiridion.channel.cli::drain-followups
+                state turn :before-request))
+        "the four texts reach the turn in the order they were typed")
+    (ok (= 1 (enchiridion.channel.cli::repl-state-queued-count state)))
+    (ok (equal '("fifth")
+               (enchiridion.channel.cli::repl-state-queued state)))))
+
+(deftest the-follow-up-character-budget-is-shared ()
+  (let* ((state (enchiridion.channel.cli::make-repl-state))
+         (turn (enchiridion.channel.cli::make-repl-turn)))
+    (setf (enchiridion.channel.cli::repl-state-active state) turn)
+    (flet ((admit (text)
+             (nth-value 0
+                        (enchiridion.channel.cli::admit-interactive-line
+                         state text))))
+      (ok (eq :follow-up (admit (make-string 8000 :initial-element #\a))))
+      (ok (eq :follow-up (admit (make-string 8000 :initial-element #\b))))
+      (ok (eq :queued (admit "one more"))
+          "a third text cannot exceed the 16000 character budget")
+      (multiple-value-bind (kind line)
+          (enchiridion.channel.cli::admit-interactive-line
+           state (make-string 16001 :initial-element #\c))
+        (ok (eq :rejected kind)
+            "an oversized line never enters the queue")
+        (ok (search "character limit" line)
+            "the rejection says why"))
+      (ok (equal '(8000 8000)
+                 (mapcar #'length
+                         (enchiridion.channel.cli::drain-followups
+                          state turn :before-request)))))))
+
+(deftest an-empty-final-drain-closes-the-turn ()
+  (let* ((state (enchiridion.channel.cli::make-repl-state))
+         (turn (enchiridion.channel.cli::make-repl-turn)))
+    (setf (enchiridion.channel.cli::repl-state-active state) turn)
+    (flet ((admit (text)
+             (nth-value 0
+                        (enchiridion.channel.cli::admit-interactive-line
+                         state text))))
+      (ok (null (enchiridion.channel.cli::drain-followups
+                 state turn :before-tools))
+          "an empty tool checkpoint is not the publication cutoff")
+      (ok (eq :follow-up (admit "first")))
+      (ok (equal '("first")
+                 (enchiridion.channel.cli::drain-followups
+                  state turn :before-final))
+          "a nonempty final drain keeps the turn open")
+      (ok (eq :follow-up (admit "second")))
+      (ok (equal '("second")
+                 (enchiridion.channel.cli::drain-followups
+                  state turn :before-final)))
+      (ok (null (enchiridion.channel.cli::drain-followups
+                 state turn :before-final))
+          "the first empty final drain is the cutoff")
+      (multiple-value-bind (kind line)
+          (enchiridion.channel.cli::admit-interactive-line state "late")
+        (ok (eq :queued kind))
+        (ok (search "no longer taking follow-ups" line)))
+      (ok (equal '("late")
+                 (enchiridion.channel.cli::repl-state-queued state))))))
+
+(deftest a-slash-command-is-not-steered-while-a-turn-runs ()
+  (let* ((state (enchiridion.channel.cli::make-repl-state))
+         (turn (enchiridion.channel.cli::make-repl-turn))
+         (status nil)
+         (text nil))
+    (setf (enchiridion.channel.cli::repl-state-active state) turn)
+    (setf text (with-output-to-string (*standard-output*)
+                 (setf status
+                       (enchiridion.channel.cli::evaluate-interactive-line
+                        state "/memory q"))))
+    (ok (eql 1 status))
+    (ok (search "not available while a turn is running" text))
+    (ok (null (enchiridion.channel.cli::repl-turn-pending turn))
+        "the slash line never reached the follow-up queue")
+    (testing "/help stays available"
+      (let ((status nil)
+            (text nil))
+        (setf text (with-output-to-string (*standard-output*)
+                     (setf status
+                           (enchiridion.channel.cli::evaluate-interactive-line
+                            state "/help"))))
+        (ok (eql 0 status))
+        (ok (search "REPL:" text))))))
+
+(deftest repl-only-commands-keep-their-existing-grammar ()
+  (let* ((state (enchiridion.channel.cli::make-repl-state))
+         (turn (enchiridion.channel.cli::make-repl-turn))
+         (status nil)
+         (text nil))
+    (setf (enchiridion.channel.cli::repl-state-active state) turn)
+    (ok (eq :quit
+            (enchiridion.channel.cli::evaluate-interactive-line
+             state "/quit now"))
+        "a trailing word does not stop /quit from leaving")
+    (setf text (with-output-to-string (*standard-output*)
+                 (setf status
+                       (enchiridion.channel.cli::evaluate-interactive-line
+                        state "/stop please"))))
+    (ok (eql 0 status))
+    (ok (enchiridion.channel.cli::repl-turn-cancelled-p turn)
+        "/stop cancels with or without a trailing word")
+    (ok (search "cancellation requested" text))))
+
+(deftest a-cancelled-turn-takes-no-more-follow-ups ()
+  (let* ((state (enchiridion.channel.cli::make-repl-state))
+         (turn (enchiridion.channel.cli::make-repl-turn)))
+    (setf (enchiridion.channel.cli::repl-state-active state) turn)
+    (enchiridion.channel.cli::request-repl-cancel state)
+    (multiple-value-bind (kind line)
+        (enchiridion.channel.cli::admit-interactive-line state "after stop")
+      (ok (eq :queued kind))
+      (ok (search "no longer taking follow-ups" line)))
+    (ok (null (enchiridion.channel.cli::drain-followups
+               state turn :before-request))
+        "a cancelled turn drains nothing")
+    (ok (equal '("after stop")
+               (enchiridion.channel.cli::repl-state-queued state)))))
+
+#+sbcl
+(deftest an-interactive-turn-steers-a-follow-up-and-eof-waits-for-it ()
+  (let* ((started (bordeaux-threads:make-semaphore :count 0))
+         (release (bordeaux-threads:make-semaphore :count 0))
+         (drained (bordeaux-threads:make-semaphore :count 0))
+         (turns '())
+         (steered '())
+         (context (enchiridion.channel.cli:make-command-context
+                   :respond-interactive
+                   (lambda (text steer cancel)
+                     (declare (ignore cancel))
+                     (push text turns)
+                     (bordeaux-threads:signal-semaphore started)
+                     (bordeaux-threads:wait-on-semaphore release)
+                     (push (funcall steer :before-request) steered)
+                     (funcall steer :before-final)
+                     (bordeaux-threads:signal-semaphore drained)
+                     0))))
+    (with-repl-fixture (fixture context :eof-seconds 5)
+      (send-repl-line fixture "first")
+      (ok (bordeaux-threads:wait-on-semaphore started :timeout 5)
+          "the turn started before the next line was typed")
+      (send-repl-line fixture "second")
+      (multiple-value-bind (lines found)
+          (read-repl-until fixture "follow-up 1/4")
+        (declare (ignore lines))
+        (ok found "the second line was accepted as a follow-up"))
+      (close-repl-input fixture)
+      (bordeaux-threads:signal-semaphore release)
+      (ok (bordeaux-threads:wait-on-semaphore drained :timeout 5)
+          "the turn drained the follow-up")
+      (ok (await-repl fixture :timeout 5) "EOF returned")
+      (ok (null (repl-fixture-error fixture))
+          (or (repl-fixture-error fixture) "the REPL did not signal an error"))
+      (ok (eq :eof (repl-fixture-result fixture)))
+      (ok (equal '("first") (nreverse turns)))
+      (ok (equal '(("second")) (nreverse steered))
+          "only the follow-up reached the model prompt")
+      (ok (not (bordeaux-threads:thread-alive-p
+                (repl-fixture-worker fixture)))
+          "the worker was gone when RUN-REPL returned"))))
+
+#+sbcl
+(deftest a-reply-while-waiting-redraws-an-idle-prompt ()
+  (let* ((started (bordeaux-threads:make-semaphore :count 0))
+         (release (bordeaux-threads:make-semaphore :count 0))
+         (context (enchiridion.channel.cli:make-command-context
+                   :respond-interactive
+                   (lambda (text steer cancel)
+                     (declare (ignore text steer cancel))
+                     (bordeaux-threads:signal-semaphore started)
+                     (bordeaux-threads:wait-on-semaphore release)
+                     (format t "REPLY-DONE~%")
+                     0))))
+    (with-repl-fixture (fixture context :eof-seconds 5)
+      (send-repl-line fixture "work")
+      (ok (bordeaux-threads:wait-on-semaphore started :timeout 5))
+      (multiple-value-bind (lines found)
+          (read-repl-until fixture "enchiridion [turn]>")
+        (declare (ignore lines))
+        (ok found "the busy prompt was printed before the reply"))
+      (bordeaux-threads:signal-semaphore release)
+      (multiple-value-bind (found window)
+          (read-repl-through fixture (format nil "REPLY-DONE~%enchiridion> "))
+        (declare (ignore window))
+        (ok found "an idle prompt follows the reply while READ-LINE waits"))
+      (send-repl-line fixture "/quit")
+      (ok (await-repl fixture :timeout 5))
+      (ok (eq :quit (repl-fixture-result fixture))))))
+
+#+sbcl
+(deftest later-lines-wait-in-order-and-a-full-queue-is-visible ()
+  (let* ((release (bordeaux-threads:make-semaphore :count 0))
+         (drained (bordeaux-threads:make-semaphore :count 0))
+         (entered (bordeaux-threads:make-semaphore :count 0))
+         (turns '())
+         (steered '())
+         (context (enchiridion.channel.cli:make-command-context
+                   :respond-interactive
+                   (lambda (text steer cancel)
+                     (declare (ignore cancel))
+                     (push text turns)
+                     (when (string= text "one")
+                       (bordeaux-threads:signal-semaphore entered)
+                       (bordeaux-threads:wait-on-semaphore release)
+                       (push (funcall steer :before-request) steered)
+                       (funcall steer :before-final)
+                       (bordeaux-threads:signal-semaphore drained))
+                     (unless (string= text "one")
+                       (bordeaux-threads:signal-semaphore entered))
+                     0))))
+    (with-repl-fixture (fixture context :eof-seconds 5)
+      (send-repl-line fixture "one")
+      (ok (bordeaux-threads:wait-on-semaphore entered :timeout 5)
+          "the first turn started")
+      (dolist (line '("two" "three" "four" "five"
+                      "six" "seven" "eight" "nine" "ten"))
+        (send-repl-line fixture line))
+      (multiple-value-bind (lines found)
+          (read-repl-until fixture "not accepted: 4 turns are already waiting")
+        (declare (ignore lines))
+        (ok found "the rejected line was reported"))
+      (bordeaux-threads:signal-semaphore release)
+      (ok (bordeaux-threads:wait-on-semaphore drained :timeout 5))
+      (loop repeat 4
+            do (ok (bordeaux-threads:wait-on-semaphore entered :timeout 5)
+                   "a queued turn started in order"))
+      (send-repl-line fixture "/quit")
+      (ok (await-repl fixture :timeout 5) "quit returned")
+      (ok (null (repl-fixture-error fixture))
+          (or (repl-fixture-error fixture) "the REPL did not signal an error"))
+      (ok (eq :quit (repl-fixture-result fixture)))
+      (ok (equal '("one" "six" "seven" "eight" "nine")
+                 (nreverse turns))
+          "later turns ran in FIFO order")
+      (ok (equal '(("two" "three" "four" "five"))
+                 (nreverse steered))
+          "only the first four texts steered the open turn")
+      (ok (not (member "ten" (nreverse turns) :test #'string=))
+          "the rejected text never ran"))))
+
+#+sbcl
+(deftest slash-stop-cancels-the-active-turn ()
+  (let* ((started (bordeaux-threads:make-semaphore :count 0))
+         (release (bordeaux-threads:make-semaphore :count 0))
+         (checked (bordeaux-threads:make-semaphore :count 0))
+         (steers '())
+         (cancelled nil)
+         (context (enchiridion.channel.cli:make-command-context
+                   :respond-interactive
+                   (lambda (text steer cancel)
+                     (declare (ignore text))
+                     (bordeaux-threads:signal-semaphore started)
+                     (bordeaux-threads:wait-on-semaphore release)
+                     (push (funcall steer :before-request) steers)
+                     (setf cancelled (funcall cancel))
+                     (bordeaux-threads:signal-semaphore checked)
+                     0))))
+    (with-repl-fixture (fixture context :eof-seconds 5)
+      (send-repl-line fixture "work")
+      (ok (bordeaux-threads:wait-on-semaphore started :timeout 5))
+      (send-repl-line fixture "/stop")
+      (multiple-value-bind (lines found)
+          (read-repl-until fixture "cancellation requested")
+        (declare (ignore lines))
+        (ok found "/stop answered while the turn was running"))
+      (bordeaux-threads:signal-semaphore release)
+      (ok (bordeaux-threads:wait-on-semaphore checked :timeout 5))
+      (ok (eq t cancelled) "the supplied cancel-p answered true")
+      (ok (null (first steers))
+          "the slash command never became a follow-up")
+      (send-repl-line fixture "/quit")
+      (ok (await-repl fixture :timeout 5))
+      (ok (eq :quit (repl-fixture-result fixture))))))
+
+#+sbcl
+(deftest ctrl-c-cancels-the-active-interactive-turn ()
+  (let* ((started (bordeaux-threads:make-semaphore :count 0))
+         (release (bordeaux-threads:make-semaphore :count 0))
+         (checked (bordeaux-threads:make-semaphore :count 0))
+         (cancelled nil)
+         (context (enchiridion.channel.cli:make-command-context
+                   :respond-interactive
+                   (lambda (text steer cancel)
+                     (declare (ignore text steer))
+                     (bordeaux-threads:signal-semaphore started)
+                     (bordeaux-threads:wait-on-semaphore release)
+                     (setf cancelled (funcall cancel))
+                     (bordeaux-threads:signal-semaphore checked)
+                     0))))
+    (with-repl-fixture (fixture context :eof-seconds 5)
+      (send-repl-line fixture "work")
+      (ok (bordeaux-threads:wait-on-semaphore started :timeout 5))
+      (multiple-value-bind (lines found)
+          (read-repl-until fixture "enchiridion [turn]>")
+        (declare (ignore lines))
+        (ok found "the prompt was printed inside the interrupt guard"))
+      (sb-thread:interrupt-thread
+       (repl-fixture-thread fixture)
+       (lambda () (enchiridion.compat:signal-interactive-interrupt)))
+      (multiple-value-bind (lines found)
+          (read-repl-until fixture "cancellation requested")
+        (declare (ignore lines))
+        (ok found "Ctrl-C reached the active turn"))
+      (bordeaux-threads:signal-semaphore release)
+      (ok (bordeaux-threads:wait-on-semaphore checked :timeout 5))
+      (ok (eq t cancelled) "the supplied cancel-p answered true")
+      (send-repl-line fixture "/quit")
+      (ok (await-repl fixture :timeout 5))
+      (ok (eq :quit (repl-fixture-result fixture))))))
+
+(deftest an-interactive-interrupt-cancels-the-active-turn ()
+  (let* ((state (enchiridion.channel.cli::make-repl-state))
+         (turn (enchiridion.channel.cli::make-repl-turn))
+         (status nil)
+         (text nil))
+    (setf (enchiridion.channel.cli::repl-state-active state) turn)
+    (setf text (with-output-to-string (*standard-output*)
+                 (setf status
+                       (enchiridion.channel.cli::handle-interactive-interrupt
+                        state))))
+    (ok (eql 0 status))
+    (ok (enchiridion.channel.cli::repl-turn-cancelled-p turn)
+        "Ctrl-C asked the active turn to stop")
+    (ok (search "cancellation requested" text))
+    (testing "with no turn it is only an interrupt"
+      (let ((state (enchiridion.channel.cli::make-repl-state))
+            (status nil)
+            (text nil))
+        (setf text (with-output-to-string (*standard-output*)
+                     (setf status
+                           (enchiridion.channel.cli::handle-interactive-interrupt
+                            state))))
+        (ok (eql 0 status))
+        (ok (search "interrupted." text))
+        (ng (search "cancellation requested" text))))))
+
+#+sbcl
+(deftest quit-does-not-join-a-hung-worker-forever ()
+  (let* ((started (bordeaux-threads:make-semaphore :count 0))
+         (never (bordeaux-threads:make-semaphore :count 0))
+         (context (enchiridion.channel.cli:make-command-context
+                   :respond-interactive
+                   (lambda (text steer cancel)
+                     (declare (ignore text steer cancel))
+                     (bordeaux-threads:signal-semaphore started)
+                     (bordeaux-threads:wait-on-semaphore never)
+                     0))))
+    (with-repl-fixture (fixture context :stop-seconds 0.2 :eof-seconds 0.2)
+      (send-repl-line fixture "work")
+      (ok (bordeaux-threads:wait-on-semaphore started :timeout 5))
+      (send-repl-line fixture "/quit")
+      (ok (await-repl fixture :timeout 3)
+          "quit returned without waiting for the hung turn")
+      (ok (eq :quit (repl-fixture-result fixture)))
+      (multiple-value-bind (lines found)
+          (read-repl-until fixture "worker was terminated" :timeout 3)
+        (declare (ignore lines))
+        (ok found "the operator was told the worker had to be terminated"))
+      (bordeaux-threads:signal-semaphore never)
+      (ok (not (bordeaux-threads:thread-alive-p
+                (repl-fixture-worker fixture)))
+          "the destroyed worker was reaped"))))
+
+#+sbcl
+(deftest eof-cancels-work-that-outlives-its-grace ()
+  (let* ((started (bordeaux-threads:make-semaphore :count 0))
+         (never (bordeaux-threads:make-semaphore :count 0))
+         (context (enchiridion.channel.cli:make-command-context
+                   :respond-interactive
+                   (lambda (text steer cancel)
+                     (declare (ignore text steer cancel))
+                     (bordeaux-threads:signal-semaphore started)
+                     (bordeaux-threads:wait-on-semaphore never)
+                     0))))
+    (with-repl-fixture (fixture context :stop-seconds 0.2 :eof-seconds 0.2)
+      (send-repl-line fixture "work")
+      (ok (bordeaux-threads:wait-on-semaphore started :timeout 5))
+      (close-repl-input fixture)
+      (ok (await-repl fixture :timeout 3)
+          "EOF returned after the grace")
+      (ok (eq :eof (repl-fixture-result fixture)))
+      (multiple-value-bind (lines found)
+          (read-repl-until fixture "still running, so it was cancelled"
+                           :timeout 3)
+        (declare (ignore lines))
+        (ok found "the operator was told why the turn was cancelled"))
+      (bordeaux-threads:signal-semaphore never)
+      (ok (not (bordeaux-threads:thread-alive-p
+                (repl-fixture-worker fixture)))))))
+
 ;;;; The supervisor commands.
 
 (deftest reload-channels-and-heartbeat-refuse-without-a-supervisor ()

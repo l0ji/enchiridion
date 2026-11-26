@@ -15,7 +15,9 @@
   (supervisor nil :type t)                 ; process-owned supervisor
   (channel nil :type t)                    ; originating channel
   (respond nil :type (or null function))   ; string -> turn exit status
-  (cancel nil :type (or null function)))   ; cancel turn in flight
+  (cancel nil :type (or null function))    ; cancel turn in flight
+  ;; (text steer cancel-p) -> exit status; runs a turn on a REPL worker
+  (respond-interactive nil :type (or null function)))
 
 (defparameter *command-context* (make-command-context)
   "Live state bound around RUN-COMMAND and RUN-REPL.")
@@ -668,39 +670,515 @@ left off the slash, and the REPL says so instead of spending a turn on it."
                  0)
                (run-plain-turn trimmed))))))))
 
+;;;; The interactive REPL.
+;;;;
+;;;; With RESPOND-INTERACTIVE bound, a turn runs on a worker thread while the
+;;;; REPL reads. A line typed before the turn's final empty drain steers that
+;;;; turn; a line typed after it waits as the next turn. The worker takes the
+;;;; queue lock only to hand the kernel its follow-up list, never around a
+;;;; model call or a socket.
+
+(defparameter +repl-followup-count+ 4
+  "The number of follow-up lines one turn accepts, matching the Fluxer channel.")
+
+(defparameter +repl-followup-characters+ 16000
+  "The characters of follow-up text one turn accepts, matching the Fluxer channel.")
+
+(defparameter +repl-queued-turns+ 4
+  "How many later turns may wait while one turn runs.")
+
+(defparameter +repl-stop-seconds+ 5
+  "Seconds to wait for a cancelled turn before destroying its worker.")
+
+(defparameter +repl-reap-seconds+ 1
+  "Seconds to wait for a destroyed worker to leave before returning anyway.")
+
+(defparameter +repl-eof-seconds+ 30
+  "Seconds to let queued work finish after the input closes.")
+
+(defparameter +repl-live-commands+ '("stop" "quit" "who" "help")
+  "Commands the interactive REPL keeps for the operator while a turn runs.")
+
+(defstruct (repl-turn (:constructor make-repl-turn))
+  (pending nil :type list)                ; texts admitted, not yet drained
+  (followups 0 :type integer)             ; texts accepted for this turn
+  (characters 0 :type integer)            ; their total length
+  (sealed-p nil :type boolean)            ; the final empty drain has passed
+  (cancelled-p nil :type boolean))        ; /stop or Ctrl-C asked it to end
+
+(defstruct (repl-state (:constructor make-repl-state))
+  (lock (bordeaux-threads:make-lock "enchiridion repl") :read-only t)
+  (ready (bordeaux-threads:make-condition-variable :name "enchiridion repl")
+         :read-only t)
+  (responder nil :type (or null function))
+  (active nil :type (or null repl-turn))
+  (queued nil :type list)                 ; later turns, oldest first
+  (queued-count 0 :type integer)
+  (stopping-p nil :type boolean)
+  (stopped-p nil :type boolean)
+  (reading-p nil :type boolean)           ; READ-LINE is waiting for input
+  (thread nil :type t))
+
+(declaim (ftype (function (repl-state) boolean) repl-busy-p))
+
+(defun repl-busy-p (state)
+  "Return T while a turn runs or later turns wait."
+  (bordeaux-threads:with-lock-held ((repl-state-lock state))
+    (or (not (null (repl-state-active state)))
+        (plusp (repl-state-queued-count state)))))
+
+(declaim (ftype (function (repl-state string) null) enqueue-repl-turn))
+
+(defun enqueue-repl-turn (state text)
+  "Append TEXT to the waiting turns. Call with the state lock held."
+  (setf (repl-state-queued state)
+        (append (repl-state-queued state) (list text)))
+  (incf (repl-state-queued-count state))
+  nil)
+
+(declaim (ftype (function (repl-state string) (values keyword (or null string)))
+                admit-interactive-line))
+
+(defun admit-interactive-line (state text)
+  "Admit TEXT while a turn may be running, returning its kind and a notice."
+  (let ((size (length text)))
+    (when (> size +repl-followup-characters+)
+      (return-from admit-interactive-line
+        (values :rejected
+                (format nil "not accepted: ~D characters is over the ~D character limit."
+                        size +repl-followup-characters+))))
+    (bordeaux-threads:with-lock-held ((repl-state-lock state))
+      (let ((active (repl-state-active state)))
+        (cond
+          ((and active
+                (not (repl-turn-cancelled-p active))
+                (not (repl-turn-sealed-p active))
+                (< (repl-turn-followups active) +repl-followup-count+)
+                (<= (+ (repl-turn-characters active) size)
+                    +repl-followup-characters+))
+           (setf (repl-turn-pending active)
+                 (append (repl-turn-pending active) (list text)))
+           (incf (repl-turn-followups active))
+           (incf (repl-turn-characters active) size)
+           (values :follow-up
+                   (format nil "follow-up ~D/~D queued."
+                           (repl-turn-followups active)
+                           +repl-followup-count+)))
+          ((< (repl-state-queued-count state) +repl-queued-turns+)
+           (enqueue-repl-turn state text)
+           (bordeaux-threads:condition-notify (repl-state-ready state))
+           (values :queued
+                   (when active
+                     (format nil "the turn is no longer taking follow-ups; queued as the next turn (~D waiting)."
+                             (repl-state-queued-count state)))))
+          (t
+           (values :rejected
+                   (format nil "not accepted: ~D turns are already waiting; wait for a reply or /stop."
+                           (repl-state-queued-count state)))))))))
+
+(declaim (ftype (function (repl-state repl-turn t) list) drain-followups))
+
+(defun drain-followups (state turn phase)
+  "Return TURN's pending follow-ups and close it at an empty final drain."
+  (bordeaux-threads:with-lock-held ((repl-state-lock state))
+    (if (or (repl-turn-cancelled-p turn)
+            (not (eq (repl-state-active state) turn)))
+        nil
+        (let ((texts (repl-turn-pending turn)))
+          (setf (repl-turn-pending turn) nil)
+          (when (and (eq phase :before-final) (null texts))
+            (setf (repl-turn-sealed-p turn) t))
+          texts))))
+
+(declaim (ftype (function (repl-state) (values boolean integer))
+                request-repl-cancel))
+
+(defun request-repl-cancel (state)
+  "Ask the active turn to stop and drop its undrained follow-ups.
+Return whether a turn was active and how many follow-ups were dropped."
+  (bordeaux-threads:with-lock-held ((repl-state-lock state))
+    (let ((turn (repl-state-active state)))
+      (if turn
+          (let ((dropped (length (repl-turn-pending turn))))
+            (setf (repl-turn-cancelled-p turn) t
+                  (repl-turn-pending turn) nil)
+            (values t dropped))
+          (values nil 0)))))
+
+(declaim (ftype (function (repl-state) integer) request-interactive-cancel))
+
+(defun request-interactive-cancel (state)
+  "Handle /stop in the interactive REPL and return its status."
+  (multiple-value-bind (requested dropped) (request-repl-cancel state)
+    (if requested
+        (progn
+          (say "cancellation requested.")
+          (when (plusp dropped)
+            (say "dropped ~D unsent follow-up~:P." dropped))
+          0)
+        (progn
+          (say "there is no turn to stop.")
+          1))))
+
+(declaim (ftype (function (repl-state) t) take-repl-work))
+
+(defun take-repl-work (state)
+  "Wait for the next turn and return (text . turn), or NIL when stopping."
+  (bordeaux-threads:with-lock-held ((repl-state-lock state))
+    (loop
+      (cond
+        ((repl-state-stopping-p state)
+         (return nil))
+        ((plusp (repl-state-queued-count state))
+         (let ((text (pop (repl-state-queued state))))
+           (decf (repl-state-queued-count state))
+           (let ((turn (make-repl-turn)))
+             (setf (repl-state-active state) turn)
+             (return (cons text turn)))))
+        (t
+         (bordeaux-threads:condition-wait (repl-state-ready state)
+                                          (repl-state-lock state)))))))
+
+(declaim (ftype (function (repl-state boolean) boolean) set-repl-reading))
+
+(defun set-repl-reading (state value)
+  "Record whether the main thread is waiting in READ-LINE."
+  (bordeaux-threads:with-lock-held ((repl-state-lock state))
+    (setf (repl-state-reading-p state) value)))
+
+(declaim (ftype (function (repl-state) null) finish-repl-work))
+
+(defun finish-repl-work (state)
+  "Mark the active turn finished and wake an EOF waiter."
+  (bordeaux-threads:with-lock-held ((repl-state-lock state))
+    (setf (repl-state-active state) nil)
+    (bordeaux-threads:condition-notify (repl-state-ready state)))
+  nil)
+
+(declaim (ftype (function (repl-state t) null) note-repl-idle-prompt))
+
+(defun note-repl-idle-prompt (state output)
+  "Draw an idle prompt when the REPL waits and no work remains.
+
+The worker writes this after a reply, so a reply that lands while READ-LINE is
+blocked does not leave the operator without a prompt. A person already typing
+can have that partial line split by this write; a canonical terminal offers no
+portable way to ask before drawing."
+  (let ((waiting nil))
+    (bordeaux-threads:with-lock-held ((repl-state-lock state))
+      (setf waiting (and (repl-state-reading-p state)
+                         (null (repl-state-active state))
+                         (zerop (repl-state-queued-count state))
+                         (not (repl-state-stopping-p state)))))
+    (when waiting
+      (format output "~&enchiridion> ")
+      (finish-output output))))
+
+(declaim (ftype (function (repl-state t) null) run-repl-worker))
+
+(defun run-repl-worker (state output)
+  "Run queued turns until STATE stops, then return."
+  (unwind-protect
+       (loop for job = (take-repl-work state)
+             while job
+             do (let ((text (car job))
+                      (turn (cdr job)))
+                  (format output "~&")
+                  (finish-output output)
+                  (handler-case
+                      (funcall (repl-state-responder state) text
+                               (lambda (phase) (drain-followups state turn phase))
+                               (lambda ()
+                                 (bordeaux-threads:with-lock-held
+                                     ((repl-state-lock state))
+                                   (repl-turn-cancelled-p turn))))
+                    (error (condition)
+                      ;; A normal turn error must not take the next queued turn
+                      ;; with it. A stop has to escape, or the worker outlives
+                      ;; the REPL.
+                      (if (repl-state-stopping-p state)
+                          (error condition)
+                          (progn
+                            (format output "~&enchiridion: the turn failed: ~A~%"
+                                    condition)
+                            (finish-output output)))))
+                  (finish-repl-work state)
+                  (note-repl-idle-prompt state output)))
+    (bordeaux-threads:with-lock-held ((repl-state-lock state))
+      (setf (repl-state-active state) nil)
+      (bordeaux-threads:condition-notify (repl-state-ready state))))
+  nil)
+
+(declaim (ftype (function (t real) boolean) join-repl-worker))
+
+(defun join-repl-worker (thread seconds)
+  "Wait up to SECONDS for THREAD, destroying it if it remains.
+Return T when it had to be destroyed."
+  (when (and thread (bordeaux-threads:thread-alive-p thread))
+    (let ((deadline (+ (get-internal-real-time)
+                       (* seconds internal-time-units-per-second))))
+      (loop while (and (bordeaux-threads:thread-alive-p thread)
+                       (< (get-internal-real-time) deadline))
+            do (sleep 0.01))
+      (if (bordeaux-threads:thread-alive-p thread)
+          (progn
+            (ignore-errors (bordeaux-threads:destroy-thread thread))
+            ;; DESTROY-THREAD returns before the target has left, and a join
+            ;; of an aborted thread signals, so poll for the exit instead.
+            (let ((reap (+ (get-internal-real-time)
+                           (* +repl-reap-seconds+
+                              internal-time-units-per-second))))
+              (loop while (and (bordeaux-threads:thread-alive-p thread)
+                               (< (get-internal-real-time) reap))
+                    do (sleep 0.01)))
+            t)
+          nil))))
+
+(declaim (ftype (function (repl-state real) boolean) wait-for-repl-idle))
+
+(defun wait-for-repl-idle (state seconds)
+  "Wait up to SECONDS for the active turn and the waiting turns to finish."
+  (let ((deadline (+ (get-internal-real-time)
+                     (* seconds internal-time-units-per-second))))
+    (bordeaux-threads:with-lock-held ((repl-state-lock state))
+      (loop
+        (when (and (null (repl-state-active state))
+                   (zerop (repl-state-queued-count state)))
+          (return t))
+        (let ((remaining (/ (- deadline (get-internal-real-time))
+                            internal-time-units-per-second)))
+          (when (<= remaining 0)
+            (return nil))
+          (bordeaux-threads:condition-wait (repl-state-ready state)
+                                           (repl-state-lock state)
+                                           :timeout remaining))))))
+
+(declaim (ftype (function (repl-state) (values integer integer boolean))
+                stop-repl-worker))
+
+(defun stop-repl-worker (state)
+  "Stop the worker, returning dropped turns, dropped follow-ups, and whether
+the worker had to be destroyed."
+  (if (repl-state-stopped-p state)
+      (values 0 0 nil)
+      (progn
+        ;; Stop admission before cancelling, so the worker cannot take a queued
+        ;; turn in the gap and leave it running.
+        (bordeaux-threads:with-lock-held ((repl-state-lock state))
+          (setf (repl-state-stopping-p state) t)
+          (bordeaux-threads:condition-notify (repl-state-ready state)))
+        (multiple-value-bind (requested followups) (request-repl-cancel state)
+          (declare (ignore requested))
+          (let ((destroyed (join-repl-worker (repl-state-thread state)
+                                             +repl-stop-seconds+))
+                (turns nil))
+            (bordeaux-threads:with-lock-held ((repl-state-lock state))
+              (setf turns (repl-state-queued-count state)
+                    (repl-state-queued state) nil
+                    (repl-state-queued-count state) 0
+                    (repl-state-active state) nil
+                    (repl-state-stopped-p state) t))
+            (when destroyed
+              (format *standard-output*
+                      "~&enchiridion: the turn did not stop; its worker was terminated.~%")
+              (finish-output *standard-output*))
+            (values turns followups destroyed))))))
+
+(declaim (ftype (function (repl-state) t) finish-interactive-quit))
+
+(defun finish-interactive-quit (state)
+  "Stop the worker for /quit and return :QUIT."
+  (when (repl-busy-p state)
+    (say "leaving; stopping the worker."))
+  (multiple-value-bind (turns followups destroyed) (stop-repl-worker state)
+    (declare (ignore destroyed))
+    (when (plusp followups)
+      (say "dropped ~D unsent follow-up~:P." followups))
+    (when (plusp turns)
+      (say "dropped ~D waiting turn~:P." turns)))
+  :quit)
+
+(declaim (ftype (function (repl-state) t) finish-interactive-eof))
+
+(defun finish-interactive-eof (state)
+  "Let queued work finish after EOF, then return :EOF.
+
+EOF is not a cancellation, so a pipe of several lines still runs. The wait is
+bounded; work that outlives it is cancelled like a quit."
+  (if (repl-busy-p state)
+      (progn
+        (say "input closed; waiting up to ~D second~:P for queued work."
+             +repl-eof-seconds+)
+        (if (wait-for-repl-idle state +repl-eof-seconds+)
+            (progn
+              (say "input closed.")
+              :eof)
+            (progn
+              (say "input closed; work is still running, so it was cancelled.")
+              (multiple-value-bind (turns followups destroyed)
+                  (stop-repl-worker state)
+                (declare (ignore destroyed))
+                (when (plusp followups)
+                  (say "dropped ~D unsent follow-up~:P." followups))
+                (when (plusp turns)
+                  (say "dropped ~D waiting turn~:P." turns)))
+              :eof)))
+      :eof))
+
+(declaim (ftype (function (repl-state) integer) handle-interactive-interrupt))
+
+(defun handle-interactive-interrupt (state)
+  "Turn Ctrl-C into a cancellation of the active turn, or abandon the line."
+  (multiple-value-bind (requested dropped) (request-repl-cancel state)
+    (fresh-line *standard-output*)
+    (if requested
+        (progn
+          (say "interrupted; cancellation requested.")
+          (when (plusp dropped)
+            (say "dropped ~D unsent follow-up~:P." dropped)))
+        (say "interrupted.")))
+  0)
+
+(declaim (ftype (function (repl-state) string) repl-prompt))
+
+(defun repl-prompt (state)
+  "Return the prompt, ending a live turn's prompt with a line break.
+
+A worker prints its reply while the main thread waits in READ-LINE. A prompt
+that ends the line keeps that reply, and any follow-up notice, at column zero."
+  (if (repl-busy-p state)
+      (format nil "enchiridion [turn]>~%")
+      "enchiridion> "))
+
+(declaim (ftype (function (repl-state string) t) evaluate-interactive-line))
+
+(defun evaluate-interactive-line (state line)
+  "Evaluate one line in the interactive REPL.
+
+A slash line is a command and never enters the model prompt. Plain text is a
+follow-up while a turn is open, and a later turn otherwise."
+  (let ((*repl-p* t))
+    (let ((trimmed (string-trim '(#\Space #\Tab #\Return) line)))
+      (cond
+        ((zerop (length trimmed)) 0)
+        ((char= #\/ (char trimmed 0))
+         (let* ((parts (split-line trimmed))
+                (name (string-downcase (subseq (first parts) 1))))
+           (cond
+             ((string= name "quit") :quit)
+             ((string= name "stop") (request-interactive-cancel state))
+             ((and (repl-busy-p state)
+                   (or (repl-command-name-p name) (find-command name))
+                   (not (member name +repl-live-commands+ :test #'string=)))
+              (say "~A is not available while a turn is running; /stop it first."
+                   (command-label name))
+              1)
+             (t (evaluate-repl-command name (rest parts))))))
+        (t
+         (let* ((parts (split-line trimmed))
+                (word (string-downcase (first parts))))
+           (if (and (= 1 (length parts)) (repl-command-name-p word))
+               (progn
+                 (say "Commands start with a slash: try `~A`."
+                      (command-label word))
+                 0)
+               (progn
+                 (multiple-value-bind (kind line)
+                     (admit-interactive-line state trimmed)
+                   (declare (ignore kind))
+                   (when line (say "~A" line)))
+                 0))))))))
+
+(declaim (ftype (function (t t function) (values t t)) run-interactive-repl))
+
+(defun run-interactive-repl (input output responder)
+  "Run the REPL with RESPONDER on a worker thread. Return the result and worker."
+  (let* ((state (make-repl-state :responder responder))
+         (thread (bordeaux-threads:make-thread
+                  (lambda ()
+                    (let ((*standard-output* output))
+                      (run-repl-worker state output)))
+                  :name "enchiridion repl turn")))
+    (setf (repl-state-thread state) thread)
+    (unwind-protect
+         (loop
+           (let ((result
+                   (catch 'repl-interrupt
+                     (enchiridion.compat:with-interrupt-handler
+                         ((lambda (condition)
+                            ;; Declining is a normal return: the search
+                            ;; continues to the entry point's handler, which
+                            ;; throws out of the process.
+                            (unless (enchiridion.compat:shutdown-interrupt-p
+                                     condition)
+                              (throw 'repl-interrupt :interrupted))))
+                       (unwind-protect
+                            (progn
+                              (set-repl-reading state t)
+                              (format output "~&~A" (repl-prompt state))
+                              (finish-output output)
+                              (let ((line (read-line input nil :eof)))
+                                (set-repl-reading state nil)
+                                (if (eq line :eof)
+                                    :eof
+                                    (evaluate-interactive-line state line))))
+                         (set-repl-reading state nil))))))
+             (cond
+               ((eq result :eof)
+                (return (values (finish-interactive-eof state) thread)))
+               ((eq result :interrupted)
+                (handle-interactive-interrupt state))
+               ((eq result :quit)
+                (return (values (finish-interactive-quit state) thread)))
+               (t nil))))
+      (stop-repl-worker state))))
+
+(declaim (ftype (function (t t) t) run-synchronous-repl))
+
+(defun run-synchronous-repl (input output)
+  "Run the REPL one turn at a time, the way it worked before follow-ups."
+  (loop
+    (format output "~&enchiridion> ")
+    (finish-output output)
+    (let ((result
+            (catch 'repl-interrupt
+              (enchiridion.compat:with-interrupt-handler
+                  ((lambda (condition)
+                     ;; Declining is a normal return: the search continues
+                     ;; to the handler the entry point installed, which
+                     ;; throws out of the process.
+                     (unless (enchiridion.compat:shutdown-interrupt-p condition)
+                       (format output "~&interrupted.~%")
+                       (finish-output output)
+                       (throw 'repl-interrupt :interrupted))))
+                (let ((line (read-line input nil :eof)))
+                  (if (eq line :eof)
+                      :eof
+                      (repl-evaluate line)))))))
+      (when (eq result :eof)
+        (return :eof))
+      (when (eq result :quit)
+        (return :quit)))))
+
 (declaim (ftype (function (&key (:context t) (:input t) (:output t)) t) run-repl))
 
 (defun run-repl (&key (context *command-context*)
                       (input *standard-input*)
                       (output *standard-output*))
   "Read lines from INPUT and evaluate each until /quit or EOF.
-SIGINT aborts the current line or turn and returns to the prompt; SIGTERM and
-SIGHUP are declined so the top-level shutdown handler stops the process."
+
+With RESPOND-INTERACTIVE in CONTEXT, one turn runs on a worker thread while the
+REPL keeps reading. The second value is that worker, or NIL when turns run
+synchronously. SIGINT cancels the turn in flight or abandons the current line;
+SIGTERM and SIGHUP are declined so the top-level shutdown handler stops the
+process."
   (let ((*command-context* context)
         (*standard-input* input)
         (*standard-output* output))
-    (loop
-      (format output "~&enchiridion> ")
-      (finish-output output)
-      (let ((result
-              (catch 'repl-interrupt
-                (enchiridion.compat:with-interrupt-handler
-                    ((lambda (condition)
-                       ;; Declining is a normal return: the search continues
-                       ;; to the handler the entry point installed, which
-                       ;; throws out of the process.
-                       (unless (enchiridion.compat:shutdown-interrupt-p condition)
-                         (format output "~&interrupted.~%")
-                         (finish-output output)
-                         (throw 'repl-interrupt :interrupted))))
-                  (let ((line (read-line input nil :eof)))
-                    (if (eq line :eof)
-                        :eof
-                        (repl-evaluate line)))))))
-        (when (eq result :eof)
-          (return :eof))
-        (when (eq result :quit)
-          (return :quit))))))
+    (let ((responder (command-context-respond-interactive context)))
+      (if responder
+          (run-interactive-repl input output responder)
+          (values (run-synchronous-repl input output) nil)))))
 
 ;;;; The handlers.
 ;;;;

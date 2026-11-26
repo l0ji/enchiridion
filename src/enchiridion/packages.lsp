@@ -404,6 +404,7 @@ before text reaches models, transcripts, or channels."))
            #:command-context-session #:command-context-broker
            #:command-context-generation #:command-context-supervisor
            #:command-context-channel #:command-context-respond
+           #:command-context-respond-interactive
            #:command-context-cancel #:repl-evaluate)
   (:documentation "REPL and shared CLI command table."))
 

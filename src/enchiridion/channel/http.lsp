@@ -19,6 +19,21 @@ reading, and counted during chunked reads).")
 (defparameter +http-max-usage-limit+ 1000
   "Maximum ?limit= value accepted by GET /usage.")
 
+(defparameter +http-turn-key-length+ 64
+  "Length of the lower-case hexadecimal capability that names one followable turn.")
+
+(defparameter +http-followup-limit+ 4
+  "Follow-up texts one keyed turn accepts.")
+
+(defparameter +http-followup-chars+ 16000
+  "Follow-up characters, summed, that one keyed turn accepts.")
+
+(defparameter +http-closed-turn-limit+ 64
+  "Closed turn keys remembered so a late follow-up hears closed, not unknown.")
+
+(defparameter +http-reply-reuse-seconds+ 30
+  "Seconds a completed keyed turn's work stays reusable by a reply_to.")
+
 (defparameter *http-drain-seconds* 6
   "Default seconds CHANNEL-STOP budgets for stopping the acceptor and draining
 in-flight turns before the supervisor closes the store.")
@@ -36,7 +51,9 @@ in-flight turns before the supervisor closes the store.")
    (allow :initarg :allow :initform nil :reader http-error-allow
           :documentation "The Allow header, when the failure is a method.")
    (retry-after :initarg :retry-after :initform nil :reader http-error-retry-after
-                :documentation "Seconds the caller should wait, or NIL."))
+                :documentation "Seconds the caller should wait, or NIL.")
+   (code :initarg :code :initform nil :reader http-error-code
+         :documentation "Stable machine-readable code for a follow-up refusal, or NIL."))
   (:report (lambda (condition stream)
              (format stream "HTTP ~D: ~A"
                      (http-error-status condition)
@@ -44,11 +61,11 @@ in-flight turns before the supervisor closes the store.")
   (:documentation
    "Refused webhook request carrying HTTP status, safe client message, and optional headers."))
 
-(defmacro http-fail (status message &key allow retry-after)
+(defmacro http-fail (status message &key allow retry-after code)
   "Signal HTTP-ERROR with STATUS and MESSAGE. Macro so the compiler sees the
 non-local exit for type checking."
   `(error 'http-error :status ,status :message ,message
-                      :allow ,allow :retry-after ,retry-after))
+                      :allow ,allow :retry-after ,retry-after :code ,code))
 
 ;;;; JSON.
 
@@ -87,11 +104,14 @@ keywords to lowercase strings."
        table))
     (t value)))
 
-(declaim (ftype (function (string) string) error-body))
+(declaim (ftype (function (string &optional (or null string)) string) error-body))
 
-(defun error-body (message)
-  "Return the one line JSON error object the webhook answers with."
-  (json-text (json-object "ok" nil "error" message)))
+(defun error-body (message &optional code)
+  "Return the one line JSON error object the webhook answers with.
+CODE, when set, is the stable machine-readable reason a follow-up was refused."
+  (if code
+      (json-text (json-object "ok" nil "error" message "code" code))
+      (json-text (json-object "ok" nil "error" message))))
 
 ;;;; The service.
 
@@ -105,21 +125,30 @@ keywords to lowercase strings."
   (bind "127.0.0.1" :type string)
   (port 8787 :type (integer 0 65535))
   (body-limit +http-body-limit+ :type (integer 1 *))
+  (followups-p nil :type boolean)
+  (turns (make-hash-table :test #'equal) :type hash-table)
+  (closed-turns nil :type list)
+  (last-work nil :type t)
+  (followup-lock nil :type t)
   (in-flight 0 :type integer)
   (in-flight-lock nil :type t))
 
 (declaim (ftype (function (&key (:turn t) (:health t) (:usage t) (:token t)
-                                (:bind string) (:port integer) (:body-limit integer))
+                                (:bind string) (:port integer) (:body-limit integer)
+                                (:followups-p boolean))
                           http-service)
                 make-http-service))
 
 (defun make-http-service (&key turn health usage token (bind "127.0.0.1") (port 8787)
-                               (body-limit +http-body-limit+))
+                               (body-limit +http-body-limit+) (followups-p nil))
   "Construct an HTTP-SERVICE without binding a port. Trims BIND and TOKEN;
-empty BIND defaults to 127.0.0.1 and empty TOKEN becomes NIL."
+empty BIND defaults to 127.0.0.1 and empty TOKEN becomes NIL. With FOLLOWUPS-P,
+TURN accepts a second argument, the checkpoint callback, and a third when a
+reply_to supplies prior work."
   (check-type bind string)
   (check-type port (integer 0 65535))
   (check-type body-limit (integer 1 *))
+  (check-type followups-p boolean)
   (let ((bind (string-trim '(#\Space #\Tab) bind))
         (token (and (stringp token)
                     (string-trim '(#\Space #\Tab #\Newline #\Return) token))))
@@ -128,6 +157,9 @@ empty BIND defaults to 127.0.0.1 and empty TOKEN becomes NIL."
                         :bind (if (plusp (length bind)) bind "127.0.0.1")
                         :port port
                         :body-limit body-limit
+                        :followups-p followups-p
+                        :followup-lock (bordeaux-threads:make-lock
+                                        "enchiridion http followups")
                         :in-flight-lock (bordeaux-threads:make-lock
                                          "enchiridion http in flight"))))
 
@@ -146,6 +178,194 @@ empty BIND defaults to 127.0.0.1 and empty TOKEN becomes NIL."
   (bordeaux-threads:with-lock-held ((http-service-in-flight-lock service))
     (decf (http-service-in-flight service)))
   nil)
+
+;;;; Follow-ups.
+;;;;
+;;;; A keyed turn registers a capability before its callback runs, but only its
+;;;; first kernel checkpoint opens admission. A turn that answers 503 has never
+;;;; accepted a follow-up. An empty :BEFORE-FINAL drain closes the key, which
+;;;; is the publication cutoff: the answer that follows cannot share its turn.
+;;;; All queue and state changes share one short lock, never a model call.
+
+(defstruct (http-turn (:constructor %make-http-turn (key)))
+  (key "" :type string)
+  (state :pending :type keyword)
+  (queue nil :type list)
+  (count 0 :type (integer 0 *))
+  (chars 0 :type (integer 0 *)))
+
+(defstruct (http-work (:constructor %make-http-work))
+  (key "" :type string)
+  (work nil :type t)
+  (at 0 :type integer))
+
+(declaim (ftype (function (http-service string) (values t t)) claim-http-work))
+
+(defun claim-http-work (service key)
+  "Return the work remembered under KEY within its reuse window, once.
+The second value is the claimed entry, so a turn that never ran can restore it
+with its original deadline. An unmatched probe leaves the remembered work
+alone; a matching expired or already used entry is forgotten."
+  (bordeaux-threads:with-lock-held ((http-service-followup-lock service))
+    (let ((stored (http-service-last-work service)))
+      (when (and stored (string= key (http-work-key stored)))
+        (let ((fresh (<= (- (get-internal-real-time) (http-work-at stored))
+                         (* +http-reply-reuse-seconds+
+                            internal-time-units-per-second))))
+          (setf (http-service-last-work service) nil)
+          (when fresh
+            (values (http-work-work stored) stored)))))))
+
+(declaim (ftype (function (http-service string t) null) remember-http-work))
+
+(defun remember-http-work (service key work)
+  "Remember opaque WORK for a completed keyed turn under KEY.
+Only the most recent entry is kept."
+  (bordeaux-threads:with-lock-held ((http-service-followup-lock service))
+    (setf (http-service-last-work service)
+          (%make-http-work :key key :work work
+                           :at (get-internal-real-time))))
+  nil)
+
+(declaim (ftype (function (http-service t) null) restore-http-work))
+
+(defun restore-http-work (service entry)
+  "Put a claimed ENTRY back for a turn that never ran, keeping its deadline.
+A newer entry is never overwritten."
+  (bordeaux-threads:with-lock-held ((http-service-followup-lock service))
+    (when (and entry (null (http-service-last-work service)))
+      (setf (http-service-last-work service) entry)))
+  nil)
+
+(declaim (ftype (function (t) boolean) turn-key-p))
+
+(defun turn-key-p (value)
+  "Return T when VALUE is 64 lower-case hexadecimal characters."
+  (and (stringp value)
+       (= (length value) +http-turn-key-length+)
+       (every (lambda (character)
+                (or (char<= #\0 character #\9)
+                    (char<= #\a character #\f)))
+              value)))
+
+(declaim (ftype (function (http-service http-turn) null) close-http-turn))
+
+(defun close-http-turn (service turn)
+  "Close TURN under SERVICE's follow-up lock and remember it for a bounded while.
+The caller holds the lock."
+  (unless (eq (http-turn-state turn) :closed)
+    (setf (http-turn-state turn) :closed)
+    (let ((closed (push turn (http-service-closed-turns service))))
+      (when (> (length closed) +http-closed-turn-limit+)
+        (let ((oldest (car (last closed))))
+          (setf (http-service-closed-turns service) (butlast closed))
+          (when (eq (gethash (http-turn-key oldest)
+                             (http-service-turns service))
+                    oldest)
+            (remhash (http-turn-key oldest)
+                     (http-service-turns service)))))))
+  nil)
+
+(declaim (ftype (function (http-service string) http-turn) register-http-turn))
+
+(defun register-http-turn (service key)
+  "Register KEY as a pending turn, refusing a key that is active or remembered."
+  (bordeaux-threads:with-lock-held ((http-service-followup-lock service))
+    (when (gethash key (http-service-turns service))
+      (http-fail 409 "That turn key is already in use." :code "turn_key_reused"))
+    (let ((turn (%make-http-turn key)))
+      (setf (gethash key (http-service-turns service)) turn)
+      turn)))
+
+(declaim (ftype (function (http-service http-turn) null) retire-http-turn))
+
+(defun retire-http-turn (service turn)
+  "Close TURN, or forget it when it never reached a first checkpoint."
+  (bordeaux-threads:with-lock-held ((http-service-followup-lock service))
+    (cond
+      ((eq (http-turn-state turn) :pending)
+       (when (eq (gethash (http-turn-key turn)
+                          (http-service-turns service))
+                 turn)
+         (remhash (http-turn-key turn) (http-service-turns service))))
+      ((eq (http-turn-state turn) :closed) nil)
+      (t (close-http-turn service turn))))
+  nil)
+
+(declaim (ftype (function (http-service http-turn t) list) drain-http-followups))
+
+(defun drain-http-followups (service turn phase)
+  "Open TURN at its first checkpoint and return its queued texts in order.
+At :BEFORE-FINAL with nothing waiting, close admission before the answer
+is published."
+  (bordeaux-threads:with-lock-held ((http-service-followup-lock service))
+    (when (eq (http-turn-state turn) :pending)
+      (setf (http-turn-state turn) :accepting))
+    (let ((texts (http-turn-queue turn)))
+      (setf (http-turn-queue turn) nil)
+      (when (and (eq phase :before-final) (null texts))
+        (close-http-turn service turn))
+      texts)))
+
+(declaim (ftype (function (http-service http-turn) function) make-turn-steer))
+
+(defun make-turn-steer (service turn)
+  "Return the checkpoint callback that drains TURN's follow-ups."
+  (lambda (phase)
+    (drain-http-followups service turn phase)))
+
+(declaim (ftype (function (t) null) close-http-turns))
+
+(defun close-http-turns (service)
+  "Close every open turn on SERVICE and forget reusable work, so a stopping
+webhook takes no follow-ups and starts its next run clean."
+  (when service
+    (bordeaux-threads:with-lock-held ((http-service-followup-lock service))
+      (let ((open '()))
+        (maphash (lambda (key turn)
+                   (declare (ignore key))
+                   (unless (eq (http-turn-state turn) :closed)
+                     (push turn open)))
+                 (http-service-turns service))
+        (dolist (turn open)
+          (close-http-turn service turn))
+        (setf (http-service-last-work service) nil))))
+  nil)
+
+(declaim (ftype (function (http-service string string) (values integer string))
+                followup-response))
+
+(defun followup-response (service key text)
+  "Admit TEXT to the active turn KEY within its 4-text and 16000-character
+budget, or refuse it with a coded 409. The codes are unknown_turn, turn_pending,
+turn_closed, and turn_full. A key is a capability: the body's author field is
+not read and cannot name a different sender."
+  (bordeaux-threads:with-lock-held ((http-service-followup-lock service))
+    (let ((turn (gethash key (http-service-turns service))))
+      (cond
+        ((null turn)
+         (http-fail 409 "No turn is waiting on that follow-up key."
+                    :code "unknown_turn"))
+        ((eq (http-turn-state turn) :pending)
+         (http-fail 409 "That turn has not reached its first checkpoint yet; retry shortly."
+                    :code "turn_pending" :retry-after "1"))
+        ((eq (http-turn-state turn) :closed)
+         (http-fail 409 "That turn is no longer accepting follow-ups."
+                    :code "turn_closed"))
+        ((>= (http-turn-count turn) +http-followup-limit+)
+         (http-fail 409 (format nil "That turn already accepted its ~D follow-ups."
+                               +http-followup-limit+)
+                    :code "turn_full"))
+        ((> (+ (http-turn-chars turn) (length text)) +http-followup-chars+)
+         (http-fail 409 (format nil "That turn already accepted ~D follow-up characters."
+                               +http-followup-chars+)
+                    :code "turn_full"))
+        (t
+         (incf (http-turn-count turn))
+         (incf (http-turn-chars turn) (length text))
+         (setf (http-turn-queue turn)
+               (nconc (http-turn-queue turn) (list text)))
+         (values 202 (json-text (json-object "ok" t "accepted" t))))))))
 
 ;;;; Authentication.
 
@@ -514,14 +734,19 @@ callback (200 when ready, 503 otherwise)."
     (http-error (condition) (error condition))
     (error () (http-fail 400 "The body is not JSON."))))
 
-(declaim (ftype (function (http-service t t) t) run-turn))
+(declaim (ftype (function (http-service t t &optional t t) t) run-turn))
 
-(defun run-turn (service turn message)
+(defun run-turn (service turn message &optional steer work)
   "Run TURN on MESSAGE while tracked as in-flight; logs and converts signalled
-errors into a failed-turn plist."
+errors into a failed-turn plist. STEER is the checkpoint callback and WORK is
+prior work a reply_to selected, each only when present."
   (enter-turn service)
   (unwind-protect
-       (handler-case (funcall turn message)
+       (handler-case
+           (cond
+             (work (funcall turn message steer work))
+             (steer (funcall turn message steer))
+             (t (funcall turn message)))
          (error (condition)
            (format *error-output* "~&enchiridion: webhook turn failed: ~A~%" condition)
            (finish-output *error-output*)
@@ -529,29 +754,49 @@ errors into a failed-turn plist."
                  :error (princ-to-string condition))))
     (leave-turn service)))
 
-(declaim (ftype (function (http-service http-request) (values integer string))
-                message-response))
+(declaim (ftype (function (hash-table) string) required-text))
 
-(defun message-response (service request)
-  "Return the status and body for POST /message: one synchronous turn."
-  (unless (json-content-type-p (http-request-content-type request))
-    (http-fail 415 "POST /message needs a JSON body."))
-  (let* ((body (parse-json-object (http-request-body request)))
-         (text (gethash "text" body))
-         (author (gethash "author" body)))
+(defun required-text (body)
+  "Return the non-empty text field BODY needs, or refuse it with a 400."
+  (let ((text (gethash "text" body)))
     (unless (and (stringp text)
                  (plusp (length (string-trim '(#\Space #\Tab #\Newline #\Return)
                                              text))))
       (http-fail 400 "The body needs a non-empty text field."))
-    (let* ((turn (http-service-turn service))
-           (message (enchiridion.channel:normalize
+    text))
+
+(declaim (ftype (function (http-service string t (or null string)
+                                          (or null string))
+                          (values integer string))
+                run-message-turn))
+
+(defun run-message-turn (service text author turn-key reply-to)
+  "Run one synchronous turn, registering TURN-KEY for follow-ups when set and
+passing work remembered under REPLY-TO when it is still fresh."
+  (let ((turn (http-service-turn service)))
+    (when (null turn)
+      (http-fail 502 "no agent is attached to this webhook."))
+    (let* ((message (enchiridion.channel:normalize
                      :channel :http
                      :author (if (stringp author) author "webhook")
                      :text text))
-           (result (if turn
-                       (run-turn service turn message)
-                       (list :ok-p nil
-                             :error "no agent is attached to this webhook."))))
+           (state (and turn-key (register-http-turn service turn-key)))
+           (work nil)
+           (claimed nil)
+           (result nil))
+      (when reply-to
+        (multiple-value-setq (work claimed)
+          (claim-http-work service reply-to)))
+      (unwind-protect
+           (setf result (if state
+                            (run-turn service turn message
+                                      (make-turn-steer service state) work)
+                            (run-turn service turn message nil work)))
+        (when (and state (getf result :ok-p) (getf result :work))
+          (remember-http-work service turn-key (getf result :work)))
+        (when (and claimed (eq (getf result :reason) :busy))
+          (restore-http-work service claimed))
+        (when state (retire-http-turn service state)))
       (cond
         ((getf result :ok-p)
          (values 200 (json-text
@@ -562,6 +807,59 @@ errors into a failed-turn plist."
                     :retry-after "1"))
         (t
          (http-fail 502 (or (getf result :error) "the turn failed.")))))))
+
+(declaim (ftype (function (http-service http-request) (values integer string))
+                message-response))
+
+(defun message-response (service request)
+  "Return the status and body for POST /message: one synchronous turn, or a
+202 admission when the body follows up to an active key.
+TURN_KEY and FOLLOW_UP_TO are caller-minted 64-character lower-case hexadecimal
+capabilities, mutually exclusive. REPLY_TO may accompany TURN_KEY or stand
+alone; it reuses a completed keyed turn's work once, and otherwise runs an
+ordinary turn. A keyed turn accepts follow-ups from its first kernel checkpoint
+until an empty :BEFORE-FINAL drain closes admission."
+  (unless (json-content-type-p (http-request-content-type request))
+    (http-fail 415 "POST /message needs a JSON body."))
+  (let* ((body (parse-json-object (http-request-body request)))
+         (text (required-text body))
+         (author (gethash "author" body))
+         (turn-key (gethash "turn_key" body))
+         (turn-key-p (nth-value 1 (gethash "turn_key" body)))
+         (follow-up-to (gethash "follow_up_to" body))
+         (follow-up-p (nth-value 1 (gethash "follow_up_to" body)))
+         (reply-to (gethash "reply_to" body))
+         (reply-to-p (nth-value 1 (gethash "reply_to" body))))
+    (cond
+      ((and turn-key-p follow-up-p)
+       (http-fail 400 "Use turn_key or follow_up_to, not both."
+                  :code "turn_key_conflict"))
+      ((and reply-to-p follow-up-p)
+       (http-fail 400 "Use reply_to or follow_up_to, not both."
+                  :code "turn_key_conflict"))
+      ((and (not (http-service-followups-p service))
+            (or turn-key-p follow-up-p reply-to-p))
+       (http-fail 400 "This webhook does not accept follow-ups."
+                  :code "followups_disabled"))
+      (follow-up-p
+       (unless (turn-key-p follow-up-to)
+         (http-fail 400 "A follow-up key must be 64 lower-case hexadecimal characters."
+                    :code "invalid_turn_key"))
+       (followup-response service follow-up-to text))
+      ((or turn-key-p reply-to-p)
+       (when turn-key-p
+         (unless (turn-key-p turn-key)
+           (http-fail 400 "A turn key must be 64 lower-case hexadecimal characters."
+                      :code "invalid_turn_key")))
+       (when reply-to-p
+         (unless (turn-key-p reply-to)
+           (http-fail 400 "A reply_to key must be 64 lower-case hexadecimal characters."
+                      :code "invalid_reply_to")))
+       (run-message-turn service text author
+                         (and turn-key-p turn-key)
+                         (and reply-to-p reply-to)))
+      (t
+       (run-message-turn service text author nil nil)))))
 
 (declaim (ftype (function (http-service http-request) (values integer string))
                 handle-http-request))
@@ -636,7 +934,8 @@ Connection: close whenever a framed body is left unread."
                    (abort-with status body))))
            (http-error (condition)
              (abort-with (http-error-status condition)
-                         (error-body (http-error-message condition))
+                         (error-body (http-error-message condition)
+                                     (http-error-code condition))
                          :allow (http-error-allow condition)
                          :retry-after (http-error-retry-after condition)))
            (error (condition)
@@ -754,6 +1053,7 @@ Serialized by STOP-LOCK; retains the acceptor slot if stopping times out."
                            (* seconds internal-time-units-per-second))))
           (when (stop-acceptor-within acceptor deadline)
             (drain-requests service acceptor deadline seconds)
+            (close-http-turns service)
             (setf (http-channel-acceptor channel) nil))))))
   nil)
 
@@ -822,18 +1122,19 @@ avoid duplicate backtraces."
 
 (declaim (ftype (function (&key (:turn t) (:health t) (:usage t) (:token t)
                                 (:bind string) (:port integer) (:body-limit integer)
-                                (:name string))
+                                (:followups-p boolean) (:name string))
                           (values http-channel &rest t))
                 start-http))
 
 (defun start-http (&key turn health usage token (bind "127.0.0.1") (port 8787)
-                        (body-limit +http-body-limit+) (name "http"))
+                        (body-limit +http-body-limit+) (followups-p nil) (name "http"))
   "Create and start an HTTP-CHANNEL with these options; blocks until STOP-HTTP."
   (let ((channel (make-http-channel
                   :name name
                   :service (make-http-service :turn turn :health health :usage usage
                                               :token token :bind bind :port port
-                                              :body-limit body-limit))))
+                                              :body-limit body-limit
+                                              :followups-p followups-p))))
     (enchiridion.channel:channel-start channel)
     channel))
 

@@ -28,11 +28,13 @@ reads them from one place rather than from three return values."
     (enchiridion.channel.http:http-error (condition) condition)))
 
 (defun service-with (&key turn health usage token (bind "127.0.0.1") (port 8787)
-                          (body-limit enchiridion.channel.http:+http-body-limit+))
-  "Return a service whose routes are the given functions."
+                          (body-limit enchiridion.channel.http:+http-body-limit+)
+                          (followups-p nil))
+  "Return a service whose routes are the given functions.
+FOLLOWUPS-P makes TURN accept the second checkpoint argument."
   (enchiridion.channel.http:make-http-service
    :turn turn :health health :usage usage :token token :bind bind :port port
-   :body-limit body-limit))
+   :body-limit body-limit :followups-p followups-p))
 
 (defun get-request (path &key query authorization)
   "Return a GET request value for PATH."
@@ -46,6 +48,30 @@ reads them from one place rather than from three return values."
    :method "POST" :path "/message" :body body
    :content-type content-type :authorization authorization
    :content-length (length body)))
+
+(defun followup-key (&optional (character #\a))
+  "Return a well-formed capability. The caller mints it; the service checks it."
+  (make-string enchiridion.channel.http::+http-turn-key-length+
+               :initial-element character))
+
+(defun json-body (&rest pairs)
+  "Return PAIRS as a JSON object body."
+  (let ((table (make-hash-table :test #'equal)))
+    (loop for (key value) on pairs by #'cddr
+          do (setf (gethash key table) value))
+    (com.inuoe.jzon:stringify table)))
+
+(defun message-call (service body &key authorization)
+  "Post BODY to SERVICE, returning (STATUS BODY) or the HTTP-ERROR it signalled."
+  (handler-case
+      (multiple-value-list
+       (enchiridion.channel.http:dispatch-http-request
+        service (post-request body :authorization authorization)))
+    (enchiridion.channel.http:http-error (condition) condition)))
+
+(defun error-code (condition)
+  "Return the follow-up code on CONDITION."
+  (enchiridion.channel.http::http-error-code condition))
 
 ;;;; Tokens.
 
@@ -497,6 +523,600 @@ before this is reached"
     (testing "and the failed turn is not left counted as in flight"
       (ok (zerop (enchiridion.channel.http::turns-running service))))))
 
+;;;; Follow-ups.
+
+(deftest a-keyed-turn-accepts-drains-and-cuts-off-follow-ups ()
+  (let ((key (followup-key #\a))
+        (service nil)
+        (pending nil)
+        (events '())
+        (closed nil)
+        (reused nil))
+    (setf service
+          (service-with
+           :followups-p t
+           :turn
+           (lambda (message steer)
+             (ok (functionp steer))
+             (testing "the follow-up cannot rename the sender"
+               (ok (string= "penny" (enchiridion.channel:msg-author message))))
+             ;; Registered but before the first checkpoint: retryable, never 202.
+             (setf pending
+                   (message-call service
+                                 (json-body "text" "too soon"
+                                            "follow_up_to" key)))
+             (ok (null (funcall steer :before-request)))
+             (testing "an active key cannot start a second turn"
+               (let ((duplicate
+                       (message-call service
+                                     (json-body "text" "duplicate"
+                                                "turn_key" key))))
+                 (ok (typep duplicate 'enchiridion.channel.http:http-error))
+                 (ok (eql 409 (enchiridion.channel.http:http-error-status duplicate)))
+                 (ok (string= "turn_key_reused" (error-code duplicate)))))
+             (let ((one (message-call service
+                                      (json-body "text" "one"
+                                                 "follow_up_to" key
+                                                 "author" "mallory")))
+                   (two (message-call service
+                                      (json-body "text" "two"
+                                                 "follow_up_to" key))))
+               (ok (and (listp one) (eql 202 (first one))))
+               (ok (and (listp two) (eql 202 (first two))))
+               (testing "the acknowledgement says what it did"
+                 (let ((ack (json-of (second one))))
+                   (ok (eq t (gethash "ok" ack)))
+                   (ok (eq t (gethash "accepted" ack)))))
+               (testing "an acknowledgement never carries the key"
+                 (ng (search key (second one)))))
+             (push (funcall steer :before-request) events)
+             (let ((three (message-call service
+                                        (json-body "text" "three"
+                                                   "follow_up_to" key))))
+               (ok (and (listp three) (eql 202 (first three)))))
+             (push (funcall steer :before-tools) events)
+             (push (funcall steer :before-final) events)
+             (setf closed
+                   (message-call service
+                                 (json-body "text" "after"
+                                            "follow_up_to" key)))
+             (list :ok-p t :reply "done" :usage nil))))
+    (let ((initial (message-call service
+                                 (json-body "text" "hello" "turn_key" key
+                                            "author" "penny"))))
+      (ok (and (listp initial) (eql 200 (first initial))))
+      (testing "the initial answer does not echo the key"
+        (ng (search key (second initial)))))
+    (testing "before the first checkpoint the key is pending, not open"
+      (ok (typep pending 'enchiridion.channel.http:http-error))
+      (ok (eql 409 (enchiridion.channel.http:http-error-status pending)))
+      (ok (string= "turn_pending" (error-code pending)))
+      (ok (equal "1" (enchiridion.channel.http::http-error-retry-after pending))))
+    (testing "the drains keep arrival order"
+      (ok (equal '(("one" "two") ("three") nil) (reverse events))))
+    (testing "an empty final drain closes admission for good"
+      (ok (typep closed 'enchiridion.channel.http:http-error))
+      (ok (eql 409 (enchiridion.channel.http:http-error-status closed)))
+      (ok (string= "turn_closed" (error-code closed)))
+      (testing "and the refusal does not leak the key"
+        (ng (search key (enchiridion.channel.http:http-error-message closed)))))
+    (testing "a closed key cannot start another turn"
+      (setf reused
+            (message-call service
+                          (json-body "text" "reuse" "turn_key" key)))
+      (ok (typep reused 'enchiridion.channel.http:http-error))
+      (ok (eql 409 (enchiridion.channel.http:http-error-status reused)))
+      (ok (string= "turn_key_reused" (error-code reused))))))
+
+(deftest a-busy-keyed-turn-never-opens-admission ()
+  (let ((key (followup-key #\b))
+        (service nil)
+        (attempts 0)
+        (early nil))
+    (setf service
+          (service-with
+           :followups-p t
+           :turn
+           (lambda (message steer)
+             (declare (ignore message steer))
+             (incf attempts)
+             (if (= attempts 1)
+                 (progn
+                   (setf early
+                         (message-call service
+                                       (json-body "text" "early"
+                                                  "follow_up_to" key)))
+                   (list :ok-p nil :reply "" :error "busy"
+                         :reason :busy :usage nil))
+                 (list :ok-p t :reply "second" :usage nil)))))
+    (let ((first (message-call service
+                               (json-body "text" "hello" "turn_key" key))))
+      (ok (typep first 'enchiridion.channel.http:http-error))
+      (ok (eql 503 (enchiridion.channel.http:http-error-status first)))
+      (ok (equal "1" (enchiridion.channel.http::http-error-retry-after first))))
+    (testing "a busy turn refused the follow-up while it was pending"
+      (ok (typep early 'enchiridion.channel.http:http-error))
+      (ok (eql 409 (enchiridion.channel.http:http-error-status early)))
+      (ok (string= "turn_pending" (error-code early))))
+    (testing "and it forgot the key rather than leaving it open"
+      (let ((late (message-call service
+                                (json-body "text" "late"
+                                           "follow_up_to" key))))
+        (ok (typep late 'enchiridion.channel.http:http-error))
+        (ok (eql 409 (enchiridion.channel.http:http-error-status late)))
+        (ok (string= "unknown_turn" (error-code late)))))
+    (testing "the same key can be retried after the 503"
+      (let ((retry (message-call service
+                                 (json-body "text" "again" "turn_key" key))))
+        (ok (listp retry))
+        (ok (eql 200 (first retry)))))))
+
+(deftest a-keyed-turn-caps-follow-ups-at-four-texts ()
+  (let ((key (followup-key #\c))
+        (service nil)
+        (fifth nil)
+        (drained nil))
+    (setf service
+          (service-with
+           :followups-p t
+           :turn
+           (lambda (message steer)
+             (declare (ignore message))
+             (ok (null (funcall steer :before-request)))
+             (dotimes (index enchiridion.channel.http::+http-followup-limit+)
+               (let ((accepted
+                       (message-call service
+                                     (json-body "text" (format nil "f~D" index)
+                                                "follow_up_to" key))))
+                 (ok (and (listp accepted) (eql 202 (first accepted))))))
+             (setf fifth
+                   (message-call service
+                                 (json-body "text" "fifth"
+                                            "follow_up_to" key)))
+             (setf drained (funcall steer :before-request))
+             (list :ok-p t :reply "done" :usage nil))))
+    (let ((initial (message-call service
+                                 (json-body "text" "hello" "turn_key" key))))
+      (ok (and (listp initial) (eql 200 (first initial)))))
+    (ok (typep fifth 'enchiridion.channel.http:http-error))
+    (ok (eql 409 (enchiridion.channel.http:http-error-status fifth)))
+    (ok (string= "turn_full" (error-code fifth)))
+    (ok (= 4 (length drained)))))
+
+(deftest a-keyed-turn-caps-follow-up-characters ()
+  (let* ((key (followup-key #\d))
+         (large (make-string enchiridion.channel.http::+http-followup-chars+
+                             :initial-element #\x))
+         (service nil)
+         (overflow nil)
+         (drained nil))
+    (setf service
+          (service-with
+           :followups-p t
+           :turn
+           (lambda (message steer)
+             (declare (ignore message))
+             (ok (null (funcall steer :before-request)))
+             (let ((accepted (message-call service
+                                           (json-body "text" large
+                                                      "follow_up_to" key))))
+               (ok (and (listp accepted) (eql 202 (first accepted)))))
+             (setf overflow
+                   (message-call service
+                                 (json-body "text" "x" "follow_up_to" key)))
+             (setf drained (funcall steer :before-request))
+             (list :ok-p t :reply "done" :usage nil))))
+    (let ((initial (message-call service
+                                 (json-body "text" "hello" "turn_key" key))))
+      (ok (and (listp initial) (eql 200 (first initial)))))
+    (ok (typep overflow 'enchiridion.channel.http:http-error))
+    (ok (eql 409 (enchiridion.channel.http:http-error-status overflow)))
+    (ok (string= "turn_full" (error-code overflow)))
+    (testing "the one text that fits is drained untouched"
+      (ok (equal (list large) drained)))))
+
+(deftest follow-up-fields-are-validated-before-admission ()
+  (let ((service (service-with
+                  :followups-p t
+                  :turn (lambda (message steer)
+                          (declare (ignore message steer))
+                          (list :ok-p t :reply "unreached" :usage nil)))))
+    (testing "a malformed initial key is a coded 400"
+      (dolist (candidate
+                (list (make-string
+                       (1- enchiridion.channel.http::+http-turn-key-length+)
+                       :initial-element #\a)
+                      (make-string
+                       (1+ enchiridion.channel.http::+http-turn-key-length+)
+                       :initial-element #\a)
+                      (make-string enchiridion.channel.http::+http-turn-key-length+
+                                   :initial-element #\A)
+                      "not-a-key"))
+        (let ((condition
+                (message-call service
+                              (json-body "text" "hi" "turn_key" candidate))))
+          (ok (typep condition 'enchiridion.channel.http:http-error))
+          (ok (eql 400 (enchiridion.channel.http:http-error-status condition)))
+          (ok (string= "invalid_turn_key" (error-code condition))))))
+    (testing "a malformed follow-up key is a coded 400"
+      (let ((condition
+              (message-call service
+                            (json-body "text" "hi" "follow_up_to"
+                                       (make-string
+                                        enchiridion.channel.http::+http-turn-key-length+
+                                        :initial-element #\G)))))
+        (ok (typep condition 'enchiridion.channel.http:http-error))
+        (ok (eql 400 (enchiridion.channel.http:http-error-status condition)))
+        (ok (string= "invalid_turn_key" (error-code condition)))))
+    (testing "a malformed reply_to is a coded 400"
+      (let ((condition
+              (message-call service
+                            (json-body "text" "hi" "reply_to"
+                                       (make-string
+                                        (1- enchiridion.channel.http::+http-turn-key-length+)
+                                        :initial-element #\a)))))
+        (ok (typep condition 'enchiridion.channel.http:http-error))
+        (ok (eql 400 (enchiridion.channel.http:http-error-status condition)))
+        (ok (string= "invalid_reply_to" (error-code condition)))))
+    (testing "both fields at once are a 400, not a guess"
+      (let ((condition
+              (message-call service
+                            (json-body "text" "hi"
+                                       "turn_key" (followup-key #\a)
+                                       "follow_up_to" (followup-key #\b)))))
+        (ok (typep condition 'enchiridion.channel.http:http-error))
+        (ok (eql 400 (enchiridion.channel.http:http-error-status condition)))
+        (ok (string= "turn_key_conflict" (error-code condition)))))
+    (testing "reply_to cannot be combined with follow_up_to"
+      (let ((condition
+              (message-call service
+                            (json-body "text" "hi"
+                                       "reply_to" (followup-key #\c)
+                                       "follow_up_to" (followup-key #\d)))))
+        (ok (typep condition 'enchiridion.channel.http:http-error))
+        (ok (eql 400 (enchiridion.channel.http:http-error-status condition)))
+        (ok (string= "turn_key_conflict" (error-code condition)))))
+    (testing "a well-formed key with no turn is a 409 unknown"
+      (let ((condition
+              (message-call service
+                            (json-body "text" "hi" "follow_up_to"
+                                       (followup-key #\9)))))
+        (ok (typep condition 'enchiridion.channel.http:http-error))
+        (ok (eql 409 (enchiridion.channel.http:http-error-status condition)))
+        (ok (string= "unknown_turn" (error-code condition)))
+        (testing "which is a different code from closed"
+          (ng (string= "turn_closed" (error-code condition))))))
+    (testing "a follow-up needs non-empty text"
+      (let ((condition
+              (message-call service
+                            (json-body "text" "   " "follow_up_to"
+                                       (followup-key)))))
+        (ok (typep condition 'enchiridion.channel.http:http-error))
+        (ok (eql 400 (enchiridion.channel.http:http-error-status condition)))))))
+
+(deftest follow-up-fields-need-the-opt-in-flag ()
+  (let ((service (service-with
+                  :turn (lambda (message)
+                          (declare (ignore message))
+                          (list :ok-p t :reply "plain" :usage nil)))))
+    (dolist (body (list (json-body "text" "hi" "turn_key" (followup-key))
+                        (json-body "text" "hi" "follow_up_to" (followup-key))
+                        (json-body "text" "hi" "reply_to" (followup-key))))
+      (let ((condition (message-call service body)))
+        (ok (typep condition 'enchiridion.channel.http:http-error))
+        (ok (eql 400 (enchiridion.channel.http:http-error-status condition)))
+        (ok (string= "followups_disabled" (error-code condition)))))
+    (testing "the same service still runs a plain message"
+      (let ((result (message-call service (json-body "text" "hi"))))
+        (ok (and (listp result) (eql 200 (first result))))))))
+
+(deftest a-service-with-followups-on-still-takes-plain-messages ()
+  (let* ((seen nil)
+         (service (service-with
+                   :followups-p t
+                   :turn (lambda (message)
+                           (setf seen message)
+                           (list :ok-p t :reply "plain" :usage nil))))
+         (result (message-call service (json-body "text" "hello"))))
+    (ok (and (listp result) (eql 200 (first result))))
+    (ok (string= "hello" (enchiridion.channel:msg-text seen)))))
+
+;;;; Reused work.
+
+(deftest a-late-message-reuses-completed-work-once ()
+  (let* ((key (followup-key #\1))
+         (other (followup-key #\2))
+         (seen '())
+         (service nil))
+    (setf service
+          (service-with
+           :followups-p t
+           :turn
+           (lambda (message &optional steer work)
+             (when steer (funcall steer :before-request))
+             (let ((text (enchiridion.channel:msg-text message)))
+               (push (list text work) seen)
+               (list :ok-p t :reply text
+                     :work (if (string= "first" text) "opaque-work" nil)
+                     :usage nil)))))
+    (let ((initial (message-call service
+                                 (json-body "text" "first" "turn_key" key))))
+      (ok (and (listp initial) (eql 200 (first initial))))
+      (testing "the work never reaches the answer"
+        (ng (search "opaque-work" (second initial)))
+        (ng (search key (second initial)))))
+    (testing "a refused key does not burn the remembered work"
+      (let ((refused (message-call service
+                                   (json-body "text" "refused"
+                                              "reply_to" key
+                                              "turn_key" key))))
+        (ok (typep refused 'enchiridion.channel.http:http-error))
+        (ok (eql 409 (enchiridion.channel.http:http-error-status refused)))
+        (ok (string= "turn_key_reused" (error-code refused)))))
+    (testing "an unmatched reply_to runs a normal turn and leaves the work"
+      (let ((unmatched (message-call service
+                                     (json-body "text" "unmatched"
+                                                "reply_to" other))))
+        (ok (and (listp unmatched) (eql 200 (first unmatched))))))
+    (testing "a matching reply_to gets the work once"
+      (let ((reused (message-call service
+                                  (json-body "text" "reused"
+                                             "reply_to" key))))
+        (ok (and (listp reused) (eql 200 (first reused))))
+        (ng (search "opaque-work" (second reused)))
+        (ng (search key (second reused)))))
+    (testing "the next matching reply_to runs without work"
+      (let ((again (message-call service
+                                 (json-body "text" "again"
+                                            "reply_to" key))))
+        (ok (and (listp again) (eql 200 (first again))))))
+    (testing "the calls show work only on the reuse"
+      (ok (equal '(("first" nil) ("unmatched" nil)
+                   ("reused" "opaque-work") ("again" nil))
+                 (reverse seen))))))
+
+(deftest work-can-ride-with-a-new-turn-key ()
+  (let* ((old (followup-key #\3))
+         (new (followup-key #\4))
+         (seen '())
+         (service nil))
+    (setf service
+          (service-with
+           :followups-p t
+           :turn
+           (lambda (message &optional steer work)
+             (when steer (funcall steer :before-request))
+             (let ((text (enchiridion.channel:msg-text message)))
+               (push (list text work (functionp steer)) seen)
+               (list :ok-p t :reply text
+                     :work (if (string= "first" text) "first-work" nil)
+                     :usage nil)))))
+    (let ((first (message-call service
+                               (json-body "text" "first" "turn_key" old))))
+      (ok (and (listp first) (eql 200 (first first)))))
+    (let ((second (message-call service
+                                (json-body "text" "second"
+                                           "reply_to" old
+                                           "turn_key" new))))
+      (ok (and (listp second) (eql 200 (first second))))
+      (testing "the prior work never reaches the answer"
+        (ng (search "first-work" (second second)))
+        (ng (search old (second second)))))
+    (testing "the second turn ran with its own key and the prior work"
+      (ok (equal '(("first" nil t) ("second" "first-work" t))
+                 (reverse seen))))))
+
+(deftest a-reply-to-probe-is-an-ordinary-turn-not-a-follow-up ()
+  (let* ((key (followup-key #\8))
+         (calls 0)
+         (service (service-with
+                   :followups-p t
+                   :turn (lambda (message &optional steer work)
+                           (declare (ignore steer work))
+                           (incf calls)
+                           (list :ok-p t
+                                 :reply (enchiridion.channel:msg-text message)
+                                 :usage nil)))))
+    (let ((turn (enchiridion.channel.http::register-http-turn service key)))
+      (setf (enchiridion.channel.http::http-turn-state turn) :accepting)
+      (let ((result (message-call service
+                                  (json-body "text" "ordinary"
+                                             "reply_to" key))))
+        (ok (and (listp result) (eql 200 (first result))))
+        (ok (string= "ordinary"
+                     (gethash "reply" (json-of (second result)))))
+        (testing "the active turn was not handed the text"
+          (ok (null (enchiridion.channel.http::http-turn-queue turn))))
+        (ok (= 1 calls))))))
+
+(deftest remembered-work-expires-and-unmatched-probes-do-not-clear-it ()
+  (let* ((service (service-with :followups-p t))
+         (key (followup-key #\5))
+         (work (enchiridion.channel.http::%make-http-work
+                :key key :work "old"
+                :at (get-internal-real-time))))
+    (setf (enchiridion.channel.http::http-service-last-work service) work)
+    (testing "an unmatched key leaves the entry alone"
+      (ok (null (enchiridion.channel.http::claim-http-work
+                 service (followup-key #\6))))
+      (ok (eq work (enchiridion.channel.http::http-service-last-work service))))
+    (testing "expired work is refused and the entry is cleared"
+      (decf (enchiridion.channel.http::http-work-at work)
+            (* (1+ enchiridion.channel.http::+http-reply-reuse-seconds+)
+               internal-time-units-per-second))
+      (ok (null (enchiridion.channel.http::claim-http-work service key)))
+      (ok (null (enchiridion.channel.http::http-service-last-work service))))))
+
+(deftest work-is-remembered-only-for-successful-keyed-turns ()
+  (testing "a failed keyed turn leaves nothing to reuse"
+    (let ((service (service-with
+                    :followups-p t
+                    :turn (lambda (message &optional steer work)
+                            (declare (ignore message work))
+                            (when steer (funcall steer :before-request))
+                            (list :ok-p nil :reply "" :error "boom"
+                                  :reason :failed :work "failed" :usage nil)))))
+      (let ((result (message-call service
+                                  (json-body "text" "hi"
+                                             "turn_key" (followup-key #\a)))))
+        (ok (typep result 'enchiridion.channel.http:http-error))
+        (ok (eql 502 (enchiridion.channel.http:http-error-status result)))
+        (ok (null (enchiridion.channel.http::http-service-last-work service))))))
+  (testing "a successful unkeyed turn has no key to remember work under"
+    (let ((service (service-with
+                    :followups-p t
+                    :turn (lambda (message &optional steer work)
+                            (declare (ignore message steer work))
+                            (list :ok-p t :reply "plain" :work "unkeyed" :usage nil)))))
+      (let ((result (message-call service (json-body "text" "hi"))))
+        (ok (and (listp result) (eql 200 (first result))))
+        (ok (null (enchiridion.channel.http::http-service-last-work service)))))))
+
+(deftest a-busy-turn-keeps-the-work-for-the-retry ()
+  (let* ((key (followup-key #\c))
+         (seen '())
+         (service nil))
+    (setf service
+          (service-with
+           :followups-p t
+           :turn
+           (lambda (message &optional steer work)
+             (when steer (funcall steer :before-request))
+             (let ((text (enchiridion.channel:msg-text message)))
+               (push (list text work) seen)
+               (cond
+                 ((string= "first" text)
+                  (list :ok-p t :reply "first" :work "kept-work" :usage nil))
+                 ((string= "busy" text)
+                  (list :ok-p nil :reply "" :error "busy"
+                        :reason :busy :usage nil))
+                 (t
+                  (list :ok-p t :reply "later" :usage nil)))))))
+    (let ((first (message-call service
+                               (json-body "text" "first" "turn_key" key))))
+      (ok (and (listp first) (eql 200 (first first)))))
+    (testing "a busy turn answers 503 without spending the work"
+      (let ((busy (message-call service
+                                (json-body "text" "busy" "reply_to" key))))
+        (ok (typep busy 'enchiridion.channel.http:http-error))
+        (ok (eql 503 (enchiridion.channel.http:http-error-status busy)))))
+    (testing "the retry still gets the work"
+      (let ((retry (message-call service
+                                 (json-body "text" "retry" "reply_to" key))))
+        (ok (and (listp retry) (eql 200 (first retry))))))
+    (testing "and the next request finds it spent"
+      (let ((again (message-call service
+                                 (json-body "text" "again" "reply_to" key))))
+        (ok (and (listp again) (eql 200 (first again))))))
+    (testing "the busy attempt and the retry both saw the work"
+      (ok (equal '(("first" nil) ("busy" "kept-work")
+                   ("retry" "kept-work") ("again" nil))
+                 (reverse seen))))))
+
+(deftest restoring-claimed-work-never-overwrites-newer-work ()
+  (let ((service (service-with :followups-p t))
+        (old (followup-key #\d))
+        (new (followup-key #\e)))
+    (setf (enchiridion.channel.http::http-service-last-work service)
+          (enchiridion.channel.http::%make-http-work
+           :key old :work "old" :at (get-internal-real-time)))
+    (multiple-value-bind (work claimed)
+        (enchiridion.channel.http::claim-http-work service old)
+      (ok (string= "old" work))
+      (ok claimed)
+      (enchiridion.channel.http::remember-http-work service new "new")
+      (enchiridion.channel.http::restore-http-work service claimed)
+      (let ((stored (enchiridion.channel.http::http-service-last-work service)))
+        (testing "the newer entry survives the restore"
+          (ok (string= new (enchiridion.channel.http::http-work-key stored)))
+          (ok (string= "new" (enchiridion.channel.http::http-work-work stored))))))))
+
+(deftest a-follow-up-is-authenticated-like-any-message ()
+  (let ((key (followup-key #\e))
+        (service nil)
+        (unauthorized nil)
+        (drained nil))
+    (setf service
+          (service-with
+           :followups-p t :token "s3cret"
+           :turn
+           (lambda (message steer)
+             (declare (ignore message))
+             (ok (null (funcall steer :before-request)))
+             (setf unauthorized
+                   (message-call service
+                                 (json-body "text" "no"
+                                            "follow_up_to" key)
+                                 :authorization "Bearer wrong"))
+             (let ((accepted (message-call service
+                                           (json-body "text" "yes"
+                                                      "follow_up_to" key)
+                                           :authorization "Bearer s3cret")))
+               (ok (and (listp accepted) (eql 202 (first accepted)))))
+             (setf drained (funcall steer :before-request))
+             (list :ok-p t :reply "done" :usage nil))))
+    (let ((initial (message-call service
+                                 (json-body "text" "hello" "turn_key" key)
+                                 :authorization "Bearer s3cret")))
+      (ok (and (listp initial) (eql 200 (first initial)))))
+    (testing "a wrong token is rejected before admission"
+      (ok (typep unauthorized 'enchiridion.channel.http:http-error))
+      (ok (eql 401 (enchiridion.channel.http:http-error-status unauthorized))))
+    (testing "only the authenticated follow-up made it into the drain"
+      (ok (equal '("yes") drained)))))
+
+(deftest a-turn-that-returns-without-a-final-drain-closes-its-key ()
+  (let ((key (followup-key #\f))
+        (service nil)
+        (accepted nil))
+    (setf service
+          (service-with
+           :followups-p t
+           :turn
+           (lambda (message steer)
+             (declare (ignore message))
+             (ok (null (funcall steer :before-request)))
+             (setf accepted
+                   (message-call service
+                                 (json-body "text" "queued"
+                                            "follow_up_to" key)))
+             (list :ok-p t :reply "done" :usage nil))))
+    (let ((initial (message-call service
+                                 (json-body "text" "hello" "turn_key" key))))
+      (ok (and (listp initial) (eql 200 (first initial)))))
+    (ok (and (listp accepted) (eql 202 (first accepted))))
+    (let ((late (message-call service
+                              (json-body "text" "late"
+                                         "follow_up_to" key))))
+      (ok (typep late 'enchiridion.channel.http:http-error))
+      (ok (eql 409 (enchiridion.channel.http:http-error-status late)))
+      (ok (string= "turn_closed" (error-code late))))))
+
+(deftest an-error-code-travels-in-the-json-body ()
+  (let ((coded (json-of (enchiridion.channel.http::error-body
+                         "no such turn" "turn_closed")))
+        (plain (json-of (enchiridion.channel.http::error-body "plain"))))
+    (ok (string= "turn_closed" (gethash "code" coded)))
+    (testing "an error without a code keeps its old shape"
+      (ok (null (gethash "code" plain))))))
+
+(deftest stopping-a-service-closes-open-keys ()
+  (let* ((key (followup-key #\7))
+         (service (service-with :followups-p t)))
+    (let ((turn (enchiridion.channel.http::register-http-turn service key)))
+      (setf (enchiridion.channel.http::http-turn-state turn) :accepting)
+      (setf (enchiridion.channel.http::http-service-last-work service)
+            (enchiridion.channel.http::%make-http-work
+             :key key :work "old" :at (get-internal-real-time)))
+      (enchiridion.channel.http::close-http-turns service)
+      (ok (null (enchiridion.channel.http::http-service-last-work service)))
+      (let ((condition
+              (message-call service
+                            (json-body "text" "late" "follow_up_to" key))))
+        (ok (typep condition 'enchiridion.channel.http:http-error))
+        (ok (eql 409 (enchiridion.channel.http:http-error-status condition)))
+        (ok (string= "turn_closed" (error-code condition)))))))
+
 (deftest an-unknown-route-and-a-wrong-method-are-refused ()
   (let ((service (service-with)))
     (testing "a known path with the wrong method is 405 and names the right one"
@@ -700,6 +1320,57 @@ overrunning read, which wakes it."
           do (if port
                  (return (values thread port))
                  (sleep 0.05)))))
+
+(deftest a-keyed-follow-up-reaches-the-original-http-connection ()
+  (if (enchiridion.compat:environment-value "ENCHIRIDION_NO_SOCKET_TESTS")
+      (ok t "skipped by ENCHIRIDION_NO_SOCKET_TESTS")
+      (let* ((ready (bordeaux-threads:make-semaphore))
+             (finish (bordeaux-threads:make-semaphore))
+             (key (followup-key))
+             (channel (enchiridion.channel.http:make-http-channel
+                       :service (service-with
+                                 :port 0 :token "local-test" :followups-p t
+                                 :turn (lambda (message &optional steer)
+                                         (declare (ignore message))
+                                         (funcall steer :before-request)
+                                         (bordeaux-threads:signal-semaphore ready)
+                                         (unless (bordeaux-threads:wait-on-semaphore finish :timeout 5)
+                                           (error "The follow-up test did not release the turn."))
+                                         (list :ok-p t :reply (car (funcall steer :before-final)))))))
+             (original nil)
+             (later nil)
+             (thread nil))
+        (flet ((post (socket body)
+                 (write-http-request
+                  (usocket:socket-stream socket)
+                  (request-text "POST" "/message" :body body
+                                :content-length (length body)
+                                :authorization "Bearer local-test"
+                                :content-type "application/json"))))
+          (unwind-protect
+               (multiple-value-bind (worker port) (start-channel-in-thread channel)
+                 (setf thread worker)
+                 (ok port)
+                 (when port
+                   (setf original (open-connection port)
+                         later (open-connection port))
+                   (post original (json-body "text" "first" "turn_key" key))
+                   (let ((opened (bordeaux-threads:wait-on-semaphore ready :timeout 3)))
+                     (ok opened)
+                     (when opened
+                       (post later (json-body "text" "joined" "follow_up_to" key))
+                       (let ((accepted (next-response later 3)))
+                         (ok (and (listp accepted) (search " 202 " (getf accepted :status)))))
+                       (bordeaux-threads:signal-semaphore finish)
+                       (let ((reply (next-response original 3)))
+                         (ok (and (listp reply)
+                                  (search "\"reply\":\"joined\"" (getf reply :body)))))))))
+            (bordeaux-threads:signal-semaphore finish)
+            (when original (ignore-errors (usocket:socket-close original)))
+            (when later (ignore-errors (usocket:socket-close later)))
+            (enchiridion.channel:channel-stop channel)
+            (when (and thread (bordeaux-threads:thread-alive-p thread))
+              (bordeaux-threads:join-thread thread)))))))
 
 (deftest a-refused-body-takes-its-connection-with-it ()
   ;; Two answers depend on what happened to the body. One that read it may keep

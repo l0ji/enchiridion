@@ -118,11 +118,13 @@ operator has to be able to see."
 ;;;; The sleep agent.
 
 (declaim (ftype (function (&key (:directory t) (:backend t) (:budget t)
-                                (:broker t) (:store t) (:lock t))
+                                (:broker t) (:store t) (:lock t)
+                                (:tool-rounds (integer 0 *)))
                           agent)
                 sleep-agent))
 
-(defun sleep-agent (&key directory backend budget broker store (lock nil))
+(defun sleep-agent (&key directory backend budget broker store (lock nil)
+                         (tool-rounds (enchiridion:config-tool-rounds nil)))
   "Return an agent for one sleep pass.
 
 It is built fresh on every tick so that the prompt is compiled from the block
@@ -139,6 +141,7 @@ share their lock; otherwise the two write in an order neither chose."
                            :budget budget
                            :broker broker
                            :store store
+                           :tool-rounds tool-rounds
                            :lock lock)))
     (dolist (block (agent-blocks agent))
       (when (member (enchiridion.memory:block-label block)
@@ -704,6 +707,7 @@ and the repository."
                :budget (agent-budget agent)
                :broker (agent-broker agent)
                :store store
+               :tool-rounds (agent-tool-rounds agent)
                :lock (agent-lock agent)))
 
 (declaim (ftype (function (enchiridion.supervisor:supervisor t agent t

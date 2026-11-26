@@ -211,6 +211,13 @@
     (testing "a key with no shipped default signals"
       (ok (signals (enchiridion:config-setting config :budget :not-a-setting))))))
 
+(deftest tool-round-limit-is-configurable ()
+  (ok (= 64 (enchiridion:config-tool-rounds nil)))
+  (ok (= 128 (enchiridion:config-tool-rounds '(:budget (:max-tool-rounds 128)))))
+  (ok (zerop (enchiridion:config-tool-rounds '(:budget (:max-tool-rounds 0)))))
+  (ok (signals (enchiridion:config-tool-rounds '(:budget (:max-tool-rounds -1)))
+               'enchiridion.errors:configuration-error)))
+
 (deftest one-llm-option-can-be-overridden-in-a-copy ()
   (let* ((config '(:llm (:max-tokens 4096) (:model-cheap "m") :memory (:enabled t)))
          (copy (enchiridion:config-with-llm-value config :max-tokens 16384)))

@@ -178,6 +178,11 @@ countable from the test."
                         :test #'eq)
             (ng (enchiridion.memory:block-writable-p block))))))))
 
+(deftest sleep-inherits-the-interactive-tool-round-limit ()
+  (let* ((agent (enchiridion.kernel:make-agent :tool-rounds 128))
+         (sleep (enchiridion.kernel::sleep-pass-agent agent nil nil)))
+    (ok (= 128 (enchiridion.kernel::agent-tool-rounds sleep)))))
+
 (deftest the-tick-agents-share-the-operator-lock ()
   (with-scratch-world (store supervisor)
     (let* ((agent (agent-of supervisor))

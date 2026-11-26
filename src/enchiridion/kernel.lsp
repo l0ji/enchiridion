@@ -117,11 +117,12 @@ the empty strings the shape has always allowed."
   (directory nil :type (or null pathname))
   (broker nil :type t)
   (tools-p t :type boolean)
-  (tool-rounds 32 :type (integer 0 *))
+  (tool-rounds (enchiridion:config-tool-rounds nil) :type (integer 0 *))
   (lock nil :type t))
 
 (defun make-agent (&key (name "default") backend blocks directory budget
-                          broker (tools-p t) (tool-rounds 32) lock store)
+                          broker (tools-p t) (tool-rounds (enchiridion:config-tool-rounds nil))
+                          lock store)
   "Return an AGENT with a prompt compiled from BLOCKS, or from DIRECTORY.
 
 The prompt is compiled here, once. Callers that pass BLOCKS usually pass the

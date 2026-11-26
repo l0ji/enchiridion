@@ -27,7 +27,7 @@
    #:control-path #:status-path #:project-root
    #:sectioned-config-p #:config-section #:config-value #:config-section-value
    #:config-with-llm-value
-   #:config-setting
+   #:config-setting #:config-tool-rounds
    ;; CONFIG-LOOKUP is the reader that answers from the active configuration
    ;; first and the shipped defaults second, which is what the provider table
    ;; wants: a config.lsp that names two keys must not blank out the other

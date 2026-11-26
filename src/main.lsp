@@ -582,7 +582,9 @@ REFRESH-MODELS is T for ASK, the one-shot command about to spend a turn, and NIL
 for every other command; CHAT and SERVE refresh on their own thread through
 START-PROVIDER-REFRESH, after the listener can bind. The refresh is the one
 thing here that can open a socket: it is bounded, and it honours :OFFLINE."
-  (let ((config (when (requirement-p requirements :config) (load-config))))
+  (let* ((config (when (requirement-p requirements :config) (load-config)))
+         (tool-rounds (when (requirement-p requirements :agent)
+                        (enchiridion:config-tool-rounds config))))
     ;; One ownership pass, before anything reads or writes the agent tree. A
     ;; command that only reads the tree still needs it when this process is
     ;; root: the tools that read it run as the agent uid, and a root-owned
@@ -617,6 +619,7 @@ thing here that can open a socket: it is bounded, and it honours :OFFLINE."
                    :backend backend
                    :directory directory
                    :budget (agent-budget-plist config)
+                   :tool-rounds tool-rounds
                    :store store
                    :broker broker))))
     (when config (enchiridion.memory:configure-memory config))

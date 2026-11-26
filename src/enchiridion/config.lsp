@@ -110,6 +110,16 @@ setting cannot be read before it has a default and a line in the docs."
     (second (or (assoc key (config-section config section) :test #'eq)
                 shipped))))
 
+(declaim (ftype (function (t) (integer 0 *)) config-tool-rounds))
+
+(defun config-tool-rounds (config)
+  "Return the maximum tool rounds per turn."
+  (let ((rounds (config-setting config :budget :max-tool-rounds)))
+    (unless (typep rounds '(integer 0 *))
+      (error 'enchiridion.errors:configuration-error
+             :key :max-tool-rounds :detail "Use a non-negative integer."))
+    rounds))
+
 ;;;; The active configuration.
 ;;;;
 ;;;; One plist is active for the life of the process, bound by READ-CONFIG.
@@ -197,6 +207,7 @@ store path. The model defaults match the shipped adapter defaults."
              (:custom-status-cooldown-seconds 60))
 
     :budget
+    (:max-tool-rounds 64)
     (:max-tokens-per-tick 400000)
     (:max-tokens-per-day 40000000)
 

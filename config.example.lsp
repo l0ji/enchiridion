@@ -36,6 +36,7 @@
     (:interval-seconds 900)
 
     :budget
+    (:max-tool-rounds 64)          ; per interactive or sleep turn
     ;; Background token caps, not spending limits for chat or ask
     (:max-tokens-per-tick 400000)
     (:max-tokens-per-day 40000000)))

@@ -85,6 +85,28 @@ Call while holding the queue lock; leave an oversized match and later matches qu
             finally (return (values (nreverse claimed) (nreverse waiting)
                                     (and (plusp count) (plusp chars))))))))
 
+(defstruct turn-reuse
+  route
+  work
+  (expires-at 0))
+
+(defun turn-time ()
+  (/ (get-internal-real-time) internal-time-units-per-second))
+
+(defun remember-turn-work (reuse route work &key (now (turn-time)))
+  "Keep the last published turn's work for up to 30 seconds."
+  (setf (turn-reuse-route reuse) route
+        (turn-reuse-work reuse) work
+        (turn-reuse-expires-at reuse) (+ now 30)))
+
+(defun take-turn-work (reuse route &key (now (turn-time)))
+  "Consume saved work, returning it only to a matching, recent turn."
+  (prog1 (and route (equal route (turn-reuse-route reuse))
+              (< now (turn-reuse-expires-at reuse))
+              (turn-reuse-work reuse))
+    (setf (turn-reuse-route reuse) nil
+          (turn-reuse-work reuse) nil)))
+
 ;;;; The digest.
 
 (defparameter +message-digest-length+ 60

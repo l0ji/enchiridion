@@ -125,6 +125,34 @@
                  (mapcar #'enchiridion.llm:message-content
                          (rest (first (scripted-backend-transcripts backend)))))))))
 
+(deftest a-late-follow-up-gets-completed-work-without-replaying-a-tool-call ()
+  (let ((enchiridion.tools::*registry* (make-hash-table :test #'equal))
+        (runs 0))
+    (enchiridion.tools:define-tool "fixture"
+      :description "Return fixture text."
+      :schema (:object)
+      :handler (lambda (arguments)
+                 (declare (ignore arguments))
+                 (incf runs)
+                 "fixture result"))
+    (let* ((backend (make-scripted-backend
+                     :replies (list (completion "" :tool-calls
+                                                (list (call "c1" "fixture" "{}")))
+                                    (completion "first reply") (completion "follow-up")
+                                    (completion "separate agent"))))
+           (agent (test-agent backend))
+           (work (nth-value 3 (enchiridion.kernel:run-turn agent "first" :reuse-p t))))
+      (ok work)
+      (ok (equal "follow-up"
+                 (enchiridion.llm:completion-text
+                  (enchiridion.kernel:run-turn agent "clarify" :reuse-p t :prior-work work))))
+      (ok (= 1 runs))
+      (let ((message (second (first (scripted-backend-transcripts backend)))))
+        (ok (search "fixture result" (enchiridion.llm:message-content message)))
+        (ng (enchiridion.llm:message-tool-calls message)))
+      (enchiridion.kernel:run-turn (test-agent backend) "different agent" :prior-work work)
+      (ok (= 2 (length (first (scripted-backend-transcripts backend))))))))
+
 (deftest a-follow-up-can-supersede-an-unpublished-status-proposal ()
   (let ((enchiridion.tools::*registry* (make-hash-table :test #'equal)))
     (enchiridion.tools.builtin:register-presence-tools)

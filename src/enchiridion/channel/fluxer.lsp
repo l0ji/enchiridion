@@ -813,6 +813,7 @@ before websocket-driver discards it."))
 (defclass fluxer-channel (enchiridion.channel:channel)
   ((turn :accessor fluxer-channel-turn :initarg :turn :initform nil :type t
          :documentation "Injected turn handler (lambda (msg) ...) returning a result plist.")
+   (reuse :reader fluxer-channel-reuse :initform (enchiridion.channel:make-turn-reuse))
    (followups-p :reader fluxer-channel-followups-p :initarg :followups-p :initform nil
                 :type boolean)
    (config :accessor fluxer-channel-config :initarg :config :initform nil
@@ -907,7 +908,7 @@ worker thread and manages cosmetic reactions on a separate coalescing worker."))
 
 (defun make-fluxer-channel (&key turn config (followups-p nil))
   "Return a stopped Fluxer channel invoking TURN for each DM.
-With FOLLOWUPS-P, pass TURN a second argument, its follow-up callback."
+With FOLLOWUPS-P, pass TURN its follow-up callback and any recent work."
   (make-instance 'fluxer-channel :name "fluxer" :turn turn :config config
                  :followups-p followups-p))
 
@@ -1962,6 +1963,7 @@ Marks :DELIVERED only after all reply chunks succeed; otherwise marks :FAILED."
   (let* ((message (message-create->msg data))
          (key (message-reaction-key data))
          (route (inbound-route data))
+         (reuse (fluxer-channel-reuse channel))
          (turn (fluxer-channel-turn channel))
          (completed nil))
     (unwind-protect
@@ -1975,7 +1977,8 @@ Marks :DELIVERED only after all reply chunks succeed; otherwise marks :FAILED."
               (enqueue-reaction channel key :failed))
              ((handler-case
                   (let ((result (if (fluxer-channel-followups-p channel)
-                                     (funcall turn message (make-turn-steer channel route))
+                                     (funcall turn message (make-turn-steer channel route)
+                                              (enchiridion.channel:take-turn-work reuse route))
                                      (funcall turn message))))
                     (cond
                       ((not (listp result))
@@ -2002,6 +2005,8 @@ Marks :DELIVERED only after all reply chunks succeed; otherwise marks :FAILED."
                                          (enchiridion.channel:msg-target message)
                                          (getf result :reply)
                                          :reply-to (reply-anchor data))
+                             (when route
+                               (enchiridion.channel:remember-turn-work reuse route (getf result :work)))
                              (when (getf result :status)
                                (ignore-errors
                                  (propose-custom-status
@@ -2412,6 +2417,7 @@ Fatal close codes stop retrying immediately."
         (fluxer-channel-socket channel) nil
         (enchiridion.channel:channel-live-p channel) t
         (enchiridion.channel:channel-state channel) :live)
+  (enchiridion.channel:take-turn-work (fluxer-channel-reuse channel) nil)
   ;; Start reaction worker before turn worker so queued messages have a reaction consumer.
   (start-reaction-worker channel)
   (setf (fluxer-channel-worker channel)

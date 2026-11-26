@@ -87,6 +87,17 @@
       (ok (equal '((:b . "other") (:a . "too long") (:a . "x")) waiting))
       (ng (funcall select waiting)))))
 
+(deftest recent-work-is-one-hop-and-belongs-to-its-route ()
+  (let ((reuse (enchiridion.channel:make-turn-reuse)))
+    (enchiridion.channel:remember-turn-work reuse :their-route :work :now 1)
+    (ng (enchiridion.channel:take-turn-work reuse :other-route :now 2))
+    (ng (enchiridion.channel:take-turn-work reuse :their-route :now 3))
+    (enchiridion.channel:remember-turn-work reuse :their-route :work :now 4)
+    (ok (eq :work (enchiridion.channel:take-turn-work reuse :their-route :now 33)))
+    (ng (enchiridion.channel:take-turn-work reuse :their-route :now 33))
+    (enchiridion.channel:remember-turn-work reuse :their-route :work :now 4)
+    (ng (enchiridion.channel:take-turn-work reuse :their-route :now 34))))
+
 ;;;; The digest.
 
 (deftest message-digest-names-channel-and-author ()

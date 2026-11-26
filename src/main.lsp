@@ -996,7 +996,7 @@ over the webhook is not filed as a turn typed at the terminal."
 (:ok-p :reply :silent-p :error :reason :status :usage).
 When BLOCK-P is NIL (default), return :busy if another turn is in flight;
 when T, wait for the agent lock."
-  (lambda (message &optional steer)
+  (lambda (message &optional steer prior-work)
     (handler-case
         (let ((text (enchiridion.channel:msg-text message))
               (channel (enchiridion.channel:msg-channel message)))
@@ -1013,7 +1013,7 @@ when T, wait for the agent lock."
             ;; this turn. It travels beside the reply so a channel that does
             ;; not show presence ignores it, and a refused proposal costs the
             ;; reply nothing.
-            (multiple-value-bind (completion proposal silent-p)
+            (multiple-value-bind (completion proposal silent-p work)
                 (enchiridion.kernel:run-turn
                  agent text
                  :session (context-session context)
@@ -1021,8 +1021,11 @@ when T, wait for the agent lock."
                  :channel channel
                  :block-p block-p
                  :allow-silence-p allow-silence-p
-                 :steer steer)
+                 :steer steer
+                 :reuse-p (eq channel :fluxer)
+                 :prior-work prior-work)
               (list :ok-p t
+                    :work work
                     :silent-p silent-p
                     :reply (enchiridion.llm.secrets:scrub
                             (enchiridion.llm:completion-text completion))

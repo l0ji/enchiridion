@@ -1450,8 +1450,8 @@ message: the frame tests do that once, at the edge.")
     (setf channel
           (enchiridion.channel.fluxer:make-fluxer-channel
            :config '(:allowed-users ("u-1" "u-2")) :followups-p t
-           :turn (lambda (message steer)
-                   (declare (ignore message))
+           :turn (lambda (message steer prior-work)
+                   (declare (ignore message prior-work))
                    (dolist (data (list (list* :id "m-other-dm" :channel_id "d-2" +direct-message+)
                                        (list* :id "m-other-user" :author '(:id "u-2") +direct-message+)
                                        (list* :id "m-attachment" :content "" +direct-message+)

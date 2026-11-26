@@ -125,7 +125,9 @@ dropped.
   failure or queue eviction.
 - **Follow-ups:** New messages from the same sender in the same DM can join a
   turn while the agent works. A message after the reply is released starts its own
-  turn. Replies to several messages link to the first one.
+  turn. For 30 seconds after sending, the next turn in that DM can reuse the
+  last reply and its tool results instead of repeating the work. Replies to
+  several messages link to the first one.
 - **Typing:** If the sender is typing when an answer is ready, the bot waits up
   to eight seconds for another message to join that answer. Typing updates do
   not extend the wait. Set `:typing-wait-seconds` to `0` to disable it.

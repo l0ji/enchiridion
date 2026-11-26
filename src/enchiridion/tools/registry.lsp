@@ -1,10 +1,4 @@
-;;;; registry.lsp --- Tool registration, schema budget, and dispatch.
-;;;;
-;;;; A tool is a name, a description, one schema, and one handler. The schema
-;;;; does two jobs: it is sent to the model as JSON, and it validates the call
-;;;; that comes back. Registration is a hash table, not a list, because a
-;;;; lookup happens on every tool call and a name collision has to be visible
-;;;; rather than silently shadowed.
+;;;; registry.lsp --- Tool registration, schema token budget, and dispatch.
 
 (in-package #:enchiridion.tools)
 
@@ -18,8 +12,7 @@
   (broker-side-p nil :type boolean))
 
 (defparameter *registry* (make-hash-table :test #'equal)
-  "Tool name to TOOL. The name is a lowercase string, so a symbol and a string
-are the same lookup.")
+  "Map of lowercase tool name strings to TOOL structs.")
 
 (declaim (ftype (function () hash-table) registry))
 
@@ -36,18 +29,14 @@ are the same lookup.")
 (declaim (ftype (function (tool) tool) register-tool))
 
 (defun register-tool (tool)
-  "Add TOOL to the registry and return it. A later definition replaces the
-earlier one, which is what a reload needs."
+  "Register TOOL in *REGISTRY*, replacing any prior definition with the same name."
   (check-type tool tool)
   (setf (gethash (normalize-tool-name (tool-name tool)) *registry*) tool)
   tool)
 
 (defmacro define-tool (name &key schema description handler self-test)
-  "Register a tool and keep its schema as a Lisp form.
-
-The schema is quoted here and converted on demand. Keeping the form rather
-than a prebuilt JSON string means a tool can be introspected and the budget
-counted without a parse, and it means a test can inspect the declaration."
+  "Register a tool with its schema stored as a quoted Lisp form for introspection
+and on-demand JSON conversion."
   `(register-tool
     (make-tool :name ,(normalize-tool-name name)
                :description ,description
@@ -114,11 +103,8 @@ counted without a parse, and it means a test can inspect the declaration."
 (declaim (ftype (function () list) registry-tool-definitions))
 
 (defun registry-tool-definitions ()
-  "Return every tool as a name, description, and parameter object.
-
-The budget is checked here because this is the object the kernel sends. A
-registry that grew past the cap reports it rather than silently spending the
-context on schemas."
+  "Return OpenAI-style tool definition objects for all registered tools.
+Signals BUDGET-EXCEEDED if total schema tokens exceed *SCHEMA-BUDGET*."
   (let ((used (registry-schema-tokens)))
     (when (> used *schema-budget*)
       (error 'enchiridion.errors:budget-exceeded
@@ -130,19 +116,12 @@ context on schemas."
 (declaim (ftype (function () string) registry-schema))
 
 (defun registry-schema ()
-  "Return every tool as one JSON array for the model.
-
-The schema budget is checked here, at the moment the model-facing object is
-built. A tool registry that grows past the cap reports it rather than silently
-spending the context on schemas."
+  "Return REGISTRY-TOOL-DEFINITIONS serialized as a JSON array string (enforcing *SCHEMA-BUDGET*)."
   (com.inuoe.jzon:stringify (registry-tool-definitions)))
 
 (defun dispatch (name arguments &key generation)
-  "Find the tool NAME, validate ARGUMENTS, and call its handler.
-
-A missing tool is NOT-FOUND, a bad argument is SCHEMA-ERROR, and a handler
-that raises becomes TOOL-ERROR with the tool's name. The caller never has to
-guess which layer failed."
+  "Look up NAME, optionally check GENERATION, validate ARGUMENTS, and invoke its handler.
+Signals NOT-FOUND, CONFIGURATION-ERROR, SCHEMA-ERROR, or wraps handler errors in TOOL-ERROR."
   (let ((tool (find-tool name)))
     (unless tool
       (error 'enchiridion.errors:not-found :kind "tool" :name name))

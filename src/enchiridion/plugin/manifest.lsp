@@ -1,10 +1,7 @@
-;;;; manifest.lsp --- Read a plugin manifest without loading the file.
+;;;; manifest.lsp --- Data-only plugin manifest reader.
 ;;;;
-;;;; The supervisor has to know the name, the description and the schema of
-;;;; every agent tool, because those are what the model sees. It must never
-;;;; execute the file to find out. This reader walks the top-level forms with
-;;;; *READ-EVAL* NIL and takes each (define-plugin ...) form as data: no
-;;;; evaluation, no compilation, and no way for a file to run by being read.
+;;;; Reads top-level (define-plugin ...) forms with *READ-EVAL* NIL and a
+;;;; restricted readtable so the supervisor extracts tool schemas without executing code.
 
 (in-package #:enchiridion.plugin)
 
@@ -51,12 +48,7 @@
 (declaim (ftype (function (t) list) plugin-form-manifest))
 
 (defun plugin-form-manifest (form)
-  "Return the manifest FORM declares.
-
-The tool form carries the name, the description and the schema, in either of
-the two spellings TOOL-FORM-PARTS understands. A plugin with no tool form
-still has a name and an empty schema, so the caller never has to guess whether
-a manifest exists."
+  "Extract (:name :description :schema) plist from a (define-plugin ...) form."
   (multiple-value-bind (name description schema)
       (tool-form-parts (plugin-form-tool form))
     (list :name (string-downcase (string (or name (plugin-form-name form))))
@@ -64,12 +56,10 @@ a manifest exists."
           :schema (or schema '(:object :properties ())))))
 
 (defparameter +manifest-file-limit+ (* 256 1024)
-  "The largest agent file the supervisor will read for manifests, in bytes.
-A plugin is a page of Lisp; a file far larger than that is not one.")
+  "Maximum agent file size in bytes for manifest reading.")
 
 (defparameter +manifest-numeric-argument-limit+ 4096
-  "The largest numeric argument a reader macro may carry, as in #4096(...).
-The reader allocates what the argument says before it reads a byte more.")
+  "Maximum numeric dispatch-macro argument (e.g. #4096(...)) allowed during manifest reads.")
 
 (defun refuse-reader-macro (stream subchar argument)
   "Refuse a reader macro the supervisor never needs to read a manifest."
@@ -86,14 +76,9 @@ above the limit."
     (funcall original stream subchar argument)))
 
 (defun manifest-readtable ()
-  "Return the readtable the supervisor reads agent files with.
-
-The supervisor runs as root and holds the secrets, and the file it reads was
-written by the agent. *READ-EVAL* NIL stops #., but the standard reader still
-builds whatever the text describes. #= and ## build circular structure, and a
-circular plist hangs GETF for good; #S calls a structure constructor; #A and
-a large #n( or #n* allocate what the text asks for. A manifest needs none of
-them, so they are refused, and the numeric argument of the rest is bounded."
+  "Return a restricted readtable for untrusted agent files.
+Rejects #=, ##, #S, #A, and #. (preventing circular structures, constructor calls,
+and arbitrary allocations) and bounds numeric arguments on #(, #*, and #R."
   (let ((table (copy-readtable nil)))
     (dolist (character '(#\= #\# #\S #\s #\A #\a #\.))
       (set-dispatch-macro-character #\# character #'refuse-reader-macro table))
@@ -107,17 +92,8 @@ them, so they are refused, and the numeric argument of the rest is bounded."
 (declaim (ftype (function (t) list) file-manifests))
 
 (defun file-manifests (path)
-  "Return the manifests PATH holds, in the order they appear.
-
-A file that will not read signals a configuration error naming the file: the
-caller is a verification path, and a silent empty list would report a broken
-plugin as an absent one.
-
-The file is read with MANIFEST-READTABLE into a package made for this read and
-deleted after it, so an agent file cannot add a symbol to a package the
-supervisor runs. A form nested deep enough to exhaust the stack is a
-STORAGE-CONDITION and not an ERROR, so the handler names SERIOUS-CONDITION: an
-uncaught one would end the supervisor."
+  "Read manifests from PATH using MANIFEST-READTABLE in a temporary package.
+Signals CONFIGURATION-ERROR on any SERIOUS-CONDITION (including stack overflow)."
   (let ((package (make-package (format nil "ENCHIRIDION-MANIFEST-~D"
                                        (random most-positive-fixnum))
                                :use '(:cl))))
@@ -143,9 +119,6 @@ uncaught one would end the supervisor."
       (delete-package package))))
 
 (defun plugin-manifests (paths)
-  "Return the manifest of every plugin in PATHS, in file order.
-
-PATHS is a list of pathnames or one pathname. This is the only thing the
-supervisor reads of an agent file."
+  "Return all plugin manifests from PATHS (a pathname or list of pathnames) in order."
   (loop for path in (if (listp paths) paths (list paths))
         append (file-manifests path)))

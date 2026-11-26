@@ -1,12 +1,5 @@
-;;;; pipe.lsp --- The Lisp filter sandbox.
-;;;;
-;;;; Shell output is expensive to put in a transcript. A filter is one Lisp
-;;;; expression that keeps or drops lines, so the same work costs no tokens.
-;;;;
-;;;; The filter is not arbitrary Lisp. A form may use only the names in
-;;;; +ALLOWED-SYMBOLS+ and the line variable $. The walker runs before EVAL, so
-;;;; a form that names SYSTEM, LOAD, EVAL, or any other door is rejected even
-;;;; though the sandbox package has the CL functions the allowed names use.
+;;;; pipe.lsp --- Restricted Lisp line-filter sandbox.
+;;;; Forms are validated by CHECK-FORM against +ALLOWED-SYMBOLS+ before EVAL.
 
 (in-package #:enchiridion.tools.pipe)
 
@@ -15,15 +8,11 @@
     "SEARCH" "PARSE-INTEGER" "STRING-UPCASE" "STRING-DOWNCASE" "STRING="
     "STRING<" "STRING>" "PRINC-TO-STRING" "FORMAT" "LIST" "IDENTITY"
     "IF" "AND" "OR" "NOT" "NULL" "T" "NIL" "=" "/=" ">" "<" ">=" "<=" "+" "-" "*" "/")
-  "Every symbol a filter form may contain, by name. Symbols from any package
-compare by name here, so a form read before the sandbox existed is still
-checked against one list.")
+  "Symbol names permitted in filter forms (matched by SYMBOL-NAME across packages).")
 
 (defparameter +allowed-operators+
   '("+" "-" "*" "/" "=" "/=" ">" "<" ">=" "<=")
-  "Function names that are also operators. The walker treats them as allowed
-because they are in the list above; this constant exists to make the intent
-readable at the point that matters.")
+  "Arithmetic and comparison operator names (subset of +ALLOWED-SYMBOLS+).")
 
 (declaim (ftype (function (t) boolean) allowed-symbol-p))
 
@@ -34,9 +23,8 @@ readable at the point that matters.")
 (declaim (ftype (function (t) t) check-form))
 
 (defun check-form (form)
-  "Walk FORM and signal when a symbol is outside the filter language.
-Strings, numbers, and characters are data and pass. A cons is walked
-recursively. Quoting and function definitions are not in the language."
+  "Recursively walk FORM and signal SCHEMA-ERROR on any symbol outside +ALLOWED-SYMBOLS+.
+Literals (strings, numbers, characters) pass; quoting and definitions are excluded."
   (cond
     ((symbolp form)
      (unless (allowed-symbol-p form)
@@ -52,11 +40,8 @@ recursively. Quoting and function definitions are not in the language."
 (declaim (ftype (function () package) make-sandbox))
 
 (defun make-sandbox ()
-  "Return a fresh package that holds $ and NTH4 for one filter.
-
-The package uses CL, and the walker is what keeps a form out of the rest of
-CL. A fresh package per filter means a later filter cannot see a binding or a
-helper left by an earlier one."
+  "Return a fresh package using :CL with special variable $ and helper function NTH4.
+CHECK-FORM restricts evaluation to +ALLOWED-SYMBOLS+; per-filter packages isolate state."
   (let* ((name (format nil "ENCHIRIDION-FILTER-~D" (random most-positive-fixnum)))
          (package (make-package name :use '(:cl))))
     (let ((dollar (intern "$" package)))
@@ -82,9 +67,8 @@ helper left by an earlier one."
     (nreverse fields)))
 
 (defun read-filter (text &key (sandbox nil))
-  "Read one filter form from TEXT with *READ-EVAL* NIL.
-The optional SANDBOX is where $ and NTH4 live. A string that holds a second
-form is rejected: a filter is one expression, not a program."
+  "Read and validate a single filter form from TEXT with *READ-EVAL* NIL.
+Uses SANDBOX (or a fresh one) for $ and NTH4; rejects empty or multi-form input."
   (let* ((package (or sandbox (make-sandbox)))
          (*package* package)
          (*read-eval* nil))
@@ -112,10 +96,7 @@ form is rejected: a filter is one expression, not a program."
       form))
 
 (defun pipe-safe-eval (form &key (line "") (sandbox nil))
-  "Evaluate one allowed filter FORM with $ bound to LINE.
-The caller normally gets FORM from READ-FILTER, which has already checked it.
-This function checks again because a caller can hold a form that came from
-somewhere else."
+  "Re-validate and evaluate FORM with $ bound to LINE in SANDBOX (or a fresh sandbox)."
   (check-form form)
   (let* ((package (or sandbox (make-sandbox)))
          (dollar (intern "$" package))
@@ -126,11 +107,8 @@ somewhere else."
 (declaim (ftype (function (string t) string) pipe-eval))
 
 (defun pipe-eval (text filter)
-  "Return TEXT with only the lines for which FILTER is true.
-
-FILTER is a string read by READ-FILTER, a form from it, or a function of one
-line. The line variable $ is bound for each line. The result is text with one
-newline after each kept line, which is what the shell tool would have shown."
+  "Filter non-empty lines of TEXT using FILTER (string, form, or predicate function),
+binding $ to each line and returning kept lines terminated by newlines."
   (let* ((sandbox (make-sandbox))
          (form (cond
                  ((stringp filter)

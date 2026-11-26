@@ -1,8 +1,4 @@
-;;;; shell.lsp --- Run a command with a time limit and a capped result.
-;;;;
-;;;; The shell tool is the broker's most direct escape hatch, which is why the
-;;;; broker, not the supervisor, runs it. This file does only three things:
-;;;; run the command, stop it at the deadline, and keep the result small.
+;;;; shell.lsp --- Run shell commands with a bounded timeout and capped output.
 
 (in-package #:enchiridion.tools.builtin)
 
@@ -10,15 +6,12 @@
   "Default seconds before a shell command is stopped.")
 
 (defparameter +shell-max-timeout+ 600
-  "The most seconds a shell command may ask for. The model chooses the timeout,
-and a turn holds the agent for as long as its command runs, so the choice is
-bounded here rather than trusted.")
+  "Maximum allowed shell command timeout in seconds.")
 
 (declaim (ftype (function (t) (integer 1 *)) shell-timeout))
 
 (defun shell-timeout (requested)
-  "Return REQUESTED as a whole number of seconds between 1 and the maximum, or
-the default when it is not a number at all."
+  "Clamp REQUESTED to [1, +SHELL-MAX-TIMEOUT+], or return +SHELL-TIMEOUT+ if non-numeric."
   (if (realp requested)
       (max 1 (min +shell-max-timeout+ (ceiling requested)))
       +shell-timeout+))

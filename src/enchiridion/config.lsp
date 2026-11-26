@@ -1,22 +1,13 @@
-;;;; config.lsp --- Reading the operator configuration.
+;;;; config.lsp --- Operator configuration reader.
 ;;;;
-;;;; config.example.lsp writes a sectioned list: :LLM is followed by a list of
-;;;; (key value) entries, then :CHANNELS by one entry per channel, and so on.
-;;;; That is not a property list. GETF on it reads the first section name and
-;;;; its first entry, then treats every later entry as a key, so a configured
-;;;; model silently becomes the default. The reader below is the one place
-;;;; that knows the difference.
-;;;;
-;;;; A flat property list is still accepted. The tests and a small config are
-;;;; easier to read that way, and the flat shape was the only shape the first
-;;;; adapter understood. The sectioned shape wins when both could match.
+;;;; Supports both the sectioned shape (:LLM (key val) ... :CHANNELS ...)
+;;;; and flat plists; sectioned takes precedence when both could match.
 
 (in-package #:enchiridion)
 
 (defparameter +config-sections+
   '(:llm :channels :budget :sandbox :memory :sleep)
-  "The top-level section names. A sectioned config is one of these keywords,
-followed by a list of (key value ...) entries, until the next section name.")
+  "Top-level section keywords recognized in sectioned configs.")
 
 (declaim (ftype (function (t) boolean) sectioned-config-p))
 
@@ -41,22 +32,13 @@ Return NIL when the section is absent or CONFIG is flat."
 (declaim (ftype (function (t) t) config-memory-db))
 
 (defun config-memory-db (config)
-  "Return the memory store path from the :MEMORY section of CONFIG, or NIL.
-
-CONFIG-VALUE reads the :LLM section, because that is where every option it
-was written for lives. The store path is the first option outside that
-section, and a reader that looked in the wrong one would fall back to the
-default file in silence, which is the failure this function exists to avoid.
-A NIL return is not an error: it means the default beside the agent files."
+  "Return :DB from the :MEMORY section of CONFIG, or NIL for the default path."
   (second (assoc :db (config-section config :memory) :test #'eq)))
 
 (declaim (ftype (function (t keyword &optional t) t) config-value))
 
 (defun config-value (config key &optional default)
-  "Return KEY from CONFIG, or DEFAULT.
-CONFIG is either the sectioned shape from config.example.lsp or a flat
-property list. The sectioned shape is tried first. The flat shape is the
-fallback, so a one-line config still reads the way it looks."
+  "Return KEY from the :LLM section of a sectioned CONFIG, or via GETF if flat."
   (let ((entry (assoc key (config-section config :llm) :test #'eq)))
     (cond
       (entry (second entry))
@@ -68,9 +50,7 @@ fallback, so a one-line config still reads the way it looks."
 (declaim (ftype (function (t keyword t) list) config-with-llm-value))
 
 (defun config-with-llm-value (config key value)
-  "Return a copy of CONFIG whose :LLM option KEY is VALUE, leaving CONFIG as it
-was. The entry goes first in the section, and CONFIG-VALUE reads the first, so
-one backend can be resolved with a cap of its own from the same configuration."
+  "Return a copy of CONFIG with :LLM option KEY prepended as VALUE."
   (if (sectioned-config-p config)
       (if (member :llm config :test #'eq)
           (loop for head in config
@@ -80,29 +60,15 @@ one backend can be resolved with a cap of its own from the same configuration."
       (list* key value config)))
 
 (defun config-section-value (config section key &optional default)
-  "Return KEY from SECTION of CONFIG, or DEFAULT.
-
-CONFIG-VALUE reads the :LLM section only, because that is where every option
-it was written for lives. The budget caps, the agent uid, the sleep interval
-and the memory limits live in sections of their own, and an option read
-through CONFIG-VALUE falls back to the default in silence: `budget` prints no
-cap for a cap that is configured, and the heartbeat never finds its interval.
-A flat CONFIG has no sections, so there DEFAULT is the whole answer rather
-than a value invented from a shape that does not carry one."
+  "Return KEY from SECTION of a sectioned CONFIG, or DEFAULT (always DEFAULT if flat)."
   (let ((entry (assoc key (config-section config section) :test #'eq)))
     (if entry (second entry) default)))
 
 (declaim (ftype (function (t keyword keyword) t) config-setting))
 
 (defun config-setting (config section key)
-  "Return KEY of SECTION from CONFIG when it sets it, and the shipped default
-from DEFAULT-CONFIG otherwise.
-
-Every setting has exactly one default, and it is written in DEFAULT-CONFIG. A
-reader that brings its own fallback is how a setting comes to be hardcoded: the
-two copies drift, and the one in the reader wins whenever config.lsp leaves the
-key out. A key the shipped defaults do not carry therefore signals, so a new
-setting cannot be read before it has a default and a line in the docs."
+  "Return KEY from SECTION in CONFIG, falling back to DEFAULT-CONFIG.
+Signals an error if KEY is not defined in DEFAULT-CONFIG."
   (let ((shipped (assoc key (config-section (default-config) section) :test #'eq)))
     (unless shipped
       (error "~S is not a setting in the ~S section of the shipped configuration."
@@ -120,45 +86,24 @@ setting cannot be read before it has a default and a line in the docs."
              :key :max-tool-rounds :detail "Use a non-negative integer."))
     rounds))
 
-;;;; The active configuration.
-;;;;
-;;;; One plist is active for the life of the process, bound by READ-CONFIG.
-;;;; A lookup asks the active configuration first and the defaults second, so
-;;;; a config.lsp that names two keys does not blank out the other twenty.
+;;;; Active configuration (falls back to DEFAULT-CONFIG per key).
 
 (defun default-config ()
-  "Return the configuration every lookup falls back to.
-
-It holds paths and behaviour only, exactly like config.lsp: a secret never
-comes from here, because a file in the repository is a file that ends up in a
-store path. The model defaults match the shipped adapter defaults."
+  "Return the shipped default configuration (paths and behavior only, no secrets)."
   '(:llm
     (:provider :openai)
     (:backend :openai)
     (:base-url nil)
-    ;; NIL means the selected provider row's model. A named model here is an
-    ;; override for every provider, and the shipped row already knows which
-    ;; model its endpoint can serve.
+    ;; NIL defers to the selected provider's default model.
     (:model-primary nil)
     (:model-cheap nil)
     (:model-sleep nil)
-    ;; NIL and not a variable name: the provider table in the LLM module names
-    ;; the key variable for the provider that was selected, and a name shipped
-    ;; here would pin every install to OpenAI's. NIL means the provider decides.
+    ;; NIL defers to the selected provider's api-key-env.
     (:api-key-env nil)
-    ;; The Messages API requires a max_tokens field on every request and has no
-    ;; default of its own; the OpenAI-shaped wire ignores the key entirely. The
-    ;; value bounds one reply, and it is not derived from the budget, which
-    ;; bounds what a day may spend.
+    ;; Per-reply cap (required by Anthropic Messages API; ignored by OpenAI wire).
     (:max-tokens 4096)
 
-    ;; The three providers this build ships a row for, so the default path
-    ;; works with no catalog cached and no network. They are configuration and
-    ;; not code on purpose: everything else this tree knows about a provider is
-    ;; generated at run time from models.dev, and a row here is exactly the
-    ;; same shape as a row the operator writes, so either can override the
-    ;; other field by field. Each row pins the endpoint, the key variable and
-    ;; the default model the shipped documentation promises.
+    ;; Built-in provider rows for offline/uncached operation; same shape as operator overrides.
     (:providers
      ((:id :openai
        :name "OpenAI"
@@ -179,20 +124,14 @@ store path. The model defaults match the shipped adapter defaults."
        :api-key-env "ANTHROPIC_API_KEY"
        :model "claude-sonnet-5-5")))
 
-    ;; The runtime catalog. :providers-url is models.dev and not a mirror, and
-    ;; the two TTLs are a day: a provider's endpoint does not move hourly, and
-    ;; a model list is a snapshot rather than an inventory.
+    ;; Runtime provider catalog and daily cache TTLs.
     (:providers-url "https://models.dev/api.json")
     (:providers-ttl-seconds 86400)
     (:models-ttl-seconds 86400)
-    ;; T means no network at start up at all: no catalog fetch, no model list.
-    ;; An explicit `enchiridion providers refresh` still works, because the
-    ;; operator asked for it.
+    ;; T disables startup network fetches (explicit refresh still works).
     (:offline nil)
 
-    ;; Cloud placement. Bedrock reads :region, Vertex reads :project and
-    ;; :location; the environment variables of the same meaning win when these
-    ;; are NIL.
+    ;; Cloud placement overrides; NIL defers to environment variables.
     (:region nil)
     (:project nil)
     (:location nil)
@@ -223,10 +162,7 @@ store path. The model defaults match the shipped adapter defaults."
                     :session 400 :ledger 250 :bootstrap 300))
     ;; The limit for a block whose label :block-limits does not name.
     (:unlisted-block-limit 1200)
-    ;; The episodic log and pull retrieval are on; push and promotion wait for
-    ;; measured instruments. T2 runs on schedule, but a pass with no deriver,
-    ;; canaries, utility task set, or tail sampler is a reported no-op rather
-    ;; than a token-burning candidate nobody can promote.
+    ;; Episodic log and pull retrieval are on; push/promotion are off by default.
     (:enabled t)
     (:retrieve t)
     (:push nil)
@@ -234,8 +170,7 @@ store path. The model defaults match the shipped adapter defaults."
     (:pack-chars 4450)
     (:push-max-fraction 0.5)
     (:maintenance-batch 200)
-    ;; Dense candidates fused with BM25, and the model reranker. Both are off
-    ;; until the operator turns them on.
+    ;; Dense embeddings and model reranker (off by default).
     (:embed nil)
     (:embed-model "text-embedding-3-small")
     (:embed-dimensions 512)
@@ -248,12 +183,10 @@ store path. The model defaults match the shipped adapter defaults."
     (:t2-episode-threshold 200)
     (:t2-max-episodes-per-tick 5)
     (:t2-max-tokens-per-pass 2000000)
-    ;; The reply cap of one T2 deriver call, apart from the :llm section's
-    ;; :max-tokens: a reasoning model spends its cap thinking, and at 4096 it
-    ;; was cut off before it answered on most records.
+    ;; Higher reply cap for T2 deriver calls (reasoning models need headroom).
     (:t2-deriver-max-tokens 16384)
     (:t2-deriver-concurrency 4)
-    ;; The model the T2 deriver calls; NIL is the :llm section's :model-cheap.
+    ;; T2 deriver model; NIL falls back to :llm :model-cheap.
     (:t2-deriver-model nil)
     (:t2-max-tokens-per-episode 16000)
     (:t2-writes-per-episode 8)
@@ -261,23 +194,20 @@ store path. The model defaults match the shipped adapter defaults."
     (:canary-min-families 4)
     (:gate-margin 0.05)
     (:gate-min-n 100)
-    ;; The most question-and-answer pairs one utility run scores, newest first.
+    ;; Max Q&A pairs scored per utility run, newest first.
     (:utility-max-tasks 400)
     (:gate-alpha 0.05)
-    ;; The pack both utility arms are scored in: a quarter of :pack-chars, so a
-    ;; short claim can win where a long answer no longer fits.
+    ;; Pack size for utility A/B arms (~25% of :pack-chars).
     (:gate-pack-chars 1100)
     (:tail-rarity-fraction 0.10)
     (:tail-min-n 50)
     (:tail-margin 0.02)
     (:precision-min 0.8)
-    ;; Promotion precision is read over the last 20 promotions and only once
-    ;; 5 have had their post-promotion check.
+    ;; Promotion precision window and minimum checked count.
     (:precision-window 20)
     (:precision-min-checked 5)
     (:quarantine-max 0.5)
-    ;; The quarantine rate is read over the last 20 gated candidates and only
-    ;; once 5 have been gated; above :quarantine-max, T2 runs weekly.
+    ;; Quarantine rate window/minimum; exceeding :quarantine-max switches T2 to weekly.
     (:quarantine-window 20)
     (:quarantine-min-candidates 5)
     (:t2-frozen-interval-seconds 604800)
@@ -290,9 +220,7 @@ store path. The model defaults match the shipped adapter defaults."
     (:interval-seconds 900)))
 
 (defparameter *config* nil
-  "The active configuration plist, or NIL before READ-CONFIG runs.
-Bound once at start up so a command can ask a configuration question without
-carrying the plist through every call.")
+  "Active configuration plist, or NIL before READ-CONFIG runs.")
 
 (defparameter *config-source* :defaults
   "Where the active configuration came from: a pathname, or :DEFAULTS.")
@@ -313,9 +241,8 @@ carrying the plist through every call.")
 (declaim (ftype (function (t &optional t) t) config-lookup))
 
 (defun config-lookup (key &optional default)
-  "Return KEY from the active configuration, then from the defaults, then
-DEFAULT. The :ABSENT sentinel is not a usable value for any key here, which is
-what lets an explicit NIL in config.lsp mean NIL rather than missing."
+  "Return KEY from active config, then DEFAULT-CONFIG, then DEFAULT.
+Uses :ABSENT sentinel so an explicit NIL in config overrides the default."
   (let ((value (config-value (config) key :absent)))
     (if (eq value :absent)
         (config-value (default-config) key default)
@@ -324,35 +251,21 @@ what lets an explicit NIL in config.lsp mean NIL rather than missing."
 (declaim (ftype (function (t) keyword) channel-key))
 
 (defun channel-key (name)
-  "Return NAME as the keyword the :CHANNELS section is keyed by.
-A keyword and a string are one value everywhere else in the tree and they are
-one value here."
+  "Convert channel NAME (keyword or string) to its :CHANNELS section keyword."
   (if (keywordp name) name (intern (string-upcase (string name)) :keyword)))
 
 (declaim (ftype (function (t) list) channel-options))
 
 (defun channel-options (entry)
-  "Return one :CHANNELS entry as a property list.
-
-A channel entry is a list of (key value ...) entries, not a property list.
-GETF on that shape reads the first option and nothing else, so every option
-after :ENABLED was unreachable: the webhook could never find its bind address
-and Fluxer could never find its allowlist. This is the one place that knows
-the difference."
+  "Convert a :CHANNELS entry of (key value) pairs into a plist."
   (loop for option in (rest entry)
         append (list (first option) (second option))))
 
 (declaim (ftype (function (t &optional t) t) channel-config))
 
 (defun channel-config (name &optional (config (config)))
-  "Return the plist under :CHANNELS for NAME, or the shipped entry for NAME.
-
-NAME is a keyword or a string; the two are one value everywhere else in the
-tree and they are one value here. The operator's options win key by key and
-the shipped entry fills the gaps, so a config.lsp that writes
-(:http (:enabled t)) keeps the default bind address and port instead of
-losing them. An explicit NIL in the operator's entry is a value and wins: it
-means off, not missing."
+  "Return merged plist for channel NAME (operator options over DEFAULT-CONFIG).
+Explicit NIL values in CONFIG override shipped defaults."
   (let ((key (channel-key name)))
     (let ((options '()))
       (dolist (entry (list (assoc key (config-section (default-config) :channels)
@@ -367,29 +280,19 @@ means off, not missing."
 (declaim (ftype (function (t keyword &optional t) t) channel-value))
 
 (defun channel-value (name key &optional default)
-  "Return KEY of the channel called NAME, or DEFAULT.
-CHANNEL-CONFIG already merges the operator's entry over the shipped one, so
-this is only the reader that gives a missing key a caller's default."
+  "Return KEY from merged CHANNEL-CONFIG for NAME, or DEFAULT."
   (getf (channel-config name) key default))
 
 (declaim (ftype (function (t) boolean) channel-enabled-p))
 
 (defun channel-enabled-p (name)
-  "Return T when the channel called NAME is enabled.
-
-The shipped entry decides when the operator writes none: :cli ships enabled and
-the network channels ship disabled, so a network surface never starts because
-nobody mentioned it."
+  "Return T when channel NAME is enabled (default: :cli enabled, network channels disabled)."
   (not (null (channel-value name :enabled))))
 
 (declaim (ftype (function (t) list) config-api-key-env-list))
 
 (defun config-api-key-env-list (config)
-  "Return the configured :API-KEY-ENV as a list of names.
-
-The key may be one name or a list, because a provider can accept its key under
-more than one variable. The provider table and CONFIGURED-SECRET-NAMES both read
-this list, so they agree on what a configured key is called."
+  "Return configured :API-KEY-ENV as a list of non-empty variable name strings."
   (let ((value (config-value config :api-key-env)))
     (cond ((and (stringp value) (plusp (length value))) (list value))
           ((listp value)
@@ -401,20 +304,13 @@ this list, so they agree on what a configured key is called."
 (declaim (ftype (function (t) list) configured-secret-names))
 
 (defun configured-secret-names (config)
-  "Return every environment variable name the configuration says holds a secret.
-
-The API key, the Fluxer bot token and the webhook token are each named by a
-configuration key rather than written into the file, so the loader has to ask
-the configuration which names to read. One list, one call to the loader, and
-one place to audit: a channel whose token variable is missing from this list
-is a token that never reaches the scrubber, and an unregistered token is the
-one kind the shape filter cannot catch."
+  "Return all secret env var names referenced by CONFIG (LLM, Fluxer, HTTP, embed)
+so the secret loader and scrubber share one authoritative list."
   (let ((names '()))
     (dolist (name (append (config-api-key-env-list config)
                           (list (getf (channel-config :fluxer config) :token-env)
                                 (getf (channel-config :http config) :token-env)
-                                ;; Dense retrieval's key, which may belong to a
-                                ;; provider other than the chat one.
+                                ;; Dense retrieval key (may differ from chat provider).
                                 (config-setting config :memory :embed-key-env))))
       (when (and (stringp name) (plusp (length name)))
         (pushnew name names :test #'string=)))
@@ -429,12 +325,7 @@ one kind the shape filter cannot catch."
                    (:cheap :model-cheap)
                    (:sleep :model-sleep))))
 
-;;;; Paths.
-;;;;
-;;;; ENCHIRIDION_HOME wins: inside the container the installed source is read
-;;;; only and the agent directory has to be on the volume. Without it the
-;;;; current directory is the root, because `nix run` executes a script in the
-;;;; store while the operator stands in the checkout.
+;;;; Paths (ENCHIRIDION_HOME overrides current working directory).
 
 (defun home-root ()
   "Return the directory the agent directory and run/ live under, no trailing
@@ -453,9 +344,7 @@ slash."
 (declaim (ftype (function () string) run-directory))
 
 (defun run-directory ()
-  "Return the directory that holds the control and status files, with a
-trailing slash. It is a plain directory of small files rather than a socket,
-so tail and grep work on it."
+  "Return the run/ directory holding control and status files, with trailing slash."
   (format nil "~A/run/" (home-root)))
 
 (declaim (ftype (function () pathname) control-path))
@@ -473,8 +362,7 @@ so tail and grep work on it."
 (declaim (ftype (function (pathname) (or null pathname)) config-parent))
 
 (defun config-parent (directory)
-  "Return the directory above DIRECTORY, or NIL at the top of the tree. At the
-top, UIOP returns the same directory, so the walk has to be told to stop."
+  "Return the parent of DIRECTORY, or NIL at filesystem root."
   (let ((parent (uiop:pathname-parent-directory-pathname directory)))
     (unless (equal (truename directory) (truename parent))
       parent)))
@@ -482,10 +370,7 @@ top, UIOP returns the same directory, so the walk has to be told to stop."
 (declaim (ftype (function () (or null string)) project-root))
 
 (defun project-root ()
-  "Return the checkout root as a namestring, or NIL.
-ENCHIRIDION_SOURCE wins, because the installed copy has no checkout above it.
-Otherwise the nearest directory above the current one that holds
-enchiridion.asd is the root."
+  "Return ENCHIRIDION_SOURCE or the nearest ancestor containing enchiridion.asd, or NIL."
   (or (enchiridion.compat:environment-value "ENCHIRIDION_SOURCE")
       (loop for directory = (uiop:ensure-directory-pathname (uiop:getcwd))
               then (config-parent directory)
@@ -547,18 +432,12 @@ enchiridion.asd is the root."
 (declaim (ftype (function () t) read-config))
 
 (defun read-config ()
-  "Load config.lsp when there is one, make it active, and return it.
-
-An absent file is not an error here: it means the defaults, and environment
-variables override the file, so a container can be injected with no file at all.
-The entry point is where that becomes an error: a command whose capability row
-names :config refuses the defaults, because the shipped configuration does not
-choose a provider."
+  "Load config.lsp if present, set *CONFIG* and *CONFIG-SOURCE*, and return it.
+Falls back to DEFAULT-CONFIG when no file is found."
   (let ((path (config-path)))
     (setf *config-source* (or path :defaults))
     (when path
-      ;; Deliberate. config.lsp is operator written Lisp that lives outside
-      ;; version control, and loading it is the only way to honour it.
+      ;; Load operator-authored config.lsp.
       (load path :verbose nil :print nil))
     (setf *config*
           (or (and (boundp 'enchiridion.user::*enchiridion-config*)
@@ -569,9 +448,7 @@ choose a provider."
 (declaim (ftype (function (&optional t) string) config-digest))
 
 (defun config-digest (&optional (configuration (config)))
-  "Return an eight character digest of CONFIGURATION, for the status file and
-the log. A digest and not the configuration itself: the status file is world
-readable and the configuration is not a place for a local path."
+  "Return an 8-hex-char digest of CONFIGURATION for logs and the world-readable status file."
   (let ((hash 5381)
         (text (princ-to-string configuration)))
     (loop for character across text

@@ -1,9 +1,4 @@
-;;;; blockops.lsp --- Read, patch, and add to the memory blocks.
-;;;;
-;;;; A block is a file the agent can reason about, not a database row. The
-;;;; tool patches a unique span, checks the capacity and the injection scan,
-;;;; and writes through the same atomic writer SET-BLOCK-TEXT uses. A failed
-;;;; write leaves the old text in place.
+;;;; blockops.lsp --- Read, patch, and add to memory block files.
 
 (in-package #:enchiridion.tools.builtin)
 
@@ -48,20 +43,14 @@
 (declaim (ftype (function (t) boolean) seed-backed-label-p))
 
 (defun seed-backed-label-p (label)
-  "Return T when LABEL is one of the four seed files the operator owns until
-bootstrap hands over: soul, persona, operator, and world."
+  "Return T when LABEL maps to a seed-backed block file."
   (not (null (assoc (string-downcase (string label)) +block-files+ :test #'string=))))
 
 (declaim (ftype (function (t string t t) string) block-write-text))
 
 (defun block-write-text (path text label directory)
-  "Check TEXT against LABEL's scan and limit, then write PATH.
-
-DIRECTORY is the agent directory the bootstrap gate reads. While the first
-steps are pending, the seed-backed labels belong to the operator: the write
-signals BOOTSTRAP-PENDING with the label and nothing is touched. The CLI writes
-these files directly and does not come through here, because the rule protects
-the operator from the agent, not the operator from themselves."
+  "Validate TEXT against LABEL's injection scan and size limit, then write PATH atomically.
+Signals BOOTSTRAP-PENDING for seed-backed labels while bootstrap is pending in DIRECTORY."
   (let ((label (intern (string-upcase (string label)) :keyword)))
     (when (and (seed-backed-label-p label)
                (enchiridion.memory:bootstrap-refuse-writes-p directory))

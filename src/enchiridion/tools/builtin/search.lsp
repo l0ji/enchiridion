@@ -1,34 +1,20 @@
-;;;; search.lsp --- Full text search over what the agent said and remembered.
-;;;;
-;;;; The store backs this tool, so it answers from SQLite:
-;;;; the raw turns and the raw memories, with FTS5 doing the matching and no
-;;;; model call in the path. Nothing is summarised, because a summary costs
-;;;; tokens and can be wrong about the one line that mattered.
-;;;;
-;;;; The directory walk stays as the files scope. A checkout with no store
-;;;; yet, and an operator who wants the Markdown, both still get an answer,
-;;;; and a PATH argument means files without the caller having to say so.
+;;;; search.lsp --- Full-text search over SQLite store (FTS5) and agent text files.
 
 (in-package #:enchiridion.tools.builtin)
 
 (defparameter +search-extensions+ '("md" "txt" "lsp" "lisp" "json" "org")
-  "File types the file walk reads. A binary or a secret store is not text to
-this tool, and .env is deliberately absent.")
+  "Allowed text file extensions for file search (.env deliberately excluded).")
 
 (defparameter +search-file-limit+ 2000
-  "The maximum files one search visits. A runaway directory should cost a
-bounded walk, not an unbounded turn.")
+  "Maximum number of files visited by one file search.")
 
 (defparameter +search-hit-chars+ 400
-  "How much of one stored body a hit shows. The whole turn is in the store and
-the agent can go and read it; this is a result line, not a transcript.")
+  "Maximum characters shown per store search hit.")
 
 ;;;; Arguments both scopes check the same way.
 
 (defun check-query (query)
-  "Signal a schema error unless QUERY is a string with something in it, and
-return it. An empty query matches every line of every file, which is a search
-that answered a question nobody asked."
+  "Return QUERY or signal SCHEMA-ERROR if it is not a non-empty string."
   (unless (and (stringp query) (plusp (length query)))
     (error 'enchiridion.errors:schema-error
            :detail "query must be a non-empty string."))
@@ -68,9 +54,7 @@ that answered a question nobody asked."
   "Return the searchable files under PATH, with a bounded walk."
   (let ((files '())
         (seen 0)
-        ;; Directories already walked, by truename. A symlink that points back
-        ;; up the tree would otherwise be followed until the stack ran out,
-        ;; because the file limit only counts files and a loop can hold none.
+        ;; Track visited directory truenames to prevent symlink loops.
         (visited (make-hash-table :test #'equal)))
     (labels ((walk (directory)
                (when (and (< seen +search-file-limit+)
@@ -124,8 +108,7 @@ that answered a question nobody asked."
 ;;;; The store.
 
 (defun one-line (text)
-  "Return TEXT with every line break and tab written as a space, so that one
-hit is one line of output and a result cannot forge a second line."
+  "Replace newlines, carriage returns, and tabs in TEXT with spaces."
   (map 'string (lambda (character)
                  (if (member character '(#\Newline #\Return #\Tab))
                      #\Space
@@ -143,11 +126,8 @@ hit is one line of output and a result cannot forge a second line."
             (when (> (length flat) +search-hit-chars+) t))))
 
 (defun search-memory-run (args scope)
-  "Search stored sessions and memories for QUERY and return one line per hit.
-
-The store is opened only when the file is already a database. Opening one
-creates it, and a search is not a reason to write to disk or to adopt a stray
-file as the agent's memory."
+  "Search stored sessions and memories for QUERY, returning one line per hit.
+Only opens the store if it already exists as a database (never creates one)."
   (let* ((query (check-query (argument args "query")))
          (limit (check-limit (or (argument args "limit") 20)))
          (path (or enchiridion.memory.store:*store-path*
@@ -181,11 +161,8 @@ file as the agent's memory."
 (declaim (ftype (function (t) string) search-run))
 
 (defun search-run (args)
-  "Search stored sessions and memories, or the agent's files.
-
-SCOPE selects the store, which is \"memory\" and the default, or the directory
-walk, which is \"files\". A PATH argument means files whatever the scope says:
-a caller that named a directory has already said what it wants walked."
+  "Search the store (scope \"memory\", \"sessions\", \"memories\") or files (scope \"files\").
+Passing PATH always selects file search regardless of SCOPE."
   (let ((scope (string-downcase (or (argument args "scope") "memory")))
         (path (argument args "path")))
     (cond

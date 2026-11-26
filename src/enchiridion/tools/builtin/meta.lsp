@@ -1,18 +1,10 @@
-;;;; meta.lsp --- Journey, author, undo, and reload.
-;;;;
-;;;; This tool is the agent's hand on its own history. Journey reads the agent
-;;;; repository. Author writes a new tool or skill file. Undo reverts the last
-;;;; commit, and it asks for confirmation because a revert is a real change.
-;;;;
-;;;; Reload records a request. The supervisor consumes it after the loader can
-;;;; verify a generation. The tool does not pretend the code is already loaded.
+;;;; meta.lsp --- Journey, author, bootstrap-step, undo, and reload tools.
+;;;; Reload only appends a control request for the supervisor to consume.
 
 (in-package #:enchiridion.tools.builtin)
 
 (defun commit-author-change (directory path)
-  "Commit the file just written when DIRECTORY is a git repository.
-A directory that is not a repository is not an error: the file is written
-either way, and the commit is what turns it into a journey entry."
+  "Commit PATH when DIRECTORY is a git repository; return NIL otherwise."
   (handler-case
       (enchiridion.git:git-commit-all
        directory

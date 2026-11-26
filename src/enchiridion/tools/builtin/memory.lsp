@@ -1,9 +1,4 @@
 ;;;; memory.lsp --- Named memories and shadow canary proposals.
-;;;;
-;;;; The store has held memories since the first session, and the model had no
-;;;; way to write one. This tool is the turn-surface half of SAVE-MEMORY: the
-;;;; name and body go through the same scrub and duplicate checks as any Lisp
-;;;; caller, and the store is opened only for the write.
 
 (in-package #:enchiridion.tools.builtin)
 

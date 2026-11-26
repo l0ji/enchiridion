@@ -1,8 +1,4 @@
-;;;; web.lsp --- Fetch a URL and search DuckDuckGo.
-;;;;
-;;;; Fetch is the useful half and the one the tests can mock. Search uses the
-;;;; DuckDuckGo JSON endpoint, which returns related topics and an abstract
-;;;; without a key. It is not a full search index, and the docstring says so.
+;;;; web.lsp --- HTTP URL fetch and DuckDuckGo instant-answer search.
 
 (in-package #:enchiridion.tools.builtin)
 
@@ -24,13 +20,10 @@
                  (format stream "%~2,'0X" byte)))))
 
 (defparameter +web-body-limit+ (* 2 1024 1024)
-  "The most bytes one fetch reads. A result is capped at a few thousand
-characters anyway; this bounds what is held in memory before the cap, so a
-link to a large download costs two megabytes and not the download.")
+  "Maximum bytes read per HTTP fetch before truncating.")
 
 (defun binary-octets-p (octets count)
-  "Return T when the first COUNT OCTETS look like binary rather than text.
-A NUL byte in the head is the test: text formats do not carry one."
+  "Return T if a NUL byte appears in the first 1024 (or COUNT) bytes of OCTETS."
   (loop for index from 0 below (min count 1024)
         thereis (zerop (aref octets index))))
 
@@ -44,11 +37,8 @@ A NUL byte in the head is the test: text formats do not carry one."
               truncated-p count)))
 
 (defun web-body-text (body)
-  "Return BODY, what the getter answered, as bounded text.
-
-The real getter is asked for a binary stream so that nothing past the limit is
-ever read. A string or an octet vector is accepted too, because that is what a
-test's getter returns and what an older dexador hands back."
+  "Convert HTTP response BODY (stream, octet vector, or string) to bounded text.
+Reads streams up to +WEB-BODY-LIMIT+ bytes and closes them."
   (typecase body
     (string body)
     ((vector (unsigned-byte 8))
@@ -109,8 +99,7 @@ test's getter returns and what an older dexador hands back."
         (when (and abstract abstract-url)
           (push (format nil "~A - ~A" abstract abstract-url) results)))
       (collect (getf data :relatedtopics)))
-    ;; RESULTS was built newest first, so it is put back in the order the
-    ;; topics arrived before it is cut: the first topics are the relevant ones.
+    ;; Restore arrival order before applying LIMIT.
     (let* ((ordered (nreverse results))
            (limited (subseq ordered 0 (min (length ordered) limit))))
       (cap-result (if limited

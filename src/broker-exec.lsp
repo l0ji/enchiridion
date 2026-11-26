@@ -1,13 +1,6 @@
-;;;; broker-exec.lsp --- The child process on the other side of the boundary.
+;;;; broker-exec.lsp --- Unprivileged child entry point for the tool broker.
 ;;;;
-;;;; The supervisor starts this script, then talks to it over the Unix socket.
-;;;; It runs as uid 1000 before any agent file is loaded. It holds no secret:
-;;;; its environment is built by the supervisor and contains only paths and the
-;;;; SBCL source registry.
-;;;;
-;;;; Run it by hand for a smoke test:
-;;;;
-;;;;   sbcl --script src/broker-exec.lsp --socket /tmp/enchiridion-broker.sock
+;;;; Usage: sbcl --script src/broker-exec.lsp --socket PATH [--uid N --gid N] | --verify-plugin DIR
 
 (require :sb-posix)
 
@@ -22,7 +15,7 @@
   (list sb-alien:system-area-pointer))
 
 (defun broker-exec-drop-privileges (arguments)
-  "Drop root privileges before ASDF can read configuration or cached code."
+  "Drop root privileges (setgroups, setgid, setuid) before ASDF reads config or cached code."
   (when (zerop (sb-posix:geteuid))
     (let ((uid (parse-integer
                 (or (broker-exec-argument arguments "--uid") "")))
@@ -47,23 +40,16 @@
 
 (require :asdf)
 
-;; The same duplicate-contrib warning the supervisor suppresses. The child
-;; runs the same source registry and the same ASDF.
+;; Suppress ASDF duplicate-contrib output as in the supervisor.
 (let ((package (find-package "ASDF/SOURCE-REGISTRY")))
   (when package
     (let ((symbol (find-symbol "*VERBOSE-OUT*" package)))
       (when symbol
         (setf (symbol-value symbol) nil)))))
 
-;; The same warning muffling as the supervisor, for the same reason: DBI's
-;; macros redefine each DEFTYPE <NAME> as a class, and the child should not
-;; print nineteen warnings before it serves its first request. The predicate
-;; matches one message and lets every other warning through.
 (defun broker-exec-muffled-warning-p (condition)
-  "Return T for the one library warning the child does not print.
-
-The test is on the report, for the reason given in src/main.lsp: SBCL keeps the
-format control of a SIMPLE-WARNING in its own representation."
+  "Return T for the DBI DEFTYPE-to-class redefinition warning muffled during system load.
+Matches on the printed report because SBCL stores SIMPLE-WARNING format controls specially."
   (let ((report (princ-to-string condition)))
     (and (>= (length report) 40)
          (eql 0 (search "redefining DEFTYPE type to be a class" report)))))
@@ -74,13 +60,8 @@ format control of a SIMPLE-WARNING in its own representation."
   (asdf:load-system "enchiridion" :verbose nil))
 
 (defun broker-exec-verify (directory &optional digests)
-  "Compile and self-test every agent file in DIRECTORY and report.
-Return 0 when the generation is good and 1 when it is not. The uid is dropped
-before a single agent file is read, so a verification that runs away runs away
-as the agent and not as the process that holds the secrets.
-
-DIGESTS is the digest string the supervisor read, and a directory that no longer
-matches it is refused without compiling a file."
+  "Compile and self-test agent files in DIRECTORY (after privilege drop); return exit code 0 or 1.
+If DIGESTS is provided, refuses a directory whose snapshot digest does not match."
   (handler-case
       (let ((result (enchiridion.plugin:verify-directory (pathname directory)
                                                         :source-digests digests)))
@@ -98,20 +79,9 @@ matches it is refused without compiling a file."
       1)))
 
 (defun broker-exec-load-generation (directory generation)
-  "Load a generation through the plugin loader.
-Return four values: the ok flag, the report, the digest string of the source that
-was published, and the generation that is live after the call. The last two are
-what the broker puts in its reply, and the supervisor compares them with the
-digest it verified and the generation it asked for.
-
-VERIFY is NIL: a separate one-shot child already compiled and self-tested these
-files before the supervisor asked for this load. Verifying here as well would
-load every file twice in one process, and the second load redefines each
-function, which verification counts as a warning and therefore as a failure.
-
-The digest the supervisor verified arrives in *LOAD-SOURCE-DIGESTS*, which the
-broker binds around this call, and the loader refuses a tree that no longer
-matches it."
+  "Load GENERATION from DIRECTORY via the plugin loader, returning (values ok-p report digest live-gen).
+Passes :VERIFY NIL because a one-shot child already verified the files (re-verifying in-process
+would trigger redefinition warnings). Reads the expected digest from *LOAD-SOURCE-DIGESTS*."
   (let* ((digests enchiridion.tools.broker::*load-source-digests*)
          (result (enchiridion.plugin:load-generation
                   directory
@@ -128,8 +98,7 @@ matches it."
 
 (defun broker-exec-main ()
   "Parse the small command line and serve until killed, or verify and exit."
-  ;; The same seed as the supervisor otherwise, and so the same temporary file
-  ;; names in the same shared directory.
+  ;; Reseed RNG so child temp names do not collide with the supervisor.
   (setf *random-state* (make-random-state t))
   (let* ((arguments (enchiridion.compat:script-arguments))
          (verify (broker-exec-argument arguments "--verify-plugin"))
@@ -161,11 +130,7 @@ matches it."
         (format *error-output* "~&broker-exec: ~A~%" condition)
         1))))
 
-;; The child is in the terminal's process group, so a Ctrl-C at the supervising
-;; terminal reaches it as well. It answers the interrupt the same way the
-;; supervisor does, with a quiet exit and no backtrace: the supervisor is about
-;; to stop the child anyway, and a trace from the sandbox side reads as the
-;; agent crashing.
+;; Exit quietly (130) on terminal SIGINT instead of printing a backtrace.
 (enchiridion.compat:exit-with
  (catch 'broker-exec-interrupt
    (enchiridion.compat:with-interrupt-handler

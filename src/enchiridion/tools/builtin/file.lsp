@@ -1,16 +1,9 @@
 ;;;; file.lsp --- File tools: index, read, write, edit, glob.
-;;;;
-;;;; The index is first because it is the token win. A model that sees a
-;;;; skeleton and line ranges can ask for the twenty lines it needs instead of
-;;;; paying for a file it has not read. The reader gives the line positions, so
-;;;; there is no parser dependency and no second grammar to keep in sync.
 
 (in-package #:enchiridion.tools.builtin)
 
 (defparameter +result-cap+ 8000
-  "The character cap for one tool result. Anything larger spills to a file and
-the model gets the head plus the path, which is cheaper than the whole result
-and still recoverable.")
+  "Max characters returned inline by a tool; larger results spill to a temp file.")
 
 (defparameter *file-read-byte-limit* (* 1024 1024)
   "The largest whole file a file or search tool decodes at once, in bytes.")
@@ -85,13 +78,8 @@ and still recoverable.")
 (declaim (ftype (function (pathname) list) file-index-forms))
 
 (defun file-index-forms (path)
-  "Return a plist per top level form in PATH: :START, :END, and :FORM.
-
-Reading is done with *READ-EVAL* NIL and a throwaway package. The file is
-agent-authored, so an evaluated reader macro in the index would be a remote
-code execution with the index's permissions. The package keeps symbols from
-polluting the running image and keeps an IN-PACKAGE form from changing the
-reader's package for the next form."
+  "Return a plist (:START :END :FORM) per top-level form in PATH.
+Reads with *READ-EVAL* NIL and a throwaway package to prevent reader eval and symbol pollution."
   (let ((text (read-file-bounded path))
         (forms '())
         (position 0)
@@ -129,11 +117,7 @@ reader's package for the next form."
                 (getf form :form))))))
 
 (defun argument (args key &optional default)
-  "Return KEY from the tool arguments, or DEFAULT.
-
-DISPATCH normalises arguments to a hash table, but a Lisp caller and a unit
-test often hold the plist directly. Both shapes answer here, so a handler does
-not fail on the shape of the thing it was called with."
+  "Return KEY from tool ARGS (hash table or keyword plist), or DEFAULT."
   (etypecase args
     (hash-table
      (multiple-value-bind (value present) (gethash key args)
@@ -173,9 +157,7 @@ not fail on the shape of the thing it was called with."
   "The files the bootstrap gate protects, and the label each one reports.")
 
 (defparameter +harness-maintained-adaptation-file+ "ADAPT.md"
-  "The file the adaptation harness owns. The file tools refuse it at every
-bootstrap state; the shell remains outside this check, as it is outside every
-file-tool policy.")
+  "Harness-maintained file; file tools refuse writes to it at every bootstrap state.")
 
 (defun absolute-pathname (path)
   "Return PATH as an absolute pathname, relative to the current directory."
@@ -214,8 +196,7 @@ file-tool policy.")
     (uiop:pathname-equal (canonical-pathname path) adaptation)))
 
 (defun check-file-write (path tool)
-  "Refuse a file-tool write that the adaptation harness owns, then apply the
-bootstrap rule. The adaptation file is refused at every bootstrap state."
+  "Refuse writes to ADAPT.md (following symlinks) at all times, and to seed-backed files during bootstrap."
   (when (adaptation-file-p path)
     (error 'enchiridion.errors:tool-error
            :tool tool

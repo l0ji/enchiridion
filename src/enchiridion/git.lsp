@@ -1,76 +1,43 @@
-;;;; git.lsp --- The agent directory as its own git repository.
+;;;; git.lsp --- Manage the agent directory as its own nested Git repository.
 ;;;;
-;;;; The agent directory is a repository of its own, nested inside whatever
-;;;; holds the checkout. Personality evolution and authored code are therefore
-;;;; a diff the operator can read, and `enchiridion undo` rolls back an agent
-;;;; change without ever touching the harness.
-;;;;
-;;;; Every call goes through ENCHIRIDION.COMPAT. No call here ever writes git
-;;;; identity and none passes `-c user.*`: the operator's global configuration
-;;;; and signing key are the only ones used. A host with no global identity is
-;;;; a host where git refuses the commit, which GIT-COMMIT-ALL reports as NIL
-;;;; rather than as a failure of the turn.
-;;;;
-;;;; A root supervisor is the other case. The agent repository belongs to the
-;;;; agent uid, and Git runs the hooks and local configuration it finds there,
-;;;; so running Git as root would both trip Git's ownership check and execute
-;;;; agent-written hooks as root. When this process is root, GIT-RUN starts
-;;;; src/git-exec.lsp instead: that bootstrap drops the supplementary groups,
-;;;; the gid, and the uid before it starts Git. No safe.directory entry is
-;;;; written and no repository configuration is trusted. A root process with no
-;;;; configured identity refuses instead of falling back to root.
+;;;; Uses the operator's global Git config/signing key (never writes user.*).
+;;;; When running as root, GIT-RUN invokes src/git-exec.lsp to drop privileges
+;;;; before touching the agent-owned repository, refusing if no identity is set.
 
 (in-package #:enchiridion.git)
 
 (defparameter +program+ "git"
-  "The program every call runs. Rebinding it is how a test proves the
-git-is-missing path without removing git from the machine.")
+  "Git executable name (rebindable in tests).")
 
 (defun git-program ()
-  "Return the Git executable. ENCHIRIDION_GIT lets a Nix wrapper name the
-store path, because the broker child starts with a fixed PATH."
+  "Return the Git executable, honoring ENCHIRIDION_GIT."
   (or (uiop:getenv "ENCHIRIDION_GIT") +program+))
 
 (defparameter +ignored+
   '("state.json" "state.json.*" "memory.db" "memory.db-*" "private/" "tmp/" "*.fasl")
-  "What the agent repository ignores. State and the database are runtime, not
-history: the agent's history is the seed files, the skills, and the tools.")
+  "Patterns ignored in the agent repository (runtime state, not history).")
 
 (defparameter +commit-timeout+ 30
-  "Seconds a git call may take. A hook that waits on a lock forever would hang
-the turn that asked for it, and a turn is not the place to wait.")
+  "Timeout in seconds for Git commands.")
 
 (defparameter +test-environment-keys+
   '("GIT_AUTHOR_NAME" "GIT_AUTHOR_EMAIL" "GIT_COMMITTER_NAME"
     "GIT_COMMITTER_EMAIL" "GIT_CONFIG_NOSYSTEM" "GIT_CONFIG_GLOBAL")
-  "The variables GIT-TEST-ENVIRONMENT sets and this process's environment is
-not allowed to carry.")
+  "Git env vars overridden by GIT-TEST-ENVIRONMENT.")
 
 (declaim (ftype (function (t) t) enchiridion.errors:error-detail))
 
 (defparameter *git-identity* nil
-  "The (UID . GID) repository Git runs as when this process is root, or NIL.
-The supervisor sets it from :SANDBOX :AGENT-UID and :AGENT-GID before any
-repository action. A root process with no identity refuses to run repository
-Git rather than running it as root.")
+  "Target (UID . GID) for repository Git when running as root, or NIL to refuse.")
 
 (defparameter +root-environment-keys+
   '("PATH" "LANG" "LC_ALL" "LC_CTYPE" "TZ" "SBCL_HOME" "LD_LIBRARY_PATH"
     "ENCHIRIDION_HOME")
-  "The only process variables a dropped Git child may inherit.
-
-GIT_* names can redirect Git at another repository or install a signing
-program, and SSH_AUTH_SOCK and the gpg agent sockets hand the agent the
-supervisor's credentials. None of those crosses the drop. HOME and TMPDIR are
-computed rather than inherited, for the same reason.")
+  "Allowlisted env vars passed across the root privilege drop (excludes GIT_*, SSH/GPG sockets).")
 
 (defun git-exec-path ()
-  "Return the privilege-drop bootstrap beside the trusted source.
-
-A root process reads it only from an absolute ENCHIRIDION_SOURCE. The working
-directory is agent-writable in a split run, and a bootstrap loaded from there
-would run as root before it could drop. A non-root process never starts the
-bootstrap, and ASDF's own source directory is the fallback for a checkout."
+  "Return path to src/git-exec.lsp.
+Root requires an absolute ENCHIRIDION_SOURCE so nothing is loaded from an agent-writable cwd."
   (let ((source (uiop:getenv "ENCHIRIDION_SOURCE")))
     (cond
       ((and source (plusp (length source)))
@@ -88,9 +55,7 @@ bootstrap, and ASDF's own source directory is the fallback for a checkout."
        (asdf:system-relative-pathname "enchiridion" "src/git-exec.lsp")))))
 
 (defun git-exec-program ()
-  "Return the SBCL that runs the bootstrap, from the same trusted runtime.
-A root process requires an absolute path: a bare name would be looked up on a
-PATH an agent-writable directory could be on, before the drop has happened."
+  "Return SBCL executable for the bootstrap; root requires an absolute path."
   (let ((program (or (uiop:getenv "ENCHIRIDION_SBCL")
                      (enchiridion.compat:lisp-runtime-path))))
     (when (zerop (enchiridion.compat:process-uid))
@@ -101,9 +66,7 @@ PATH an agent-writable directory could be on, before the drop has happened."
     program))
 
 (defun checked-git-identity ()
-  "Return *GIT-IDENTITY* as a (UID . GID) cons, or signal.
-A root process with no identity, or one that is not two positive integers, must
-not run repository Git at all: the fallback would be the supervisor's uid."
+  "Return *GIT-IDENTITY* as a (UID . GID) of positive integers, or signal CONFIGURATION-ERROR."
   (let ((identity *git-identity*))
     (unless (and (consp identity)
                  (integerp (car identity))
@@ -116,11 +79,7 @@ not run repository Git at all: the fallback would be the supervisor's uid."
     identity))
 
 (defun git-root-environment ()
-  "Return the allowlisted environment a dropped Git child gets.
-
-HOME is the state root and never root's home, so the agent's own
-Git configuration and signing key are the ones used. TMPDIR is the agent's tmp
-directory, because /tmp is root-owned in the container."
+  "Return allowlisted env for dropped Git children, setting HOME and TMPDIR under ENCHIRIDION_HOME."
   (let* ((state (uiop:getenv "ENCHIRIDION_HOME"))
          (usable (and state (plusp (length state))))
          (home (if usable state "/nonexistent"))
@@ -149,12 +108,8 @@ directory, because /tmp is root-owned in the container."
               (mapcar #'princ-to-string arguments))))
 
 (defun git-invocation (directory arguments &key environment)
-  "Return the program, arguments, and child environment GIT-RUN should use.
-
-A non-root process gets the plain Git command and ENVIRONMENT unchanged: the
-host operator's configuration and signing key stay in charge. A root process
-gets the bootstrap and the allowlisted environment, and never the caller's
-ENVIRONMENT, which could be a test or a supervisor variable carrying a key."
+  "Return (values program arguments environment) for GIT-RUN.
+Root uses the privilege-drop bootstrap and allowlisted env, ignoring caller ENVIRONMENT."
   (let ((command (git-command directory arguments)))
     (if (zerop (enchiridion.compat:process-uid))
         (let ((identity (checked-git-identity)))
@@ -172,19 +127,8 @@ ENVIRONMENT, which could be a test or a supervisor variable carrying a key."
 (declaim (ftype (function (t list &key (:environment t) (:timeout t)) t) git-run))
 
 (defun git-run (directory arguments &key environment (timeout +commit-timeout+))
-  "Run git with ARGUMENTS in DIRECTORY and return its combined output and
-status, the way ENCHIRIDION.COMPAT:RUN-PROGRAM-CAPTURE returns them.
-
-The directory is passed with -C rather than as the child's working directory,
-because the compat launcher starts the child where this process stands. A
-directory that does not exist yet still reaches git: git's own sentence about
-the path is more useful than a Lisp error about a pathname.
-
-ENVIRONMENT replaces the child environment when it is given. The tests use it
-to supply an author and to switch signing off in a build sandbox that has
-neither, and they build it with GIT-TEST-ENVIRONMENT so PATH survives. A root
-process ignores it and passes the allowlist GIT-ROOT-ENVIRONMENT builds, because
-an inherited key or signing socket must not cross the drop."
+  "Run git -C DIRECTORY with ARGUMENTS and return combined output and exit status.
+Root ignores ENVIRONMENT and uses GIT-ROOT-ENVIRONMENT."
   (multiple-value-bind (program command child-environment)
       (git-invocation directory arguments :environment environment)
     (enchiridion.compat:run-program-capture program command
@@ -194,13 +138,7 @@ an inherited key or signing socket must not cross the drop."
 (declaim (ftype (function () list) git-test-environment))
 
 (defun git-test-environment ()
-  "Return this process's environment with a test author and no global git
-configuration.
-
-The sandbox a nix build runs in has no `~/.gitconfig`, so a commit there has
-no identity and, if the host config were reachable, would try to sign with a
-key the sandbox does not have. PATH and everything else survives, because the
-environment is replaced and not merely added to."
+  "Return current env with a test author and global/system Git config disabled (preserves PATH)."
   (let ((entries '()))
     (loop for (name . value) in (enchiridion.compat:environment)
           unless (member name +test-environment-keys+ :test #'string=)
@@ -216,11 +154,7 @@ environment is replaced and not merely added to."
 (declaim (ftype (function () boolean) git-available-p))
 
 (defun git-available-p ()
-  "Return T when Git answers. Main refuses to start when this is NIL.
-
-The version check runs as this process, without the repository bootstrap: no
-repository or configuration is consulted, so a root supervisor can check Git
-before the sandbox identity is known."
+  "Return T when `git --version` succeeds (runs directly without repo bootstrap)."
   (handler-case
       (multiple-value-bind (output status)
           (enchiridion.compat:run-program-capture
@@ -232,13 +166,7 @@ before the sandbox identity is known."
 (declaim (ftype (function (t) boolean) repository-p))
 
 (defun repository-p (directory)
-  "Return T when DIRECTORY itself is the top of a git work tree.
-
-The check is for DIRECTORY's own .git and not for `rev-parse
---is-inside-work-tree`, because the agent directory is nested inside the
-checkout. A plain directory inside another repository answers yes to
-rev-parse, and that answer would make the harness commit the agent's change
-into the project's history."
+  "Return T when DIRECTORY has its own .git entry (avoids rev-parse matching a parent repo)."
   (let ((path (uiop:ensure-directory-pathname directory)))
     (not (null (or (probe-file (merge-pathnames ".git/" path))
                    (probe-file (merge-pathnames ".git" path)))))))
@@ -256,9 +184,7 @@ into the project's history."
 (declaim (ftype (function (t) t) write-ignore-file))
 
 (defun write-ignore-file (directory)
-  "Write the ignore file into DIRECTORY when there is none, and return its path.
-An operator who edited it keeps their edit: this file is created, never
-overwritten, for the same reason a seed file is."
+  "Write .gitignore into DIRECTORY if absent, without overwriting existing edits."
   (let ((path (merge-pathnames ".gitignore"
                                (uiop:ensure-directory-pathname directory))))
     (unless (probe-file path)
@@ -273,8 +199,7 @@ overwritten, for the same reason a seed file is."
 (declaim (ftype (function (t) string) git-init))
 
 (defun git-init (directory)
-  "Create a repository at DIRECTORY, write its ignore file, and return git's
-output. An existing repository is left alone."
+  "Initialize a Git repo at DIRECTORY, write .gitignore if missing, and return git's output."
   (let ((path (uiop:ensure-directory-pathname directory)))
     (ensure-directories-exist (merge-pathnames "x" path))
     (multiple-value-bind (output status)
@@ -294,21 +219,10 @@ output. An existing repository is left alone."
       (string-trim '(#\Space #\Newline #\Return #\Tab) output))))
 
 (defparameter *commit-environment* nil
-  "The child environment GIT-COMMIT-ALL gives git, or NIL to inherit.
-
-Tests bind this to GIT-TEST-ENVIRONMENT, because a nix build sandbox has no
-global git configuration and therefore no identity to commit under. Production
-leaves it NIL, so the operator's own configuration and signing key are used.
-A root process ignores it for the allowlist GIT-ROOT-ENVIRONMENT builds.")
+  "Child env for GIT-COMMIT-ALL (NIL inherits; tests bind to GIT-TEST-ENVIRONMENT; ignored by root).")
 
 (defparameter *commit-lock* (bordeaux-threads:make-lock "enchiridion commit")
-  "The lock around GIT-COMMIT-ALL, one per process.
-
-Every agent directory is one repository with one index. A turn on a channel
-thread and a sleep pass on the heartbeat thread both end in a commit, and two
-git commands at once collide on .git/index.lock: git refuses, the commit is
-reported, and one turn's changes would never land. The lock makes the second
-commit wait instead of losing the work.")
+  "Process-wide lock serializing GIT-COMMIT-ALL to prevent .git/index.lock collisions.")
 
 (declaim (ftype (function (string) t) report-history-failure))
 
@@ -320,12 +234,7 @@ commit wait instead of losing the work.")
   (finish-output *error-output*))
 
 (defparameter *history-failure-reporter* #'report-history-failure
-  "Called with a detail string when GIT-COMMIT-ALL cannot record a commit.
-
-The default writes one line to *ERROR-OUTPUT*. A caller may bind this to its
-own log. Reporting never signals and never replaces the turn's reply: a host
-with no identity still answers the operator, and the operator can see why the
-change is not in the history.")
+  "Called with a detail string when GIT-COMMIT-ALL fails; never signals.")
 
 (defun note-history-failure (detail)
   (when (and detail *history-failure-reporter*)
@@ -372,17 +281,10 @@ change is not in the history.")
         detail)))
 
 (defparameter +stale-index-lock-seconds+ 600
-  "How old .git/index.lock must be before an opted-in commit moves it aside.
-Ten minutes is longer than the thirty second commit timeout, and the age is the
-only evidence Git leaves about the writer. Age is not proof: recovery is off
-unless the operator opts in (see *STALE-LOCK-RECOVERY-P*).")
+  "Minimum age in seconds before an opted-in commit quarantines .git/index.lock.")
 
 (defparameter *stale-lock-recovery-p* nil
-  "Whether a refused commit may move a stale index lock aside and retry.
-Default NIL: another process, container, or hand-run Git command can hold a
-lock longer than any threshold. An operator who knows this process is the
-repository's only writer binds it to T; otherwise the refusal is reported
-through *HISTORY-FAILURE-REPORTER*.")
+  "When T, allow GIT-COMMIT-ALL to quarantine a stale .git/index.lock and retry once (default NIL).")
 
 (defparameter *stale-lock-reporter*
   (lambda (lock quarantine age)
@@ -390,8 +292,7 @@ through *HISTORY-FAILURE-REPORTER*.")
             "~&enchiridion: moved a ~D second~:P old Git index lock aside (~A -> ~A) and retried the commit.~%  Restore it with mv if a Git command in this repository was still running.~%"
             age lock quarantine)
     (finish-output *error-output*))
-  "Called with the lock path, where it was moved, and its age in seconds.
-The default writes two lines to *ERROR-OUTPUT* and never signals.")
+  "Called with (lock quarantine age) after quarantining a stale index lock.")
 
 (defun note-stale-lock (lock quarantine age)
   (when *stale-lock-reporter*
@@ -403,8 +304,7 @@ The default writes two lines to *ERROR-OUTPUT* and never signals.")
   (merge-pathnames ".git/index.lock" (uiop:ensure-directory-pathname directory)))
 
 (defun stale-git-lock-p (path &key (now (get-universal-time)))
-  "Return PATH's age in seconds when it is old enough that its writer may be
-gone. A directory or a vanished file answers NIL. The report shows the age."
+  "Return PATH's age in seconds if it is a file at least +STALE-INDEX-LOCK-SECONDS+ old, else NIL."
   (let ((written (ignore-errors (file-write-date path))))
     (when (and (integerp written)
                (not (uiop:directory-exists-p path)))
@@ -416,10 +316,7 @@ gone. A directory or a vanished file answers NIL. The report shows the age."
   (pathname (format nil "~A.stale-~D" (namestring lock) now)))
 
 (defun recover-stale-git-lock (directory)
-  "Move DIRECTORY's index lock aside when it is stale, and return its new path.
-The lock is renamed, not deleted, so a live writer's lock can be restored and a
-crash leaves evidence. A directory, a young lock, recovery not opted in, and a
-failed rename all answer NIL, and the caller keeps the original refusal."
+  "If *STALE-LOCK-RECOVERY-P* is T and .git/index.lock is stale, rename it aside and return the quarantine path."
   (when *stale-lock-recovery-p*
     (let ((lock (git-index-lock directory)))
       (when (probe-file lock)
@@ -437,8 +334,7 @@ failed rename all answer NIL, and the caller keeps the original refusal."
   (and (stringp output) (search "index.lock" output)))
 
 (defun git-lock-hint (detail)
-  "Return DETAIL with the stale-lock opt-in named, when recovery is off.
-Otherwise the operator sees a fatal Git line and no name for the setting."
+  "Append the *STALE-LOCK-RECOVERY-P* hint to DETAIL when stale-lock recovery is off."
   (if (and (stringp detail) (not *stale-lock-recovery-p*))
       (concatenate 'string
                    detail
@@ -448,20 +344,9 @@ Otherwise the operator sees a fatal Git line and no name for the setting."
 (declaim (ftype (function (t string &key (:environment t)) t) git-commit-all))
 
 (defun git-commit-all (directory message &key (environment *commit-environment*))
-  "Stage everything in DIRECTORY and commit it with MESSAGE.
-
-Return two values: the commit hash, :NONE when there was nothing to commit, or
-NIL when Git refuses; and a short detail string when the refusal lost history.
-A host with no identity, no key, or a refusing commit hook is reported through
-*HISTORY-FAILURE-REPORTER* instead of being swallowed, and the turn's reply is
-still delivered. A turn that changed nothing is the normal case and reports
-nothing.
-
-The whole stage-and-commit pair is one unit under *COMMIT-LOCK*: another
-thread's `git add` between this one's add and commit would commit the wrong
-set of files. A refusal about .git/index.lock gets one retry after a lock older
-than +STALE-INDEX-LOCK-SECONDS+ is moved aside; a younger lock is left alone,
-because another command may hold it."
+  "Stage everything in DIRECTORY and commit with MESSAGE under *COMMIT-LOCK*.
+Returns (values result detail): hash, :NONE if clean, or NIL on refusal (reported via *HISTORY-FAILURE-REPORTER*).
+Retries once on .git/index.lock failure if stale-lock recovery succeeds."
   (let (result detail)
     (bordeaux-threads:with-lock-held (*commit-lock*)
       (let ((path (uiop:ensure-directory-pathname directory)))
@@ -492,9 +377,7 @@ because another command may hold it."
                                           (git-lock-failure-p output)))))))
                      (error (condition)
                        (values nil (condition-failure-detail condition) nil)))))
-          ;; One retry, and only for a lock refusal: moving a stale lock lets
-          ;; the next tick record the change instead of repeating the refusal.
-          ;; A younger lock may belong to another command and is left alone.
+          ;; Retry once on index.lock failure if stale-lock recovery moved the lock aside.
           (multiple-value-bind (first-result first-detail first-lock-p)
               (attempt)
             (multiple-value-bind (final-result final-detail)
@@ -514,11 +397,7 @@ because another command may hold it."
 (declaim (ftype (function (t &key (:limit t) (:pathspec t)) list) git-log))
 
 (defun git-log (directory &key (limit 20) pathspec)
-  "Return up to LIMIT commits of DIRECTORY, newest first, each (hash . subject).
-A repository with no commits yet returns the empty list.
-
-LIMIT is a keyword and not an optional argument, because an ordinary lambda
-list may not hold &OPTIONAL and &KEY at the same time."
+  "Return up to LIMIT commits of DIRECTORY, newest first, as (hash . subject) pairs, or NIL."
   (let ((arguments (append (list "log"
                                  (format nil "-n~D" limit)
                                  "--format=%H%x09%s")
@@ -553,14 +432,7 @@ list may not hold &OPTIONAL and &KEY at the same time."
 (declaim (ftype (function (t t &key (:environment t)) string) git-revert))
 
 (defun git-revert (directory revision &key (environment *commit-environment*))
-  "Revert REVISION and return git's output.
-
-A revert is a commit, so it takes the same ENVIRONMENT GIT-COMMIT-ALL does;
-without one, a host with no identity refuses it.
-
-A conflict signals a tool error carrying git's own text: the tree is left
-mid-revert for the operator to resolve, and hiding that behind a boolean would
-be the wrong kind of quiet."
+  "Revert REVISION and return git's output; signals TOOL-ERROR on conflict (leaving tree mid-revert)."
   (multiple-value-bind (output status)
       (git-run directory (list "revert" "--no-edit" revision)
                :environment environment)

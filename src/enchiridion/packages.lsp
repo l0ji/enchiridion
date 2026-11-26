@@ -1,10 +1,6 @@
-;;;; packages.lsp --- One package per subsystem.
+;;;; packages.lsp --- Subsystem package definitions.
 ;;;;
-;;;; A symbol carries the name of its thing, never the name of its package, so
-;;;; it is enchiridion.llm:complete and not enchiridion:llm-complete. Every
-;;;; import is explicit. Nothing outside this file uses another package
-;;;; wholesale, because a wholesale use is how two files quietly disagree about
-;;;; what list-length means.
+;;;; All cross-package imports are explicit; symbols do not repeat package names.
 
 (defpackage #:enchiridion
   (:nicknames #:core)
@@ -28,18 +24,12 @@
    #:sectioned-config-p #:config-section #:config-value #:config-section-value
    #:config-with-llm-value
    #:config-setting #:config-tool-rounds
-   ;; CONFIG-LOOKUP is the reader that answers from the active configuration
-   ;; first and the shipped defaults second, which is what the provider table
-   ;; wants: a config.lsp that names two keys must not blank out the other
-   ;; twenty. It is exported because the LLM module reads provider defaults
-   ;; through it.
+   ;; Active-then-default lookup used by the LLM provider table.
    #:config-lookup
-   ;; The provider table and the secret loader read one key-name list.
+   ;; Shared API key env-var list.
    #:config-api-key-env-list
    #:configured-secret-names #:config-memory-db)
-  (:documentation
-   "Configuration. Paths and behaviour only; a secret never comes from here,
-because a file in the repository is a file that ends up in a store path."))
+  (:documentation "Operator configuration (paths and behavior only, no secrets)."))
 
 (defpackage #:enchiridion.compat
   (:use #:cl)
@@ -61,10 +51,7 @@ because a file in the repository is a file that ends up in a store path."))
    #:set-file-mode #:file-mode #:symlink-target
    #:with-interrupt-handler #:signal-interactive-interrupt
    #:install-shutdown-signals #:shutdown-interrupt-p #:signal-shutdown-interrupt)
-  (:documentation
-   "The only file in the tree that contains implementation extensions.
-Everything above it is standard Common Lisp, which is what makes the agent
-able to rewrite itself without rewriting the porting layer."))
+  (:documentation "Implementation-specific portability layer; everything above is standard CL."))
 
 (defpackage #:enchiridion.git
   (:use #:cl)
@@ -74,12 +61,8 @@ able to rewrite itself without rewriting the porting layer."))
    #:git-run #:git-current-branch #:git-test-environment #:*commit-environment*
     #:*git-identity* #:*history-failure-reporter* #:*stale-lock-reporter*)
   (:documentation
-   "The agent directory is its own git repository, so personality evolution and
-authored code are a diff the operator can read and revert. Every call goes
-through ENCHIRIDION.COMPAT. A non-root process uses the operator's global
-configuration and signing key; a root process runs repository Git through
-src/git-exec.lsp as the configured agent uid and gid, with the agent's own
-configuration. No call writes git identity."))
+   "Git wrapper for the agent directory via ENCHIRIDION.COMPAT.
+Root processes run Git via src/git-exec.lsp as the configured agent uid/gid."))
 
 (defpackage #:enchiridion.errors
   (:use #:cl)
@@ -89,20 +72,14 @@ configuration. No call writes git identity."))
    #:block-overflow #:block-frozen #:bootstrap-pending #:budget-exceeded
    #:duplicate-message #:not-found #:unauthorized #:condition-report-line
    #:turn-cancelled #:turn-busy #:busy-agent
-   ;; The note every condition carries. The report line stays one line so it can
-   ;; go in a log; this is the part that says what to do about it.
+   ;; Human-readable detail attached to conditions.
    #:error-detail)
-  (:documentation
-   "The condition hierarchy. Conditions, not formatted strings: a caller can
-recover from a block overflow by asking it for the shortfall, and it cannot
-recover from a string."))
+  (:documentation "Structured condition hierarchy for recoverable error handling."))
 
 (defpackage #:enchiridion.llm
   (:use #:cl)
   (:export
-   ;; The protocol every backend implements. Three generic functions and the
-   ;; check that stands in for satisfies, because SBCL has no
-   ;; defprotocol.
+   ;; Backend protocol.
    #:complete #:embed #:model-capabilities #:backend-name #:backendp
    ;; The result and message shapes.
    #:message #:user-message #:assistant-message #:system-message
@@ -115,10 +92,7 @@ recover from a string."))
    #:completion-cache-read-tokens #:completion-cache-write-tokens
    #:completion-total-tokens #:copy-completion
    #:take-completion-tool-message
-   ;; The adapter registry and the provider record it speaks. A handler
-   ;; registers itself under an id; the provider table resolves an id to the
-   ;; handler and hands it a PROVIDER. Nothing here names a vendor, which is
-   ;; what keeps a Bedrock or a Vertex file from reaching into the core.
+   ;; API handler registry and provider/model records.
    #:api-handler #:find-api-handler #:register-api-handler
    #:registered-api-handlers #:provider-supported-p
    #:provider #:provider-id #:provider-name #:provider-api #:provider-profile
@@ -130,8 +104,7 @@ recover from a string."))
    #:model-info-reasoning-p #:model-info-context #:model-info-output
    #:model-info-cost-input #:model-info-cost-output
    #:model-info-cost-cache-read #:model-info-cost-cache-write
-   ;; The declarative quirks. A DIALECT is data, so a new provider is usually a
-   ;; profile entry and not a function.
+   ;; Declarative wire dialects.
    #:dialect #:dialect-field #:dialect-profile #:dialect-profile-p
    #:make-dialect-for
    ;; Auth: the simple schemes are here, the signed ones register themselves.
@@ -145,33 +118,18 @@ recover from a string."))
    ;; The runtime catalog and the provider table that consumes it.
    #:read-catalog-file #:refresh-catalog #:catalog-providers
    #:provider-models #:resolve-provider #:list-providers #:provider-from-base-url
-   ;; Backends. Each wire shape is selected by RESOLVE-BACKEND, and the two
-   ;; protocols live in files of their own so neither can quietly grow the
-   ;; other's fields.
+   ;; Backends.
    #:openai-backend #:anthropic-backend #:resolve-backend
-   ;; The two halves of the OpenAI wire format, exported so they can be tested
-   ;; without a network. They are pure functions over text and data, which is
-   ;; the only reason the format is testable at all. PARSE-JSON goes with them
-   ;; because it is the JSON door: one place decides what a parsed object is.
+   ;; Pure OpenAI wire serialization/parsing and JSON helpers.
    #:completion-request #:parse-completion #:parse-json #:stringify
-   ;; The two halves of the Anthropic wire format, exported for the same
-   ;; reason. ANTHROPIC-PARSE-COMPLETION takes the reply text rather than a
-   ;; parsed object, because it has to tell an empty array from an absent
-   ;; field and has to keep a tool input an object.
+   ;; Pure Anthropic wire serialization/parsing.
    #:anthropic-completion-request #:anthropic-parse-completion
-   ;; Tiers. The models are primary-model, cheap-model and sleep-model rather
-   ;; than the bare words, because a function named SLEEP in a package that
-   ;; uses CL is a package lock error.
+   ;; Model tiers (prefixed to avoid shadowing CL:SLEEP).
    #:*model-primary* #:*model-cheap* #:*model-sleep*
    #:tier #:model-for-tier #:primary-model #:cheap-model #:sleep-model
-   ;; Provider selection and the variable that holds the key for the active
-   ;; provider. Main uses the second one before it builds the backend, and it
-   ;; unions PROVIDER-KEY-NAMES into the names the loader reads, so a key for a
-   ;; provider that is not selected still reaches the scrubber.
+   ;; Provider detection and key env-var discovery.
    #:detect-provider #:default-api-key-env #:provider-key-names)
-  (:documentation
-   "LLM backends, the request and result shapes they share, and the three
-model tiers. The kernel never branches on which backend is in use."))
+  (:documentation "LLM backends, shared message/completion types, and model tiers."))
 
 (defpackage #:enchiridion.llm.secrets
   (:use #:cl)
@@ -186,32 +144,21 @@ model tiers. The kernel never branches on which backend is in use."))
    #:*loaded-sources*
    #:*sealed*
    #:+redaction-marker+
-   ;; The container path and the three operations over it. The supervisor reads
-   ;; the file, checks its mode, and unlinks it once the values are in memory,
-   ;; so the path is shared rather than written out at each call site; and the
-   ;; environment sweep needs the predicate that says which variable names are
-   ;; credential-shaped.
+   ;; Container secrets path, loading, mode checks, and scrubbing.
    #:+container-secrets-path+
    #:load-secrets #:load-secrets-from #:register-secret #:clear-secrets
    #:secret-names #:secret-value #:secret-source #:secret-present-p
    #:secret-file-mode-ok-p #:discard-secrets-file
    #:scrub #:scrub-object #:scrub-tree #:sealed-p #:seal #:unseal
    #:scrubber #:pattern #:secrets-file #:role-name-p #:credential-variable-p
-   ;; The one resolution of "which .env does the operator mean". The loader in
-   ;; src/main.lsp and the `secrets` command both call it, so the file that is
-   ;; read and the file that is reported cannot become two different files.
+   ;; Shared .env path resolution for loader and `secrets` command.
    #:operator-secrets-file
-   ;; What the loader actually read, and the mode it had then. A report about a
-   ;; file that was deliberately unlinked cannot be a fresh lookup of a file
-   ;; that was never there, and these two are what the `secrets` command reads
-   ;; instead when the container copy has already been discarded.
+   ;; Recorded path/mode from load time (persists after container file unlink).
    #:secrets-file-read #:secrets-file-mode-read
    #:parse-env-line)
   (:documentation
-   "Loads .env into memory and scrubs every loaded value and every known shape
-out of text on its way to a model, a transcript, or Fluxer. This is the
-defence against a secret that reached a block through some path the operator
-did not think of."))
+   "Loads .env secrets into memory and scrubs loaded values and credential shapes
+before text reaches models, transcripts, or channels."))
 
 (defpackage #:enchiridion.memory
   (:use #:cl)
@@ -227,9 +174,7 @@ did not think of."))
    ;; Templates, exported so that a test can assert on them without a disk.
    #:seed-templates #:*seed-templates* #:seed-template #:seed-description
    #:seed-kind
-   ;; Runtime state. state.json holds the generation counter the loader bumps
-   ;; and the bootstrap record the first turns work through. One reader and one
-   ;; writer, so a corrupt file has one place to fall back to defaults.
+   ;; Runtime state (state.json: generation counter and bootstrap progress).
    #:state-file #:default-state #:read-state #:write-state
    #:state-generation #:set-state-generation
    #:bootstrap-steps #:bootstrap-handover #:reset-bootstrap
@@ -333,8 +278,7 @@ did not think of."))
    #:apply-memory-settings #:*compaction-rebase-every* #:*compaction-rebase-turns*
    #:*memory-canaries* #:*canary-min-families* #:*tail-rarity-fraction*
    #:*tail-min-n* #:*utility-max-tasks*
-   ;; Integration entry points. Defined in later files; exported here so the
-   ;; kernel and the command table have one visible interface.
+   ;; Integration entry points.
    #:retrieve-for-turn #:retrieve-rows-for-turn #:record-retrieval
    #:record-retrieval-outcome #:maintenance
    #:build-candidate #:promote-generation #:rollback-generation #:requeue-generation #:generation-row
@@ -350,42 +294,31 @@ did not think of."))
    #:encode-vector #:decode-vector
    ;; The bounded recent-conversation window a prompt carries.
    #:conversation-window #:*recent-turn-count* #:*recent-window-chars*)
-  (:documentation
-   "Memory blocks, the operator seed files that back the first three of them,
-the three loading tiers, the bootstrap state machine, and the episodic log
-with its retrieval, generations, and gates."))
+  (:documentation "Memory blocks, seed templates, tiers, bootstrap state, and episodic log/retrieval."))
 
 (defpackage #:enchiridion.memory.store
   (:use #:cl)
   (:export
-   ;; The one path a caller needs before a store exists. A store is a file, so
-   ;; the default is a rule about directories and not a piece of state.
+   ;; Store path resolution and lifecycle.
    #:*store-path* #:default-store-path #:store-file-p
    #:open-store #:close-store #:store-path
    #:record-turn #:turn-row #:session-count #:recent-sessions #:delete-session
-   ;; A turn row is a struct, and the four fields a searcher reads are exported
-   ;; so that the text, the role, and the session survive the round trip.
+   ;; Turn row accessors.
    #:turn-row-id #:turn-row-session #:turn-row-role #:turn-row-body
    #:turn-row-model #:turn-row-channel #:turn-row-ts
    #:search-sessions #:search-memories #:save-memory #:list-memories
    #:session-block #:set-session-block #:ledger-block #:set-ledger-block
    #:record-usage #:usage-rows #:usage-since #:drop-store
-   ;; The ledger, summed. The CLI prints it and the heartbeat budgets against
-   ;; it, so the grouping lives in one place and the two cannot disagree.
+   ;; Usage ledger aggregation.
    #:usage-summary #:usage-total-since #:usage-session-total #:recent-turns
    ;; The task queue. The CLI writes it and the sleep agent drains it.
    #:enqueue-task #:dequeue-task #:complete-task #:fail-task #:recover-tasks
    #:count-tasks #:list-tasks #:remove-task
    #:task-row #:task-row-id #:task-row-body #:task-row-status #:task-row-ts
-   ;; The database primitives the memory layer uses. They are exported so
-   ;; that a derived module is part of this system rather than a caller reaching
-   ;; through a double colon. WITH-STORE-TRANSACTION is the multi-statement
-   ;; write primitive that strict schema creation and generation promotion need.
+   ;; SQLite primitives for derived memory modules.
    #:exec #:query-rows #:field #:last-row-id #:scrubbed #:fts-query
    #:with-store-lock #:with-store-transaction #:store-connection)
-  (:documentation
-   "SQLite with FTS5 over raw messages. Returns real text: no summarisation and
-no model call, so a search costs nothing."))
+  (:documentation "SQLite + FTS5 persistence for turns, memories, usage, and tasks."))
 
 (defpackage #:enchiridion.tools
   (:use #:cl)
@@ -399,16 +332,12 @@ no model call, so a search costs nothing."))
    ;; Schema.
    #:*schema-budget* #:schema-tokens #:schema-budget-report #:validate-arguments
    #:schema-to-json #:schema-json-string #:schema-error-message)
-  (:documentation
-   "Tool registration, the single schema that drives the model facing JSON and
-the argument validation, and dispatch."))
+  (:documentation "Tool registry, JSON schema generation/validation, and dispatch."))
 
 (defpackage #:enchiridion.tools.pipe
   (:use #:cl)
   (:export #:pipe-eval #:pipe-safe-eval #:read-filter #:filter-form #:make-sandbox)
-  (:documentation
-   "The Lisp filter sandbox. In Lisp the filter is an ordinary expression, so
-this costs no interpreter of its own."))
+  (:documentation "Sandboxed Lisp filter expression evaluator."))
 
 (defpackage #:enchiridion.tools.broker
   (:use #:cl)
@@ -417,9 +346,7 @@ this costs no interpreter of its own."))
    #:make-broker #:broker-health #:serve-broker
    #:broker-verify-plugin #:broker-load-generation
    #:*load-generation-function* #:*start-progress-function*)
-  (:documentation
-   "Supervisor side of the privilege boundary. Agent authored code runs in the
-child; the supervisor never loads it."))
+  (:documentation "Supervisor-side privilege boundary; agent code runs in the broker child."))
 
 (defpackage #:enchiridion.tools.builtin
   (:use #:cl)
@@ -427,9 +354,7 @@ child; the supervisor never loads it."))
    #:register-builtin-tools #:file-index #:file-index-forms #:shell-run
    #:search-run #:block-ops #:memory-run #:meta-run #:presence-run
    #:register-presence-tools #:web-fetch #:cap-result #:spill-path)
-  (:documentation
-   "The built-in tools. Index before read, cap every result, and spill the
-middle of anything oversized to a file the agent can go and read."))
+  (:documentation "Built-in tools with result capping and oversized-output spilling."))
 
 (defpackage #:enchiridion.plugin
   (:use #:cl)
@@ -439,25 +364,20 @@ middle of anything oversized to a file the agent can go and read."))
    #:current-generation #:generation-history #:package-name-for-generation
    #:verify-directory #:verify-result #:verify-ok-p #:verify-report
    #:discard-generation
-   ;; The loader. Manifests are read from the source forms, so the supervisor
-   ;; can register a tool the model sees without ever loading a handler.
+   ;; Loader and data-only manifest reader.
    #:*generation* #:plugin-registry #:agent-source-files #:load-agent-code
    #:load-generation #:generation-result #:generation-result-ok-p
    #:generation-result-report #:generation-result-generation
    #:plugin-manifests #:manifest-name #:manifest-description #:manifest-schema
    #:verify-file #:run-self-tests #:tool
-   ;; Skills. Lisp function skills and markdown reference skills live side by
-   ;; side under skills/, and the listing surface reads both through these.
+   ;; Lisp and markdown reference skills under skills/.
    #:skill-files #:reference-skill-files #:read-reference-skill
    #:generation-result-reference-skills #:verify-result-reference-skills
     #:snapshot-sources #:source-snapshot #:source-snapshot-p
     #:source-snapshot-files #:source-snapshot-digest #:source-snapshot-directory
     #:source-changes #:source-mismatch #:source-digest-value
     #:generation-result-digests #:verify-result-digests)
-  (:documentation
-   "Hot reloadable agent code. Each generation loads into a fresh package, so
-a rename leaves no stale symbol behind and a bad edit costs one turn rather
-than the process."))
+  (:documentation "Hot-reloadable agent code with per-generation packages and verification."))
 
 (defpackage #:enchiridion.channel
   (:use #:cl)
@@ -468,9 +388,7 @@ than the process."))
    #:msg #:make-msg #:msg-id #:msg-channel #:msg-target #:msg-thread #:msg-author
    #:msg-text #:msg-ts #:msg-reply-to #:normalize #:deliver #:message-digest
    #:digest-text)
-  (:documentation
-   "The channel protocol and the one message shape every channel normalizes
-into. The agent loop never learns which channel a turn arrived on."))
+  (:documentation "Channel protocol and normalized message type."))
 
 (defpackage #:enchiridion.channel.cli
   (:use #:cl)
@@ -478,9 +396,7 @@ into. The agent loop never learns which channel a turn arrived on."))
            #:run-repl #:run-command #:command-table #:command-names
            #:command-help #:repl-only-commands
            #:command-requirements #:command-problem #:*doctor-function*
-           ;; The context a command reads. Handlers keep the one-argument
-           ;; shape the shared table promises, so the live objects a command
-           ;; needs travel in a special rather than in a second parameter.
+           ;; Dynamic command context passed to one-argument handlers.
            #:*command-context* #:make-command-context
            #:command-context-directory #:command-context-config
            #:command-context-store #:command-context-agent
@@ -488,9 +404,7 @@ into. The agent loop never learns which channel a turn arrived on."))
            #:command-context-generation #:command-context-supervisor
            #:command-context-channel #:command-context-respond
            #:command-context-cancel #:repl-evaluate)
-  (:documentation
-   "The REPL and the shared command table that also backs the shell
-interface, so the two surfaces cannot drift."))
+  (:documentation "REPL and shared CLI command table."))
 
 (defpackage #:enchiridion.channel.http
   (:use #:cl)
@@ -507,18 +421,13 @@ interface, so the two surfaces cannot drift."))
            #:check-http-policy
            #:http-error #:http-error-status #:http-error-message
            #:+http-body-limit+ #:+http-usage-limit+ #:+http-max-usage-limit+)
-  (:documentation
-   "The webhook. Loopback by default; a non loopback bind without a token is
-refused at startup rather than at first request."))
+  (:documentation "HTTP webhook channel; loopback by default, non-loopback requires a token."))
 
 (defpackage #:enchiridion.channel.fluxer
   (:use #:cl)
   (:export #:start-fluxer #:stop-fluxer #:fluxer-running-p #:allowed-p
            #:make-fluxer-channel #:propose-custom-status #:custom-status)
-  (:documentation
-   "Direct messages only. Group channels, guild events, and mentions are out,
-and the bot's reactions only report the state of a message it was sent, so the
-allowlist is the whole authorisation story."))
+  (:documentation "Fluxer DM channel; allowlist-gated direct messages only."))
 
 (defpackage #:enchiridion.supervisor
   (:use #:cl)
@@ -529,8 +438,7 @@ allowlist is the whole authorisation story."))
    #:supervisor-run-directory
    #:supervisor-generation #:supervisor-channels #:supervisor-running-p
     #:supervisor-enable-channel #:supervisor-channel-factory
-   ;; Health reads: channel rows including disabled ones, heartbeat liveness,
-   ;; and the write report.
+   ;; Health and status reporting.
    #:supervisor-channel-rows #:supervisor-disabled-channels
    #:supervisor-heartbeat-live-p #:supervisor-write-report
    #:supervisor-heartbeat-p #:supervisor-heartbeat-interval
@@ -542,25 +450,20 @@ allowlist is the whole authorisation story."))
    #:supervisor-tick-ok-p #:supervisor-tick-requested-p #:supervisor-tick-running-p
    #:supervisor-last-compacted-turn #:supervisor-last-sleep-turn
    #:supervisor-reload #:find-channel
-   ;; The two files that let a one-shot shell command talk to a process that is
-   ;; already up. A file, not a socket, so tail and grep work on it.
+   ;; File-based control/status IPC under run/.
    #:control-file #:status-file #:read-status #:status-fresh-p #:request-control
    #:+control-wait-seconds+ #:queue-control
    #:status-generation #:status-channels #:status-bootstrap #:status-pid
    #:status-updated #:status-report #:status-handled #:status-report-ok-p
    #:status-writes #:status-heartbeat)
-  (:documentation
-   "The process that owns the channels, and the two run/ files it exchanges with
-the shell. It is the only writer of run/enchiridion.status, which is what lets
-`enchiridion health` answer whether or not the agent is up."))
+  (:documentation "Supervisor process owning channels, heartbeats, and run/ control/status files."))
 
 (defpackage #:enchiridion.kernel
   (:use #:cl)
   (:export
    #:agent #:make-agent #:agent-name #:agent-turn #:run-turn #:agent-snapshot
    #:*turn-progress-function*
-   ;; The parts of an agent a caller inspects: what answers, what the prompt is
-   ;; compiled from, what the caps are, and where it writes.
+   ;; Agent accessors.
    #:agent-backend #:agent-blocks #:agent-budget #:agent-directory
    #:compile-prompt #:prompt #:prompt-text #:prompt-tokens #:snapshot-p
    #:record-spend #:spend #:spend-since #:spend-count #:spend-summary #:reset-spend
@@ -568,23 +471,17 @@ the shell. It is the only writer of run/enchiridion.status, which is what lets
    #:session #:make-session #:session-id #:session-turns #:end-session
    #:heartbeat #:task-queue #:enqueue-task #:dequeue-task #:task-queue-length
    #:sleep-agent #:run-sleep-pass
-   ;; The bearing, the evidence checks, and the one learned entry a pass may
-   ;; add. They are exported because tests and an operator's own Lisp use them.
+   ;; Adaptation bearing and proposals.
    #:adaptation-path #:adaptation-proposal-path #:adaptation-maturity
    #:adaptation-bearing #:adaptation-begin #:adaptation-finish
    #:adaptation-apply-proposal #:adaptation-maintenance-prompt
    #:adaptation-rows #:revert-adaptation #:*adaptation-operator-channels*
-   ;; What a failed transcript or usage write leaves for a health reader.
+   ;; Persistence failure reporting for health checks.
    #:*persistence-failure-reporter* #:persistence-failures
    #:last-persistence-failure)
-  (:documentation
-   "The agent loop, the prompt compiler, the frozen snapshot, and the ledger.
-This is the frozen core: it holds the shape of the system and it does not
-change shape at run time."))
+  (:documentation "Core agent loop, prompt compiler, snapshot, budget ledger, and sleep pass."))
 
 (defpackage #:enchiridion.user
   (:use #:cl)
   (:export #:*enchiridion-config*)
-  (:documentation
-   "The package config.lsp is read into. It exists so that the operator writes
-a Lisp file and the project stays a Lisp project."))
+  (:documentation "Package into which operator config.lsp files are loaded."))

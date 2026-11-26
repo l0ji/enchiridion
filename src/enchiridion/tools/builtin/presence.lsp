@@ -1,22 +1,11 @@
-;;;; presence.lsp --- The agent's deliberate public status proposal.
-;;;;
-;;;; The tool records a proposal and nothing else. The channel that owns the
-;;;; presence decides whether it is valid, too soon, or already showing, so a
-;;;; proposal cannot publish itself and a refused one costs nothing. Nothing
-;;;; here reads a reply, a transcript, or reasoning: the agent names the text
-;;;; it wants the world to see, and every other source stays private.
+;;;; presence.lsp --- Public custom status proposal tool.
 
 (in-package #:enchiridion.tools.builtin)
 
 (declaim (ftype (function (t) t) presence-run))
 
 (defun presence-run (args)
-  "Return one line after proposing the public custom status ARGS names.
-
-TEXT is the proposed line and CLEAR asks to remove the current one. The Fluxer
-channel validates the text, enforces its cooldown, and expires it; this tool
-only carries the proposal to the turn. A status is public, so the description
-asks for deliberate wording rather than anything copied out of a conversation."
+  "Validate a custom status proposal (TEXT or CLEAR); the Fluxer channel enforces limits and publishing."
   (let ((text (argument args "text"))
         (clear (argument args "clear")))
     (cond

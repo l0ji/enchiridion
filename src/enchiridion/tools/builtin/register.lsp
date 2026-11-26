@@ -1,8 +1,5 @@
-;;;; register.lsp --- One place that registers every builtin.
-;;;;
-;;;; The aggregator lives after the files it names. A function body may name a
-;;;; later function, but a warning about an undefined function is an error in
-;;;; this tree, so the order is part of the build.
+;;;; register.lsp --- Aggregator registering all built-in tools.
+;;;; Loaded last because undefined-function warnings are build errors.
 
 (in-package #:enchiridion.tools.builtin)
 

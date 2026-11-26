@@ -1,34 +1,17 @@
-;;;; schema.lsp --- One declaration, two jobs: the model schema and the check.
+;;;; schema.lsp --- Lisp tool schema DSL, JSON Schema conversion, and cl-jschema validation.
 ;;;;
-;;;; A tool's schema is a small Lisp form, not a JSON string. The same form
-;;;; builds the JSON Schema sent to the model and validates the arguments that
-;;;; come back. One source means the two cannot drift.
-;;;;
-;;;; The forms are deliberately close to JSON Schema:
-;;;;
-;;;;   (:object :required (:path) :properties ((:path :string)
-;;;;                                             (:from :integer)
-;;;;                                             (:to :integer)))
-;;;;
-;;;; The JSON conversion is in this file; validation is delegated to
-;;;; cl-jschema, which is the one JSON Schema implementation in the tree.
+;;;; Example: (:object :required (:path) :properties ((:path :string) (:from :integer)))
 
 (in-package #:enchiridion.tools)
 
 (defparameter *schema-budget* 2000
-  "The token budget for all tool schemas sent with a prompt. It is a soft
-budget: the report says what is over, and the caller decides whether to drop a
-tool or raise the cap.")
+  "Maximum total estimated tokens allowed across all registered tool schemas.")
 
 (declaim (ftype (function (t) hash-table) schema-to-json))
 
 (defun schema-to-json (schema)
-  "Return SCHEMA as a hash table that JZON writes as JSON Schema.
-
-A keyword is a type. A list is a compound form whose head names the type and
-whose tail is keyword arguments. The object form adds additionalProperties
-false, because a tool that ignores a misspelled argument is a tool that runs
-with the wrong argument and reports success."
+  "Convert Lisp SCHEMA (keyword type or (:object ...) / (:array ...) form) to a JZON hash table.
+Object schemas always set additionalProperties to false and include a properties table."
   (cond
     ((keywordp schema)
      (let ((table (make-hash-table :test #'equal)))
@@ -40,10 +23,7 @@ with the wrong argument and reports success."
         (let ((table (make-hash-table :test #'equal)))
           (setf (gethash "type" table) "object")
           (setf (gethash "additionalProperties" table) nil)
-          ;; Always present, even empty. An object schema with no properties
-          ;; and additionalProperties false is what a plugin with no tool
-          ;; form gets, and without the key the validator reads NIL where it
-          ;; wants a table and every call to the tool fails.
+          ;; Always emit an empty properties table; cl-jschema expects a hash table when additionalProperties is false.
           (setf (gethash "properties" table) (make-hash-table :test #'equal))
           (loop for (key value) on (rest schema) by #'cddr
                 do (case key
@@ -93,9 +73,7 @@ with the wrong argument and reports success."
   (ceiling (length (schema-json-string schema)) 4))
 
 (defun arguments-to-json (arguments)
-  "Return ARGUMENTS as the hash table shape JZON and cl-jschema expect.
-A property list gets string keys. A hash table is already what a parsed tool
-call holds and is passed through."
+  "Normalize ARGUMENTS (NIL, hash table, or plist) to a string-keyed hash table for JZON/cl-jschema."
   (cond
     ((null arguments) (make-hash-table :test #'equal))
     ((hash-table-p arguments) arguments)
@@ -112,15 +90,10 @@ call holds and is passed through."
 (declaim (ftype (function (t t) boolean) validate-arguments))
 
 (defun validate-arguments (schema arguments)
-  "Return T when ARGUMENTS matches SCHEMA. Signal SCHEMA-ERROR otherwise.
-
-CL-JSCHEMA signals INVALID-JSON with one or more INVALID-JSON-VALUE children;
-the children carry the JSON pointer and the reason, and both go into the detail
-so the model can correct the call instead of guessing."
-  ;; cl-jschema signals a type error, NIL is not a HASH-TABLE, on an object
-  ;; schema with no properties, whether the key is absent or empty. Such a
-  ;; schema takes no arguments, since additionalProperties is false, and that
-  ;; is checked here rather than handed to the validator.
+  "Validate ARGUMENTS against SCHEMA via cl-jschema, returning T or signaling SCHEMA-ERROR
+with joined cl-jschema error messages."
+  ;; cl-jschema signals a type error on object schemas with no properties;
+  ;; handle zero-argument objects directly since additionalProperties is false.
   (when (and (consp schema)
              (eq (first schema) :object)
              (null (getf (rest schema) :properties))

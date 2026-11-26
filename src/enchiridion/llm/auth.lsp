@@ -1,36 +1,22 @@
-;;;; auth.lsp --- How a credential becomes a header, a query parameter, or a
-;;;; signature.
+;;;; auth.lsp --- Credential headers, query parameters, and request signers.
 ;;;;
-;;;; There are four simple answers and two signed ones. The simple four are
-;;;; here: a bearer token, a vendor-named key header (Azure's api-key), an
-;;;; x-api-key header (Anthropic), and a query parameter (Google's older
-;;;; samples), plus the no-credential case a local server wants.
-;;;;
-;;;; The signed two are not here, and that is the point. AWS Signature V4 and
-;;;; Google OAuth are each a body of code that one vendor uses; they live in
-;;;; aws-sigv4.lsp and gcp-oauth.lsp. Those files register a signer under their
-;;;; scheme name, and this file dispatches to it. Nothing above auth.lsp names
-;;;; a vendor, and adding a third signed scheme later is a file and a register
-;;;; call rather than an edit here.
+;;;; Static schemes (:bearer, :api-key-header, :x-api-key, :query-param, :none)
+;;;; are handled here; signed schemes (:aws-sigv4, :gcp-oauth) register via
+;;;; REGISTER-AUTH-SIGNER from aws-sigv4.lsp and gcp-oauth.lsp.
 
 (in-package #:enchiridion.llm)
 
-;;;; The static schemes.
+;;;; Static schemes.
 
 (declaim (ftype (function (t t &optional list) list) auth-headers))
 
 (defun auth-headers (dialect key &optional extra)
-  "Return the credential header for DIALECT, or NIL when there is none.
-
-A signed scheme returns nothing here: its header cannot be written until the
-request exists, and AUTH-APPLY is what puts it in place."
+  "Return credential headers for DIALECT merged with EXTRA, or NIL for
+query-param, none, and signed schemes (applied later by AUTH-APPLY)."
   (let ((scheme (dialect-field dialect :auth-scheme :bearer))
-        ;; A row may state :auth-header NIL, so the default applies here.
+        ;; Explicit :auth-header NIL falls back to "api-key".
         (name (or (dialect-field dialect :auth-header nil) "api-key"))
-        ;; A vendor-named header sometimes carries a scheme word in its value:
-        ;; Cloudflare's gateway wants `cf-aig-authorization: Bearer <token>`,
-        ;; and the credential itself is the token. The prefix is data so that
-        ;; one header name is not enough information to send a right request.
+        ;; Optional value prefix, e.g. "Bearer " for custom gateway headers.
         (prefix (dialect-field dialect :auth-prefix "")))
     (merge-headers
      (case scheme
@@ -51,23 +37,17 @@ request exists, and AUTH-APPLY is what puts it in place."
                            (list pair))))))
 
 (defun auth-query-params (dialect key)
-  "Return the credential query parameters for DIALECT.
-
-Google's older samples pass the key as ?key=...; the endpoint also accepts a
-header, and the profile chooses. Every other scheme answers the empty list."
+  "Return credential query parameters for DIALECT (:query-param only), or NIL."
   (if (and (eq (dialect-field dialect :auth-scheme) :query-param)
            (plusp (length key)))
       (list (cons (or (dialect-field dialect :auth-query "key") "key") key))
       '()))
 
-;;;; The signed schemes.
+;;;; Signed schemes.
 
 (defparameter *auth-signers* '()
-  "Scheme keyword to a function of (DIALECT KEY REQUEST) returning headers.
-
-A signer closes over its own credentials and its own clock, so this table is
-the only thing the core knows about it. Filled by aws-sigv4.lsp and
-gcp-oauth.lsp as they load.")
+  "Plist mapping signed scheme keywords to functions of (DIALECT KEY REQUEST)
+returning headers.")
 
 (declaim (ftype (function (symbol function) t) register-auth-signer))
 
@@ -81,19 +61,13 @@ gcp-oauth.lsp as they load.")
   "Return the signer registered for SCHEME, or NIL."
   (getf *auth-signers* scheme))
 
-;;;; The one entry point.
+;;;; Entry point.
 
-;; A URL with a query string has to gain parameters without losing what it
-;; already carries; the catalog and the model listers build URLs with query
-;; strings of their own, so this is not hypothetical.
 (declaim (ftype (function (string t list) string) url-with-query))
 
 (defun url-with-query (url key parameters)
-  "Return URL with KEY as the query parameter, plus PARAMETERS, appended.
-
-KEY is the credential parameter name and may be NIL when there is only
-PARAMETERS. An existing query string is kept and extended rather than
-replaced, because the model listers add parameters of their own."
+  "Return URL with optional KEY and PARAMETERS appended to any existing query
+string. Accepts (NAME VALUE) or (NAME . VALUE) entries."
   (let ((parameters (if (and key (plusp (length key)))
                         (cons key parameters)
                         parameters)))
@@ -101,9 +75,6 @@ replaced, because the model listers add parameters of their own."
         (format nil "~A~A~{~A=~A~^&~}"
                 url
                 (if (search "?" url) "&" "?")
-                ;; A caller may write a parameter as (NAME VALUE) or as
-                ;; (NAME . VALUE), exactly as a header may be written, and the
-                ;; two must not produce different URLs.
                 (loop for parameter in parameters
                       append (list (quri:url-encode (princ-to-string (car parameter)))
                                     (quri:url-encode
@@ -114,12 +85,8 @@ replaced, because the model listers add parameters of their own."
         url)))
 
 (defun auth-apply (dialect key request &key extra)
-  "Return REQUEST with DIALECT's credential applied to it.
-
-The one place a handler has to call for auth, so a scheme that needs the
-finished body (SigV4 hashes it) and one that needs only the key take the same
-path. The body is already in the request at this point, which is exactly why
-signing is done here and not when the connection is built."
+  "Apply DIALECT's query params, static headers, extra headers, and any
+registered signer to REQUEST (after its body is populated) and return REQUEST."
   (let* ((scheme (dialect-field dialect :auth-scheme :bearer))
          (signer (find-auth-signer scheme))
          (url (url-with-query (http-request-url request)

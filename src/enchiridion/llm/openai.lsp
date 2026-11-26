@@ -1,54 +1,16 @@
-;;;; openai.lsp --- The OpenAI chat completions handler.
+;;;; openai.lsp --- OpenAI chat completions API handler.
 ;;;;
-;;;; One adapter covers OpenAI, OpenCode Go, Azure, OpenRouter, Groq and the
-;;;; long tail that speaks the chat completions shape. What differs between
-;;;; them is a DIALECT --- an auth header, a base path, a body field name ---
-;;;; and a dialect is data (see dialects.lsp), not a branch in this file.
-;;;;
-;;;; The request and the response are separated from the transport on purpose:
-;;;; COMPLETION-REQUEST and PARSE-COMPLETION are pure functions over text and
-;;;; data, so the whole wire format is testable without a network, a key, or a
-;;;; provider. The only part that needs any of those is the transport, and it
-;;;; lives in http.lsp now, not here.
-;;;;
-;;;; The handler registers itself as :OPENAI-CHAT at the bottom of the file.
-;;;; The provider table resolves a provider to this file through the registry
-;;;; and never names OpenAI: BUILD-OPENAI-PROVIDER receives an already resolved
-;;;; PROVIDER record (endpoint, key, model, profile, headers, options) and
-;;;; returns a BACKEND.
-;;;;
-;;;; The file is in dependency order, bottom to top, and it has to be. A name
-;;;; used before it is defined is not a forward declaration in Lisp: the
-;;;; compiler reads a symbol it has never seen as a variable, and the failure
-;;;; surfaces at run time as UNBOUND-VARIABLE from a function that plainly
-;;;; exists. The same trap closed in on the backend's own DEFMETHOD, which is
-;;;; why COMPLETE is defined after SEND-COMPLETION rather than with the other
-;;;; methods at the top, and it is why the registration is the last form here.
+;;;; Pure request/response builders live separately from HTTP transport (http.lsp).
+;;;; Provider differences are encoded as DIALECT data (dialects.lsp).
+;;;; Registered as :OPENAI-CHAT at EOF.
 
 (in-package #:enchiridion.llm)
 
 ;;;; The connection.
-;;;;
-;;;; The struct is OPENAI-CONNECTION and the constructor is OPENAI-BACKEND, so
-;;;; that the exported name is a function and the type stays an internal
-;;;; detail. A struct and a function cannot share one name here without the
-;;;; export list meaning two different things depending on how it is read.
 
-;; base-url always ends in a slash, so paths can be appended to it. api-key is
-;; never logged and never put in an error report. model is the default for
-;; this backend. timeout is seconds to wait for a reply, and retries is how
-;; many extra attempts a 429 or a 5xx earns. session-id identifies one
-;; conversation to OpenCode Go, which uses it for routing and prompt caching.
-;;
-;; headers are the operator's extra headers and dialect is the resolved quirk
-;; record; both are already merged by the provider table, so this handler never
-;; reads the configuration. A connection with a NIL dialect behaves exactly
-;; like the generic OpenAI wire, which is what every existing test relies on.
-;;
-;; max-tokens is the reply cap. NIL omits the field, which is what the generic
-;; wire did before this slot existed and what a provider with no configured cap
-;; still does; when it is set, the dialect decides which of the two spellings
-;; the provider accepts.
+;; base-url always has a trailing slash. api-key is never logged.
+;; session-id routes and caches conversations on OpenCode Go.
+;; dialect NIL uses generic OpenAI wire defaults; max-tokens NIL omits the cap.
 (defstruct (openai-connection (:constructor %make-connection))
   (:base-url "https://api.openai.com/v1/" :type string)
   (:api-key "" :type string)
@@ -69,14 +31,9 @@
                              (max-tokens nil)
                              (timeout 60)
                              (retries 2))
-  "Return a BACKEND that speaks the OpenAI chat completions shape.
-
-BASE-URL gains a trailing slash when it lacks one, because every path is
-appended to it and a missing slash silently turns /v1 into a host named v1.
-SESSION-ID is generated when it is absent; one backend is one conversation.
-DIALECT is the resolved quirk record from dialects.lsp; NIL means the generic
-wire, which is what a provider with no profile gets. MAX-TOKENS is the reply
-cap the dialect names the field for; NIL sends no cap."
+  "Return a BACKEND for the OpenAI chat completions API.
+Ensures BASE-URL has a trailing slash, generates SESSION-ID if absent, and
+uses generic OpenAI wire defaults when DIALECT is NIL."
   (%make-connection
    :base-url (ensure-trailing-slash base-url)
    :api-key (or api-key "")
@@ -90,22 +47,14 @@ cap the dialect names the field for; NIL sends no cap."
 
 ;;;; Shared dialect helpers.
 ;;;;
-;;;; A dialect is a record of overrides on top of the generic wire, and the
-;;;; generic wire is a NIL dialect. DIALECT-FIELD cannot be asked for a boolean
-;;;; with a T default: it answers its default for a slot that holds NIL, and
-;;;; NIL is exactly what a profile writes to switch a switch off
-;;;; (:openai-local has no tool_choice to send). So the helpers below read the
-;;;; slot with a NIL default whenever a dialect exists and fall back to the
-;;;; generic truth when there is none.
+;;;; For boolean switches where a dialect can explicitly set NIL (e.g. disabling
+;;;; tool_choice), read with a NIL default when a dialect is present and fall
+;;;; back to T only when DIALECT is NIL.
 
 (declaim (ftype (function (t t) string) dialect-path-with-model))
 
 (defun dialect-path-with-model (path model)
-  "Return PATH with every {model} replaced by MODEL.
-
-Azure's deployment path names the model inside the path, and a proxy's prefix
-may do the same, so the substitution belongs to the path and not to a branch in
-a handler. A path that does not carry the placeholder comes back unchanged."
+  "Return PATH with every {model} placeholder replaced by MODEL."
   (loop with result = (make-string-output-stream)
         with start = 0
         for position = (search "{model}" path :start2 start)
@@ -119,16 +68,8 @@ a handler. A path that does not carry the placeholder comes back unchanged."
 (declaim (ftype (function (t) t) plist-as-json-object))
 
 (defun plist-as-json-object (value)
-  "Return VALUE with every plist in it turned into a JSON object.
-
-STRINGIFY writes a plist as an ARRAY of alternating keys and values, which is
-the wrong shape for a vendor's extra request field and for tool arguments that
-arrived as a JSON object and were read back as a plist. Hash tables, strings,
-numbers and T are already what the writer wants and are returned untouched.
-A plist is the only nested shape a dialect carries, and it is either a field
-list or an argument object; an array would have arrived as a JSON array, which
-PARSE-JSON also turns into a list, so this function treats a bare list as the
-key/value pair list the writer is about to be handed."
+  "Recursively convert plists in VALUE to JSON hash tables.
+Required because STRINGIFY serializes plists as JSON arrays, not objects."
   (cond
     ((hash-table-p value) value)
     ((consp value)
@@ -140,27 +81,18 @@ key/value pair list the writer is about to be handed."
 (declaim (ftype (function (t) string) openai-max-tokens-key))
 
 (defun openai-max-tokens-key (dialect)
-  "Return the body key DIALECT wants the reply cap written under.
-
-The two spellings are not interchangeable: a provider that wants
-max_completion_tokens rejects max_tokens, and the other way round. Only the
-named one is written, and no cap writes neither."
+  "Return the max-tokens body key for DIALECT (\"max_completion_tokens\" or \"max_tokens\")."
   (if (eq (dialect-field dialect :max-tokens-field :max-tokens)
           :max-completion-tokens)
       "max_completion_tokens"
       "max_tokens"))
 
-;; The name is not DIALECT-EXTRA-BODY: that is the accessor the EXTRA-BODY slot
-;; already generates in dialects.lsp, and a function that takes it over is a
-;; redefinition warning, which this system makes an error.
+;; Distinct from the DIALECT-EXTRA-BODY struct accessor in dialects.lsp.
 (declaim (ftype (function (t) list) dialect-extra-body-fields))
 
 (defun dialect-extra-body-fields (dialect)
-  "Return DIALECT's extra request fields as (NAME . VALUE) pairs.
-
-The profile carries them as a plist of keywords and the wire wants JSON names,
-so the key is downcased here. A nested plist becomes an object rather than the
-array of alternating keys the JSON writer would otherwise produce for it."
+  "Return DIALECT's extra request fields as (NAME . VALUE) pairs with downcased
+JSON keys and nested plists converted to JSON objects."
   (let ((fields (dialect-field dialect :extra-body '())))
     (loop for (key value) on fields by #'cddr
           collect (cons (string-downcase (string key))
@@ -169,14 +101,8 @@ array of alternating keys the JSON writer would otherwise produce for it."
 (declaim (ftype (function (list) list) dialect-query-param-pairs))
 
 (defun dialect-query-param-pairs (parameters)
-  "Return PARAMETERS as proper (NAME . VALUE) pairs.
-
-A profile spells a parameter as a two element list --- (\"api-version\"
-\"2024-06-01\") --- and URL-WITH-QUERY walks its list with (LOOP FOR (NAME .
-VALUE) IN ...), which reads the second element of a two element list as a one
-element list and writes the query string as api-version=(2024-06-01). One
-function turns every spelling into the cons that walker wants, and it is called
-where the dialect is built so no handler has to remember to."
+  "Normalize PARAMETERS from two-element lists into (NAME . VALUE) cons pairs
+as expected by URL-WITH-QUERY."
   (loop for entry in parameters
         collect (cond ((not (consp entry)) entry)
                       ((consp (cdr entry)) (cons (car entry) (cadr entry)))
@@ -185,13 +111,7 @@ where the dialect is built so no handler has to remember to."
 (declaim (ftype (function (t) t) normalize-dialect-query-params))
 
 (defun normalize-dialect-query-params (dialect)
-  "Return DIALECT with every query parameter a proper (NAME . VALUE) pair.
-
-This is called wherever a dialect is about to be handed to AUTH-APPLY, because
-a profile spells a parameter as a two element list and the one appender reads a
-parameter as a cons. It is idempotent, so a dialect a provider builder already
-normalised costs nothing here, and a NIL dialect --- the generic wire --- is
-returned untouched."
+  "Idempotently normalize DIALECT's query-params to (NAME . VALUE) cons pairs."
   (when dialect
     (setf (dialect-query-params dialect)
           (dialect-query-param-pairs (dialect-query-params dialect))))
@@ -200,14 +120,8 @@ returned untouched."
 (declaim (ftype (function (t t) t) openai-field-value))
 
 (defun openai-field-value (data path)
-  "Return the value PATH names inside DATA, or NIL when it is absent.
-
-PATH is a field name or several of them joined with dots, because one provider
-reports a cached token count inside a nested object
-(prompt_tokens_details.cached_tokens) and another reports the same number at
-the top level under a name of its own (prompt_cache_hit_tokens). DATA is the
-plist shape PARSE-JSON produces; a hash table, as jzon produced it, is accepted
-too, so a caller that reads a reply with either parser can share this."
+  "Look up dot-separated PATH in plist or hash-table DATA, or return NIL.
+Supports both nested fields (prompt_tokens_details.cached_tokens) and flat ones."
   (when (and data path (stringp path) (plusp (length path)))
     (let ((node data)
           (start 0))
@@ -220,20 +134,12 @@ too, so a caller that reads a reply with either parser can share this."
           (unless dot (return node))
           (setf start (1+ dot)))))))
 
-;;;; Headers.
-;;;;
-;;;; The credential is not built here. AUTH-APPLY writes it, so a bearer token,
-;;;; Azure's api-key header, a query parameter and a signature all take one
-;;;; path, and a provider that replaces a header does so through one merge.
+;;;; Headers. Credentials are applied later by AUTH-APPLY.
 
 (declaim (ftype (function (&optional list) list) openai-static-headers))
 
 (defun openai-static-headers (&optional extra)
-  "Return the chat completions headers that are not the credential.
-
-The content type and the user agent are the same on every provider, and they
-live here so the chat request and the model lister cannot disagree about them.
-EXTRA is merged last, which is what lets a provider replace either one."
+  "Return non-credential OpenAI headers (Content-Type, User-Agent), with EXTRA merged last."
   (merge-headers
    (list (cons :content-type "application/json")
          (cons :user-agent "enchiridion/0.1.0"))
@@ -242,25 +148,12 @@ EXTRA is merged last, which is what lets a provider replace either one."
 (declaim (ftype (function (string &optional list) list) openai-headers))
 
 (defun openai-headers (session-id &optional extra)
-  "Return the headers one chat completions request carries.
-
-X-OPENCODE-SESSION is the one header OpenCode Go needs that a generic OpenAI
-client does not send: it is the routing key and the prompt cache key, and a
-generic server ignores it. The credential is added by AUTH-APPLY after this
-list exists, because where it belongs depends on the scheme."
+  "Return chat request headers including x-opencode-session, with EXTRA merged last."
   (merge-headers
    (openai-static-headers)
    (cons (cons :x-opencode-session session-id) extra)))
 
 ;;;; The request.
-;;;;
-;;;; The shape is the one every OpenAI-compatible server accepts:
-;;;;
-;;;;   {"model": "...", "messages": [{"role": "user", "content": "hi"}]}
-;;;;
-;;;; A tool call id rides along on a tool message because the provider matches
-;;;; results to calls by id, and a result whose id is missing or wrong is
-;;;; answered with an error rather than with a guess.
 
 (declaim (ftype (function (t) hash-table) tool-call->request))
 
@@ -274,16 +167,9 @@ list exists, because where it belongs depends on the scheme."
 (declaim (ftype (function (t) t) normalize-tool-arguments))
 
 (defun normalize-tool-arguments (arguments)
-  "Return a tool call's arguments as the JSON text the tool layer validates.
-
-Three shapes arrive in practice and all three become text. A provider that
-follows the specification sends a JSON string and it is passed through
-unchanged, because parsing and re-writing it could only change it. A provider
-that sends the arguments as an object arrives here either as a plist (this
-tree's PARSE-JSON turned the object into one) or as a jzon hash table, and
-either is written back as the object it was. An absent field and the empty
-string become an empty object: a tool that takes no arguments is a real thing,
-and the tool layer can index {} without a special case."
+  "Normalize tool-call ARGUMENTS to a JSON string.
+Passes non-empty strings through, serializes hash tables/plists as JSON objects,
+and turns NIL, +JSON-NULL+, or empty strings into \"{}\"."
   (cond
     ((null arguments) "{}")
     ((eq arguments +json-null+) "{}")
@@ -296,7 +182,8 @@ and the tool layer can index {} without a special case."
                 message->request-message))
 
 (defun message->request-message (message &optional dialect replay-p)
-  "Return MESSAGE in the destination dialect."
+  "Return MESSAGE encoded for DIALECT. When REPLAY-P is true, replays
+reasoning_content on assistant messages and sets empty tool-call content to null."
   (let* ((role (message-role message))
          (body (json-object :role (if (string= "system" role)
                                       (dialect-field dialect :system-role "system")
@@ -320,21 +207,11 @@ and the tool layer can index {} without a special case."
   (json-object :type "function" :function definition))
 
 (defun openai-request-body (model messages &key tools dialect max-tokens stream replay-p)
-  "Return the request body for MODEL continuing MESSAGES as data.
-
-The data shape and not text, because a dialect may need to rewrite a field
-before the body is written, and because the Bedrock and Vertex paths that share
-this builder stringify once at the end.
-
-DIALECT decides the system role, the name of the reply cap, which of the three
-optional fields are sent at all, and which extra fields are merged in. STREAM
-is NIL for every request this tree makes today: it exists so that a caller that
-does ask for a stream gets the stream_options field, which is legal only beside
-\"stream\": true, and only from a provider whose profile accepts it."
+  "Return the chat completions request body for MODEL and MESSAGES as a hash table.
+Applies DIALECT overrides (system role, max-tokens key, tool/stream flags, extra
+body fields) and reasoning replay when REPLAY-P is true."
   (flet ((flag (key)
-           ;; The raw slot answers a boolean, and the generic wire answers T
-           ;; when there is no dialect at all. See the note above the shared
-           ;; helpers for why the default cannot be passed to DIALECT-FIELD.
+           ;; Explicit NIL on a dialect overrides the generic T default.
            (if dialect (dialect-field dialect key nil) t)))
     (let ((body (json-object
                  :model model
@@ -371,11 +248,7 @@ does ask for a stream gets the stream_options field, which is legal only beside
 (declaim (ftype (function (t) list) parse-tool-calls))
 
 (defun parse-tool-calls (reply)
-  "Return the tool calls in REPLY, a request message read from the wire.
-
-Arguments are normalised to JSON text whichever of the three shapes the
-provider sent, because the tool layer and the TOOL-CALL store hold text and
-nothing above them wants to know that some servers send an object."
+  "Parse tool_calls from REPLY, normalizing each call's arguments to a JSON string."
   (loop for call in (getf reply :tool_calls)
         when call
         collect (%make-tool-call
@@ -385,17 +258,9 @@ nothing above them wants to know that some servers send an object."
                              (getf (getf call :function) :arguments)))))
 
 (defun parse-completion (data &key dialect replay-p)
-  "Return the COMPLETION described by DATA, which is the parsed JSON object a
-chat completions reply carries.
-
-Signals rather than returning an empty completion when the reply has no
-choices. An empty completion is indistinguishable from a model that said
-nothing, and that is the one failure the agent cannot recover from on its own.
-
-DIALECT decides where the chain of thought is read from and which fields carry
-the token counts. Reasoning is stored apart from the reply text and is never
-concatenated into it: a caller that showed TEXT to the operator would be
-showing the model's private notes as its answer."
+  "Parse a chat completions JSON plist DATA into a COMPLETION.
+Signals BACKEND-ERROR when choices are missing or when a thinking tool call
+cannot be replayed. Keeps reasoning-text separate from reply text."
   (let ((choices (getf data :choices)))
     (unless (and (listp choices) (plusp (length choices)))
       (error 'enchiridion.errors:backend-error
@@ -435,9 +300,6 @@ showing the model's private notes as its answer."
                         usage
                         (dialect-field dialect :output-tokens-field
                                        "completion_tokens")))
-       ;; A provider that reports cached tokens as a field of its own rather
-       ;; than inside prompt_tokens_details still has to be counted, or the
-       ;; ledger says every turn cost full price.
        :cache-read-tokens (json-count
                            (openai-field-value
                             usage
@@ -452,17 +314,9 @@ showing the model's private notes as its answer."
 ;;;; The transport.
 
 (defun send-completion (connection messages model &key tools)
-  "Return the COMPLETION for MESSAGES from CONNECTION using MODEL.
-
-The URL is the connection's base URL and the dialect's chat path, with {model}
-replaced by MODEL: Azure's deployment path and a proxy's prefix are data and
-not a branch. The credential is applied last, to the finished request, because
-a signed scheme has to see the body and the URL before it can sign them, and
-because that is the one call every scheme shares.
-
-The reply is parsed after POST-WITH-RETRIES returns, not inside it: a 200 that
-carries something PARSE-JSON cannot read is not a transport failure and is not
-retried, and the retry loop stays a loop over one HTTP call."
+  "Send a chat completion request for MESSAGES to CONNECTION using MODEL.
+Applies AUTH-APPLY last so signed schemes see the final URL and body.
+Reasoning replay is enabled only for deepseek-v4.1-flash on OpenCode Go."
   (let* ((dialect (normalize-dialect-query-params
                    (openai-connection-dialect connection)))
          (replay-p (and (string= model "deepseek-v4.1-flash")
@@ -501,43 +355,27 @@ retried, and the retry loop stays a loop over one HTTP call."
      :dialect dialect :replay-p replay-p)))
 
 ;;;; The operations.
-;;;;
-;;;; Last of the operations, because COMPLETE is a call into SEND-COMPLETION
-;;;; and a DEFMETHOD that calls a name the compiler has not seen yet compiles
-;;;; into a variable reference and fails at run time.
 
 (defmethod backend-name ((connection openai-connection))
   "Return a short name for this backend."
   (format nil "openai (~A)" (openai-connection-base-url connection)))
 
 (defmethod model-capabilities ((connection openai-connection))
-  "Return what this backend's models support.
-
-  :cache             the provider reports cached prompt tokens
-  :cache-breakpoints an explicit cache breakpoint is accepted in the request
-  :tools             tool calling is available
-  :streaming         a stream can be requested, and is not used here
-
-:CACHE-BREAKPOINTS is nil because no request sends one. It is
-reported as absent rather than as present-and-ignored so that nothing above
-has to guess whether the feature is real."
+  "Return capabilities plist for this backend (:cache-breakpoints is NIL because
+OpenAI requests do not send explicit cache breakpoints)."
   (declare (ignore connection))
   '(:tools t :streaming t :cache t :cache-breakpoints nil))
 
 (defmethod complete ((connection openai-connection) messages
                      &key model tools budget)
-  "Continue MESSAGES and return the COMPLETION.
-
-BUDGET is ignored: the budget decides whether a turn starts, not how long a
-reply may be, and the reply cap comes from the provider's own option."
+  "Continue MESSAGES and return a COMPLETION. BUDGET is ignored; max tokens comes
+from the connection."
   (declare (ignore budget))
   (send-completion connection messages
                    (or model (openai-connection-model connection))
                    :tools tools))
 
-;;;; Embeddings. The same base URL, key and auth scheme as the chat path, with
-;;;; the embeddings path appended. One request carries every text given; the
-;;;; caller batches.
+;;;; Embeddings.
 
 (defun embedding-request (model texts dimensions)
   "Return the JSON body of one embeddings request."
@@ -591,22 +429,11 @@ reply may be, and the reply cap comes from the provider's own option."
          (length texts)))))
 
 ;;;; The adapter.
-;;;;
-;;;; The provider table hands over an already resolved PROVIDER: endpoint, key,
-;;;; model, profile, headers and options. Everything vendor specific is either
-;;;; in the row or in the dialect, and this section is the only place that
-;;;; knows both a PROVIDER and this wire.
 
 (declaim (ftype (function (provider) t) openai-dialect-for))
 
 (defun openai-dialect-for (provider)
-  "Return the resolved dialect for PROVIDER.
-
-The provider's profile names the quirks and the row's :dialect-overrides
-replaces any single field. The row's own :query-params are appended to the
-profile's and every parameter is turned into a proper pair, because
-AUTH-APPLY is the one place that appends a query string and a second appender
-would drift from it."
+  "Resolve PROVIDER's dialect with :dialect-overrides and normalized query params."
   (let ((dialect (make-dialect-for
                   (provider-profile provider)
                   :protocol :openai
@@ -619,12 +446,7 @@ would drift from it."
 (declaim (ftype (function (provider) t) build-openai-provider))
 
 (defun build-openai-provider (provider)
-  "Return the :OPENAI-CHAT backend PROVIDER describes.
-
-The key is the resolved value and never the name of the variable that holds it,
-so this function cannot print or re-read one. The model is the provider's
-chosen one and falls back to its default; the backend replaces a missing one
-with the primary tier."
+  "Construct an :OPENAI-CHAT backend from resolved PROVIDER."
   (openai-backend
    :base-url (provider-base-url provider)
    :api-key (provider-key provider)
@@ -646,9 +468,7 @@ with the primary tier."
 (declaim (ftype (function (t) (or null integer)) openai-model-count))
 
 (defun openai-model-count (value)
-  "Return VALUE as a positive count, or NIL when the source did not say.
-NIL is not zero: a source that states no context window has not stated that the
-window is empty."
+  "Return VALUE if it is a positive integer, else NIL (unknown, not zero)."
   (if (and (integerp value) (plusp value)) value nil))
 
 (declaim (ftype (function (t) (or null number)) openai-model-price))
@@ -660,13 +480,8 @@ window is empty."
 (declaim (ftype (function (t) (or null number)) openai-token-price))
 
 (defun openai-token-price (value)
-  "Return VALUE, a price stated per token, as USD per million tokens.
-
-OpenRouter states its prices as strings of USD per token. The ledger keeps the
-per-million figure and this is the one place the unit is converted. A string
-that is not a number is an unknown price and not a zero one. READ is performed
-with *READ-EVAL* bound to NIL, because the string comes from a provider and a
-provider must not be able to run code in this process."
+  "Convert per-token USD price VALUE (number or numeric string) to USD per
+million tokens, or NIL if unparseable. Parses strings with *READ-EVAL* NIL."
   (let ((number (typecase value
                   (number value)
                   (string (let ((*read-eval* nil))
@@ -677,19 +492,8 @@ provider must not be able to run code in this process."
 (declaim (ftype (function (t t) model-info) openai-model-row))
 
 (defun openai-model-row (entry shape)
-  "Return ENTRY, one model of a listed provider, as a MODEL-INFO row.
-
-The three list shapes carry different facts. :DATA is the generic list, whose
-entries may add a context window and models.dev style flags. :OLLAMA names the
-model under NAME. :OPENROUTER is the rich one: it states the context window,
-the prices as USD-per-token strings, and which parameters --- tools, reasoning
---- the model accepts.
-
-An entry that carries a pricing object or a supported_parameters array is read
-as the rich shape even when the profile left the shape at its default, because
-those two fields are what decide how the numbers and the flags are read, and a
-profile that forgets to name the shape should not silently turn prices into
-NIL."
+  "Convert one model list ENTRY into a MODEL-INFO for SHAPE (:DATA, :OLLAMA, :OPENROUTER).
+Entries carrying :pricing or :supported_parameters use rich OpenRouter parsing."
   (let* ((ollama (eq shape :ollama))
          (rich (or (eq shape :openrouter)
                    (not (null (getf entry :supported_parameters)))
@@ -740,10 +544,7 @@ NIL."
 (declaim (ftype (function (t t) t) openai-model-entries))
 
 (defun openai-model-entries (payload shape)
-  "Return the model entries PAYLOAD carries for SHAPE.
-
-Ollama lists them under models, every other compatible endpoint under data.
-Both keys are read here so a caller never has to branch on a vendor."
+  "Extract model entries from PAYLOAD (:models for :OLLAMA, :data otherwise)."
   (case shape
     (:ollama (getf payload :models))
     (t (getf payload :data))))
@@ -751,11 +552,7 @@ Both keys are read here so a caller never has to branch on a vendor."
 (declaim (ftype (function (t t) list) openai-model-infos))
 
 (defun openai-model-infos (payload shape)
-  "Return every model PAYLOAD lists, as MODEL-INFO rows.
-
-An entry that is not an object is skipped rather than turned into a row of
-empty strings: a malformed reply should cost the models it could not describe
-and not the whole list."
+  "Convert model entries in PAYLOAD to MODEL-INFO rows, skipping malformed entries."
   (let ((entries (openai-model-entries payload shape)))
     (if (and (listp entries) (every #'consp entries))
         (loop for entry in entries collect (openai-model-row entry shape))
@@ -764,13 +561,8 @@ and not the whole list."
 (declaim (ftype (function (provider) t) list-openai-models))
 
 (defun list-openai-models (provider)
-  "Return the MODEL-INFO rows PROVIDER's own endpoint reports.
-
-The path and the shape are the dialect's. A profile that says it has no list
-(a NIL shape) answers NIL rather than sending a request that can only fail.
-The credential is applied with AUTH-APPLY for the same reason a chat request
-is: a header, a query parameter and a signature are one code path, and the
-model list must not be the one caller that forgets one of them."
+  "Fetch MODEL-INFO rows from PROVIDER's models endpoint using its dialect path,
+shape, and AUTH-APPLY. Returns NIL when the dialect has no models listing."
   (let* ((dialect (openai-dialect-for provider))
          (shape (if dialect
                     (dialect-field dialect :models-list-shape nil)
@@ -792,9 +584,6 @@ model list must not be the one caller that forgets one of them."
          shape)))))
 
 ;;;; Registration.
-;;;;
-;;;; Last form in the file, and it has to be: it names the two functions above
-;;;; with #', and a #' of a name the compiler has not seen is a warning.
 
 (register-api-handler
  :openai-chat

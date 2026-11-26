@@ -1,43 +1,18 @@
 ;;;; bedrock.lsp --- Amazon Bedrock's two Anthropic shapes, and its model list.
 ;;;;
-;;;; Bedrock speaks the Messages schema and does not speak Anthropic's
-;;;; transport. There are two ways in and they are different APIs:
-;;;;
+;;;; Two APIs share the Messages schema via dialect profiles in dialects.lsp:
 ;;;;   :bedrock-invoke    POST {base-url}/model/{model}/invoke
-;;;;     The model is in the path, the API revision is a body field called
-;;;;     anthropic_version, the beta feature list is a body array called
-;;;;     anthropic_beta, and there is no anthropic-version header at all.
-;;;;
+;;;;                      (model in path; anthropic_version & anthropic_beta in body)
 ;;;;   :bedrock-messages  POST https://bedrock-mantle.{region}.api.aws/anthropic/v1/messages
-;;;;     Anthropic's own Messages transport behind AWS's newer gateway: the
-;;;;     model is in the body, the revision travels in the anthropic-version
-;;;;     header and the betas in anthropic-beta.
-;;;;
-;;;; The differences are data. dialects.lsp ships a profile for each shape and
-;;;; this file reads it, so the version's location, the beta channel, whether a
-;;;; 1h cache TTL is accepted and whether the model goes in the body are all
-;;;; decided in one table rather than in branches here. What is left is the two
-;;;; things no dialect can carry: the URL, and which credential signs it.
-;;;;
-;;;; Signing is not written here either. The request goes through AUTH-APPLY and
-;;;; the :AWS-SIGV4 signer that aws-sigv4.lsp registered, with the region, the
-;;;; service and the method bound around the call. A bearer token, when one was
-;;;; resolved, replaces the signature: Bedrock accepts either, and an operator
-;;;; with a short-lived token should not have to hold a secret key as well.
+;;;;                      (model in body; anthropic-version & anthropic-beta in headers)
+;;;; Requests authenticate via AUTH-APPLY (:AWS-SIGV4 or :BEARER when a token is resolved).
 
 (in-package #:enchiridion.llm)
 
 ;;;; The connection.
 
-;; api is the handler id AND the dialect profile, deliberately: a Bedrock
-;; handler speaks exactly one wire, so there is nothing for the provider table to
-;; choose, and a second name for the same fact is a second name to keep in step.
-;;
-;; key holds the bearer token when the provider table resolved one, and is empty
-;; otherwise. region is the provider's own option or NIL, and the environment is
-;; consulted at request time rather than here, because a backend is built while
-;; a configuration is being read and a missing region should not stop a listing
-;; of what is configured.
+;; api is both handler ID and dialect profile. key holds an optional bearer token;
+;; region is resolved per request when NIL so config listing works without AWS_REGION.
 (defstruct (bedrock-connection (:constructor %make-bedrock-connection))
   (:api :bedrock-invoke :type keyword)
   (:dialect nil :type (or null dialect))
@@ -58,13 +33,9 @@
 (declaim (ftype (function (keyword &key (:bearer-p t)) t) bedrock-dialect-for))
 
 (defun bedrock-dialect-for (api &key bearer-p)
-  "Return the DIALECT that decorates the handler API's wire.
-
-Two of the profile's fields are corrected here rather than in dialects.lsp.
-MODEL-IN-BODY-P is NIL on the invoke path because the model is in the URL and
-Bedrock refuses a body that names it twice. The auth scheme becomes :BEARER when
-a token was resolved, which is how one handler reaches both credentials without
-this file writing a header itself."
+  "Return the DIALECT for API, clearing :model-in-body-p on :bedrock-invoke
+(Bedrock rejects a duplicate model in the body) and switching :auth-scheme to
+:bearer when BEARER-P is true."
   (make-dialect-for api
                     :protocol :anthropic
                     :overrides (append (and bearer-p (list :auth-scheme :bearer))
@@ -74,13 +45,8 @@ this file writing a header itself."
 (declaim (ftype (function (bedrock-connection) string) bedrock-region))
 
 (defun bedrock-region (connection)
-  "Return the region CONNECTION's endpoint lives in.
-
-The provider's own option wins, then AWS_REGION and AWS_DEFAULT_REGION, read
-from the loader first and the environment second: a value in .env is not in the
-process environment, and the supervisor unsets credential shaped names. There is
-no default region: a request signed for the wrong one is a 403 that names
-nothing, and us-east-1 may be another continent."
+  "Return CONNECTION's AWS region (:region option, then AWS_REGION, then
+AWS_DEFAULT_REGION, checking secrets before env), or signal CONFIGURATION-ERROR."
   (let ((region (or (aws-nonempty-string (bedrock-connection-region connection))
                     (secret-or-environment "AWS_REGION")
                     (secret-or-environment "AWS_DEFAULT_REGION"))))
@@ -92,11 +58,7 @@ nothing, and us-east-1 may be another continent."
 (declaim (ftype (function (bedrock-connection t) string) bedrock-model))
 
 (defun bedrock-model (connection model)
-  "Return the model to ask for: the turn's, the connection's, or an error.
-
-The invoke path carries the model in its URL, so a request with no model is a
-request with an empty path segment and a 404 that names nothing. Refusing here
-names the field."
+  "Return the model for a request (MODEL, then CONNECTION's model), or signal CONFIGURATION-ERROR."
   (or (aws-nonempty-string model)
       (aws-nonempty-string (bedrock-connection-model connection))
       (error 'enchiridion.errors:configuration-error
@@ -106,11 +68,8 @@ names the field."
 (declaim (ftype (function (bedrock-connection) string) bedrock-service))
 
 (defun bedrock-service (connection)
-  "Return the SigV4 service name for CONNECTION's shape.
-
-The two shapes are two services: the invoke path is signed for bedrock, and the
-mantle gateway for bedrock-mantle. The control plane is bedrock for both, which
-is why the model list passes its service explicitly instead of asking here."
+  "Return the SigV4 service name for CONNECTION (\"bedrock-mantle\" for
+:bedrock-messages, \"bedrock\" for :bedrock-invoke)."
   (if (eq (bedrock-connection-api connection) :bedrock-messages)
       "bedrock-mantle"
       "bedrock"))
@@ -118,11 +77,8 @@ is why the model list passes its service explicitly instead of asking here."
 (declaim (ftype (function (bedrock-connection) string) bedrock-version))
 
 (defun bedrock-version (connection)
-  "Return the API revision this wire announces, wherever the profile puts it.
-
-The invoke profile names bedrock-2023-05-31 in the body; the mantle profile
-leaves the field unset because the gateway speaks Anthropic's own revision, and
-that is the default here."
+  "Return CONNECTION's API revision from its dialect :version-value, defaulting
+to +ANTHROPIC-VERSION+."
   (or (aws-nonempty-string
        (dialect-field (bedrock-connection-dialect connection) :version-value))
       +anthropic-version+))
@@ -130,11 +86,7 @@ that is the default here."
 (declaim (ftype (function (bedrock-connection) boolean) bedrock-version-in-body-p))
 
 (defun bedrock-version-in-body-p (connection)
-  "Return T when this shape announces its revision in the body.
-
-The two locations are exclusive, which is the point: a request that carries both
-an anthropic_version field and an anthropic-version header is a request that
-names two protocols, and Bedrock's invoke path rejects the header outright."
+  "Return T when CONNECTION's dialect places the API revision in the request body."
   (eq (dialect-field (bedrock-connection-dialect connection)
                      :version-location :header)
       :body))
@@ -143,23 +95,15 @@ names two protocols, and Bedrock's invoke path rejects the header outright."
                 bedrock-option-integer))
 
 (defun bedrock-option-integer (value default &optional (minimum 1))
-  "Return VALUE when it is a whole number at least MINIMUM, else DEFAULT.
-
-A configuration file is text and an operator's typo reaches this handler as a
-string. A type error from a structure constructor names a slot nobody wrote,
-while the default value keeps a turn running and the option the operator meant to
-change is the one visible in the token count."
+  "Return VALUE if it is an integer >= MINIMUM, else DEFAULT."
   (if (and (integerp value) (>= value minimum)) value default))
 
 (declaim (ftype (function (provider &key (:api t)) bedrock-connection)
                 bedrock-backend))
 
 (defun bedrock-backend (provider &key (api :bedrock-invoke))
-  "Return a BACKEND that speaks one of Bedrock's two Anthropic shapes.
-
-The connection is built once and holds what does not change between turns; the
-region and the credential are resolved per request, because the environment and
-the secret store are read at that point."
+  "Build a BEDROCK-CONNECTION for PROVIDER using API; region and credentials
+are resolved per request."
   (let ((bearer (or (provider-key provider) "")))
     (%make-bedrock-connection
      :api api
@@ -183,12 +127,8 @@ the secret store are read at that point."
                 bedrock-endpoint-url))
 
 (defun bedrock-endpoint-url (connection path default-host)
-  "Return PATH under CONNECTION's base URL, or under DEFAULT-HOST.
-
-A provider that names a base URL is trusted to be the endpoint: a VPC endpoint
-and a test double are both that, and neither answers at the regional name. The
-slash is added rather than assumed, because a base URL without one turns the
-first path segment into a host name."
+  "Resolve PATH under CONNECTION's base URL (ensuring a trailing slash), or
+under https://DEFAULT-HOST/."
   (let ((base (bedrock-connection-base-url connection)))
     (if (and (stringp base) (plusp (length base)))
         (concatenate 'string (ensure-trailing-slash base) path)
@@ -206,12 +146,8 @@ first path segment into a host name."
                 bedrock-request-url))
 
 (defun bedrock-request-url (connection region model)
-  "Return the URL for one request from CONNECTION.
-
-The invoke path substitutes the model, escaped as a path segment: an inference
-profile id carries a colon, and a colon sent raw in a request target is a URL the
-service and the signature can disagree about. The mantle profile names its path
-in the dialect because that is the field the table keeps for exactly this."
+  "Return the request URL for CONNECTION, using the dialect's :chat-path or
+model/<uri-encoded-model>/invoke (encoding colons in inference profile IDs)."
   (let ((path (or (aws-nonempty-string
                    (dialect-field (bedrock-connection-dialect connection)
                                   :chat-path))
@@ -222,11 +158,8 @@ in the dialect because that is the field the table keeps for exactly this."
 (declaim (ftype (function (bedrock-connection string) string) bedrock-models-url))
 
 (defun bedrock-models-url (connection region)
-  "Return the control plane URL that lists the Anthropic foundation models.
-
-byProvider=anthropic is part of the URL and is signed with the rest of it: the
-query string is inside the canonical request, and a parameter appended after
-signing is a parameter AWS refuses."
+  "Return the control-plane URL for listing Anthropic foundation models
+(byProvider=anthropic is included so it is part of the signed query string)."
   (bedrock-endpoint-url connection
                         "foundation-models?byProvider=anthropic"
                         (format nil "bedrock.~A.amazonaws.com" region)))
@@ -237,13 +170,9 @@ signing is a parameter AWS refuses."
                 bedrock-request-body))
 
 (defun bedrock-request-body (connection messages model tools)
-  "Return the request body for MESSAGES as data.
-
-Everything that differs between the two shapes comes from the dialect: whether
-the model is written, whether the revision goes in the body, and whether the beta
-list is a body array. The cache TTL is dropped when the profile says the endpoint
-has no 1h lifetime, and cache_control itself is placed by the Anthropic builder
-on the blocks that end the reusable prefix, which both endpoints accept."
+  "Build the Anthropic request body hash table for CONNECTION per its dialect
+(omitting model when in path, placing anthropic_version/anthropic_beta in body
+when configured, and dropping cache_ttl if unsupported)."
   (let* ((dialect (bedrock-connection-dialect connection))
          (body (anthropic-request-body
                 messages
@@ -265,14 +194,9 @@ on the blocks that end the reusable prefix, which both endpoints accept."
 (declaim (ftype (function (bedrock-connection) list) bedrock-request-headers))
 
 (defun bedrock-request-headers (connection)
-  "Return the headers a request carries that are not the credential.
-
-The revision header and the beta header are written only when the dialect puts
-them in a header, so the invoke path gets neither: an anthropic-version header on
-that endpoint is a different API's field, and the betas travel in the body.
-
-The provider's own extra headers are merged underneath, so a configured header
-cannot replace the content type that makes the body readable."
+  "Return non-credential headers for CONNECTION (anthropic-version and
+anthropic-beta only when the dialect puts them in headers), merged over
+provider extra headers."
   (let* ((dialect (bedrock-connection-dialect connection))
          (headers (list (cons :content-type "application/json"))))
     (when (not (bedrock-version-in-body-p connection))
@@ -289,13 +213,9 @@ cannot replace the content type that makes the body readable."
                 bedrock-bearer-token))
 
 (defun bedrock-bearer-token (connection)
-  "Return the bearer token to send, or NIL when the request must be signed.
-
-AWS_BEARER_TOKEN_BEDROCK is AWS's own short lived token and wins outright. It is
-read from the loader first and the environment second: the supervisor unsets a
-credential shaped variable once the loader holds it. A provider key is a bearer
-token only while there is no access key to sign with: a machine with both has a
-signature its operator configured, and that is the credential."
+  "Return the bearer token to send, or NIL to sign with SigV4.
+AWS_BEARER_TOKEN_BEDROCK (secrets then env) always wins; CONNECTION's key is
+used as a bearer token only when no AWS signing credentials are available."
   (or (aws-nonempty-string (secret-or-environment "AWS_BEARER_TOKEN_BEDROCK"))
       (let ((key (aws-nonempty-string (bedrock-connection-key connection))))
         (when (and key (not (aws-credentials-available-p)))
@@ -309,22 +229,9 @@ signature its operator configured, and that is the credential."
 
 (defun bedrock-authorize (connection request &key (extra '()) (method "POST")
                                                  service)
-  "Return REQUEST with CONNECTION's credential applied.
-
-Through AUTH-APPLY, so the scheme is the dialect's answer and this file writes no
-credential header: :BEARER produces the Authorization header from the token, and
-:AWS-SIGV4 reaches the signer aws-sigv4.lsp registered. A signer needs the region,
-the service and the method, and the dialect record carries none of them, so they
-are bound around the call; the endpoint that built the URL is what knows them.
-
-SERVICE overrides the shape's own service name, which the control plane needs:
-listing models is a bedrock call whichever of the two shapes asked for the list.
-
-EXTRA is where this handler's own headers go, and they are not signed: the
-signature covers the host, the x-amz-* headers and the session token, which is
-exactly the set AWS requires, and adding the content type to it would mean a
-proxy that rewrites a charset breaks every request. AUTH-APPLY merges EXTRA
-under whatever the signer returned, so the two do not fight over a name."
+  "Apply CONNECTION's credential to REQUEST via AUTH-APPLY (:bearer if a token
+is resolved, else :aws-sigv4 with *AWS-REGION*, *AWS-SERVICE*, and
+*AWS-REQUEST-METHOD* bound). EXTRA headers are merged under signed headers."
   (let* ((bearer (bedrock-bearer-token connection))
          (dialect (if bearer
                       (bedrock-dialect-for (bedrock-connection-api connection)
@@ -340,10 +247,7 @@ under whatever the signer returned, so the two do not fight over a name."
 (declaim (ftype (function (t) string) bedrock-short-text))
 
 (defun bedrock-short-text (payload)
-  "Return PAYLOAD as text, cut to something an error report can carry.
-
-A proxy that answers with an HTML error page answers with a kilobyte of it, and
-an error whose detail is a whole page is an error nobody reads."
+  "Return PAYLOAD as text truncated to 200 characters for error details."
   (let ((text (if (stringp payload) payload (princ-to-string payload))))
     (if (> (length text) 200)
         (concatenate 'string (subseq text 0 200) "...")
@@ -352,18 +256,9 @@ an error whose detail is a whole page is an error nobody reads."
 (declaim (ftype (function (string) completion) bedrock-completion))
 
 (defun bedrock-completion (payload)
-  "Return the COMPLETION described by PAYLOAD, the reply text.
-
-Two failures that look like successes are told apart here. AWS's error envelope
-is an object with a message and no content, and it becomes a TRANSPORT-ERROR
-carrying the service's own words, because nothing about the request changes by
-reading it as a completion. A reply that is not a JSON object at all, an array or
-a page of HTML, is a CONFIGURATION-ERROR naming the reply: the shape is wrong
-before any content could be wrong.
-
-Everything else goes to ANTHROPIC-PARSE-COMPLETION, which owns the reply shape
-and reports a reply with no content blocks itself. PARSE-JSON upcases every key,
-so AWS's message and Message are one key by the time they get here."
+  "Parse PAYLOAD as a Bedrock completion. Non-object JSON signals
+CONFIGURATION-ERROR; an object with a :message key signals TRANSPORT-ERROR
+(status 200); otherwise delegates to ANTHROPIC-PARSE-COMPLETION."
   (let* ((raw (handler-case (parse-json payload) (error () nil)))
          (data (and (consp raw) (keywordp (first raw)) raw)))
     (unless data
@@ -378,21 +273,12 @@ so AWS's message and Message are one key by the time they get here."
                :detail message)))
     (anthropic-parse-completion payload)))
 
-;;;; The model list.
-;;;;
-;;;; The control plane is the only listing Bedrock offers, and it is deliberately
-;;;; forgiving: the control plane has changed shape between API revisions, an
-;;;; operator's VPC endpoint may answer with less, and a model list that throws
-;;;; is a provider that cannot be listed at all.
+;;;; The model list (forgiving control-plane parser).
 
 (declaim (ftype (function (t t) t) bedrock-row-value))
 
 (defun bedrock-row-value (row key)
-  "Return KEY from ROW, one row of the parsed control plane reply, or NIL.
-
-ROWS comes from a provider and may be anything at all: a row that is not an
-object answers NIL here rather than signalling, because one odd row must not lose
-the rest of the list."
+  "Return KEY from plist ROW, or NIL if ROW is not a list."
   (if (listp row) (getf row key) nil))
 
 (declaim (ftype (function (t t) list) bedrock-plist-list))
@@ -405,11 +291,8 @@ the rest of the list."
 (declaim (ftype (function (t) list) bedrock-summary-rows))
 
 (defun bedrock-summary-rows (data)
-  "Return the rows in DATA, the parsed control plane reply.
-
-Models and inference profiles are both accepted, and so is a bare array: the
-byProvider filter returns modelSummaries, a call that asks for profiles answers
-with inferenceProfileSummaries, and a proxy may hand back the array itself."
+  "Extract model rows from parsed control-plane DATA (modelSummaries,
+inferenceProfileSummaries, or a bare list)."
   (cond
     ((null data) '())
     ((and (listp data) (keywordp (first data)))
@@ -421,11 +304,7 @@ with inferenceProfileSummaries, and a proxy may hand back the array itself."
 (declaim (ftype (function (t) (or null string)) bedrock-arn-tail))
 
 (defun bedrock-arn-tail (arn)
-  "Return the last slash separated field of ARN, or NIL.
-
-A model row from an older revision names its model only by ARN. The tail of an
-ARN is the model id or the inference profile id, which is the name a caller
-needs, and an ARN with no slash is itself that name."
+  "Return the last slash-separated segment of ARN (or ARN itself if no slash), or NIL."
   (let ((arn (aws-nonempty-string arn)))
     (when arn
       (let ((slash (position #\/ arn :from-end t)))
@@ -434,11 +313,7 @@ needs, and an ARN with no slash is itself that name."
 (declaim (ftype (function (t) (or null string)) bedrock-row-id))
 
 (defun bedrock-row-id (row)
-  "Return the model id a control plane row names, or NIL.
-
-The id may arrive as a model id, as an inference profile id, or only inside an
-ARN, and inference profile ids are the ones a caller wants in a region that has
-no on demand access to the model itself."
+  "Return the model or inference profile ID from ROW, falling back to the tail of :modelarn."
   (or (aws-nonempty-string (bedrock-row-value row :modelid))
       (aws-nonempty-string (bedrock-row-value row :inferenceprofileid))
       (aws-nonempty-string (bedrock-row-value row :id))
@@ -456,23 +331,15 @@ no on demand access to the model itself."
 (declaim (ftype (function (t) boolean) bedrock-anthropic-row-p))
 
 (defun bedrock-anthropic-row-p (row)
-  "Return T when ROW names Anthropic as its provider, or names none.
-
-The request asks for byProvider=anthropic. This is what keeps a control plane
-that ignored the filter from filling the catalog with models this handler cannot
-speak to, and a row from an inference profile, which carries no provider, is kept."
+  "Return T when ROW's :providername is \"anthropic\" or absent (as on inference profiles)."
   (let ((provider (aws-nonempty-string (bedrock-row-value row :providername))))
     (or (null provider) (string-equal provider "anthropic"))))
 
 (declaim (ftype (function (t) list) bedrock-model-rows))
 
 (defun bedrock-model-rows (payload)
-  "Return MODEL-INFO rows for PAYLOAD, the control plane reply text.
-
-A reply that is not JSON, a missing array and a row with no id all yield fewer
-rows and never an error. TOOL-CALL-P is true for every row: the control plane does
-not report tool support, and every Anthropic model Bedrock serves calls tools,
-which is what the catalog's default rule reads."
+  "Parse control-plane PAYLOAD into MODEL-INFO structs for Anthropic rows,
+ignoring malformed data and setting :tool-call-p to T."
   (let* ((data (handler-case (parse-json payload) (error () nil)))
          (rows (bedrock-summary-rows data)))
     (loop for row in rows
@@ -486,10 +353,8 @@ which is what the catalog's default rule reads."
 (declaim (ftype (function (provider) list) bedrock-list-models))
 
 (defun bedrock-list-models (provider)
-  "Return the Anthropic models Bedrock's control plane offers for PROVIDER.
-
-The list is one GET, signed for the bedrock service whichever shape asked, and
-read through *HTTP-GET-FUNCTION* so a test can answer from a fixture."
+  "Fetch Anthropic models from Bedrock's control plane for PROVIDER via a GET
+signed for the \"bedrock\" service."
   (let* ((connection (bedrock-backend provider
                                       :api (or (provider-api provider)
                                                :bedrock-invoke)))
@@ -505,10 +370,6 @@ read through *HTTP-GET-FUNCTION* so a test can answer from a fixture."
      (get-with-retries signed (bedrock-connection-retries connection)))))
 
 ;;;; The operations.
-;;;;
-;;;; Last, because COMPLETE calls the builders above and a DEFMETHOD that calls a
-;;;; name the compiler has not seen yet compiles into a variable reference and
-;;;; fails at run time rather than here.
 
 (defmethod backend-name ((connection bedrock-connection))
   "Return a short name for this backend."
@@ -517,28 +378,15 @@ read through *HTTP-GET-FUNCTION* so a test can answer from a fixture."
           (or (bedrock-connection-region connection) "no region")))
 
 (defmethod model-capabilities ((connection bedrock-connection))
-  "Return what this backend's models support.
-
-  :tools             tool calling is available
-  :streaming         NIL: the invoke path streams through a different endpoint
-  :cache             the provider reports cached prompt tokens
-  :cache-breakpoints cache_control is accepted on a content block
-
-:STREAMING is NIL here and T on Anthropic's own backend, and the difference is
-real: this handler never calls the streaming operation, and reporting a feature
-as present when nothing sends it is how a caller ends up waiting for a reply that
-will not arrive."
+  "Return supported capabilities (:streaming is NIL because this handler does
+not call the streaming endpoint)."
   (declare (ignore connection))
   '(:tools t :streaming nil :cache t :cache-breakpoints t))
 
 (defmethod complete ((connection bedrock-connection) messages
                      &key model tools budget)
-  "Continue MESSAGES and return the COMPLETION.
-
-The body is built first and the URL second, both from the same dialect, so the
-model that is in the URL is the model that is absent from the body. BUDGET is
-ignored: the budget decides whether a turn starts, not how long a reply may be,
-and max_tokens comes from the connection."
+  "Continue MESSAGES and return a COMPLETION. BUDGET is ignored; max_tokens
+comes from CONNECTION."
   (declare (ignore budget))
   (let* ((region (bedrock-region connection))
          (model (bedrock-model connection model))

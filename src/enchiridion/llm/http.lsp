@@ -1,20 +1,4 @@
-;;;; http.lsp --- One transport, one retry loop, and the headers that ride on it.
-;;;;
-;;;; There used to be two transports, http-post and anthropic-http-post, and
-;;;; they differed in nothing but their headers. Keeping both forced every
-;;;; caller through a six argument call whose last parameter meant "the
-;;;; session id" on one wire and "the anthropic version" on the other, and it
-;;;; made a third wire (Bedrock, Vertex) impossible without a third copy of the
-;;;; retry policy.
-;;;;
-;;;; A request is now a value: URL, body, headers, timeout. A handler builds
-;;;; one, signs or decorates it, and hands it to POST-WITH-RETRIES. The retry
-;;;; policy is written once and cannot drift between providers, because there
-;;;; is no second loop to drift from.
-;;;;
-;;;; Nothing here knows a provider. The header builders live with the handler
-;;;; that sends them; this file owns only how a request is put on the wire and
-;;;; what is worth sending again.
+;;;; http.lsp --- Shared HTTP transport, bounded response reading, and retry loop.
 
 (in-package #:enchiridion.llm)
 
@@ -23,12 +7,7 @@
 (declaim (ftype (function (string) string) ensure-trailing-slash))
 
 (defun ensure-trailing-slash (url)
-  "Return URL ending in a slash, adding one when it lacks it.
-
-Every path in this tree is appended to a base URL, so a missing slash silently
-turns /v1 into a host named v1 and the request fails with a name error instead
-of a useful message. One function for it means the rule cannot be right in one
-handler and wrong in another."
+  "Return URL with a trailing slash, appending one if missing."
   (if (and (plusp (length url))
            (char= (char url (1- (length url))) #\/))
       url
@@ -37,9 +16,7 @@ handler and wrong in another."
 (declaim (ftype (function () string) new-session-id))
 
 (defun new-session-id ()
-  "Return a 32 character hexadecimal session id. OpenCode Go asks for one on
-every request so that it can route a conversation and keep its prompt cache
-warm. A handler generates one when it is built and reuses it for every turn."
+  "Return a 32-character uppercase hex session ID."
   (format nil "~32,'0X" (random (expt 2 128))))
 
 (declaim (ftype (function (list list) list) merge-headers))
@@ -47,10 +24,8 @@ warm. A handler generates one when it is built and reuses it for every turn."
 (declaim (ftype (function (t) list) beta-list))
 
 (defun beta-list (value)
-  "Return VALUE as a list of feature names.
-
-A configuration file spells a short list as a comma separated string and a Lisp
-caller spells it as a list; both reach a handler as the same list."
+  "Normalize VALUE (comma-separated string or list of strings) into a list of
+feature names."
   (cond
     ((null value) '())
     ((stringp value)
@@ -64,17 +39,8 @@ caller spells it as a list; both reach a handler as the same list."
 (declaim (ftype (function (list) list) header-pairs))
 
 (defun header-pairs (headers)
-  "Return HEADERS as an alist of conses.
-
-dexador walks a header list with (LOOP FOR (NAME . VALUE) IN HEADERS), so a
-two element list leaves VALUE bound to the list of its one element and the
-header goes on the wire as `X-Tenant: (acme)`. That is a real defect and not a
-style point: the operator writes ((\"X-Tenant\" \"acme\")) in config.lsp, the
-docs show that spelling, and it must reach the wire as a header.
-
-Both spellings are accepted and both come out as conses, because a value that
-is a keyword such as :content-type and a value that is a list are one fact to
-every caller here. This is the one place that knows the difference."
+  "Normalize HEADERS into an alist of (NAME . VALUE) conses for dexador, which
+formats (NAME VALUE) lists with parentheses."
   (loop for header in headers
         when header
           collect (if (consp (cdr header))
@@ -84,16 +50,8 @@ every caller here. This is the one place that knows the difference."
 (declaim (ftype (function (list list) list) merge-headers))
 
 (defun merge-headers (base extra)
-  "Return BASE with every header in EXTRA added, EXTRA winning a name clash.
-
-Names are compared case-insensitively because HTTP header names are, and
-because one side of this call is a list of keywords written in Lisp and the
-other is a list of strings that came out of config.lsp. A provider that wants a
-different Authorization header must be able to replace the one the handler
-built, and that is exactly what this merge allows.
-
-Both sides go through HEADER-PAIRS, so a caller may write a header either way
-and cannot smuggle a parenthesised value onto the wire."
+  "Merge EXTRA onto BASE case-insensitively (EXTRA wins), normalizing both sides
+via HEADER-PAIRS."
   (let ((result (header-pairs base)))
     (dolist (header (header-pairs extra) result)
       (let ((name (car header)))
@@ -105,14 +63,7 @@ and cannot smuggle a parenthesised value onto the wire."
 
 ;;;; The request.
 
-;; Headers is an alist of conses and not a list of two element lists. dexador
-;; walks the header list with (LOOP FOR (NAME . VALUE) IN HEADERS), so a two
-;; element list leaves VALUE bound to a list of one string and the header goes
-;; on the wire as a parenthesised list.
-;;
-;; The constructor is MAKE-HTTP-REQUEST and not a %MAKE- one because this
-;; structure is built by every handler and by tests, and a private constructor
-;; would only mean an exported wrapper per caller.
+;; HEADERS must be an alist of (NAME . VALUE) conses for dexador.
 (defstruct (http-request (:constructor make-http-request))
   (:url "" :type string)
   (:body "" :type string)
@@ -121,20 +72,8 @@ and cannot smuggle a parenthesised value onto the wire."
 
 ;;;; The transport.
 
-;; dexador signals HTTP-REQUEST-FAILED on any 4xx or 5xx and returns the body
-;; on a 2xx, so the status is read off the condition rather than off a return
-;; value. RESPONSE-STATUS is that condition's reader; it is not a way to ask
-;; "what did the last call return", and calling it with no arguments is a
-;; style warning about arity.
-;;
-;; The argument names are dexador's, not guesses. It spells the payload :CONTENT
-;; and not :DATA, spells the content type as a header and not as a :CONTENT-TYPE
-;; argument, and spells both halves of a deadline :READ-TIMEOUT and
-;; :CONNECT-TIMEOUT with no :TIMEOUT at all. Passing the names that read well
-;; instead of the names it accepts is a style warning about unknown argument
-;; keywords, and a warning here is an error.
-;;
-;; Responses are binary streams until the byte limit has been checked
+;; dexador uses :content, :read-timeout, and :connect-timeout, and signals
+;; HTTP-REQUEST-FAILED on 4xx/5xx (status via RESPONSE-STATUS).
 (defparameter *request-deadline-factor* 5
   "The wall-clock deadline as a multiple of one socket timeout.")
 
@@ -202,22 +141,17 @@ and cannot smuggle a parenthesised value onto the wire."
   "POST REQUEST and return the reply text."
   (bounded-http-request request))
 
-;; The transport is a special so a test can replace it without a network. That
-;; is also the only way to test the retry path, because the retry path is about
-;; what happens between two calls and not about what a provider says.
 (defparameter *http-post-function* #'http-post
   "The function POST-WITH-RETRIES uses to make one HTTP request. Bound in tests.")
 
 (defparameter *retry-delay* 2
-  "The base delay in seconds for a retry. Attempt N waits N times this. Bound
-to 0 in tests so a retry test does not spend six seconds asleep.")
+  "Base retry backoff in seconds (attempt N sleeps N * *RETRY-DELAY*). Bound to 0 in tests.")
 
 (declaim (ftype (function (string) (or null string)) provider-error-message))
 
 (defun provider-error-message (payload)
-  "Return the provider's own error text from PAYLOAD, or a short note when
-there is none. A reply that is not JSON at all is not a crash: a proxy in
-front of the provider answers HTML."
+  "Extract a provider error message from JSON PAYLOAD, or return a fallback note
+if non-JSON."
   (handler-case
       (let* ((parsed (parse-json payload))
              (error-object (getf parsed :error)))
@@ -227,9 +161,7 @@ front of the provider answers HTML."
           ((stringp (getf parsed :error_description))
            (getf parsed :error_description))
           ((stringp error-object) error-object)
-          ;; AWS and GCP spell the same fact with a capitalized key and no
-          ;; wrapper object; reading it here keeps every handler's errors
-          ;; legible without a per-vendor error parser.
+          ;; AWS and GCP use top-level message/Message without an error wrapper.
           ((stringp (getf parsed :message)) (getf parsed :message))
           ((stringp (getf parsed :Message)) (getf parsed :Message))
           (t (string-right-trim '(#\Space #\Newline #\Return) (or payload "")))))
@@ -239,23 +171,9 @@ front of the provider answers HTML."
                 post-with-retries))
 
 (defun post-with-retries (transport request retries)
-  "POST REQUEST with TRANSPORT, repeating a retryable status.
-
-429 and 5xx are repeated with a growing gap, because they are the two the same
-request is worth sending again. 529 is Anthropic's overloaded status and 504
-is its gateway timeout; both are above 500 and are covered by the same test.
-Everything else in the 4xx range is reported at once: a wrong key or a wrong
-model does not become right by being repeated.
-
-There is no loop inside the handler. The handler returns after it sleeps, the
-body of the outer loop ends, and the outer loop runs again. An inner (loop)
-would be a new infinite loop and a 429 would hang the process instead of
-retrying the request.
-
-Each attempt has a wall-clock deadline of *REQUEST-DEADLINE-FACTOR* times the
-request's timeout. A request that reaches it is reported as a transport error
-and not repeated: one that hung once is a wait, and three of them are a
-longer wait that a heartbeat tick spends blocked."
+  "Send REQUEST via TRANSPORT, retrying HTTP 429 and 5xx up to RETRIES times
+with linear backoff (*RETRY-DELAY* * attempt). Each attempt has a wall-clock
+deadline of *REQUEST-DEADLINE-FACTOR* * timeout; timeouts and other 4xx fail immediately."
   (let ((attempt 0)
         (deadline (* *request-deadline-factor* (http-request-timeout request))))
     (loop
@@ -283,9 +201,6 @@ longer wait that a heartbeat tick spends blocked."
 
 ;;;; The one GET.
 
-;; The catalog and the model-list calls need a GET and nothing else. The
-;; injection point mirrors *HTTP-POST-FUNCTION* and the web tool's
-;; *WEB-GET-FUNCTION*, so a test can answer from a fixture.
 (defparameter +http-get-timeout+ 10
   "Seconds before one catalog or model-list request is abandoned.")
 
@@ -295,8 +210,7 @@ longer wait that a heartbeat tick spends blocked."
                         :method :get))
 
 (defparameter *http-get-function* #'http-get
-  "The function the catalog and the model listers use to make one HTTP GET.
-Bound in tests so no catalog test opens a socket.")
+  "HTTP GET function used by catalog and model listers. Bound in tests.")
 
 (defun get-with-retries (request &optional (retries 2))
   "GET REQUEST through the shared deadline and retry policy."

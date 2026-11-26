@@ -1,35 +1,13 @@
-;;;; aws-sigv4.lsp --- AWS Signature Version 4, over an HTTP request.
+;;;; aws-sigv4.lsp --- AWS Signature Version 4 signing over HTTP-REQUEST.
 ;;;;
-;;;; Bedrock is the only AWS service this tree speaks to, and every request to
-;;;; it has to be signed. Nothing about the signature is negotiated: a canonical
-;;;; request is built from the method, the path, the query, the headers and the
-;;;; hash of the body; that text is hashed into a string to sign; and a key
-;;;; derived from the secret signs it. Every step here is a pure function of
-;;;; text, which is the only reason a signature can be checked against AWS's own
-;;;; published vectors without a socket and without a key.
-;;;;
-;;;; The request shape is not this file's business. SIGN-REQUEST reads an
-;;;; HTTP-REQUEST and returns a new header list; the vendor handler decides the
-;;;; URL, the region, the service and the body. The signed scheme is registered
-;;;; under :AWS-SIGV4, so a dialect-driven handler reaches it through AUTH-APPLY
-;;;; and this file never learns which handler called it.
-;;;;
-;;;; Being strict is deliberate. A missing credential raises instead of signing
-;;;; with the empty string: a request signed with no key comes back a 403 that
-;;;; names neither the key nor the field, and the operator is left guessing
-;;;; which of several environment variables was the wrong one.
+;;;; Pure canonicalization, key derivation, and signing helpers (testable
+;;;; directly against AWS SigV4 vectors), registered as :AWS-SIGV4 for AUTH-APPLY.
 
 (in-package #:enchiridion.llm)
 
 ;;;; Credentials.
-;;;;
-;;;; A credential is a value and not three specials, because the signer must be
-;;;; able to sign with a credential somebody else resolved: the Bedrock handler
-;;;; resolves one per request, and a test injects one directly.
 
-;; The session token is genuinely absent when there is none. An empty string
-;; would be signed as an x-amz-security-token header whose value is nothing,
-;; and AWS reads that as a malformed request rather than as no token at all.
+;; SESSION-TOKEN is NIL when absent so an empty x-amz-security-token is never signed.
 (defstruct (aws-credential (:constructor %make-aws-credential))
   (:access-key "" :type string)
   (:secret-key "" :type string)
@@ -40,12 +18,8 @@
                 make-aws-credential))
 
 (defun make-aws-credential (&key access-key secret-key session-token)
-  "Return an AWS credential holding ACCESS-KEY, SECRET-KEY and SESSION-TOKEN.
-
-A missing key becomes the empty string, which AWS-CREDENTIAL-USABLE-P then
-refuses: the value exists so that a half configured operator gets a
-CONFIGURATION-ERROR naming :AWS-CREDENTIALS, and not a type error about a slot
-that was handed NIL."
+  "Construct an AWS-CREDENTIAL; missing access/secret keys default to \"\" so
+AWS-CREDENTIAL-USABLE-P rejects them cleanly."
   (%make-aws-credential :access-key (or access-key "")
                         :secret-key (or secret-key "")
                         :session-token session-token))
@@ -53,21 +27,13 @@ that was handed NIL."
 (declaim (ftype (function (t) (or null string)) aws-nonempty-string))
 
 (defun aws-nonempty-string (value)
-  "Return VALUE when it is a string with at least one character, else NIL.
-
-A variable that is set to the empty string is set and says nothing, which is
-the same fact as an unset one here. Every reader below funnels through this so
-that the two spellings of absence cannot disagree."
+  "Return VALUE if it is a non-empty string, else NIL."
   (and (stringp value) (plusp (length value)) value))
 
 (declaim (ftype (function (string) (or null string)) secret-or-environment))
 
 (defun secret-or-environment (name)
-  "Return NAME's value from the secret store, then from the environment.
-
-The secret store wins because it holds what the loader read from the operator's
-file. An exported variable is the weaker statement of the same fact, and a
-stale export must not override the file the operator edits."
+  "Look up NAME in the secret store first, falling back to the environment."
   (or (aws-nonempty-string (enchiridion.llm.secrets:secret-value name))
       (aws-nonempty-string (enchiridion.compat:environment-value name))))
 
@@ -76,15 +42,9 @@ stale export must not override the file the operator edits."
                 aws-credentials))
 
 (defun aws-credentials (&key access-key secret-key session-token)
-  "Return the AWS credentials available to sign with, or NIL when there are none.
-
-An explicit argument wins over everything: the caller that passes one has
-already decided. The names are the three every AWS toolchain reads.
-
-Half a credential is not a credential and answers NIL rather than a struct
-whose signature would be wrong. The caller that needs one says so with an error
-that names the key, and that error is the point: it is the only place in the
-system that can tell an operator which of the three variables was missing."
+  "Resolve AWS credentials from explicit args, then AWS_ACCESS_KEY_ID /
+AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN (secrets then env). Returns NIL
+unless both access and secret keys are present."
   (let ((access (or (aws-nonempty-string access-key)
                     (secret-or-environment "AWS_ACCESS_KEY_ID")))
         (secret (or (aws-nonempty-string secret-key)
@@ -98,21 +58,14 @@ system that can tell an operator which of the three variables was missing."
 (declaim (type (or null function) *aws-credentials-function*))
 
 (defparameter *aws-credentials-function* #'aws-credentials
-  "The function SIGN-REQUEST asks for credentials when it is given none.
-
-Bound in tests to a constant, so a signature is never a function of the
-operator's own environment. NIL means no resolver at all, which is how a test
-says 'signing must fail here'.")
+  "Zero-arg credential resolver used by SIGN-REQUEST when no credentials are
+passed; NIL disables resolution.")
 
 (declaim (ftype (function () (or null aws-credential)) resolve-aws-credentials))
 
 (defun resolve-aws-credentials ()
-  "Return the credential *AWS-CREDENTIALS-FUNCTION* answers, or NIL.
-
-The special is copied into a local before it is called because a special
-variable is not narrowed by SBCL's flow analysis: FUNCALL on a perhaps-NIL
-special is a warning waiting to happen, and this system makes a warning an
-error."
+  "Call *AWS-CREDENTIALS-FUNCTION* if it is a function, else return NIL.
+Copies the special to a local so SBCL can narrow its type."
   (let ((resolver *aws-credentials-function*))
     (if (functionp resolver) (funcall resolver) nil)))
 
@@ -127,20 +80,11 @@ error."
 (declaim (ftype (function () boolean) aws-credentials-available-p))
 
 (defun aws-credentials-available-p ()
-  "Return T when this process has AWS credentials to sign a request with.
-
-The Bedrock handler asks before it chooses between a bearer token and a
-signature: a provider key is a bearer token only while there is no access key
-to sign with."
+  "Return T when usable AWS signing credentials can be resolved."
   (aws-credential-usable-p (resolve-aws-credentials)))
 
 ;;;; Octets, hex and hashing.
-;;;;
-;;;; IRONCLAD takes octets and answers octets. Text reaches it through
-;;;; COMPAT:ENCODE-UTF8 and not through an ironclad string convenience, because
-;;;; the body hash has to be the hash of the bytes that go on the wire: a body
-;;;; with one non-ASCII character hashes differently under UTF-8 and Latin-1,
-;;;; and the service compares its own hash of what it received.
+;;;; Uses UTF-8 via COMPAT:ENCODE-UTF8 so digests match wire bytes.
 
 (declaim (ftype (function (string) vector) aws-string-octets))
 
@@ -151,10 +95,7 @@ to sign with."
 (declaim (ftype (function (vector) string) aws-hex))
 
 (defun aws-hex (octets)
-  "Return OCTETS as lowercase hexadecimal text.
-
-Lowercase, because AWS's published signatures are lowercase and a signature
-that differs only in case is a signature that differs."
+  "Return OCTETS as lowercase hexadecimal text (as required by SigV4)."
   (string-downcase (format nil "~{~2,'0X~}" (coerce octets 'list))))
 
 (declaim (ftype (function (vector) vector) aws-sha256))
@@ -173,30 +114,16 @@ that differs only in case is a signature that differs."
 (declaim (ftype (function (t) string) aws-sha256-hex))
 
 (defun aws-sha256-hex (text)
-  "Return the lowercase hex SHA-256 of TEXT.
-
-One function for the two places a hash is written down: the x-amz-content-sha256
-header and the last line of the canonical request are the same number, and a
-signature built from two different spellings of it is refused."
+  "Return the lowercase hex SHA-256 of TEXT (UTF-8; NIL treated as \"\")."
   (aws-hex (aws-sha256 (aws-string-octets (or text "")))))
 
 ;;;; Percent-encoding.
-;;;;
-;;;; The canonical query string is built from the bytes of each parameter and
-;;;; not from re-encoded text: a value that arrived already encoded is decoded
-;;;; to bytes and encoded again, so %2F stays %2F and a raw space becomes %20.
-;;;; Encoding a decoded string instead would need a second string, and one for
-;;;; every multi-byte character in it.
 
 (declaim (ftype (function (vector) string) aws-encode-octets))
 
 (defun aws-encode-octets (octets)
-  "Return OCTETS percent-encoded the way SigV4 wants them.
-
-The unreserved set is A-Z, a-z, 0-9, hyphen, underscore, dot and tilde. Every
-other byte becomes an uppercase %XY, including the space, which AWS requires to
-be %20 and not a plus: a plus is a legal character in a query value and would
-be re-encoded as %2B, so using one for a space is a signature mismatch."
+  "Percent-encode OCTETS per SigV4: keep A-Z, a-z, 0-9, '-', '_', '.', '~',
+and encode all other bytes (including space as %20) as uppercase %XY."
   (with-output-to-string (out)
     (loop for byte across octets
           do (if (or (<= 65 byte 90) (<= 97 byte 122) (<= 48 byte 57)
@@ -213,13 +140,8 @@ be re-encoded as %2B, so using one for a space is a signature mismatch."
 (declaim (ftype (function (string) vector) aws-percent-decode))
 
 (defun aws-percent-decode (text)
-  "Return TEXT with every %XY sequence replaced by its byte, as octets.
-
-A character that is not part of an escape is encoded to its own UTF-8 bytes, so
-a query value that is half encoded, half raw, still canonicalises to the bytes
-the service will see. A percent sign that is not followed by two hexadecimal
-digits is a literal percent sign and not an error: the input is a URL somebody
-else built, and a URL with a stray % is a URL with a stray %."
+  "Decode %XY escapes in TEXT to octets, UTF-8 encoding literal characters
+(including any stray '%' not followed by two hex digits)."
   (let ((octets (make-array (length text) :element-type '(unsigned-byte 8)
                                           :fill-pointer 0)))
     (loop with index = 0
@@ -244,11 +166,7 @@ else built, and a URL with a stray % is a URL with a stray %."
 (declaim (ftype (function (character string) list) aws-split))
 
 (defun aws-split (delimiter text)
-  "Return TEXT split at every DELIMITER, as a list of strings.
-
-An empty field is kept rather than dropped: the caller decides whether an empty
-query parameter or an empty model name means anything, and a splitter that
-silently removes one cannot tell the two apart."
+  "Split TEXT at every DELIMITER into a list of strings, preserving empty fields."
   (let ((parts '())
         (start 0))
     (loop for position = (position delimiter text :start start)
@@ -259,29 +177,17 @@ silently removes one cannot tell the two apart."
     (nreverse parts)))
 
 ;;;; The clock.
-;;;;
-;;;; SigV4 signs the moment of the request, so the signature expires with it. A
-;;;; universal time is the argument and the special is the default, which is what
-;;;; lets the published vectors be reproduced exactly.
 
 (declaim (type (or null integer) *signing-time*))
 
 (defparameter *signing-time* nil
-  "The universal time SIGN-REQUEST signs with. NIL means the wall clock.
-
-Bound in tests: a signature over the current second cannot be compared with a
-vector, and a test that waits for a particular second is a test that fails on
-the second attempt.")
+  "Universal time used by SIGN-REQUEST when :time is NIL; NIL uses wall clock.")
 
 (declaim (ftype (function (integer) (values string string)) aws-timestamp))
 
 (defun aws-timestamp (universal-time)
-  "Return UNIVERSAL-TIME as the two timestamps SigV4 needs.
-
-The first value is the ISO 8601 basic format the x-amz-date header and the
-string to sign carry, 20150830T123600Z. The second is the date, the first eight
-characters of it, which starts the scope. Both are UTC: a signature is not a
-local time, and a zone offset would change the characters that are signed."
+  "Return UNIVERSAL-TIME in UTC as (VALUES amz-date short-date), i.e.
+YYYYMMDDTHHMMSSZ and YYYYMMDD."
   (multiple-value-bind (second minute hour day month year)
       (decode-universal-time universal-time 0)
     (let ((stamp (format nil "~4,'0D~2,'0D~2,'0DT~2,'0D~2,'0D~2,'0DZ"
@@ -289,24 +195,12 @@ local time, and a zone offset would change the characters that are signed."
       (values stamp (subseq stamp 0 8)))))
 
 ;;;; The URL.
-;;;;
-;;;; The host, the path and the query are read out of the URL here rather than
-;;;; kept beside it, because the URL is what the transport will send and a
-;;;; signature over a second copy of the path is a signature over a copy that
-;;;; can drift.
 
 (declaim (ftype (function (string) (values string string string)) aws-url-parts))
 
 (defun aws-url-parts (url)
-  "Return URL's host, path and query as three values.
-
-The scheme and any user information are dropped, and a port is kept, because
-the Host header is the authority as the client sends it and AWS signs exactly
-that. The path is returned as it appears in the URL: it is signed as sent, so a
-caller that needs an escaped path escapes it before building the URL.
-
-A URL with no host is a configuration error rather than a signature over an
-empty host, which AWS answers with a message about the credential."
+  "Extract (VALUES host path query) from URL, dropping scheme/userinfo/fragment
+and keeping port. Signals CONFIGURATION-ERROR if host is missing or has spaces."
   (let* ((scheme (search "://" url))
          (after (if scheme (subseq url (+ scheme 3)) url))
          (cut (or (position-if (lambda (character) (find character "/?#"))
@@ -330,35 +224,20 @@ empty host, which AWS answers with a message about the credential."
 (declaim (ftype (function (t) string) aws-canonical-uri))
 
 (defun aws-canonical-uri (path)
-  "Return PATH as the canonical URI.
-
-An empty path is the root, and a path is signed exactly as it goes on the wire,
-so this adds the leading slash a relative path lacks and re-encodes nothing. A
-canonicaliser that encoded here would double-encode a path the caller had
-already escaped, and AWS compares the bytes it received with the bytes that were
-signed."
+  "Return PATH as the canonical URI (ensuring a leading '/', defaulting empty
+to \"/\") without re-encoding."
   (cond
     ((or (null path) (zerop (length path))) "/")
     ((char= (char path 0) #\/) path)
     (t (concatenate 'string "/" path))))
 
 ;;;; The canonical request.
-;;;;
-;;;; The five pieces are built separately because each has a published vector:
-;;;; a header value that was trimmed, a query whose parameters were sorted, a
-;;;; body whose hash is the last line. Any one of them wrong produces a
-;;;; signature that is wrong in a way no error message explains.
 
 (declaim (ftype (function (t) string) aws-trim-header-value))
 
 (defun aws-trim-header-value (value)
-  "Return VALUE with the whitespace AWS removes from a header value.
-
-AWS trims leading and trailing whitespace and collapses an internal run of
-whitespace to one space before signing. The collapsing is not cosmetic: a
-request whose header value has two spaces in a row is signed over the value
-with one, and a signer that only trims produces a signature the service
-refuses."
+  "Trim leading/trailing whitespace from VALUE and collapse internal whitespace
+runs to a single space, per SigV4."
   (let ((text (if (stringp value) value (princ-to-string value))))
     (with-output-to-string (out)
       (let ((pending nil)
@@ -375,12 +254,7 @@ refuses."
 (declaim (ftype (function (list) list) aws-canonical-header-pairs))
 
 (defun aws-canonical-header-pairs (headers)
-  "Return HEADERS as lowercased, trimmed, name-sorted pairs.
-
-Names are lowercased because HTTP header names are case-insensitive and AWS
-signs the lowercase spelling with an exact string comparison. Sorting is by the
-lowercase name, which is what makes the signed header list and the canonical
-header block agree without a second sort."
+  "Return HEADERS as (lowercase-name . trimmed-value) pairs sorted by name."
   (sort (loop for (name . value) in headers
               collect (cons (string-downcase (string name))
                             (aws-trim-header-value value)))
@@ -389,12 +263,8 @@ header block agree without a second sort."
 (declaim (ftype (function (t) string) aws-canonical-query-string))
 
 (defun aws-canonical-query-string (query)
-  "Return QUERY as the canonical query string, or the empty string.
-
-Each parameter is decoded to bytes and encoded again, sorted by encoded name
-and then by encoded value, and joined with &. A parameter with no value keeps
-its =, because AWS distinguishes a parameter that has no value from one that is
-absent, and the two are not the same request."
+  "Canonicalize QUERY: percent-decode and re-encode each param, sort by encoded
+name then encoded value, and join as name=value with '&' (valueless params keep '=')."
   (if (or (null query) (zerop (length query)))
       ""
       (let ((pairs '()))
@@ -422,11 +292,8 @@ absent, and the two are not the same request."
 (declaim (ftype (function (list) string) aws-canonical-headers))
 
 (defun aws-canonical-headers (pairs)
-  "Return the canonical header block for PAIRS, ending in a newline.
-
-The trailing newline is part of the block: the canonical request separates the
-headers from the signed header list with an empty line, and splitting on lines
-without it is where a hand written signer usually goes wrong."
+  "Format canonical header PAIRS as name:value lines, including the trailing
+newline required before the signed-headers line."
   (with-output-to-string (out)
     (loop for (name . value) in pairs
           do (format out "~A:~A~%" name value))))
@@ -441,13 +308,8 @@ without it is where a hand written signer usually goes wrong."
                 aws-canonical-request))
 
 (defun aws-canonical-request (method uri query headers payload-hash)
-  "Return the canonical request text for one signed request.
-
-METHOD is the verb as sent. URI is the path as sent. QUERY is the raw query
-string, canonicalised here. HEADERS is the alist that will be sent, canonicalised
-here. PAYLOAD-HASH is the lowercase hex SHA-256 of the body, which is also the
-x-amz-content-sha256 header when one is sent, and the caller hashes once and
-reuses the digest because two spellings of it cannot both be right."
+  "Build the SigV4 canonical request from METHOD, URI, raw QUERY, HEADERS alist,
+and lowercase hex PAYLOAD-HASH."
   (let ((pairs (aws-canonical-header-pairs headers)))
     (format nil "~A~%~A~%~A~%~A~%~A~%~A"
             method
@@ -468,22 +330,16 @@ reuses the digest because two spellings of it cannot both be right."
 (declaim (ftype (function (string string string) string) aws-string-to-sign))
 
 (defun aws-string-to-sign (canonical-request timestamp scope)
-  "Return the string to sign for CANONICAL-REQUEST.
-
-TIMESTAMP is the ISO 8601 basic timestamp and not the date: the string to sign
-carries the full instant while the scope carries the date, and swapping them
-produces a signature that is wrong only near midnight UTC."
+  "Build the AWS4-HMAC-SHA256 string to sign from CANONICAL-REQUEST, full
+ISO 8601 TIMESTAMP, and credential SCOPE."
   (format nil "AWS4-HMAC-SHA256~%~A~%~A~%~A"
           timestamp scope (aws-sha256-hex canonical-request)))
 
 (declaim (ftype (function (string string string string) vector) aws-signing-key))
 
 (defun aws-signing-key (secret date region service)
-  "Return the SigV4 signing key for one date, region and service, as octets.
-
-The key is derived, not stored: four HMACs, each over the previous result, so
-the secret itself never reaches the wire and a captured signature cannot be
-replayed against another region or another day."
+  "Derive the SigV4 signing key via chained HMAC-SHA256 over \"AWS4\"+SECRET,
+DATE, REGION, SERVICE, and \"aws4_request\"."
   (let* ((initial (aws-string-octets (concatenate 'string "AWS4" secret)))
          (dated (aws-hmac initial (aws-string-octets date)))
          (scoped (aws-hmac dated (aws-string-octets region)))
@@ -494,12 +350,7 @@ replayed against another region or another day."
                 aws-signature))
 
 (defun aws-signature (canonical-request timestamp region service credentials)
-  "Return the lowercase hex signature for CANONICAL-REQUEST.
-
-This is the whole algorithm minus the header assembly: hash the canonical
-request into the string to sign, derive the key, sign. It is a function of its
-arguments alone, which is what lets a test compare it with AWS's published
-signature for a request nobody sends."
+  "Compute the lowercase hex SigV4 signature for CANONICAL-REQUEST."
   (let* ((date (subseq timestamp 0 8))
          (scope (aws-scope date region service))
          (string-to-sign (aws-string-to-sign canonical-request timestamp scope))
@@ -510,12 +361,7 @@ signature for a request nobody sends."
 (declaim (ftype (function (string string string string) string) aws-authorization))
 
 (defun aws-authorization (access-key scope signed-headers signature)
-  "Return the Authorization header value for a signed request.
-
-The header is the only place the algorithm is visible on the wire, and it is
-written here and not in SIGN-REQUEST because a test compares it whole with
-AWS's expected value: the credential, the scope, the signed header list and the
-signature are four separate chances to be wrong."
+  "Format the AWS4-HMAC-SHA256 Authorization header value."
   (format nil "AWS4-HMAC-SHA256 Credential=~A/~A, SignedHeaders=~A, Signature=~A"
           access-key scope signed-headers signature))
 
@@ -530,27 +376,10 @@ signature are four separate chances to be wrong."
 (defun sign-request (request region service &key credentials time
                                                      (method "POST")
                                                      (content-sha256-p t))
-  "Return REQUEST's headers with SigV4 authentication added.
-
-CREDENTIALS is the credential to sign with; NIL asks
-*AWS-CREDENTIALS-FUNCTION*, which is the secret store and then the environment.
-TIME is a universal time, NIL means *SIGNING-TIME*, and NIL again means the
-clock. Both are arguments so that a signature can be a function of a published
-vector rather than of the day the test ran.
-
-METHOD is an argument because HTTP-REQUEST has no method slot: the transport
-sends a POST and the model listers send a GET, and a signature computed for the
-wrong verb is refused without saying so.
-
-CONTENT-SHA256-P adds the x-amz-content-sha256 header and signs it, which is
-the default because AWS requires every x-amz-* header to be signed and because
-the digest is what lets the service check the body before reading it. AWS's own
-published test suite predates that header, so the vector fixtures turn it off
-rather than pretend the header is not part of this implementation.
-
-HOST comes from the URL and is always signed: a request whose Host header was
-replaced in transit is a request for another service, which is the whole reason
-AWS requires it in the signed set."
+  "Return REQUEST's headers with SigV4 authentication added (Host, x-amz-date,
+optional x-amz-content-sha256 and x-amz-security-token, and Authorization).
+Resolves CREDENTIALS via *AWS-CREDENTIALS-FUNCTION* and TIME via *SIGNING-TIME*
+or wall clock when NIL; CONTENT-SHA256-P can be disabled for legacy test vectors."
   (let ((credentials (or credentials (resolve-aws-credentials))))
     (unless (aws-credential-usable-p credentials)
       (error 'enchiridion.errors:configuration-error
@@ -583,38 +412,25 @@ AWS requires it in the signed set."
                           (aws-credential-access-key credentials)
                           scope signed signature))))))))))
 
-;;;; The signed scheme.
-;;;;
-;;;; AUTH-APPLY calls a signer with (DIALECT KEY REQUEST) and merges what it
-;;;; returns. The three facts a signature needs that a dialect record does not
-;;;; carry travel in specials: the endpoint builder knows its region, its
-;;;; service and its method, and binds them around the call. They are bound and
-;;;; not passed because the signer's argument list is auth.lsp's, and widening it
-;;;; would put an AWS-specific parameter in a vendor-neutral dispatch table.
+;;;; The signed scheme (:AWS-SIGV4 for AUTH-APPLY).
+;;;; Region, service, and method travel in specials to keep AUTH-APPLY vendor-neutral.
 
 (declaim (type (or null string) *aws-region* *aws-service* *aws-request-method*))
 
 (defparameter *aws-region* nil
-  "The region SIGN-REQUEST signs for while a signer runs. Bound by the handler
-that built the endpoint, because only it knows the region.")
+  "AWS region bound around AWS-SIGV4-SIGNER by the endpoint builder.")
 
 (defparameter *aws-service* nil
-  "The SigV4 service name while a signer runs. NIL means BEDROCK, which is the
-service this tree signs for.")
+  "SigV4 service name bound around AWS-SIGV4-SIGNER (defaults to \"bedrock\").")
 
 (defparameter *aws-request-method* nil
-  "The HTTP method while a signer runs. NIL means POST, which every signed call
-here except the control plane's model list is.")
+  "HTTP method bound around AWS-SIGV4-SIGNER (defaults to \"POST\").")
 
 (declaim (ftype (function (t t http-request) list) aws-sigv4-signer))
 
 (defun aws-sigv4-signer (dialect key request)
-  "Sign REQUEST for the region, service and method bound around this call.
-
-DIALECT and KEY are ignored: the scheme is already the dialect's answer, and
-the key this scheme would carry is the bearer token the dialect would have used
-for :BEARER instead. The credential comes from *AWS-CREDENTIALS-FUNCTION*,
-which is the one place that decides where a signature's key comes from."
+  "AUTH-APPLY signer for :AWS-SIGV4; ignores DIALECT and KEY and signs REQUEST
+using *AWS-REGION*, *AWS-SERVICE*, and *AWS-REQUEST-METHOD*."
   (declare (ignore dialect key))
   (sign-request request
                 (or (aws-nonempty-string *aws-region*)

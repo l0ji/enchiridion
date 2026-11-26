@@ -1,30 +1,12 @@
-;;;; dialects.lsp --- The quirks of one provider, as data.
+;;;; dialects.lsp --- Provider wire quirks represented as data.
 ;;;;
-;;;; Every "OpenAI-compatible" vendor is compatible with a different subset.
-;;;; Azure wants the key in an api-key header and the deployment in the path;
-;;;; Google's compatibility shim lives under /v1beta/openai and rejects
-;;;; tool_choice; DeepSeek reports its chain of thought in reasoning_content
-;;;; and its cache hits in prompt_cache_hit_tokens; a local server wants no
-;;;; auth at all. None of those is a reason for a handler of its own, and all
-;;;; of them are a reason not to scatter IFs through openai.lsp.
-;;;;
-;;;; A DIALECT is a record of those differences. A PROFILE is a named set of
-;;;; values for it. A provider picks a profile (models.dev's npm plus the
-;;;; provider id and host decide which), and config.lsp may override any single
-;;;; field, which is what makes a one-off endpoint a configuration line rather
-;;;; than a patch.
-;;;;
-;;;; The fields are all optional and all defaulted to the generic behaviour, so
-;;;; a provider with no profile at all behaves exactly like the plain OpenAI or
-;;;; Anthropic wire. That is what every existing test relies on.
+;;;; A DIALECT overrides generic OpenAI/Anthropic wire defaults. A PROFILE is a
+;;;; named preset; a NIL dialect uses generic wire behavior.
 
 (in-package #:enchiridion.llm)
 
 (defstruct (dialect (:constructor %make-dialect))
-  ;; Which schema this dialect decorates. :OPENAI and :ANTHROPIC are the two
-  ;; the handlers implement; the field is here so a profile cannot be applied
-  ;; to the wrong wire by accident.
-  (protocol nil)
+  (protocol nil)                     ; :OPENAI or :ANTHROPIC
   (profile nil)
 
   ;; --- auth -------------------------------------------------------------
@@ -32,66 +14,48 @@
   ;; :API-KEY-HEADER    NAME: KEY            (Azure: api-key)
   ;; :X-API-KEY         x-api-key: KEY       (Anthropic)
   ;; :QUERY-PARAM       ?NAME=KEY            (Google's older samples)
-  ;; :NONE              no credential header at all (Ollama, LM Studio)
+  ;; :NONE              no credential header (Ollama, LM Studio)
   ;; :AWS-SIGV4         signed by aws-sigv4.lsp
   ;; :GCP-OAUTH         bearer from gcp-oauth.lsp
   (auth-scheme :bearer)
   (auth-header nil)                  ; header name for :API-KEY-HEADER
-  ;; A literal that goes in front of the credential inside a vendor-named
-  ;; header: Cloudflare's gateway wants `Bearer <token>` under a header of its
-  ;; own, and the token alone is not a valid value there.
-  (auth-prefix "")
+  (auth-prefix "")                   ; prefix inside vendor header (e.g. "Bearer ")
   (auth-query nil)                   ; parameter name for :QUERY-PARAM
 
   ;; --- url --------------------------------------------------------------
-  ;; CHAT-PATH is appended to the provider's base URL. {model} is substituted,
-  ;; which is how Azure's deployment path is expressed without a branch.
-  (chat-path nil)                    ; NIL means the handler's own default
-  (models-path nil)                  ; NIL means the handler's own default
+  ;; CHAT-PATH is appended to base URL with {model} substituted.
+  (chat-path nil)                    ; NIL uses handler default
+  (models-path nil)                  ; NIL uses handler default (explicit NIL disables)
   (query-params '() :type list)      ; extra query parameters, e.g. api-version
   (extra-headers '() :type list)     ; extra headers, e.g. attribution
 
   ;; --- body -------------------------------------------------------------
-  ;; :MAX_TOKENS or :MAX_COMPLETION_TOKENS. The named field is written; the
-  ;; other is not, because a provider that wants one often rejects the other.
-  (max-tokens-field :max-tokens)
-  ;; "system" or "developer". OpenAI's reasoning models took the developer
-  ;; role where the system role used to be.
-  (system-role "system")
+  (max-tokens-field :max-tokens)     ; :MAX-TOKENS or :MAX-COMPLETION-TOKENS
+  (system-role "system")             ; "system" or "developer"
   (send-tool-choice-p t)
   (send-parallel-tool-calls-p t)
   (send-stream-options-p t)
-  ;; Extra request fields merged into the body, so a vendor's thinking switch
-  ;; is a data line and not a function. NIL means none.
-  (extra-body '() :type list)
+  (extra-body '() :type list)        ; extra request fields merged into body
 
   ;; --- response ---------------------------------------------------------
-  ;; Where the chain of thought arrives, when it arrives beside the answer:
-  ;; "reasoning_content", "reasoning", or NIL.
-  (reasoning-field nil)
-  ;; Where the token counts arrive. The generic OpenAI names are the default;
-  ;; DeepSeek reports cache hits under names of its own.
+  (reasoning-field nil)              ; "reasoning_content", "reasoning", or NIL
   (input-tokens-field "prompt_tokens")
   (output-tokens-field "completion_tokens")
   (cache-read-tokens-field "prompt_tokens_details.cached_tokens")
   (cache-write-tokens-field "cache_creation_input_tokens")
-  ;; :STRING, :OBJECT or :EITHER. Some servers hand the tool arguments back as
-  ;; an object where the specification says a JSON string.
-  (tool-arguments-form :either)
+  (tool-arguments-form :either)      ; :STRING, :OBJECT, or :EITHER
 
   ;; --- anthropic-only ---------------------------------------------------
-  ;; :HEADER writes anthropic-version, :BODY writes anthropic_version.
-  (version-location :header)
+  (version-location :header)         ; :HEADER (anthropic-version) or :BODY (anthropic_version)
   (version-value nil)
   (model-in-body-p t)
-  ;; :HEADER or :BODY for the beta feature list.
-  (beta-channel :header)
+  (beta-channel :header)             ; :HEADER or :BODY for beta feature list
   (cache-ttl-supported-p t)
   (thinking-supported-p t)
 
   ;; --- model listing ----------------------------------------------------
   ;; :DATA ({"data":[{"id"}]}), :OLLAMA ({"models":[{"name"}]}),
-  ;; :OPENROUTER (data with pricing), or NIL for no listing at all.
+  ;; :OPENROUTER (data with pricing), or NIL for no listing.
   (models-list-shape :data)
 
   ;; Distinguish omitted keys from explicit NIL
@@ -100,13 +64,7 @@
 (declaim (ftype (function (t) symbol) dialect-slot))
 
 (defun dialect-slot (key)
-  "Return KEY as the slot symbol of DIALECT, or signal a configuration error.
-
-The keys are written as keywords in the profile table because that is how a
-config.lsp row spells them, and SLOT-VALUE wants the symbol the defstruct
-interned in this package. A keyword is not EQL to that symbol however equal
-their names look, so the translation is done once, here, rather than trusted
-to work."
+  "Return the ENCHIRIDION.LLM slot symbol for keyword KEY, or signal a configuration error."
   (let ((symbol (find-symbol (string-upcase (string key)) '#:enchiridion.llm)))
     (unless symbol
       (error 'enchiridion.errors:configuration-error
@@ -117,15 +75,8 @@ to work."
 (declaim (ftype (function (t t &optional t) t) dialect-field))
 
 (defun dialect-field (dialect key &optional default)
-  "Return KEY from DIALECT, or DEFAULT when DIALECT is NIL or does not state KEY.
-
-A NIL dialect is the generic wire, so every caller can read a field without a
-guard and the generic path is the absence of an override rather than a second
-set of defaults.
-
-A field the dialect states as NIL answers NIL rather than DEFAULT: config.lsp
-spells `this endpoint has no model list' as :models-path nil, and a reader that
-answered the generic path would send a request the endpoint does not have."
+  "Return KEY from DIALECT, or DEFAULT when DIALECT is NIL or KEY is unset.
+An explicitly set NIL slot returns NIL rather than DEFAULT."
   (if dialect
       (let ((value (slot-value dialect (dialect-slot key))))
         (if (or value (member key (dialect-explicit dialect) :test #'eq))
@@ -135,21 +86,11 @@ answered the generic path would send a request the endpoint does not have."
 
 ;;;; The profiles.
 
-;; Each entry is PROFILE . PLIST. Only the fields that differ from the generic
-;; wire are listed; everything else is the struct default, and a field listed
-;; as NIL is a deliberate "the generic value is wrong here and absence is the
-;; answer" (a path with no default, a reasoning field that does not exist).
-;;
-;; The base URLs are not here on purpose. models.dev carries an `api' for every
-;; provider that has one, and a provider that lacks it names its endpoint in
-;; config.lsp. The two exceptions, the vendor packages whose base URL models.dev
-;; does not carry, are in +npm-adapters+ in providers.lsp where the package is
-;; what supplies it.
+;; Profile name -> override plist. Only fields differing from struct defaults
+;; are listed; explicit NIL overrides a default (e.g. disabling models-path).
 (defparameter +dialect-profiles+
   '((:openai . ())
-    ;; A local server (Ollama, LM Studio, llama.cpp) has no credential to
-    ;; check but still requires a value in its client, ignores tool_choice, and
-    ;; lists its models at a path of its own on Ollama.
+    ;; Local servers (Ollama, LM Studio, llama.cpp): no auth, no tool_choice.
     (:openai-local . (:auth-scheme :none
                       :send-tool-choice-p nil))
     (:ollama . (:auth-scheme :none
@@ -182,14 +123,9 @@ answered the generic path would send a request the endpoint does not have."
     (:cloudflare-gateway . (:auth-scheme :api-key-header
                             :auth-header "cf-aig-authorization"
                             :auth-prefix "Bearer "))
-    ;; Anthropic's own endpoint takes x-api-key, not a bearer token.
     (:anthropic . (:auth-scheme :x-api-key))
-    ;; An Anthropic-shaped gateway that authenticates with a bearer token
-    ;; instead of x-api-key, as OpenRouter's Messages endpoint does.
     (:anthropic-gateway . (:auth-scheme :bearer))
-    ;; Bedrock's InvokeModel path carries the version in the body, has no
-    ;; anthropic-version header, and no 1h cache TTL. The model is a path
-    ;; segment, so the body must not name it.
+    ;; Bedrock InvokeModel puts version/betas in body, model in path, and lacks 1h cache TTL.
     (:bedrock-invoke . (:auth-scheme :aws-sigv4
                         :version-location :body
                         :version-value "bedrock-2023-05-31"
@@ -208,10 +144,7 @@ answered the generic path would send a request the endpoint does not have."
 (declaim (ftype (function (t) t) dialect-profile-plist))
 
 (defun dialect-profile-plist (profile)
-  "Return the plist for PROFILE, or NIL when there is no such profile.
-
-An unknown profile is not an error here: the caller names the profile in a
-configuration error, because it knows which provider asked for it."
+  "Return the override plist for PROFILE, or NIL if unknown."
   (and profile (cdr (assoc profile +dialect-profiles+ :test #'eq))))
 
 (declaim (ftype (function (t) boolean) dialect-profile-p))
@@ -221,13 +154,8 @@ configuration error, because it knows which provider asked for it."
   (not (null (assoc profile +dialect-profiles+ :test #'eq))))
 
 (defun make-dialect-for (profile &key protocol overrides)
-  "Return the DIALECT for PROFILE with OVERRIDES applied.
-
-OVERRIDES is a plist of dialect slot names to values, as a config.lsp provider
-row gives them. An override whose value is NIL is applied as NIL and not
-ignored: the operator wrote it, and one of these fields genuinely means
-absent (a models-path of NIL is how a provider with no list endpoint says
-so)."
+  "Return a DIALECT for PROFILE with plist OVERRIDES applied.
+Explicit NIL values are recorded in DIALECT-EXPLICIT so they override defaults."
   (when (and profile (not (dialect-profile-p profile)))
     (error 'enchiridion.errors:configuration-error
            :key :profile

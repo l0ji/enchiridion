@@ -1,71 +1,35 @@
-;;;; catalog.lsp --- The runtime models.dev catalog, cached under run/.
+;;;; catalog.lsp --- Runtime models.dev catalog cached under run/.
 ;;;;
-;;;; No provider and no model is committed to this tree. Which providers exist,
-;;;; what their endpoints are, which models they serve, what a model costs and
-;;;; how large its context window is are all facts the vendors own and change on
-;;;; their own schedule. This file fetches them from models.dev at run time,
-;;;; trims them to what a request needs, and writes them under run/ so the next
-;;;; process starts without a network.
-;;;;
-;;;; Two files are written and the split is deliberate. providers.json holds one
-;;;; small row per provider: the id, the name, the npm package models.dev knows
-;;;; it by, its key variable names, its endpoint, and the model the catalog
-;;;; considers its default. provider-models.json holds the metadata of every
-;;;; model in that index: the context window, the output limit, tool calling,
-;;;; the four USD per million costs, and the release date. A live model list
-;;;; from a provider's own endpoint is joined against the second file by model
-;;;; id, so a request can be priced without a second network call.
-;;;;
-;;;; The parsed provider index is a LIST OF PROVIDER structs. A hash table keyed
-;;;; by id would be no slower to look up, but two callers walk the index in
-;;;; order --- detection matches a host against it, and the model list is joined
-;;;; provider by provider --- and a list keeps that order in the open.
-;;;;
-;;;; Nothing here signals on a missing, unreadable or corrupt cache. A cache is
-;;;; an optimisation, and an agent that refuses to start because a file under
-;;;; run/ was half written is a worse failure than one that starts slowly and
-;;;; refreshes.
+;;;; Fetches models.dev at run time and writes two files under run/:
+;;;; providers.json (provider index, loaded as an ordered list of PROVIDER
+;;;; structs) and provider-models.json (per-provider model metadata for pricing
+;;;; and limits). Missing or corrupt cache files return NIL rather than signaling.
 
 (in-package #:enchiridion.llm)
 
 ;;;; The cache.
 
-;; The index is read once and kept here. NIL means "not loaded", so a test
-;; binds this to a fixture instead of touching run/, and a refresh clears it.
 (defparameter *catalog* nil
-  "The parsed provider index (a list of PROVIDER structs), or NIL when it has
-not been loaded. The cache file is read once and memoised here.")
+  "Memoized provider index (list of PROVIDER structs), or NIL if not loaded.")
 
-;; The model metadata is a second cache and a second special, because it is
-;; read on a different schedule from the index: a provider's model list is
-;; joined against it on every `providers models' call.
 (defparameter *catalog-models* nil
-  "Provider name to a list of MODEL-INFO, or NIL when it has not been loaded.
-The metadata file beside the provider index is read once and memoised here.")
+  "Memoized hash table mapping provider cache name to list of MODEL-INFO, or NIL.")
 
-;; A test binds this; the operator sets ENCHIRIDION_PROVIDERS_PATH to write a
-;; cache somewhere else while regenerating one. Both are checked in that order,
-;; because a binding is a caller's decision and the variable is a session's.
 (defparameter *catalog-path*
   (merge-pathnames "providers.json" (enchiridion:run-directory))
-  "Where the provider index is cached. Resolved from the run directory when this
-file loads, so ENCHIRIDION_HOME must be set before it does.")
+  "Default provider index cache path, resolved from run-directory at load time.")
 
 (defparameter *catalog-models-path* nil
   "Where the model metadata is cached, or NIL for provider-models.json beside
 *CATALOG-PATH*.")
 
 (defparameter *catalog-url* nil
-  "The models.dev document to fetch, or NIL to take :providers-url from the
-configuration and then fall back to models.dev. A special so a test can point
-the fetch at a fixture.")
+  "Override URL for models.dev fetch, or NIL to use :providers-url / default.")
 
 (declaim (ftype (function () pathname) catalog-path))
 
 (defun catalog-path ()
-  "Return the provider index file to read and write.
-ENCHIRIDION_PROVIDERS_PATH wins, because regenerating a cache elsewhere is the
-one reason to name a path at all; then *CATALOG-PATH*."
+  "Return the provider index path: ENCHIRIDION_PROVIDERS_PATH if set, else *CATALOG-PATH*."
   (let ((override (enchiridion.compat:environment-value "ENCHIRIDION_PROVIDERS_PATH")))
     (if (nonempty-string-p override) (pathname override) *catalog-path*)))
 
@@ -77,13 +41,7 @@ the provider index."
   (or *catalog-models-path*
       (merge-pathnames "provider-models.json" (catalog-path))))
 
-;;;; Small readers over parsed JSON.
-;;;;
-;;;; The document arrives in two shapes and both are handled here. parse-json
-;;;; turns an object into a plist keyed by keywords; the file this module
-;;;; writes is built with JSON-OBJECT, so a test may hand over a hash table
-;;;; keyed by strings instead. One reader for both means the trimming and the
-;;;; reading of the cache cannot disagree about what a field is called.
+;;;; JSON object readers (supporting both keyword-keyed plists and string-keyed hash tables).
 
 (declaim (ftype (function (t) boolean) nonempty-string-p))
 
@@ -94,20 +52,13 @@ the provider index."
 (declaim (ftype (function (t) string) catalog-key-name))
 
 (defun catalog-key-name (key)
-  "Return KEY, a JSON object key, as the lower case string this module uses.
-jzon pools short object keys and can hand over a character, which is why STRING
-is called rather than trusting KEY to be one already."
+  "Return JSON object KEY as a lowercase string (coercing characters/symbols via STRING)."
   (string-downcase (string key)))
 
 (declaim (ftype (function (t t &optional t) t) catalog-field))
 
 (defun catalog-field (entry key &optional default)
-  "Return KEY from ENTRY, a parsed JSON object, or DEFAULT.
-
-ENTRY is a plist keyed by keywords after PARSE-JSON, or a hash table keyed by
-strings after JSON-OBJECT. The comparison is case-insensitive and the key may
-be a keyword, a string or a character, because all three arrive from the two
-parsers and their callers."
+  "Return KEY from parsed JSON object ENTRY (plist or hash table), case-insensitively, or DEFAULT."
   (cond
     ((hash-table-p entry) (json-value entry key default))
     ((consp entry)
@@ -134,8 +85,7 @@ parsers and their callers."
 (declaim (ftype (function (t t) (or null number)) catalog-number))
 
 (defun catalog-number (entry key)
-  "Return KEY of ENTRY as a number, or NIL. Zero and NIL are different facts:
-NIL means the source did not say."
+  "Return KEY of ENTRY as a number, or NIL when absent (distinct from 0)."
   (let ((value (catalog-field entry key)))
     (if (numberp value) value nil)))
 
@@ -144,13 +94,7 @@ NIL means the source did not say."
 (declaim (ftype (function (string) (or null string)) expand-environment))
 
 (defun expand-environment (text)
-  "Return TEXT with every ${NAME} replaced by NAME's environment value.
-
-models.dev names an account-dependent endpoint that way: Azure's is
-https://${AZURE_RESOURCE_NAME}.openai.azure.com/. A name the environment does
-not hold makes the endpoint unknowable, and an endpoint with a hole in it is
-worse than none, so the whole string comes back NIL in that case rather than a
-URL that fails later without saying why."
+  "Expand ${NAME} placeholders in TEXT via secrets or environment; return NIL if any variable is missing."
   (let ((out (make-string-output-stream))
         (start 0))
     (loop
@@ -182,11 +126,7 @@ URL that fails later without saying why."
 (declaim (ftype (function (t) list) map-pairs))
 
 (defun map-pairs (data)
-  "Return DATA, a JSON object, as a list of (key . value) with string keys.
-
-A hash table is read directly; a plist is walked two at a time. A key that is
-NIL ends the walk, which is what a malformed object looks like rather than a
-crash in the middle of a cache refresh."
+  "Return JSON object DATA (hash table or plist) as a list of (lowercase-key . value) pairs."
   (cond
     ((hash-table-p data)
      (loop for key being the hash-keys of data
@@ -200,22 +140,13 @@ crash in the middle of a cache refresh."
 (declaim (ftype (function (t) list) sorted-pairs))
 
 (defun sorted-pairs (data)
-  "Return DATA as a list of (key . value) sorted by key.
-
-models.dev is a map and a map has no order; sorting here is what makes the
-written cache, the detection scan and the model metadata join reproducible from
-one process to the next."
+  "Return DATA as (key . value) pairs sorted by key for deterministic caching and lookup."
   (sort (map-pairs data) #'string< :key #'car))
 
 (declaim (ftype (function (t) boolean) wrapper-shape-p))
 
 (defun wrapper-shape-p (data)
-  "Return T when DATA is this module's wrapper, {\"meta\" ..., \"providers\" ...},
-rather than models.dev's own flat map of provider id to provider.
-
-The test is the key set, not the presence of \"providers\": a flat map whose
-keys are a hundred provider ids cannot be confused with a two key wrapper, and
-the value of \"providers\" is required not to look like a provider row itself."
+  "Return T when DATA is our {\"meta\" ..., \"providers\" ...} wrapper rather than a flat provider map."
   (let ((providers (catalog-field data "providers")))
     (and (or (hash-table-p providers) (consp providers))
          (or (null (catalog-field providers "npm"))
@@ -238,17 +169,13 @@ the value of \"providers\" is required not to look like a provider row itself."
 (declaim (ftype (function (t) string) model-release-date))
 
 (defun model-release-date (entry)
-  "Return ENTRY's release date as a string, or the empty string.
-The dates are ISO 8601, so they sort lexicographically, and a model that has
-none sorts before every model that does."
+  "Return ENTRY's ISO 8601 release_date or last_updated string, or \"\"."
   (or (catalog-string entry "release_date") (catalog-string entry "last_updated") ""))
 
 (declaim (ftype (function (list) cons) best-catalog-model))
 
 (defun best-catalog-model (models)
-  "Return the latest model in MODELS, a list of (id . entry).
-The greatest release date wins and the smallest id breaks a tie, so two
-snapshots released the same month always resolve to the same model."
+  "Return the newest (id . entry) in MODELS, breaking release-date ties by smallest id."
   (reduce (lambda (left right)
             (let ((left-date (model-release-date (cdr left)))
                   (right-date (model-release-date (cdr right))))
@@ -262,24 +189,14 @@ snapshots released the same month always resolve to the same model."
 (declaim (ftype (function (list) (or null string)) catalog-default-model))
 
 (defun catalog-default-model (models)
-  "Return the model id the catalog considers the default, or NIL.
-
-A model that cannot call tools cannot drive this harness, whatever its context
-window says, so tool callers are preferred. A catalog with no such model still
-has a newest model, and a catalog with no models has no answer at all."
+  "Return the default model id from MODELS, preferring the newest tool-calling model, or NIL."
   (when models
     (let ((tool-models (remove-if-not (lambda (model)
                                         (catalog-field (cdr model) "tool_call"))
                                       models)))
       (car (best-catalog-model (or tool-models models))))))
 
-;;;; The npm package to the wire it speaks.
-;;;;
-;;;; models.dev says which AI SDK package a provider is built with. This tree
-;;;; has no SDK, so the package is what says whether the endpoint speaks the
-;;;; chat completions shape, the Messages shape, or something only a vendor
-;;;; file above this one knows. Only the protocol is decided here; the adapter
-;;;; id and the per-vendor base URL are the provider table's business.
+;;;; Mapping models.dev npm packages to wire protocols.
 
 (declaim (ftype (function (t) t) catalog-protocol))
 
@@ -301,9 +218,7 @@ has a newest model, and a catalog with no models has no answer at all."
 (declaim (ftype (function (t) list) catalog-env-names))
 
 (defun catalog-env-names (entry)
-  "Return ENTRY's env field as a list of names. A provider with none answers
-the empty list, because the callers all append and NIL is not an appendable
-list in every one of them."
+  "Return ENTRY's env field as a list of nonempty strings, or NIL."
   (let ((value (catalog-field entry "env")))
     (cond
       ((nonempty-string-p value) (list value))
@@ -324,9 +239,7 @@ list in every one of them."
 (declaim (ftype (function (t t) hash-table) trim-model))
 
 (defun trim-model (id entry)
-  "Return ENTRY, one model of the models.dev document, as a small JSON object.
-Cost and limit travel as four flat numbers and one context/output pair, because
-the only reader is the model list join, which asks by name and not by shape."
+  "Trim a models.dev model ENTRY into a flat JSON object with limits and costs."
   (let ((limit (catalog-field entry "limit"))
         (cost (catalog-field entry "cost")))
     (json-object "id" id
@@ -344,15 +257,7 @@ the only reader is the model list join, which asks by name and not by shape."
 (declaim (ftype (function (t) t) trim-catalog))
 
 (defun trim-catalog (data)
-  "Return DATA, a parsed models.dev document, trimmed to what a cache needs.
-
-Two values come back, both JSON objects built with JSON-OBJECT so that
-STRINGIFY writes them as objects rather than as arrays. The first is the
-provider index {\"meta\" ... \"providers\" {id row}}; the second is the model
-metadata {\"providers\" {id [model ...]}}. The provider row keeps only
-id, name, npm, env, api, doc, the computed default model, and the protocol the
-npm package implies; everything else models.dev carries is dropped, because a
-cache that grows with the catalog is a cache that has to be re-read in full."
+  "Trim parsed models.dev DATA into two JSON objects: (values provider-index model-metadata)."
   (let ((providers (make-hash-table :test #'equal))
         (metadata (make-hash-table :test #'equal)))
     (dolist (pair (catalog-provider-entries data))
@@ -384,17 +289,8 @@ cache that grows with the catalog is a cache that has to be re-read in full."
 (declaim (ftype (function (t) t) provider-id-keyword))
 
 (defun provider-id-keyword (id)
-  "Return ID as a keyword, or NIL when it is not a name at all.
-
-A provider id is written as a keyword in config.lsp, as a string in a
-configuration that was read from a file, and as a string in the catalog; all
-three are one value here. The keyword is interned in KEYWORD, which is legal to
-grow at run time because it is the one package a program may extend.
-
-NIL is tested first and that test is load bearing. NIL is a symbol, so the
-SYMBOLP clause below would intern it and answer :NIL, which is a true value:
-every `missing :provider means use detection' path would then select a provider
-called NIL instead."
+  "Normalize ID (keyword, string, or symbol) to a keyword, or NIL.
+NIL is handled before SYMBOLP so NIL never interns as :NIL."
   (cond
     ((null id) nil)
     ((keywordp id) id)
@@ -405,9 +301,7 @@ called NIL instead."
 (declaim (ftype (function (t) string) provider-cache-name))
 
 (defun provider-cache-name (id)
-  "Return ID as the lower case name the model metadata is keyed by and the
-per-provider model cache file is named after. A character that is not safe in
-a file name becomes a hyphen, so a catalog id can never name a directory."
+  "Return ID as a lowercase filename-safe string (non-alphanumeric chars replaced with hyphens)."
   (if (null id)
       "provider"
       (map 'string
@@ -438,14 +332,7 @@ a file name becomes a hyphen, so a catalog id can never name a directory."
 (declaim (ftype (function (t &optional t) list) model-info-array))
 
 (defun model-info-array (entries &optional (source :catalog))
-  "Return ENTRIES, an array of model objects that carry their own id, as a
-list of MODEL-INFO.
-
-This is the shape the per-provider model cache is written in, and it is not
-the shape the catalog metadata is written in: a provider's list has no key to
-hang a model on because the endpoint already said the id, while the catalog
-map is keyed by provider. Reading one with the other's reader answers an empty
-list rather than an error, which is why the two readers are separate."
+  "Convert a JSON list of model objects carrying \"id\" fields into a list of MODEL-INFO."
   (if (consp entries)
       (loop for entry in entries
             for id = (catalog-field entry "id")
@@ -456,11 +343,7 @@ list rather than an error, which is why the two readers are separate."
 (declaim (ftype (function (t t) provider) catalog-index-row))
 
 (defun catalog-index-row (id entry)
-  "Return one row of the provider index as a PROVIDER struct.
-
-The endpoint, the npm package and the protocol are kept in OPTIONS rather than
-in slots, because none of them is a field the registry knows about; the
-provider table above this file turns them into an adapter id and a base URL."
+  "Build a PROVIDER struct from a catalog index row, storing :npm and :protocol in OPTIONS."
   (let* ((npm (catalog-string entry "npm"))
          (written (catalog-field entry "protocol"))
          (protocol (cond ((keywordp written) written)
@@ -489,12 +372,7 @@ provider table above this file turns them into an adapter id and a base URL."
 (declaim (ftype (function (t) (or null list)) read-catalog-file))
 
 (defun read-catalog-file (path)
-  "Return the provider index cached at PATH, or NIL.
-
-The wrapper this module writes and models.dev's own flat map are both accepted,
-unknown keys are ignored, and a missing, unreadable or corrupt file is NIL
-rather than a condition: the caller falls back to the shipped rows and, when it
-may, to a refresh."
+  "Read provider index from PATH (wrapper or flat map), returning NIL if missing or corrupt."
   (let ((data (ignore-errors (parse-json (uiop:read-file-string path)))))
     (when data (ignore-errors (catalog-index data)))))
 
@@ -514,11 +392,7 @@ a list of MODEL-INFO, or NIL when there is no usable file."
 (declaim (ftype (function () (or null list)) catalog-providers))
 
 (defun catalog-providers ()
-  "Return the cached provider index, reading the cache file once.
-
-NIL means there is no cache: no file, an unreadable one, or one that is not
-this shape. The NIL is not memoised, so a later call after a refresh sees the
-new file without a second entry point."
+  "Return the memoized provider index, reading it once. Missing/corrupt NIL is not memoized."
   (or *catalog*
       (setf *catalog* (read-catalog-file (catalog-path)))))
 
@@ -535,10 +409,7 @@ than NIL when there is no file, so the missing file is probed once."
 (declaim (ftype (function (provider) (or null list)) catalog-models-for))
 
 (defun catalog-models-for (provider)
-  "Return the models.dev metadata for PROVIDER, or NIL.
-
-This is the fallback a provider's own model endpoint falls back to, and the
-source of the cost and limit metadata joined onto a live list."
+  "Return cached models.dev MODEL-INFO list for PROVIDER, or NIL."
   (gethash (provider-cache-name (provider-id provider)) (catalog-model-metadata)))
 
 ;;;; Expiry.
@@ -546,12 +417,7 @@ source of the cost and limit metadata joined onto a live list."
 (declaim (ftype (function (t t) boolean) catalog-expired-p))
 
 (defun catalog-expired-p (path ttl)
-  "Return T when the cache at PATH is missing or older than TTL seconds.
-
-TTL is the configuration's :providers-ttl-seconds or :models-ttl-seconds. NIL
-and a non-positive TTL both mean `always stale': an operator who configured no
-lifetime asked for a fresh read, and the alternative, a cache that never
-expires, hides a provider's new endpoint forever."
+  "Return T if PATH is missing, older than TTL seconds, or TTL is NIL/non-positive."
   (let ((written (ignore-errors (file-write-date path))))
     (or (null written)
         (not (and (numberp ttl) (plusp ttl)))
@@ -562,21 +428,13 @@ expires, hides a provider's new endpoint forever."
 (declaim (ftype (function (string) t) fetch-catalog-text))
 
 (defun fetch-catalog-text (url)
-  "GET URL and return the reply text, with a bounded wait.
-
-The transport is a special so that no test opens a socket, exactly like the
-model listers' calls: *HTTP-GET-FUNCTION* is the one door to the network on
-this path."
+  "GET URL via the retry transport with +HTTP-GET-TIMEOUT+ and return the response body."
   (get-with-retries (make-http-request :url url :timeout +http-get-timeout+)))
 
 (declaim (ftype (function (t t) t) write-json-file))
 
 (defun write-json-file (path object)
-  "Write OBJECT as JSON to PATH and return PATH.
-
-The write is a temp file beside the target and a rename over it, so a reader
-never sees half a document and a failure leaves the previous file in place. The
-rename is UIOP's, which is the one portable spelling of `replace this file'."
+  "Atomically write OBJECT as UTF-8 JSON to PATH via a sibling temp file and rename."
   (let* ((path (pathname path))
          (name (or (pathname-name path) "catalog"))
          (temp (make-pathname :name (concatenate 'string name ".tmp") :defaults path))
@@ -597,12 +455,7 @@ rename is UIOP's, which is the one portable spelling of `replace this file'."
 (declaim (ftype (function (string) t) catalog-fetch))
 
 (defun catalog-fetch (url)
-  "Return the catalog at URL parsed, or signal a condition the CLI can print.
-
-A refusal from the transport becomes a TRANSPORT-ERROR carrying the status, so
-`enchiridion providers refresh' reports one line and returns 1. Anything else,
-including a body that is not JSON, becomes a CONFIGURATION-ERROR at
-:PROVIDERS-URL, because that is the key whose value named the URL."
+  "Fetch and parse JSON from URL; signals TRANSPORT-ERROR on HTTP failure or CONFIGURATION-ERROR otherwise."
   (handler-case (parse-json (fetch-catalog-text url))
     (enchiridion.errors:transport-error (condition)
       (error condition))
@@ -625,19 +478,10 @@ from the active configuration, then models.dev itself."
       (enchiridion:config-value (enchiridion:config) :providers-url)
       "https://models.dev/api.json"))
 
-;; No F-TYPE: REFRESH-CATALOG and PROVIDER-MODELS take &KEY arguments, and SBCL
-;; wants every keyword in an F-TYPE lambda list to have been declared in one
-;; already, which for these two would be a dummy declaration per keyword. See
-;; RESOLVE-BACKEND in providers.lsp for the same choice.
+;; No FTYPE: SBCL requires pre-declared keyword types in &KEY FTYPEs.
 (defun refresh-catalog (&key url path)
-  "Fetch the catalog, trim it, write it, and return the new provider index.
-
-URL defaults to the configuration's :providers-url; PATH defaults to
-CATALOG-PATH, and when PATH is given the model metadata is written beside it.
-The index is returned as a list of PROVIDER structs, so a caller can use it
-without reading the file back. A fetch or parse failure signals, and the
-previous cache is untouched because the write happens only after a successful
-fetch."
+  "Fetch, trim, and atomically write the catalog index and model metadata, clearing memoized caches.
+Signals on fetch/parse failure without modifying existing cache files; returns the new provider list."
   (let* ((url (or url (catalog-url)))
          (index-path (or path (catalog-path)))
          (models-path (if path

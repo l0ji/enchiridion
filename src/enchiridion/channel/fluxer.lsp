@@ -62,7 +62,7 @@ not a close code.")
 socket and then says nothing is not a gateway to sit and wait on.")
 
 (defparameter +message-limit+ 2000
-  "How many characters one message may carry. The resolved default for a bot.")
+  "The outbound message limit, in UTF-16 code units.")
 
 (defparameter +custom-status-max-characters+ 128
   "The longest custom status text the gateway accepts, in characters.")
@@ -601,49 +601,258 @@ the only place a replay is visible."
 
 ;;;; Cutting a reply into messages.
 
-(declaim (ftype (function (character) boolean) whitespace-character-p))
-
 (defun whitespace-character-p (character)
-  "Return T when CHARACTER is whitespace a message can be cut at."
   (not (null (member character '(#\Space #\Tab #\Newline #\Return #\Page)
-                      :test #'char=))))
+                     :test #'char=))))
 
-(declaim (ftype (function (string integer) list) chunk-text))
+(defun message-character-width (character)
+  ;; Fluxer measures content in UTF-16 code units
+  (if (> (char-code character) #xffff) 2 1))
+
+(defun message-width (text)
+  (loop for character across text sum (message-character-width character)))
+
+(defun message-end (text start end budget)
+  (loop for index from start below end
+        do (decf budget (message-character-width (char text index)))
+        when (minusp budget) return index
+        finally (return end)))
+
+(defstruct markdown-span
+  start end body-start body-end fence block-spoiler)
+
+(defparameter +inline-markdown-scanner+
+  (cl-ppcre:create-scanner
+   (concatenate 'string
+                "\\\\[^\\r\\n]|\\[[^\\[\\]\\r\\n]*\\]"
+                "\\((?>[^()\\r\\n]*)(?:\\([^()\\r\\n]*\\)(?>[^()\\r\\n]*))*\\)"
+                "|<https?://[^\\s<>]+>|https?://[^\\s<>]+"
+                "|(?<!`)(`{1,2})(?!`)[^\\r\\n]+?(?<![\\\\`])\\1(?!`)"
+                "|(\\|\\|)[^\\r\\n]+?(?<!\\\\)\\2"
+                "|(?<![\\w*_~])((?>\\*{1,3}|_{1,3}|~~))(?![\\s*_~])"
+                "[^\\r\\n]+?(?<![\\\\\\s])\\3(?![*_~])")))
+
+(defun inline-markdown-spans (text start end)
+  (loop for from = start then to
+        while (< from end)
+        for (match to groups-start groups-end) =
+          (multiple-value-list (cl-ppcre:scan +inline-markdown-scanner+ text :start from :end end))
+        while match
+        for marker = (position-if #'identity groups-start)
+        for width = (and marker (- (aref groups-end marker) (aref groups-start marker)))
+        unless (and width (not (position-if-not (lambda (c) (char= c (char text match)))
+                                                text :start match :end to)))
+          collect (make-markdown-span :start match :end to
+                                      :body-start (and width (+ match width))
+                                      :body-end (and width (- to width)))))
+
+(defun backtick-end (text start end)
+  (or (position-if-not (lambda (character) (char= character #\`)) text :start start :end end)
+      end))
+
+(defun fence-opener (text start end)
+  (loop with inline-width = nil
+        for index = start then after
+        while (< index end)
+        for character = (char text index)
+        for after = (case character
+                      (#\\ (min end (+ index 2)))
+                      (#\` (backtick-end text index end))
+                      (otherwise (1+ index)))
+        when (char= character #\`)
+          do (let ((width (- after index)))
+               (cond ((eql width inline-width) (setf inline-width nil))
+                     (inline-width nil)
+                     ((< width 3) (setf inline-width width))
+                     ((not (position #\` text :start after :end end))
+                      (return (values index width)))))))
+
+(defun fence-closer (text start end width)
+  (loop for tick = (position #\` text :start start :end end)
+          then (position #\` text :start after :end end)
+        while tick
+        for after = (backtick-end text tick end)
+        when (>= (- after tick) width)
+          do (when (or (= after end) (whitespace-character-p (char text after)))
+               (return (values (if (position-if-not #'whitespace-character-p text
+                                                    :start start :end tick)
+                                   tick
+                                   start)
+                               after)))
+             (return)))
+
+(defun markdown-spans (text &optional (from 0) (end (length text)))
+  (let ((prose-start from)
+        (opening nil)
+        (spans '()))
+    (labels ((add-prose (stop)
+               (dolist (span (inline-markdown-spans text prose-start stop))
+                 (push span spans))))
+      (loop for start = from then next
+            while (< start end)
+            for line-end = (or (position #\Newline text :start start :end end) end)
+            for next = (min (1+ line-end) end)
+            for first = (position-if-not #'whitespace-character-p text :start start :end line-end)
+            do (cond
+                 (opening
+                  (multiple-value-bind (body-end close)
+                      (fence-closer text start line-end (markdown-span-fence opening))
+                    (when close
+                      (setf (markdown-span-body-end opening) body-end
+                            (markdown-span-end opening) close
+                            prose-start close)
+                      (push opening spans)
+                      (setf opening nil))))
+                 ((and first (<= (+ first 2) line-end)
+                       (string= "||" text :start2 first :end2 (+ first 2))
+                       (not (search "||" text :start2 (+ first 2) :end2 line-end)))
+                  (let ((close (search "||" text :start2 next :end2 end)))
+                    (when close
+                      (add-prose start)
+                      (setf prose-start (+ close 2)
+                            next (1+ (or (position #\Newline text :start prose-start :end end)
+                                         (1- end))))
+                      (push (make-markdown-span :start start :end prose-start :block-spoiler t
+                                                :body-start (+ first 2) :body-end close)
+                            spans))))
+                 ((and first (< line-end end) (not (char= #\> (char text first))))
+                  (multiple-value-bind (tick width) (fence-opener text first line-end)
+                    (when tick
+                      (let ((opener (if (= tick first) start tick)))
+                        (add-prose opener)
+                        (setf prose-start opener
+                              opening (make-markdown-span :start opener :body-start next
+                                                          :fence width))))))))
+      (add-prose end))
+    (nreverse spans)))
+
+(defun next-chunk-start (text start end keep-indent)
+  (let ((visible (position-if-not #'whitespace-character-p text :start start :end end)))
+    (if visible
+        (let ((newline (position #\Newline text :start start :end visible :from-end t)))
+          (cond (newline (1+ newline))
+                ((or keep-indent (and (plusp start) (char= (char text (1- start)) #\Newline)))
+                 start)
+                (t visible)))
+        end)))
+
+(defun markdown-cut (text start end spans)
+  "Return the best cut in the window, without splitting a protected span."
+  (let ((paragraph nil)
+        (line nil)
+        (space nil))
+    (loop for index from start below end
+          for span = (first spans)
+          for character = (char text index)
+          do (cond
+               ((and span (= index (markdown-span-start span)))
+                (when (> (markdown-span-end span) end)
+                  (setf end index)
+                  (return))
+                (setf index (1- (markdown-span-end span)))
+                (pop spans))
+               ((char= character #\Newline)
+                (when (and line (not (position-if-not #'whitespace-character-p text
+                                                      :start line :end index)))
+                  (setf paragraph (1+ index)))
+                (setf line (1+ index)))
+               ((and (> index start) (whitespace-character-p character)
+                     (not (whitespace-character-p (char text (1- index)))))
+                (setf space index))))
+    (or paragraph line space end)))
+
+(declaim (ftype (function (string (integer 2 *)) list) chunk-text))
 
 (defun chunk-text (text limit)
-  "Return TEXT as pieces of at most LIMIT characters, cutting on whitespace.
-
-Each piece is a slice of TEXT rather than a reflow of it, so a reply keeps its
-line breaks and its indentation. The cut consumes the run of whitespace at the
-seam, so no piece begins with whitespace, and text that is only whitespace
-gives no pieces at all. A single word longer than LIMIT is the one thing cut
-mid word, because there is nowhere else to cut it."
-  (let ((length (length text))
-        (limit (max 1 limit))
-        (start 0)
+  "Fit Fluxer messages to LIMIT, counting any repeated Markdown delimiters."
+  (let ((end (length text))
         (pieces '()))
-    (loop
-      (loop while (and (< start length)
-                       (whitespace-character-p (char text start)))
-            do (incf start))
-      (when (>= start length)
-        (return))
-      (let ((end (min length (+ start limit))))
-        (if (>= end length)
-            (progn (push (subseq text start end) pieces)
-                   (setf start length))
-            (let ((cut (position-if #'whitespace-character-p text
-                                    :start start :end end :from-end t)))
-              (if (and cut (> cut start))
-                  (progn (push (subseq text start cut) pieces)
-                         (setf start cut))
-                  ;; No whitespace in the window, so the word itself is longer
-                  ;; than one message and has to be cut.
-                  (progn (push (subseq text start end) pieces)
-                         (setf start end)))))))
-    (nreverse pieces)))
+    (labels ((emit (start end prefix suffix)
+               (when (or (plusp (length prefix))
+                         (position-if-not #'whitespace-character-p text :start start :end end))
+                 (push (with-output-to-string (message)
+                         (write-string prefix message)
+                         (write-string text message :start start :end end)
+                         (write-string suffix message))
+                       pieces)))
+             (body-room (budget prefix suffix)
+               (- budget (message-width prefix) (message-width suffix)))
+             (split-verbatim (start end prefix suffix fence)
+               (let ((budget (body-room limit prefix suffix))
+                     (line-suffix (and fence (format nil "~%~A" suffix))))
+                 (when (<= (if fence 3 2) budget)
+                   (loop for from = start then cut
+                         while (< from end)
+                         for hard-end = (message-end text from end budget)
+                         for newline = (and fence (position #\Newline text :start from :end hard-end
+                                                             :from-end t))
+                         for cut = (cond (newline (1+ newline))
+                                         (fence (message-end text from hard-end (1- budget)))
+                                         (t hard-end))
+                         do (emit from cut prefix (if (and fence (not newline)) line-suffix suffix)))
+                   t)))
+             (split-span (span prefix suffix depth)
+               (let* ((start (markdown-span-start span))
+                      (end (markdown-span-end span))
+                      (body-start (markdown-span-body-start span))
+                      (body-end (markdown-span-body-end span))
+                      (fence (markdown-span-fence span))
+                      (spoiler (markdown-span-block-spoiler span))
+                      (code (and body-start (char= (char text start) #\`)))
+                      (opener (cond (spoiler (format nil "~A||~%" prefix))
+                                    (body-start (concatenate 'string prefix
+                                                             (subseq text start body-start)))))
+                      (closer (cond (fence (concatenate 'string
+                                                       (make-string fence :initial-element #\`)
+                                                       suffix))
+                                    (spoiler (format nil "~%||~A" suffix))
+                                    (body-end (concatenate 'string
+                                                           (subseq text body-end end) suffix)))))
+                 (cond
+                   ((and (or fence code) (split-verbatim body-start body-end opener closer fence)))
+                   ((and body-start (not (or fence code)) (< depth 10)
+                         (<= 2 (body-room limit opener closer)))
+                    (split-range body-start body-end
+                                 (if spoiler (markdown-spans text body-start body-end)
+                                     (inline-markdown-spans text body-start body-end))
+                                 opener closer (1+ depth)))
+                   (t (split-range start end nil prefix suffix depth)))))
+             (split-range (start end spans prefix suffix &optional (depth 0))
+               (loop with budget = (body-room limit prefix suffix)
+                     with next = start
+                     for first-span = (first spans)
+                     for keep-indent = (and first-span (= (markdown-span-start first-span) next)
+                                            (or (markdown-span-fence first-span)
+                                                (markdown-span-block-spoiler first-span)))
+                     for from = (next-chunk-start text next end keep-indent)
+                     for hard-end = (message-end text from end budget)
+                     while (< from end)
+                     do (loop while (and spans (<= (markdown-span-end (first spans)) from))
+                              do (pop spans))
+                        (let ((span (first spans)))
+                          (cond
+                            ((= hard-end end)
+                             (emit from end prefix suffix)
+                             (return))
+                            ((and span (= (markdown-span-start span) from)
+                                  (> (markdown-span-end span) hard-end))
+                             (split-span span prefix suffix depth)
+                             (setf next (markdown-span-end span)))
+                            (t
+                             (setf next (markdown-cut text from hard-end spans))
+                             (emit from (if (zerop (length suffix))
+                                            next
+                                            (1+ (or (position-if-not #'whitespace-character-p text
+                                                                    :start from :end next :from-end t)
+                                                    (1- from))))
+                                   prefix suffix)))))))
+      (cond
+        ((not (position-if-not #'whitespace-character-p text)) nil)
+        ((= end (message-end text 0 end limit)) (list text))
+        (t (split-range 0 end (markdown-spans text) "" "")
+           (nreverse pieces))))))
 
-(declaim (ftype (function (t integer) list) outbound-chunks))
+(declaim (ftype (function (t (integer 2 *)) list) outbound-chunks))
 
 (defun outbound-chunks (text limit)
   "Return TEXT scrubbed, as the pieces a reply is sent in, or NIL.

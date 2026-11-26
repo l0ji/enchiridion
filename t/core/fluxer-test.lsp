@@ -789,6 +789,94 @@ message: the frame tests do that once, at the edge.")
     (ng (enchiridion.channel.fluxer::chunk-text "   " 2000))
     (ng (enchiridion.channel.fluxer::chunk-text (format nil "~% ~%") 2000))))
 
+(deftest markdown-splits-at-structural-boundaries ()
+  (flet ((chunks (text limit)
+           (enchiridion.channel.fluxer::chunk-text text limit)))
+    (testing "A short Markdown reply is unchanged"
+      (let ((text (format nil "## Details~%~%  - nested~%~%```lisp~%  (+ 1 2)~%```")))
+        (ok (equal (chunks text 2000) (list text)))))
+    (testing "A paragraph break takes precedence over a line or word break"
+      (ok (equal (chunks (format nil "first paragraph~%~%second line~%third line") 30)
+                 (list (format nil "first paragraph~%~%")
+                       (format nil "second line~%third line")))))
+    (testing "A new message retains nesting at the start of a list line"
+      (ok (equal (chunks (format nil "- list item~%  - nested item") 16)
+                 (list (format nil "- list item~%") "  - nested item"))))
+    (testing "Inline formatting and links that fit move whole to the next message"
+      (dolist (span '("`an inline code span`" "**two bold words**"
+                      "*two italic words*" "__two underlined words__"
+                      "~~two removed words~~" "||two spoiler words||"
+                      "[link label](https://e.test/a(b))" "<https://e.test/example>"))
+        (ok (equal (chunks (concatenate 'string "Before the " span) (length span))
+                   (list "Before the" span)))))
+    (testing "An oversized spoiler stays hidden in every continuation"
+      (ok (equal (chunks "||keep these words hidden||" 15)
+                 '("||keep these||" "||words||" "||hidden||"))))
+    (testing "A supplementary character costs two UTF-16 code units"
+      (ok (equal (chunks "ab😀" 3) '("ab" "😀"))))))
+
+(deftest fenced-code-stays-fenced-across-messages ()
+  (flet ((chunks (text limit)
+           (enchiridion.channel.fluxer::chunk-text text limit)))
+    (testing "A fence that fits moves whole to the next message"
+      (let ((block (format nil "```sh~%  echo hi~%```")))
+        (ok (equal (chunks (format nil "Run this:~%~%~A" block) (length block))
+                   (list (format nil "Run this:~%~%") block)))))
+    (testing "Each continuation keeps the language, indentation, and blank lines"
+      (let* ((text (format nil "```lisp~%  first line~%~%  second line~%  third line~%```"))
+             (pieces (chunks text 27)))
+        (ok (equal pieces (list (format nil "```lisp~%  first line~%~%```")
+                                (format nil "```lisp~%  second line~%```")
+                                (format nil "```lisp~%  third line~%```"))))
+        (ok (every (lambda (piece) (<= (length piece) 27)) pieces))))
+    (testing "A code line longer than the budget can be split without losing text"
+      (let* ((text (format nil "````text~%  one very long line with ``` inside~%````"))
+             (pieces (chunks text 25)))
+        (ok (every (lambda (piece) (<= (length piece) 25)) pieces))
+        (ok (every (lambda (piece) (and (eql 0 (search (format nil "````text~%") piece))
+                                       (string= (format nil "~%````") piece
+                                                :start2 (- (length piece) 5))))
+                   pieces))
+        (ok (string= "  one very long line with ``` inside"
+                     (apply #'concatenate 'string
+                            (mapcar (lambda (piece) (subseq piece 9 (- (length piece) 5)))
+                                    pieces))))))))
+
+(deftest oversized-markdown-preserves-literal-content ()
+  (flet ((chunks (text limit)
+           (enchiridion.channel.fluxer::chunk-text text limit)))
+    (testing "Runs of Markdown punctuation do not produce synthetic formatting"
+      (dolist (marker '(#\* #\_ #\| #\~))
+        (let* ((text (make-string 2500 :initial-element marker))
+               (pieces (chunks text 2000)))
+          (ok (equal '(2000 500) (mapcar #'length pieces)))
+          (ok (string= text (apply #'concatenate 'string pieces))))))
+    (testing "Oversized inline code keeps significant spaces"
+      (ok (equal '("` foo`" "` `") (chunks "` foo `" 6)))
+      (ok (equal '("`  `" "` `") (chunks "`   `" 4))))
+    (testing "Text following a closing fence is not code"
+      (let* ((code (format nil "```lisp~%abcdefghij~%klmnopqrst~%```"))
+             (pieces (chunks (concatenate 'string code " after the code") 24)))
+        (ok (equal pieces (list (format nil "```lisp~%abcdefghij~%```")
+                                (format nil "```lisp~%klmnopqrst~%```")
+                                "after the code")))))
+    (testing "Fences preceded by prose stay fenced across messages"
+      (let ((text (format nil "Example: ```lisp~%abcdefghij~%klmnopqrst~%```")))
+        (ok (equal (chunks text 24) (list "Example:"
+                                         (format nil "```lisp~%abcdefghij~%```")
+                                         (format nil "```lisp~%klmnopqrst~%```"))))))
+    (testing "Multiline spoilers close and reopen at message boundaries"
+      (let* ((text (format nil "||~%first hidden line~%second hidden line~%||"))
+             (pieces (chunks text 26)))
+        (ok (= 2 (length pieces)))
+        (ok (every (lambda (piece)
+                     (and (<= (length piece) 26)
+                          (string= (format nil "||~%") piece :end2 3)
+                          (string= (format nil "~%||") piece :start2 (- (length piece) 3))))
+                   pieces))
+        (ok (search "first hidden line" (first pieces)))
+        (ok (search "second hidden line" (second pieces)))))))
+
 (deftest a-reply-is-scrubbed-before-it-becomes-a-rest-body ()
   (let ((key "correcthorsebatterystaple"))
     (unwind-protect
@@ -1318,6 +1406,25 @@ message: the frame tests do that once, at the edge.")
               (gethash "d-1/m-late"
                        (enchiridion.channel.fluxer::fluxer-channel-reaction-pending
                         channel)))))))
+
+(deftest a-markdown-reply-is-posted-as-complete-code-blocks ()
+  (let* ((line (make-string 1200 :initial-element #\λ))
+         (reply (format nil "```lisp~%~A~%~A~%```" line line))
+         (channel (enchiridion.channel.fluxer:make-fluxer-channel
+                   :config '(:allowed-users ("u-1"))
+                   :turn (lambda (message)
+                           (declare (ignore message))
+                           (list :ok-p t :reply reply))))
+         (sent '())
+         (enchiridion.llm::*http-request-function*
+           (lambda (url &rest options)
+             (declare (ignore url))
+             (push (getf (enchiridion.llm:parse-json (getf options :content)) :content) sent)
+             "{\"id\":\"reply\"}")))
+    (setf (enchiridion.channel.fluxer::fluxer-channel-token channel) "fake")
+    (enchiridion.channel.fluxer::handle-inkbound channel +direct-message+)
+    (let ((expected (format nil "```lisp~%~A~%```" line)))
+      (ok (equal sent (list expected expected))))))
 
 (deftest a-reply-that-fails-mid-chunk-is-not-delivered ()
   (let* ((posts 0)

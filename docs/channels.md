@@ -155,7 +155,10 @@ only when it is a `MESSAGE_CREATE`, the channel type is a one-to-one direct
 message, the event has no guild id, the author is not a bot or the agent, and
 the author id is on the allowlist. Every other event is dropped.
 
-A reply is cut into pieces of at most 2000 characters, one message per piece.
+A reply is cut at paragraph or line breaks where possible. Fenced code outside
+blockquotes repeats its fences and language tag across messages. Each message
+fits within 2,000 UTF-16 code units, including repeated Markdown markers.
+Continuation messages do not repeat table headers, list markers, or quote prefixes.
 A 429 retries up to three times. It resumes a session that ended less than 60
 seconds ago, and otherwise identifies again. Reconnects stop after five
 attempts. Close codes 4002, 4004 and 4012 end the session without a retry, and

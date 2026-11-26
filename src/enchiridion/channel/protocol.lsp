@@ -65,8 +65,9 @@ GET-UNIVERSAL-TIME when absent/zero."
 
 (defun make-followup-selector (same-route-p message-text &key (count 4) (chars 16000))
   "Return a selector for one turn, with a shared COUNT and CHARS budget.
-Given a pending list, return the claimed messages and the remaining list in order.
-Call while holding the queue lock; leave an oversized match and later matches queued."
+Given a pending list, return the claims, the remaining list in order, and
+whether another match can fit. Leave an oversized match and later matches
+queued. Call with the queue lock held."
   (lambda (pending)
     (let ((claimed '()) (waiting '()))
       (loop for tail on pending
@@ -85,27 +86,41 @@ Call while holding the queue lock; leave an oversized match and later matches qu
             finally (return (values (nreverse claimed) (nreverse waiting)
                                     (and (plusp count) (plusp chars))))))))
 
+(defparameter +turn-reuse-limit+ 8)
+
+(defstruct (saved-work (:constructor make-saved-work (route value expires-at)))
+  route value expires-at)
+
 (defstruct turn-reuse
-  route
-  work
-  (expires-at 0))
+  (entries nil :type list))
 
 (defun turn-time ()
   (/ (get-internal-real-time) internal-time-units-per-second))
 
+(defun prune-turn-work (reuse route now)
+  (setf (turn-reuse-entries reuse)
+        (delete-if (lambda (entry)
+                     (or (equal route (saved-work-route entry))
+                         (<= (saved-work-expires-at entry) now)))
+                   (turn-reuse-entries reuse))))
+
 (defun remember-turn-work (reuse route work &key (now (turn-time)))
-  "Keep the last published turn's work for up to 30 seconds."
-  (setf (turn-reuse-route reuse) route
-        (turn-reuse-work reuse) work
-        (turn-reuse-expires-at reuse) (+ now 30)))
+  "Keep the last published turn's work for ROUTE for up to 30 seconds."
+  (prune-turn-work reuse route now)
+  (when work
+    (push (make-saved-work route work (+ now 30)) (turn-reuse-entries reuse))
+    (let ((tail (nthcdr (1- +turn-reuse-limit+) (turn-reuse-entries reuse))))
+      (when tail (setf (cdr tail) nil)))))
 
 (defun take-turn-work (reuse route &key (now (turn-time)))
-  "Consume saved work, returning it only to a matching, recent turn."
-  (prog1 (and route (equal route (turn-reuse-route reuse))
-              (< now (turn-reuse-expires-at reuse))
-              (turn-reuse-work reuse))
-    (setf (turn-reuse-route reuse) nil
-          (turn-reuse-work reuse) nil)))
+  "Consume recent saved work for ROUTE without discarding other routes' work."
+  (let ((entry (find route (turn-reuse-entries reuse) :key #'saved-work-route :test #'equal)))
+    (prune-turn-work reuse route now)
+    (when (and entry (< now (saved-work-expires-at entry)))
+      (saved-work-value entry))))
+
+(defun clear-turn-work (reuse)
+  (setf (turn-reuse-entries reuse) nil))
 
 ;;;; The digest.
 

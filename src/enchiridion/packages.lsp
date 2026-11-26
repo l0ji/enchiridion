@@ -388,7 +388,7 @@ before text reaches models, transcripts, or channels."))
    #:msg #:make-msg #:msg-id #:msg-channel #:msg-target #:msg-thread #:msg-author
    #:msg-text #:msg-ts #:msg-reply-to #:normalize #:deliver #:message-digest
    #:digest-text #:make-followup-selector
-   #:make-turn-reuse #:remember-turn-work #:take-turn-work)
+   #:make-turn-reuse #:remember-turn-work #:take-turn-work #:clear-turn-work)
   (:documentation "Channel protocol and normalized message type."))
 
 (defpackage #:enchiridion.channel.cli

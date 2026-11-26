@@ -1004,7 +1004,7 @@ else only the finished steps are written, one plain line each. The event
 
 (defun make-channel-turn (context &key (block-p nil) (allow-silence-p nil))
   "Return a turn handler for a channel, returning a result plist
-(:ok-p :reply :silent-p :error :reason :status :usage).
+(:ok-p :reply :silent-p :error :reason :status :usage :work).
 When BLOCK-P is NIL (default), return :busy if another turn is in flight;
 when T, wait for the agent lock."
   (lambda (message &optional steer prior-work)

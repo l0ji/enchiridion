@@ -2418,7 +2418,7 @@ Fatal close codes stop retrying immediately."
         (fluxer-channel-socket channel) nil
         (enchiridion.channel:channel-live-p channel) t
         (enchiridion.channel:channel-state channel) :live)
-  (enchiridion.channel:take-turn-work (fluxer-channel-reuse channel) nil)
+  (enchiridion.channel:clear-turn-work (fluxer-channel-reuse channel))
   ;; Start reaction worker before turn worker so queued messages have a reaction consumer.
   (start-reaction-worker channel)
   (setf (fluxer-channel-worker channel)

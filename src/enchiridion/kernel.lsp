@@ -603,10 +603,20 @@ Silently ignores non-repositories, missing git identity, and clean trees."
       (push (subseq entry 0 size) (turn-work-results work))
       (decf (turn-work-room work) size))))
 
-(defun prior-work-message (work)
-  (enchiridion.llm:assistant-message
-   (format nil "Recent work from the previous reply (context only).~%~A~{~%~A~}"
-           (turn-work-reply work) (reverse (turn-work-results work)))))
+(defun prior-work-message (work history)
+  (let ((reply (turn-work-reply work))
+        (results (turn-work-results work)))
+    (when (some (lambda (entry)
+                  (let ((body (cdr entry)))
+                    (and (string= "assistant" (car entry))
+                         (<= (length reply) (length body))
+                         (string= reply body :end2 (length reply)))))
+                history)
+      (setf reply nil))
+    (when (or reply results)
+      (enchiridion.llm:assistant-message
+       (format nil "Recent work from the previous reply (context only).~@[~%~A~]~{~%~A~}"
+               reply (reverse results))))))
 
 (declaim (ftype (function (agent string t t t keyword t t t t t t)
                           (values t t boolean t))
@@ -660,6 +670,7 @@ call and may signal to enforce a soft budget cap."
                        :session (or (and session (session-id session)) "default")
                        :limit enchiridion.memory:*recent-turn-count*
                        :chars enchiridion.memory:*recent-window-chars*)))
+           (work-context (and prior (prior-work-message prior history)))
            (messages (append
                       (list (enchiridion.llm:system-message
                              (enchiridion.llm.secrets:scrub
@@ -672,7 +683,7 @@ call and may signal to enforce a soft budget cap."
                                       (enchiridion.llm:assistant-message body)
                                       (enchiridion.llm:user-message body))))
                               history)
-                     (when prior (list (prior-work-message prior)))
+                     (when work-context (list work-context))
                      (list (enchiridion.llm:user-message
                              (enchiridion.llm.secrets:scrub user-text)))))
            (bootstrap-active (and (agent-directory agent) (not (eq channel :sleep))

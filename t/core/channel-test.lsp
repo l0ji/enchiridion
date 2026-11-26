@@ -91,12 +91,22 @@
   (let ((reuse (enchiridion.channel:make-turn-reuse)))
     (enchiridion.channel:remember-turn-work reuse :their-route :work :now 1)
     (ng (enchiridion.channel:take-turn-work reuse :other-route :now 2))
-    (ng (enchiridion.channel:take-turn-work reuse :their-route :now 3))
-    (enchiridion.channel:remember-turn-work reuse :their-route :work :now 4)
-    (ok (eq :work (enchiridion.channel:take-turn-work reuse :their-route :now 33)))
+    (enchiridion.channel:remember-turn-work reuse :other-route :other-work :now 3)
+    (ok (eq :work (enchiridion.channel:take-turn-work reuse :their-route :now 29)))
+    (ok (eq :other-work (enchiridion.channel:take-turn-work reuse :other-route :now 30)))
     (ng (enchiridion.channel:take-turn-work reuse :their-route :now 33))
     (enchiridion.channel:remember-turn-work reuse :their-route :work :now 4)
     (ng (enchiridion.channel:take-turn-work reuse :their-route :now 34))))
+
+(deftest the-recent-work-cache-evicts-the-oldest-route-first ()
+  (let ((reuse (enchiridion.channel:make-turn-reuse))
+        (enchiridion.channel::+turn-reuse-limit+ 2))
+    (enchiridion.channel:remember-turn-work reuse :first :one :now 1)
+    (enchiridion.channel:remember-turn-work reuse :second :two :now 2)
+    (enchiridion.channel:remember-turn-work reuse :third :three :now 3)
+    (ng (enchiridion.channel:take-turn-work reuse :first :now 4))
+    (ok (eq :two (enchiridion.channel:take-turn-work reuse :second :now 4)))
+    (ok (eq :three (enchiridion.channel:take-turn-work reuse :third :now 4)))))
 
 ;;;; The digest.
 

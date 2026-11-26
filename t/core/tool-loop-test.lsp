@@ -134,6 +134,16 @@
                  'enchiridion.errors:turn-cancelled))
     (ok (= 1 (length (enchiridion.kernel:spend agent))))))
 
+(deftest recent-work-does-not-duplicate-a-reply-already-in-history ()
+  (let* ((work (enchiridion.kernel::make-turn-work :reply "already sent"
+                                                   :results '("fixture: result")))
+         (history '(("assistant" . "already sent")))
+         (context (enchiridion.kernel::prior-work-message work history)))
+    (ok (search "fixture: result" (enchiridion.llm:message-content context)))
+    (ng (search "already sent" (enchiridion.llm:message-content context)))
+    (setf (enchiridion.kernel::turn-work-results work) nil)
+    (ng (enchiridion.kernel::prior-work-message work history))))
+
 (deftest a-late-follow-up-gets-completed-work-without-replaying-a-tool-call ()
   (let ((enchiridion.tools::*registry* (make-hash-table :test #'equal))
         (runs 0))

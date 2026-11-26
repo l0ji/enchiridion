@@ -16,8 +16,11 @@ with `--channel http` or `--channel fluxer`.
 - Slash lines (`/help`, `/stop`, `/quit`, `/who`, or `/<command>`) run commands.
 - A single bare word that matches a command prints a slash hint instead of
   sending a turn to the model. Two or more words are always sent to the agent.
-- `Ctrl-C` cancels the current line or turn and returns to the prompt. `Ctrl-D`
-  or `/quit` exits.
+- You can keep typing while the agent works. Extra lines can join the active
+  turn or queue for the next one. A follow-up sent within 30 seconds of a reply
+  can reuse its completed work. The agent can leave a message unanswered.
+- `/stop` cancels the active turn. `Ctrl-C` cancels the current line or turn.
+  `/quit` cancels and exits; `Ctrl-D` lets pending work finish before exiting.
 
 When `serve` runs without a TTY (for example, in Docker), the terminal channel
 marks itself `:unavailable` and stays down.

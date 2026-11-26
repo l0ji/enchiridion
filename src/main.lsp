@@ -317,7 +317,8 @@ Refuses a world-readable secrets file before reading any entries."
   (session nil :type t)
   (generation 0 :type integer)
   (started-p nil :type boolean)
-  (provider-refresh nil :type t))
+  (provider-refresh nil :type t)
+  (terminal-worker nil :type t))
 
 (declaim (ftype (function (t) list) agent-budget-plist))
 
@@ -602,6 +603,9 @@ turn: the builtins still work, and the agent is told what happened."
 
 (defun close-context (context)
   "Stop the broker, close the session and the store, and return NIL."
+  (when (and (context-terminal-worker context)
+             (bordeaux-threads:thread-alive-p (context-terminal-worker context)))
+    (return-from close-context nil))
   (when (context-started-p context)
     (ignore-errors (enchiridion.tools.broker:broker-stop (context-broker context))))
   (when (context-session context)
@@ -931,53 +935,60 @@ else only the finished steps are written, one plain line each. The event
       (error (condition)
         (list :ok-p nil :generation previous :report (condition-line condition))))))
 
-(defun make-respond (context cancelled &key (channel :cli))
-  "Return the function the command table calls for one turn.
+(defun respond-in-terminal (context channel text cancel-p steer reuse)
+  "Run and print a terminal turn."
+  (handler-case
+      (progn
+        (unless (context-backend context)
+          (error 'enchiridion.errors:configuration-error
+                 :key :api-key
+                 :detail (format nil "No API key. Put ~A in .env or the environment."
+                                 (enchiridion.llm:default-api-key-env
+                                  (context-config context)))))
+        (ensure-started context)
+        (let ((printer (unless reuse (make-progress-printer *error-output*))))
+          (multiple-value-bind (completion proposal silent-p work)
+              (unwind-protect
+                   (let ((enchiridion.kernel:*turn-progress-function* printer))
+                     (enchiridion.kernel:run-turn
+                      (context-agent context) text
+                      :session (context-session context) :store (context-store context)
+                      :channel channel :cancel-p cancel-p :steer steer
+                      :allow-silence-p (not (null reuse))
+                      :reuse-p (not (null reuse))
+                      :prior-work (when reuse
+                                    (enchiridion.channel:take-turn-work reuse :terminal))))
+                (when printer (funcall printer :finish nil)))
+            (declare (ignore proposal))
+            (unless silent-p
+              (print-completion completion (context-config context))
+              (finish-output)
+              (when reuse
+                (enchiridion.channel:remember-turn-work reuse :terminal work)))))
+        0)
+    (enchiridion.errors:turn-cancelled (condition)
+      (format *error-output* "~&~A~%" condition)
+      (finish-output *error-output*)
+      1)
+    (enchiridion.errors:enchiridion-error (condition)
+      (format *error-output* "~&~A~%" condition)
+      (let ((detail (enchiridion.errors:error-detail condition)))
+        (when (stringp detail)
+          (format *error-output* "~A~%" detail)))
+      (finish-output *error-output*)
+      1)))
 
-A turn the operator stopped is reported as stopped and not as a failure: the
-tokens are spent either way, and the operator asked for it.
-
-CHANNEL is the surface the turn arrived on. It is recorded on every spend row
-and every transcript row, and it names the git commit, so a turn that came in
-over the webhook is not filed as a turn typed at the terminal."
-  (lambda (text)
-    (handler-case
-        (progn
-          (unless (context-backend context)
-            (error 'enchiridion.errors:configuration-error
-                   :key :api-key
-                   :detail (format nil "No API key. Put ~A in .env or the environment."
-                                   (enchiridion.llm:default-api-key-env
-                                    (context-config context)))))
-          (ensure-started context)
-          ;; A /stop is for the turn in flight. The REPL only reads one between
-          ;; turns, so a flag left over from it would cancel this turn and every
-          ;; turn after it.
-          (setf (car cancelled) nil)
-          (let* ((printer (make-progress-printer *error-output*))
-                 (completion
-                   (unwind-protect
-                        (let ((enchiridion.kernel:*turn-progress-function* printer))
-                          (enchiridion.kernel:run-turn
-                           (context-agent context) text
-                           :session (context-session context)
-                           :store (context-store context)
-                           :channel channel
-                           :cancel-p (lambda () (car cancelled))))
-                     (funcall printer :finish nil))))
-            (print-completion completion (context-config context))
-            0))
-      (enchiridion.errors:turn-cancelled (condition)
-        (format *error-output* "~&~A~%" condition)
-        (finish-output *error-output*)
-        1)
-      (enchiridion.errors:enchiridion-error (condition)
-        (format *error-output* "~&~A~%" condition)
-        (let ((detail (enchiridion.errors:error-detail condition)))
-          (when (stringp detail)
-            (format *error-output* "~A~%" detail)))
-        (finish-output *error-output*)
-        1))))
+(defun make-respond (context cancelled &key (channel :cli) interactive-p)
+  "Return the synchronous or interactive terminal responder."
+  (if interactive-p
+      (let ((reuse (enchiridion.channel:make-turn-reuse)))
+        (lambda (text steer cancel-p)
+          (setf (context-terminal-worker context) (bordeaux-threads:current-thread))
+          (unwind-protect (respond-in-terminal context channel text cancel-p steer reuse)
+            (setf (context-terminal-worker context) nil))))
+      (lambda (text)
+        (setf (car cancelled) nil)
+        (respond-in-terminal context channel text (lambda () (car cancelled)) nil nil))))
 
 ;;;; Channels.
 ;;;;
@@ -1282,7 +1293,7 @@ heartbeat, and the kernel owns what a tick does."
      :bootstrap-line (bootstrap-line (context-directory context))
      :reload-function (lambda (supervisor) (broker-reload context supervisor)))))
 
-(defun command-context-for (context &key supervisor respond cancel)
+(defun command-context-for (context &key supervisor respond respond-interactive cancel)
   "Return the command table's view of CONTEXT."
   (enchiridion.channel.cli:make-command-context
    :directory (context-directory context)
@@ -1295,6 +1306,7 @@ heartbeat, and the kernel owns what a tick does."
    :channel :cli
    :supervisor supervisor
    :respond respond
+   :respond-interactive respond-interactive
    :cancel cancel))
 
 (defun join-arguments (arguments)
@@ -1403,6 +1415,7 @@ factories before starting the supervisor."
                      context
                      :supervisor supervisor
                      :respond (make-respond context cancelled)
+                     :respond-interactive (make-respond context cancelled :interactive-p t)
                      :cancel (lambda () (setf (car cancelled) t)))))
              (multiple-value-bind (channels factories)
                  (build-channels context supervisor command-context options name)

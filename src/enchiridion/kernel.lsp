@@ -710,6 +710,8 @@ call and may signal to enforce a soft budget cap."
                                     (enchiridion.llm:completion-text completion))
                          :calls (length (enchiridion.llm:completion-tool-calls completion)))
           (persist-usage store session (record-spend agent completion :channel channel))
+          (when (and cancel-p (funcall cancel-p))
+            (error 'enchiridion.errors:turn-cancelled :turn rounds))
           (let* ((calls (enchiridion.llm:completion-tool-calls completion))
                  (next (append-followups steer (if (and calls (not wrapped-up))
                                                    :before-tools :before-final)
@@ -750,6 +752,8 @@ call and may signal to enforce a soft budget cap."
                   (incf rounds)
                   (setf messages (append messages (list tool-message)))
                   (loop for (call . later) on calls do
+                    (when (and cancel-p (funcall cancel-p))
+                      (error 'enchiridion.errors:turn-cancelled :turn rounds))
                     (note-progress :tool-start
                                    :name (enchiridion.llm:tool-call-name call)
                                    :arguments (enchiridion.llm:tool-call-arguments call))

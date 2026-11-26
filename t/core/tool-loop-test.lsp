@@ -125,6 +125,15 @@
                  (mapcar #'enchiridion.llm:message-content
                          (rest (first (scripted-backend-transcripts backend)))))))))
 
+(deftest a-cancel-during-a-model-call-does-not-publish-the-answer ()
+  (let* ((backend (make-scripted-backend :replies (list (completion "answer"))))
+         (agent (test-agent backend :tools-p nil))
+         (checks 0))
+    (ok (signals (enchiridion.kernel:run-turn agent "question"
+                                             :cancel-p (lambda () (> (incf checks) 1)))
+                 'enchiridion.errors:turn-cancelled))
+    (ok (= 1 (length (enchiridion.kernel:spend agent))))))
+
 (deftest a-late-follow-up-gets-completed-work-without-replaying-a-tool-call ()
   (let ((enchiridion.tools::*registry* (make-hash-table :test #'equal))
         (runs 0))

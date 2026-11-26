@@ -1898,9 +1898,9 @@ Coalesces by replacing any queued state for KEY; drops with a log line if full."
 
 ;;;; The worker: the one thread that runs a turn.
 
-(defun typing-fresh-p (channel route now)
+(defun typing-expires-at (channel route)
   (let ((entry (assoc route (fluxer-channel-typing channel) :test #'equal)))
-    (and entry (< (- now (cdr entry)) +typing-fresh-seconds+))))
+    (when entry (+ (cdr entry) +typing-fresh-seconds+))))
 
 (defun claim-followups (channel select route grace
                         &key (clock #'real-seconds) (wait #'bordeaux-threads:condition-wait))
@@ -1910,8 +1910,7 @@ Coalesces by replacing any queued state for KEY; drops with a log line if full."
         (waited nil))
     (bordeaux-threads:with-lock-held (lock)
       (loop
-        (when (or (fluxer-channel-stopping-p channel)
-                  (and waited (>= (funcall clock) deadline)))
+        (when (fluxer-channel-stopping-p channel)
           (return (values nil waited)))
         (multiple-value-bind (claimed waiting room-p)
             (funcall select (fluxer-channel-pending channel))
@@ -1921,13 +1920,15 @@ Coalesces by replacing any queued state for KEY; drops with a log line if full."
               (let ((key (message-reaction-key data)))
                 (when key (push key (fluxer-channel-active-reactions channel)))))
             (return (values claimed waited)))
-          (let ((now (funcall clock)))
-            (unless (and deadline room-p (< now deadline)
-                         (typing-fresh-p channel route now))
+          (let* ((now (funcall clock))
+                 (typing-end (when (and deadline room-p)
+                               (typing-expires-at channel route)))
+                 (wait-until (when typing-end (min deadline typing-end))))
+            (unless (and wait-until (< now wait-until))
               (return (values nil waited)))
             (setf waited t)
             (funcall wait (fluxer-channel-pending-ready channel)
-                     lock :timeout (- deadline now))))))))
+                     lock :timeout (- wait-until now))))))))
 
 (defun make-turn-steer (channel route)
   "Return the follow-up callback for an authenticated DM route."

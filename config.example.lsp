@@ -28,7 +28,7 @@
      (:allowed-users nil)            ; e.g. ("your-user-id")
      (:token-env "FLUXER_BOT_TOKEN")
      (:typing-wait-seconds 8)        ; wait for a sender who is typing
-      (:custom-status nil)            ; temporary public status
+     (:custom-status nil)            ; temporary public status
      (:custom-status-user nil))      ; only this user may set it
 
     :sleep

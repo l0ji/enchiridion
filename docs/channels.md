@@ -151,8 +151,9 @@ dropped.
   last reply and its tool results instead of repeating the work. Replies to
   several messages link to the first one.
 - **Typing:** If the sender is typing when an answer is ready, the bot waits up
-  to eight seconds for another message to join that answer. Typing updates do
-  not extend the wait. Set `:typing-wait-seconds` to `0` to disable it.
+  to eight seconds for another message to join that answer. A typing signal
+  expires after eight seconds without an update. Updates do not extend the reply
+  deadline. Set `:typing-wait-seconds` to `0` to disable the wait.
 - **Silence:** The agent can choose not to reply to a DM. It still records the
   incoming message and clears the processing reaction. An empty model response
   without that decision counts as a failed turn.

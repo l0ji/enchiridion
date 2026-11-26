@@ -46,6 +46,25 @@ degraded `/health`, which returns the full health object with `ok:false`).
 | `GET /health` | Returns `200` when ready, `503` if an enabled channel is down, an enabled heartbeat died, or no supervisor is running. |
 | `GET /usage` | Returns token ledger rows (`count`, `rows`), oldest first. Optional `?limit=N` (default `50`, max `1000`). |
 
+### Follow-ups
+
+Generate a new secret key for each turn with `openssl rand -hex 32`. Keep it
+private. The `author` field is a display label, not an identity check. All
+requests still use the usual HTTP authentication. Send `follow_up_to` on a
+separate connection while the original synchronous request is open.
+
+| Body fields in addition to `text` | Result |
+| --- | --- |
+| `turn_key` | Start a synchronous turn that can accept follow-ups. |
+| `follow_up_to` | Join the open turn with this key. `202` means it was accepted; read the combined answer from the original request. |
+| `reply_to` | Start a new synchronous turn using the latest keyed reply's work if it is available. Reuse is one-time and expires after 30 seconds. May include a new `turn_key`. |
+
+One open turn can accept four follow-ups totaling up to 16,000 characters. A
+`409` includes a `code`: `turn_pending` means retry shortly, `turn_closed` or
+`unknown_turn` means send a new turn, and `turn_full` means it cannot take more.
+Never reuse a `turn_key` for a different turn. Unkeyed requests still get
+`503` with `Retry-After` while the agent is busy.
+
 ### Example
 
 ```sh

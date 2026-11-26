@@ -1033,7 +1033,7 @@ when T, wait for the agent lock."
                  :block-p block-p
                  :allow-silence-p allow-silence-p
                  :steer steer
-                 :reuse-p (eq channel :fluxer)
+                 :reuse-p (or (eq channel :fluxer) (and (eq channel :http) (not (null steer))))
                  :prior-work prior-work)
               (list :ok-p t
                     :work work
@@ -1228,6 +1228,7 @@ the network channels."
            (enchiridion.channel.http:make-http-channel
             :service (enchiridion.channel.http:make-http-service
                       :turn (make-channel-turn context)
+                      :followups-p t
                       :health (make-http-health supervisor context)
                       :usage (make-ledger-reader (context-store context))
                       :token (http-token entry)

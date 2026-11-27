@@ -30,6 +30,7 @@
     :default-component-class "cl-source-file.lsp"
     :components
     ((:file "errors-test")
+     (:file "log-test")
      (:file "compat-test")
      (:file "config-test")
      (:file "startup-test")

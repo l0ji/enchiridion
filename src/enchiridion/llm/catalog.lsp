@@ -373,21 +373,32 @@ NIL is handled before SYMBOLP so NIL never interns as :NIL."
 
 (defun read-catalog-file (path)
   "Read provider index from PATH (wrapper or flat map), returning NIL if missing or corrupt."
-  (let ((data (ignore-errors (parse-json (uiop:read-file-string path)))))
-    (when data (ignore-errors (catalog-index data)))))
+  (when (probe-file path)
+    (handler-case
+        (let ((data (parse-json (uiop:read-file-string path))))
+          (when data (catalog-index data)))
+      (error (condition)
+        (enchiridion.log:log-warn :llm "ignoring unreadable catalog file ~A: ~A" path condition)
+        nil))))
 
 (declaim (ftype (function (t) (or null hash-table)) read-catalog-models-file))
 
 (defun read-catalog-models-file (path)
   "Return the model metadata cached at PATH as a hash table of provider name to
 a list of MODEL-INFO, or NIL when there is no usable file."
-  (let ((data (ignore-errors (parse-json (uiop:read-file-string path)))))
-    (when data
-      (let ((table (make-hash-table :test #'equal)))
-        (dolist (pair (map-pairs (catalog-field data "providers")))
-          (setf (gethash (car pair) table)
-                (model-info-array (cdr pair))))
-        table))))
+  (when (probe-file path)
+    (handler-case
+        (let ((data (parse-json (uiop:read-file-string path))))
+          (when data
+            (let ((table (make-hash-table :test #'equal)))
+              (dolist (pair (map-pairs (catalog-field data "providers")))
+                (setf (gethash (car pair) table)
+                      (model-info-array (cdr pair))))
+              table)))
+      (error (condition)
+        (enchiridion.log:log-warn :llm "ignoring unreadable catalog models file ~A: ~A"
+                                  path condition)
+        nil))))
 
 (declaim (ftype (function () (or null list)) catalog-providers))
 

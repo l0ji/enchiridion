@@ -355,6 +355,7 @@ Callers hold *RELOAD-LOCK*; REGISTRY is replaced atomically without mutating the
 
 (defun refused-generation (report live snapshot)
   "Return a refused GENERATION-RESULT that leaves the live generation alone."
+  (enchiridion.log:log-warn :plugin "generation refused (staying on ~D): ~A" live report)
   (%make-generation-result :ok-p nil
                            :report report
                            :generation live
@@ -405,6 +406,8 @@ Returns (values loaded-paths private-registry private-plugins)."
           refusal
           (progn
             (publish-generation registry plugins generation)
+            (enchiridion.log:log-info :plugin "generation ~D published (~D file~:P)"
+                                      generation (length loaded))
             (%make-generation-result
              :ok-p t
              :report (format nil "generation ~D loaded, ~D file~:P"

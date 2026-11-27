@@ -918,7 +918,10 @@ until an empty :BEFORE-FINAL drain closes admission."
   "Dispatch one request as JSON, catching all errors so hunchentoot never emits HTML.
 Checks auth before reading the body, and seals RAW-POST-DATA plus sets
 Connection: close whenever a framed body is left unread."
-  (let ((service (http-acceptor-service acceptor)))
+  (let ((service (http-acceptor-service acceptor))
+        (started (get-internal-real-time))
+        (method (string-upcase (string (hunchentoot:request-method* request))))
+        (path (or (hunchentoot:script-name* request) "/")))
     ;; Close if framing cannot be read
     (when (handler-case (request-body-unread-p request)
             (error () t))
@@ -927,17 +930,33 @@ Connection: close whenever a framed body is left unread."
          (handler-case
              (progn
                (unless (authorized-p service (hunchentoot:header-in* :authorization request))
+                 (enchiridion.log:log-warn :http "401 unauthorized ~A ~A" method path)
                  (setf (hunchentoot:header-out :www-authenticate) "Bearer")
                  (http-fail 401 "A bearer token is required."))
                (let ((parsed (request-from-hunchentoot service request)))
                  (multiple-value-bind (status body) (handle-http-request service parsed)
+                   (let ((elapsed-ms (round (* 1000 (- (get-internal-real-time) started))
+                                            internal-time-units-per-second)))
+                     (enchiridion.log:log-info :http "~A ~A -> ~D (~Dms)"
+                                               method path status elapsed-ms))
                    (abort-with status body))))
            (http-error (condition)
-             (abort-with (http-error-status condition)
-                         (error-body (http-error-message condition)
-                                     (http-error-code condition))
-                         :allow (http-error-allow condition)
-                         :retry-after (http-error-retry-after condition)))
+             (let ((status (http-error-status condition))
+                   (elapsed-ms (round (* 1000 (- (get-internal-real-time) started))
+                                      internal-time-units-per-second)))
+               (unless (= status 401)
+                 (if (>= status 500)
+                     (enchiridion.log:log-warn :http "~A ~A -> ~D (~Dms): ~A"
+                                               method path status elapsed-ms
+                                               (http-error-message condition))
+                     (enchiridion.log:log-info :http "~A ~A -> ~D (~Dms): ~A"
+                                               method path status elapsed-ms
+                                               (http-error-message condition))))
+               (abort-with status
+                           (error-body (http-error-message condition)
+                                       (http-error-code condition))
+                           :allow (http-error-allow condition)
+                           :retry-after (http-error-retry-after condition))))
            (error (condition)
              (format *error-output* "~&enchiridion: webhook error: ~A~%" condition)
              (finish-output *error-output*)

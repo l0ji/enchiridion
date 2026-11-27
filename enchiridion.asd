@@ -43,6 +43,7 @@
        (:file "config")
        (:file "git")
        (:file "errors")
+       (:file "log")
        (:module "llm"
         :serial t
         :default-component-class "cl-source-file.lsp"

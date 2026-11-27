@@ -105,7 +105,9 @@
                                   LIMIT ?)"
                              (list (max 1 +adaptation-memory-full+))))))
             (or (and row (enchiridion.memory.store:field row "n")) 0))
-        (error () 0))
+        (error (condition)
+          (enchiridion.log:log-warn :adaptation "memory maturity query failed: ~A" condition)
+          0))
     0))
 
 (defun adaptation-experience-count (store)
@@ -127,7 +129,9 @@
                                   LIMIT ?)"
                              (list (max 1 +adaptation-experience-full+))))))
             (or (and row (enchiridion.memory.store:field row "n")) 0))
-        (error () 0))
+        (error (condition)
+          (enchiridion.log:log-warn :adaptation "experience maturity query failed: ~A" condition)
+          0))
     0))
 
 (declaim (ftype (function (t) rational) adaptation-maturity))
@@ -415,7 +419,9 @@
 Rolls back ADAPT.md if the database insert fails; commit errors are ignored."
   (multiple-value-bind (entry reason) (adaptation-validate-proposal store proposal)
     (if (null entry)
-        (list :status :refused :reason reason)
+        (progn
+          (enchiridion.log:log-warn :adaptation "refused preference proposal: ~A" reason)
+          (list :status :refused :reason reason))
         (handler-case
             (multiple-value-bind (before after)
                 (adaptation-append directory entry)
@@ -426,6 +432,8 @@ Rolls back ADAPT.md if the database insert fails; commit errors are ignored."
                      (format nil "Adaptation from turn~P ~{~D~^, ~}"
                              (length (getf entry :evidence))
                              (getf entry :evidence)))
+                    (enchiridion.log:log-info :adaptation "applied preference #~D (~A/~A)"
+                                              id (getf entry :kind) (getf entry :category))
                     (list :status :applied
                           :id id
                           :kind (getf entry :kind)
@@ -434,10 +442,14 @@ Rolls back ADAPT.md if the database insert fails; commit errors are ignored."
                           :evidence (getf entry :evidence)))
                 (error (condition)
                   ;; Roll back ADAPT.md if recording the row failed.
+                  (enchiridion.log:log-warn :adaptation "recording adaptation failed, rolling back ADAPT.md: ~A"
+                                            (enchiridion.errors:condition-report-line condition))
                   (ignore-errors (adaptation-write-file directory before))
                   (list :status :refused
                         :reason (enchiridion.errors:condition-report-line condition)))))
           (error (condition)
+            (enchiridion.log:log-warn :adaptation "writing ADAPT.md failed: ~A"
+                                      (enchiridion.errors:condition-report-line condition))
             (list :status :refused
                   :reason (enchiridion.errors:condition-report-line condition)))))))
 
@@ -518,18 +530,22 @@ Reverts direct ADAPT.md edits; allows at most one change (bearing or proposal) p
              :problem (adaptation-pass-problem state)))
       ((adaptation-direct-change-p state)
        ;; Revert direct edits (and commit the revert if the turn already committed).
+       (enchiridion.log:log-warn :adaptation "reverted direct edit to ADAPT.md during maintenance pass")
        (adaptation-restore state)
        (adaptation-commit directory "Revert a direct adaptation write")
        (ignore-errors (delete-file (adaptation-proposal-path directory)))
        (list :status :direct-reverted))
       ((adaptation-pass-changed-p state)
        ;; Bearing change uses this pass's single-change budget; defer any proposal.
-       (ignore-errors
-         (adaptation-record-bearing store
-                                    (adaptation-pass-bearing state)
-                                    (adaptation-pass-evidence state)
-                                    (adaptation-pass-before state)
-                                    (adaptation-pass-expected state)))
+       (enchiridion.log:log-info :adaptation "updated bearing (~A)" (adaptation-pass-evidence state))
+       (handler-case
+           (adaptation-record-bearing store
+                                      (adaptation-pass-bearing state)
+                                      (adaptation-pass-evidence state)
+                                      (adaptation-pass-before state)
+                                      (adaptation-pass-expected state))
+         (error (condition)
+           (enchiridion.log:log-warn :adaptation "could not record bearing change: ~A" condition)))
        (ignore-errors (delete-file (adaptation-proposal-path directory)))
        (list :status :bearing
              :bearing (adaptation-pass-bearing state)))
@@ -539,7 +555,9 @@ Reverts direct ADAPT.md edits; allows at most one change (bearing or proposal) p
          (cond
            ((null proposal)
             (if reason
-                (list :status :refused :reason reason)
+                (progn
+                  (enchiridion.log:log-warn :adaptation "refused unreadable proposal: ~A" reason)
+                  (list :status :refused :reason reason))
                 (list :status :none)))
            (t
             (let ((result (adaptation-apply-proposal store directory proposal)))

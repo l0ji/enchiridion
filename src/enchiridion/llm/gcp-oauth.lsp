@@ -348,6 +348,7 @@ and a 64 KiB response cap."
                          +gcp-token-default-lifetime+))
            (expiry (+ now (- lifetime +gcp-token-safety-margin+))))
       (setf *gcp-token-cache* (cons token expiry))
+      (enchiridion.log:log-info :llm "exchanged GCP OAuth access token (lifetime ~Ds)" lifetime)
       token)))
 
 (declaim (ftype (function (integer) (or null string)) gcp-cached-access-token))

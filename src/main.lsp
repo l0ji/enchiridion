@@ -495,7 +495,9 @@ When REFRESH-MODELS is T (used by ASK), refresh stale provider catalogs first."
                    :tool-rounds tool-rounds
                    :store store
                    :broker broker))))
-    (when config (enchiridion.memory:configure-memory config))
+    (when config
+      (enchiridion.log:configure-logging :config config)
+      (enchiridion.memory:configure-memory config))
     (when (and config backend) (install-memory-instruments config backend key))
     (enchiridion.tools.builtin:register-builtin-tools)
     (%make-context :directory directory
@@ -1399,6 +1401,8 @@ factories before starting the supervisor."
            :key :agent-directory
            :detail "Run enchiridion init and edit the identity files before serving."))
   (let ((context (make-command-state +turn-requirements+)))
+    (when (string= name "serve")
+      (enchiridion.log:configure-logging :config (context-config context) :default-level :info))
     (unwind-protect
          (progn
            (when (and (string= name "serve") (not (context-store context)))

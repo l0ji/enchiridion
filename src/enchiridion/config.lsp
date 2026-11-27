@@ -6,7 +6,7 @@
 (in-package #:enchiridion)
 
 (defparameter +config-sections+
-  '(:llm :channels :budget :sandbox :memory :sleep)
+  '(:llm :channels :budget :sandbox :memory :sleep :logging)
   "Top-level section keywords recognized in sectioned configs.")
 
 (declaim (ftype (function (t) boolean) sectioned-config-p))
@@ -218,7 +218,10 @@ Signals an error if KEY is not defined in DEFAULT-CONFIG."
 
     :sleep
     (:enabled t)
-    (:interval-seconds 900)))
+    (:interval-seconds 900)
+
+    :logging
+    (:level nil)))
 
 (defparameter *config* nil
   "Active configuration plist, or NIL before READ-CONFIG runs.")

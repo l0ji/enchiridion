@@ -192,7 +192,10 @@ Per-connection errors are swallowed so an interrupted client does not terminate 
                         (error () (return nil)))))
       (unwind-protect
            (handler-case (serve-connection (usocket:socket-stream connection))
-             (error () nil))
+             (error (condition)
+               (enchiridion.log:log-warn :broker "child connection closed with error: ~A"
+                                         condition)
+               nil))
         (ignore-errors (usocket:socket-close connection))))))
 
 (defun serve-broker (socket &key (uid nil) (gid nil))
@@ -203,8 +206,10 @@ Non-root processes skip privilege dropping."
     (enchiridion.compat:clear-supplementary-groups)
     (when (and gid (plusp gid))
       (enchiridion.compat:set-process-gid gid))
-    (enchiridion.compat:set-process-uid uid))
+    (enchiridion.compat:set-process-uid uid)
+    (enchiridion.log:log-info :broker "dropped privileges to uid=~D gid=~D" uid (or gid 0)))
   (let ((server (usocket:socket-listen socket nil :backlog 5 :reuse-address t)))
+    (enchiridion.log:log-info :broker "listening on ~A" socket)
     (unwind-protect
          (accept-loop server)
       (usocket:socket-close server))))
@@ -222,6 +227,7 @@ Non-root processes skip privilege dropping."
     (dolist (name '("SBCL_HOME" "CL_SOURCE_REGISTRY" "ASDF_OUTPUT_TRANSLATIONS"
                     "ENCHIRIDION_HOME"
                     "ENCHIRIDION_SOURCE" "ENCHIRIDION_SBCL" "ENCHIRIDION_GIT"
+                    "ENCHIRIDION_LOG_LEVEL"
                     "LD_LIBRARY_PATH" "XDG_CACHE_HOME" "XDG_CONFIG_HOME"))
       (let ((value (uiop:getenv name)))
         (when value
@@ -367,6 +373,9 @@ individually because tool subprocesses lead their own process groups."
                 (broker-running-p broker) t
                 ;; Clear broken flag on fresh connection so the next call does not trigger recovery.
                 (broker-broken-p broker) nil)
+          (enchiridion.log:log-info :broker "child started (pid ~A) on ~A"
+                                    (enchiridion.compat:process-pid child)
+                                    (broker-socket broker))
           broker)
       (error (condition)
         ;; Reap the failed child and any helpers so SBCL does not retain the process object.
@@ -424,6 +433,8 @@ instead of reading a stale or partial frame."
   (let ((stream (shiftf (broker-stream broker) nil)))
     (when stream
       (ignore-errors (close stream :abort t))))
+  (unless (broker-broken-p broker)
+    (enchiridion.log:log-warn :broker "marking broker stream broken (~A)" (broker-socket broker)))
   (setf (broker-broken-p broker) t)
   broker)
 
@@ -469,6 +480,7 @@ Logs a warning to *ERROR-OUTPUT* if reloading the last generation fails."
   (unless (broker-running-p broker)
     (error 'enchiridion.errors:transport-error
            :detail "The broker is not running, so no child was started."))
+  (enchiridion.log:log-warn :broker "restarting broker child on ~A" (broker-socket broker))
   (let ((child (broker-child broker)))
     (when child
       (stop-child child :grace 0.2)
@@ -520,9 +532,14 @@ TRANSPORT-ERROR. Signals TOOL-ERROR when the reply reports an error."
              (recover-broker broker))
            (let ((data (exchange broker operation arguments limit)))
              (when (eq data :timeout)
+               (enchiridion.log:log-warn :broker "tool ~A timed out after ~As" operation limit)
                ;; Only child-backed brokers can restart; in-process test brokers reconnect on next call.
                (let ((restarted (and (broker-child broker)
-                                     (ignore-errors (restart-child broker)))))
+                                     (handler-case (restart-child broker)
+                                       (error (condition)
+                                         (enchiridion.log:log-error :broker "child restart after timeout failed: ~A"
+                                                                    condition)
+                                         nil)))))
                  (error 'enchiridion.errors:transport-error
                         :detail (if restarted
                                     (format nil "The tool ~A did not answer within ~A seconds, so the broker was restarted."

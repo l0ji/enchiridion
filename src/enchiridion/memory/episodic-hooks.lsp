@@ -429,7 +429,8 @@ GENERATION is :LIVE (default), a specific generation id, or NIL (episodes only).
   "Return (VALUES pack-text retrieval-id), or NIL when disabled, empty, or on error."
   (when (and store (retrieval-enabled-p))
     (with-memory-usage (store :session session :channel channel)
-     (let ((terms (tokenise text)))
+     (let ((terms (tokenise text))
+           (started (get-internal-real-time)))
       (when terms
         (handler-case
             (let ((rows (retrieve-rows-for-turn
@@ -455,7 +456,12 @@ GENERATION is :LIVE (default), a specific generation id, or NIL (episodes only).
                                                  :predicted nil
                                                  :pack-refs refs
                                                  :generation-id (live-generation-id store)
-                                                 :ts now)))
+                                                 :ts now))
+                           (elapsed-ms (round (* 1000 (- (get-internal-real-time) started))
+                                              internal-time-units-per-second)))
+                      (enchiridion.log:log-debug
+                       :memory "retrieved pack id=~A (rows=~D included=~D chars=~D ms=~D)"
+                       id (length rows) (length included) (length pack) elapsed-ms)
                       (values pack id))))))
           (enchiridion.errors:schema-error () nil)
           (error (c)

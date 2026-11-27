@@ -154,8 +154,12 @@ TEXT overrides the standing prompt when given."
                              +task-prompt-limit+)))
          (adaptation (and maintenance-p
                           (handler-case (adaptation-begin agent store)
-                            (error () nil))))
+                            (error (condition)
+                              (enchiridion.log:log-warn :sleep "adaptation-begin failed: ~A" condition)
+                              nil))))
          (prompt (or text (if task (task-prompt task) +sleep-maintenance-prompt+))))
+    (enchiridion.log:log-info :sleep "starting ~:[maintenance pass~;task ~D~]"
+                              task (and task (enchiridion.memory.store:task-row-id task)))
     (unwind-protect
          (handler-case
              (let ((completion (run-turn agent prompt
@@ -165,7 +169,9 @@ TEXT overrides the standing prompt when given."
                                          :channel channel
                                          :pre-request pre-request)))
                (when task
-                 (enchiridion.memory.store:complete-task store (enchiridion.memory.store:task-row-id task)))
+                 (enchiridion.memory.store:complete-task store (enchiridion.memory.store:task-row-id task))
+                 (enchiridion.log:log-info :sleep "task ~D completed"
+                                           (enchiridion.memory.store:task-row-id task)))
                (list :ran-p t
                      :task-id (and task (enchiridion.memory.store:task-row-id task))
                      :status (if task :done :idle)
@@ -174,12 +180,18 @@ TEXT overrides the standing prompt when given."
                                       (handler-case
                                           (adaptation-finish adaptation store
                                                              :success-p t)
-                                        (error () nil)))
+                                        (error (condition)
+                                          (enchiridion.log:log-warn :sleep "adaptation-finish failed: ~A" condition)
+                                          nil)))
                      :reply (enchiridion.llm:completion-text completion)))
            (enchiridion.errors:budget-exceeded (condition)
+             (enchiridion.log:log-warn :sleep "~:[maintenance pass~;task ~D~] stopped by budget: ~A"
+                                       task (and task (enchiridion.memory.store:task-row-id task))
+                                       (enchiridion.errors:condition-report-line condition))
              (when maintenance-p
-               (ignore-errors (adaptation-finish adaptation store
-                                                :success-p nil)))
+               (handler-case (adaptation-finish adaptation store :success-p nil)
+                 (error (err)
+                   (enchiridion.log:log-warn :sleep "adaptation rollback failed: ~A" err))))
              (when task
                ;; Fail rather than requeue: earlier tool rounds may have already had side effects.
                (enchiridion.memory.store:fail-task store (enchiridion.memory.store:task-row-id task)))
@@ -192,9 +204,13 @@ TEXT overrides the standing prompt when given."
                                  (enchiridion.errors:condition-report-line condition))
                    :reply ""))
            (error (condition)
+             (enchiridion.log:log-warn :sleep "~:[maintenance pass~;task ~D~] failed: ~A"
+                                       task (and task (enchiridion.memory.store:task-row-id task))
+                                       (enchiridion.errors:condition-report-line condition))
              (when maintenance-p
-               (ignore-errors (adaptation-finish adaptation store
-                                                :success-p nil)))
+               (handler-case (adaptation-finish adaptation store :success-p nil)
+                 (error (err)
+                   (enchiridion.log:log-warn :sleep "adaptation rollback failed: ~A" err))))
              (when task
                (enchiridion.memory.store:fail-task store (enchiridion.memory.store:task-row-id task)))
              (list :ran-p t
@@ -632,6 +648,8 @@ Limits retries per turn window to +COMPACTION-ATTEMPTS-PER-WINDOW+ without advan
         (cond
           ;; Keep cursor unchanged on blank/refused output so turns are not dropped.
           ((null compacted)
+           (enchiridion.log:log-warn :sleep "session ~:[compaction~;rebase~] produced no usable block (turn ~D): ~A"
+                                     rebase-p newest (or refusal "empty output"))
            (if refusal
                (format nil "compaction produced nothing usable: ~A" refusal)
                "compaction produced no text"))
@@ -639,6 +657,8 @@ Limits retries per turn window to +COMPACTION-ATTEMPTS-PER-WINDOW+ without advan
            (setf (enchiridion.supervisor:supervisor-last-compacted-turn supervisor)
                  (enchiridion.memory.store:turn-row-id (first recent)))
            (setf *compaction-window* nil)
+           (enchiridion.log:log-info :sleep "session block ~:[compacted~;rebased~] through turn ~D (~D chars)"
+                                     rebase-p newest (length compacted))
            (if rebase-p
                "the session block was rebuilt from raw turns"
                "the session block was compacted")))))))

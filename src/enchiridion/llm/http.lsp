@@ -175,29 +175,47 @@ if non-JSON."
 with linear backoff (*RETRY-DELAY* * attempt). Each attempt has a wall-clock
 deadline of *REQUEST-DEADLINE-FACTOR* * timeout; timeouts and other 4xx fail immediately."
   (let ((attempt 0)
-        (deadline (* *request-deadline-factor* (http-request-timeout request))))
+        (deadline (* *request-deadline-factor* (http-request-timeout request)))
+        (url (http-request-url request)))
     (loop
-      (handler-case
-          (return (enchiridion.compat:with-deadline
-                      (deadline :on-timeout
-                                (error 'enchiridion.errors:transport-error
-                                       :detail (format nil "no reply within ~A seconds"
-                                                       deadline)))
-                    (funcall transport request)))
-        (dexador.error:http-request-failed (failure)
-          (let ((status (dexador.error:response-status failure)))
-            (if (and (integerp status)
-                     (or (= status 429) (>= status 500))
-                     (< attempt retries))
-                (progn (incf attempt)
-                       (sleep (* *retry-delay* attempt)))
-                (error 'enchiridion.errors:transport-error
-                       :status status
-                       :detail (format nil "~D after ~D attempt~:P: ~A"
-                                       status
-                                       (1+ attempt)
-                                       (provider-error-message
-                                        (dexador.error:response-body failure)))))))))))
+      (let ((started (get-internal-real-time)))
+        (handler-case
+            (let ((reply (enchiridion.compat:with-deadline
+                             (deadline :on-timeout
+                                       (progn
+                                         (enchiridion.log:log-warn
+                                          :llm "request timed out after ~As: ~A (attempt ~D)"
+                                          deadline url (1+ attempt))
+                                         (error 'enchiridion.errors:transport-error
+                                                :detail (format nil "no reply within ~A seconds"
+                                                                deadline))))
+                           (funcall transport request))))
+              (enchiridion.log:log-debug
+               :llm "request ok (~Dms, attempt ~D): ~A"
+               (round (* 1000 (- (get-internal-real-time) started))
+                      internal-time-units-per-second)
+               (1+ attempt) url)
+              (return reply))
+          (dexador.error:http-request-failed (failure)
+            (let ((status (dexador.error:response-status failure)))
+              (if (and (integerp status)
+                       (or (= status 429) (>= status 500))
+                       (< attempt retries))
+                  (let ((delay (* *retry-delay* (1+ attempt))))
+                    (incf attempt)
+                    (enchiridion.log:log-warn
+                     :llm "retrying ~A after HTTP ~D (attempt ~D/~D, wait ~As)"
+                     url status attempt retries delay)
+                    (sleep delay))
+                  (let ((detail (format nil "~D after ~D attempt~:P: ~A"
+                                        status
+                                        (1+ attempt)
+                                        (provider-error-message
+                                         (dexador.error:response-body failure)))))
+                    (enchiridion.log:log-warn :llm "request failed for ~A: ~A" url detail)
+                    (error 'enchiridion.errors:transport-error
+                           :status status
+                           :detail detail))))))))))
 
 ;;;; The one GET.
 

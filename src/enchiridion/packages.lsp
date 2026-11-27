@@ -76,6 +76,14 @@ Root processes run Git via src/git-exec.lsp as the configured agent uid/gid."))
    #:error-detail)
   (:documentation "Structured condition hierarchy for recoverable error handling."))
 
+(defpackage #:enchiridion.log
+  (:use #:cl)
+  (:export
+   #:*log-level* #:*log-stream* #:*scrubber*
+   #:parse-log-level #:level-enabled-p #:configure-logging
+   #:log-event #:log-debug #:log-info #:log-warn #:log-error)
+  (:documentation "Shared thread-safe, level-filtered, secret-scrubbed plaintext logging."))
+
 (defpackage #:enchiridion.llm
   (:use #:cl)
   (:export

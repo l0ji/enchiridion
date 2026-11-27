@@ -49,7 +49,10 @@ unreadable."
   (let ((path (and directory (merge-pathnames name directory))))
     (if (and path (probe-file path))
         (handler-case (uiop:read-file-string path :external-format :utf-8)
-          (file-error () (enchiridion.memory:seed-template name)))
+          (file-error (condition)
+            (enchiridion.log:log-warn :kernel "could not read ~A, falling back to seed template: ~A"
+                                      path condition)
+            (enchiridion.memory:seed-template name)))
         (enchiridion.memory:seed-template name))))
 
 (defun blocks-from-directory (&key directory store)
@@ -66,7 +69,11 @@ unreadable."
              (enchiridion.memory:make-block
               :label name
               :text (if store
-                        (handler-case (funcall reader store) (error () ""))
+                        (handler-case (funcall reader store)
+                          (error (condition)
+                            (enchiridion.log:log-warn :kernel "could not read ~(~A~) block from store: ~A"
+                                                      name condition)
+                            ""))
                         "")
               :writable-p t)))
       (list (read-block "SOUL.md" :persona nil)
@@ -117,7 +124,7 @@ Allocates a per-agent turn lock unless LOCK is supplied."
 
 (defun refresh-file-blocks (agent)
   "Recompile the prompt when a file-backed block changes."
-  (let ((changed nil))
+  (let ((changed '()))
     (let ((blocks
             (mapcar (lambda (block)
                       (let* ((path (enchiridion.memory:block-file block))
@@ -131,11 +138,13 @@ Allocates a per-agent turn lock unless LOCK is supplied."
                                     :text text :file path
                                     :limit (enchiridion.memory:block-limit block)
                                     :writable-p (enchiridion.memory:block-writable-p block))
-                              (setf changed t)))))
+                              (push (enchiridion.memory:block-label block) changed)))))
                     (agent-blocks agent))))
       (when changed
         (setf (agent-snapshot agent) (compile-prompt blocks)
-              (agent-blocks agent) blocks)))))
+              (agent-blocks agent) blocks)
+        (enchiridion.log:log-info :kernel "recompiled prompt snapshot for ~A (changed: ~{~(~A~)~^, ~})"
+                                  (agent-name agent) (nreverse changed))))))
 
 (defparameter +live-style-note+
   "Take your cues from the current exchange. A style correction applies to this
@@ -406,33 +415,42 @@ Returns NIL when neither is provided or both are set ambiguously."
   "Execute tool CALL for AGENT; return (VALUES text outcome failed-p).
 Tool errors are captured as scrubbed error text (including error-detail) so
 the turn continues and the model can recover."
-  (handler-case
-      (let* ((name (enchiridion.llm:tool-call-name call))
-             (directory (agent-directory agent))
-             (arguments (enchiridion.llm:parse-json
-                         (enchiridion.llm:tool-call-arguments call)))
-             (result (cond
-                       ((and (string= name "shell") directory
-                             (enchiridion.memory:bootstrap-refuse-writes-p directory))
-                        (error 'enchiridion.errors:tool-error :tool name
-                               :detail "The built-in shell is unavailable until bootstrap handover."))
-                       ((agent-broker agent)
-                         (enchiridion.tools.broker:broker-call
-                          (agent-broker agent)
-                          (enchiridion.llm:tool-call-name call)
-                          arguments))
-                       (t (enchiridion.tools:dispatch name arguments))))
-             (text (tool-result-text result)))
-        (when (string= name "presence")
-          (setf *turn-proposal* (presence-proposal arguments)))
-        (values text (tool-outcome text) nil))
-    (error (condition)
-      (let* ((detail (and (typep condition 'enchiridion.errors:enchiridion-error)
-                          (enchiridion.errors:error-detail condition)))
-             (text (tool-result-text
-                    (format nil "error: ~A~@[ ~A~]" condition
-                            (and (stringp detail) (plusp (length detail)) detail)))))
-        (values text 0 t)))))
+  (let ((name (enchiridion.llm:tool-call-name call))
+        (started (get-internal-real-time)))
+    (handler-case
+        (let* ((directory (agent-directory agent))
+               (arguments (enchiridion.llm:parse-json
+                           (enchiridion.llm:tool-call-arguments call)))
+               (result (cond
+                         ((and (string= name "shell") directory
+                               (enchiridion.memory:bootstrap-refuse-writes-p directory))
+                          (error 'enchiridion.errors:tool-error :tool name
+                                 :detail "The built-in shell is unavailable until bootstrap handover."))
+                         ((agent-broker agent)
+                          (enchiridion.tools.broker:broker-call
+                           (agent-broker agent)
+                           name
+                           arguments))
+                         (t (enchiridion.tools:dispatch name arguments))))
+               (text (tool-result-text result))
+               (elapsed-ms (round (* 1000 (- (get-internal-real-time) started))
+                                  internal-time-units-per-second)))
+          (when (string= name "presence")
+            (setf *turn-proposal* (presence-proposal arguments)))
+          (enchiridion.log:log-debug :kernel "tool ~A ok (~Dms, ~D chars)"
+                                     name elapsed-ms (length text))
+          (values text (tool-outcome text) nil))
+      (error (condition)
+        (let* ((detail (and (typep condition 'enchiridion.errors:enchiridion-error)
+                            (enchiridion.errors:error-detail condition)))
+               (text (tool-result-text
+                      (format nil "error: ~A~@[ ~A~]" condition
+                              (and (stringp detail) (plusp (length detail)) detail))))
+               (elapsed-ms (round (* 1000 (- (get-internal-real-time) started))
+                                  internal-time-units-per-second)))
+          (enchiridion.log:log-warn :kernel "tool ~A failed (~Dms): ~A"
+                                    name elapsed-ms (one-line-text text))
+          (values text 0 t))))))
 
 ;;;; Persistence.
 ;;;; Store write failures are counted and reported without failing the turn.
@@ -565,7 +583,10 @@ Silently ignores non-repositories, missing git identity, and clean trees."
           (enchiridion.git:git-commit-all
            directory
            (format nil "Agent turn ~D via ~A" (agent-turn agent) channel))
-        (error () nil)))))
+        (error (condition)
+          (enchiridion.log:log-debug :kernel "git commit skipped for turn ~D: ~A"
+                                     (agent-turn agent) condition)
+          nil)))))
 
 (defun append-followups (steer phase messages store session channel &optional draft)
   "Append new user messages to MESSAGES, or return NIL if none arrived."
@@ -694,11 +715,19 @@ call and may signal to enforce a soft budget cap."
            (last-words nil)
            (completion nil)
            (tool-message nil)
-           (silent-p nil))
+           (silent-p nil)
+           (turn-started (get-internal-real-time))
+           (spend-before (spend-count agent)))
+      (enchiridion.log:log-info :kernel "turn start agent=~A channel=~(~A~) session=~A model=~A"
+                                (agent-name agent) channel
+                                (or (and session (session-id session)) "default")
+                                (or model "default"))
       (persist-turn store session "user" text :channel channel)
       (loop
         (block round
           (when (and cancel-p (funcall cancel-p))
+            (enchiridion.log:log-info :kernel "turn cancelled at round ~D (channel=~(~A~))"
+                                      rounds channel)
             (error 'enchiridion.errors:turn-cancelled :turn rounds))
           (when pre-request
             (funcall pre-request rounds))
@@ -754,6 +783,8 @@ call and may signal to enforce a soft budget cap."
             ;; At the round cap, drop pending tool calls and force one wrap-up reply.
             (if (>= rounds (agent-tool-rounds agent))
                 (progn
+                  (enchiridion.log:log-warn :kernel "tool round limit reached (~D) for ~A on ~(~A~)"
+                                            rounds (agent-name agent) channel)
                   (note-progress :round-limit :rounds rounds)
                   (setf wrapped-up t
                         messages (append messages
@@ -786,6 +817,13 @@ call and may signal to enforce a soft budget cap."
                                            (enchiridion.llm:tool-call-id call))))))))))))
       (incf (agent-turn agent))
       (commit-agent-turn agent channel)
+      (let ((summary (spend-summary (spend-since agent spend-before)))
+            (elapsed-ms (round (* 1000 (- (get-internal-real-time) turn-started))
+                               internal-time-units-per-second)))
+        (enchiridion.log:log-info
+         :kernel "turn done agent=~A channel=~(~A~) rounds=~D in=~D out=~D ms=~D~:[~; silent~]"
+         (agent-name agent) channel (getf summary :rounds)
+         (getf summary :input) (getf summary :output) elapsed-ms silent-p))
       (when work
         (let ((reply (enchiridion.llm.secrets:scrub (enchiridion.llm:completion-text completion))))
           (if (blank-text-p reply)
@@ -805,6 +843,8 @@ as the fourth value, which a caller may pass back as PRIOR-WORK."
   (let ((lock (agent-lock agent)))
     (when lock
       (unless (bordeaux-threads:acquire-lock lock block-p)
+        (enchiridion.log:log-warn :kernel "turn rejected: agent ~A busy (channel=~(~A~))"
+                                  (agent-name agent) channel)
         (error 'enchiridion.errors:turn-busy :agent (agent-name agent))))
     (unwind-protect
          (run-turn-locked agent text model session store channel cancel-p

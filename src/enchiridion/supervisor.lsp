@@ -601,6 +601,10 @@ Initializes LAST-TICK to now so the first scheduled tick waits one interval."
   (when (supervisor-heartbeat-p supervisor)
     (supervisor-ensure-heartbeat-thread supervisor))
   (supervisor-write-status supervisor)
+  (enchiridion.log:log-info :supervisor "started (generation=~D channels=~D heartbeat=~:[off~;on~])"
+                            (supervisor-generation supervisor)
+                            (length (supervisor-channels supervisor))
+                            (supervisor-heartbeat-p supervisor))
   supervisor)
 
 (defparameter +shutdown-budget-seconds+ 20
@@ -635,6 +639,7 @@ Initializes LAST-TICK to now so the first scheduled tick waits one interval."
 
 (defun supervisor-stop (supervisor)
   "Stop heartbeat and channels within +SHUTDOWN-BUDGET-SECONDS+, write final status, and return SUPERVISOR."
+  (enchiridion.log:log-info :supervisor "stopping")
   (setf (supervisor-running-p supervisor) nil)
   (let ((deadline (+ (get-internal-real-time)
                      (* +shutdown-budget-seconds+ internal-time-units-per-second))))
@@ -695,24 +700,34 @@ Initializes LAST-TICK to now so the first scheduled tick waits one interval."
 
 (defun supervisor-tick (supervisor)
   "Run one tick via the hook, record status, and return its result plist. Never signals."
-  (setf (supervisor-tick-requested-p supervisor) nil
-        (supervisor-tick-running-p supervisor) t
-        (supervisor-tick-started supervisor) (get-universal-time))
-  (unwind-protect
-       (let* ((hook (supervisor-tick-function supervisor))
-              (result (if hook
-                          (handler-case (funcall hook supervisor)
-                            (error (condition)
-                              (list :ok-p nil
-                                    :report (enchiridion.errors:condition-report-line
-                                             condition))))
-                          (list :ok-p nil :report "no heartbeat hook is attached"))))
-         (setf (supervisor-last-tick supervisor) (get-universal-time)
-               (supervisor-ticks supervisor) (1+ (supervisor-ticks supervisor))
-               (supervisor-tick-ok-p supervisor) (not (null (getf result :ok-p)))
-               (supervisor-tick-report supervisor) (or (getf result :report) ""))
-         result)
-    (setf (supervisor-tick-running-p supervisor) nil)))
+  (let ((started (get-internal-real-time)))
+    (setf (supervisor-tick-requested-p supervisor) nil
+          (supervisor-tick-running-p supervisor) t
+          (supervisor-tick-started supervisor) (get-universal-time))
+    (unwind-protect
+         (let* ((hook (supervisor-tick-function supervisor))
+                (result (if hook
+                            (handler-case (funcall hook supervisor)
+                              (error (condition)
+                                (list :ok-p nil
+                                      :report (enchiridion.errors:condition-report-line
+                                               condition))))
+                            (list :ok-p nil :report "no heartbeat hook is attached")))
+                (ok-p (not (null (getf result :ok-p))))
+                (report (or (getf result :report) ""))
+                (elapsed-ms (round (* 1000 (- (get-internal-real-time) started))
+                                   internal-time-units-per-second)))
+           (setf (supervisor-last-tick supervisor) (get-universal-time)
+                 (supervisor-ticks supervisor) (1+ (supervisor-ticks supervisor))
+                 (supervisor-tick-ok-p supervisor) ok-p
+                 (supervisor-tick-report supervisor) report)
+           (if ok-p
+               (enchiridion.log:log-info :supervisor "heartbeat tick #~D ok (~Dms): ~A"
+                                         (supervisor-ticks supervisor) elapsed-ms report)
+               (enchiridion.log:log-warn :supervisor "heartbeat tick #~D failed (~Dms): ~A"
+                                         (supervisor-ticks supervisor) elapsed-ms report))
+           result)
+      (setf (supervisor-tick-running-p supervisor) nil))))
 
 (declaim (ftype (function (supervisor &key (:interval real)) supervisor)
                 supervisor-heartbeat-loop))
@@ -1092,6 +1107,9 @@ Requests and claims are always deleted after execution so handlers are never rep
                           (values (enchiridion.llm.secrets:scrub
                                    (princ-to-string condition))
                                   nil)))))
+                 (if ok-p
+                     (enchiridion.log:log-info :supervisor "control ~S ok: ~A" line report)
+                     (enchiridion.log:log-warn :supervisor "control ~S refused: ~A" line report))
                  (answer path report ok-p))))
       (dolist (line (consume-control-lines run)) (run-line line nil))
       (dolist (path requests)
@@ -1100,7 +1118,10 @@ Requests and claims are always deleted after execution so handlers are never rep
           (if (control-file-older-p path (- (get-universal-time)
                                             +control-pending-seconds+))
               ;; Answer expired requests explicitly so waiting callers do not time out silently.
-              (answer path "control request expired in the queue." nil)
+              (progn
+                (enchiridion.log:log-warn :supervisor "control request ~A expired in queue"
+                                          (file-namestring path))
+                (answer path "control request expired in the queue." nil))
               (run-line (read-control-request path) path)))))
     count))
 

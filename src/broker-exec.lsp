@@ -115,6 +115,7 @@ would trigger redefinition warnings). Reads the expected digest from *LOAD-SOURC
       (return-from broker-exec-main 2))
     (handler-case
         (progn
+          (enchiridion.log:configure-logging)
           (enchiridion.tools.builtin:register-builtin-tools)
           (setf enchiridion.tools.broker:*load-generation-function*
                 #'broker-exec-load-generation)

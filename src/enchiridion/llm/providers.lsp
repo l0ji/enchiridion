@@ -540,7 +540,10 @@ Refreshes catalog once on miss only when REFRESH is true and :offline is false."
           (when (and (null row)
                      refresh
                      (not (enchiridion:config-value config :offline)))
-            (ignore-errors (refresh-catalog))
+            (handler-case (refresh-catalog)
+              (error (condition)
+                (enchiridion.log:log-warn :llm "catalog refresh failed while resolving ~A: ~A"
+                                          wanted condition)))
             (setf row (find-row (catalog-plists) wanted)))
           (unless row
             (error 'enchiridion.errors:configuration-error
@@ -692,15 +695,20 @@ the active provider, and credential-shaped vars of supported cached catalog prov
 
 (defun read-model-cache (path ttl)
   "Read cached MODEL-INFO list from PATH if within TTL seconds (TTL NIL accepts any age; missing fetched_at is stale)."
-  (let ((data (ignore-errors (parse-json (uiop:read-file-string path)))))
-    (when data
-      (let ((stamp (catalog-field data "fetched_at")))
-        (when (or (null ttl)
-                  (and (integerp stamp)
-                       (numberp ttl)
-                       (plusp ttl)
-                       (<= (- (get-universal-time) stamp) ttl)))
-          (model-info-array (catalog-field data "models") :provider))))))
+  (when (probe-file path)
+    (let ((data (handler-case (parse-json (uiop:read-file-string path))
+                  (error (condition)
+                    (enchiridion.log:log-warn :llm "ignoring unreadable model cache ~A: ~A"
+                                              path condition)
+                    nil))))
+      (when data
+        (let ((stamp (catalog-field data "fetched_at")))
+          (when (or (null ttl)
+                    (and (integerp stamp)
+                         (numberp ttl)
+                         (plusp ttl)
+                         (<= (- (get-universal-time) stamp) ttl)))
+            (model-info-array (catalog-field data "models") :provider)))))))
 
 (declaim (ftype (function (model-info) hash-table) model-info->data))
 

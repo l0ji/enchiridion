@@ -515,10 +515,13 @@ another builder holds the lease, or :NO-DERIVER if *ASSERTION-DERIVER* is NIL."
             (claim-now (get-universal-time)))
        (if (not (claim-generation store generation-id owner :now claim-now))
            ;; Another builder holds the lease; retry on the next tick.
-           (list :built nil
-                 :reason :claimed
-                 :generation-id generation-id
-                 :remaining (unprocessed-episode-count store generation-id))
+           (progn
+             (enchiridion.log:log-info :memory "T2 generation ~D lease held by another builder"
+                                       generation-id)
+             (list :built nil
+                   :reason :claimed
+                   :generation-id generation-id
+                   :remaining (unprocessed-episode-count store generation-id)))
            (unwind-protect
                 (let ((episodes (candidate-episodes store generation-id limit))
                       (now (get-universal-time))
@@ -541,6 +544,9 @@ another builder holds the lease, or :NO-DERIVER if *ASSERTION-DERIVER* is NIL."
                                                       (or (null r) (getf r :error)))
                                                     results))
                                      (length results))))
+                      (when outage
+                        (enchiridion.log:log-warn :memory "T2 generation ~D deriver outage detected (>50%% failures in batch of ~D)"
+                                                  generation-id (length results)))
                       (loop for episode in episodes
                             for result in results
                             for error = (or (null result) (getf result :error))
@@ -578,6 +584,11 @@ another builder holds the lease, or :NO-DERIVER if *ASSERTION-DERIVER* is NIL."
                   (let ((remaining (unprocessed-episode-count store generation-id)))
                     (when (zerop remaining)
                       (set-generation-status store generation-id "candidate"))
+                    (enchiridion.log:log-info
+                     :memory "T2 generation ~D batch: processed=~D skipped=~D remaining=~D assertions=~D rejected=~D conflicts=~D tokens=~D status=~(~A~)"
+                     generation-id (length derived) skipped remaining
+                     accepted rejected conflicts tokens
+                     (if (zerop remaining) :candidate :building))
                     (list :built t
                           :generation-id generation-id
                           :processed (length derived)

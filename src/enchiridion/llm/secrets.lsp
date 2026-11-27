@@ -391,3 +391,5 @@ Checks SYMBOLP explicitly so SBCL does not infer NAME as SYMBOL."
                 object)
        copy))
     (t object)))
+
+(setf enchiridion.log:*scrubber* #'scrub)
